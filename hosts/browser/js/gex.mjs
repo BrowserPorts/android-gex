@@ -2915,6 +2915,7 @@ export class Gex {
       cache_op: e.gex_cache_op,
       safepoint: (SP_CODE && single.on) ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
+      crypto: e.gex_crypto,
       x87: e.gex_x87,
       mx: e.gex_mx,
       // A counting unit's table calls (cgen.rs `gex_icall_note`).
@@ -3167,6 +3168,7 @@ export class Gex {
       cache_op: e.gex_cache_op,
       safepoint: (SP_CODE && single.on) ? this.#singleSafepoint(e) : e.gex_safepoint,
       fma: e.gex_fma,
+      crypto: e.gex_crypto,
       x87: e.gex_x87,
       mx: e.gex_mx,
       // A counting unit's table calls (cgen.rs `gex_icall_note`).
