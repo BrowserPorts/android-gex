@@ -66,6 +66,7 @@ pub mod unix;
 pub use gex_f80 as f80;
 pub mod x86;
 pub mod i386;
+pub mod darwin;
 
 pub use errno::Errno;
 pub use proc::{ProcTable, INIT_PID};
