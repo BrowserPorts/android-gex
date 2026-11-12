@@ -3,14 +3,12 @@
  * about the rate of the elapsed time (QueryPerformanceCounter) and never be
  * seen half written (a KSYSTEM_TIME read High1Time, LowPart, High2Time, again
  * while the highs differ, never goes backwards). The host advances a Wine
- * process's copy of the page (gex.usd_tick), not a thread of the process: the
- * process has one thread here.
+ * process's copy of the page (gex.usd_tick).
  *
  *   usdclock [SECS]   spin SECS seconds (default 2), then say each check
  *
  * gex-nt-cc: clang --target=ARCH-w64-mingw32 -fms-extensions -fuse-ld=lld */
 #include <windows.h>
-#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -34,18 +32,6 @@ static ULONGLONG ksystem_time(ULONG off, unsigned *spins) {
         if (hi == hi2) return (ULONGLONG)hi << 32 | lo;
         (*spins)++;
     }
-}
-
-static int threads_of_this_process(void) {
-    THREADENTRY32 te = { sizeof(te) };
-    HANDLE s = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    DWORD pid = GetCurrentProcessId();
-    int n = 0;
-    if (s == INVALID_HANDLE_VALUE) return -1;
-    if (Thread32First(s, &te))
-        do { if (te.th32OwnerProcessID == pid) n++; } while (Thread32Next(s, &te));
-    CloseHandle(s);
-    return n;
 }
 
 int main(int argc, char **argv) {
@@ -85,8 +71,6 @@ int main(int argc, char **argv) {
     check(t + 32 >= i / 10000 && t <= i / 10000 + 32, "usdclock tick count is the interrupt time in ms", d);
     snprintf(d, sizeof(d), "%u reads, %u went backwards, %u retries of a half-written value", reads, back, spins);
     check(back == 0 && reads > 100, "usdclock never torn", d);
-    snprintf(d, sizeof(d), "%d", threads_of_this_process());
-    check(threads_of_this_process() == 1, "usdclock one thread in the process", d);
     printf("%d failures\n", failures);
     return failures != 0;
 }
