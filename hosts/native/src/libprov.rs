@@ -618,6 +618,9 @@ pub(crate) fn register(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(IMPORT_MODULE, "usd_publish", |mut caller: Caller<'_, HostState>, src: i32, size: i32| -> wasmtime::Result<i32> {
         crate::host(crate::door::usd_move(&mut caller, src as u32, size as u32, true))
     })?;
+    linker.func_wrap(IMPORT_MODULE, "usd_tick", |mut caller: Caller<'_, HostState>, at: i32| -> wasmtime::Result<()> {
+        crate::host(crate::door::usd_tick(&mut caller, at as u32))
+    })?;
     // The native DLL a function pointer (a table index) or a static
     // variable's address is in, as its skeleton's base (ntdll's
     // LdrFindEntryForAddress, when no image holds the address).

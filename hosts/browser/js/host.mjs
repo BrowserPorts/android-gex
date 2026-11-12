@@ -1121,6 +1121,9 @@ export class ProcessHost {
     // Including the warm ones nobody claimed.
     for (const w of this.#warm) w.terminate();
     this.#warm = [];
+    this.#usdClock?.terminate();
+    this.#usdClock = null;
+    this.#usdPids.clear();
     // A later `start` saves again (a Worker cut off inside a save left its count).
     if (this.#saveGate) this.#saveGate.fill(0);
   }
@@ -1651,6 +1654,27 @@ export class ProcessHost {
     return best < 0 ? undefined : this.#recycled.splice(best, 1)[0];
   }
 
+  /** The one Worker that advances every Wine process's KUSER_SHARED_DATA
+   *  clocks (usd-clock.mjs), made at the first process that asks
+   *  (`gex.usd_tick`); it holds no runtime. */
+  #usdClock = null;
+  #usdPids = new Set();
+  #usdTick(pid, m) {
+    if (!(m.memory instanceof WebAssembly.Memory)) return;
+    const proc = Number(String(pid).split(':')[0]);
+    if (!this.#usdClock) {
+      this.#usdClock = this.#makeWorker();
+      if (this.#door) this.#usdClock.postMessage({ kind: 'usdClock', op: 'door', door: this.#door });
+    }
+    this.#usdPids.add(proc);
+    this.#usdClock.postMessage({ kind: 'usdClock', op: 'add', pid: proc, memory: m.memory, at: m.at, clock: m.clock });
+  }
+  /** Process proc ended: its page is no longer written (nor its memory held). */
+  #usdDrop(proc) {
+    if (!this.#usdPids.delete(proc)) return;
+    this.#usdClock?.postMessage({ kind: 'usdClock', op: 'drop', pid: proc });
+  }
+
   #onMessage(pid, w, m, resolve, reject) {
     switch (m?.kind) {
       case 'ready': {
@@ -1738,12 +1762,16 @@ export class ProcessHost {
         // An exec waits on the gate (`#otherGate`) for the answer.
         this.#loadOther().catch(() => {});
         break;
+      case 'usdTick':
+        this.#usdTick(pid, m);
+        break;
       case 'doorPublish': {
         // The wineserver's door: every Worker of
         // the session, now and later, gets the server's memory and module.
         this.#door = m.door;
         narrate(`[host] wineserver pid ${m.door?.pid} published its door`);
         for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: m.door });
+        this.#usdClock?.postMessage({ kind: 'usdClock', op: 'door', door: m.door });
         break;
       }
       case 'wantLibrary':
@@ -2067,6 +2095,7 @@ export class ProcessHost {
           const c = this.#carried.get(proc);
           this.#onExit(m, proc);
           forgetMemory(proc);
+          this.#usdDrop(proc);
           this.#release(pid, w);
           if (c?.resolve) {
             this.#carried.delete(proc);
@@ -2092,7 +2121,9 @@ export class ProcessHost {
           Atomics.notify(i32, a);
           this.#door = null;
           for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: null });
+          this.#usdClock?.postMessage({ kind: 'usdClock', op: 'door', door: null });
         }
+        this.#usdDrop(Number(String(pid).split(':')[0]));
         // Kept for the page flavour's fork children only.
         if (m.recycle instanceof WebAssembly.Memory && !this.#foreign(pid)) this.#keepMemory(m.recycle);
         if (this.#extra?.exitTrace) {

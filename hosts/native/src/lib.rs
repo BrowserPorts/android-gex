@@ -1347,6 +1347,8 @@ fn run_program_with(
     let phase = std::time::Instant::now();
 
     let memory = gex_mem::GuestMemory::new(shared.clone());
+    // the process's KUSER_SHARED_DATA clock (`gex.usd_tick`) goes with it
+    let usd_guard = door::UsdGuard::new(&memory);
     store.data_mut().memory = Some(memory.clone());
     store.data_mut().with_kernel(|k| publish_vm(k, &memory));
     // The memory is new, so all of the guest's part of it reads as zero: an
@@ -1616,6 +1618,7 @@ fn run_program_with(
         // The old image's memory goes before the new one runs: every holder
         // of it is dropped here, or it stays resident for the new program's
         // whole life.
+        drop(usd_guard);
         drop(store);
         drop(linker);
         drop(spawn);

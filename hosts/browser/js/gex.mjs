@@ -7249,6 +7249,13 @@ export class Gex {
       // process's start and written by the first boot's fill.
       usd_copy: (dst, size) => this.#usdMove(addrNum(dst), size >>> 0, false),
       usd_publish: (src, size) => this.#usdMove(addrNum(src), size >>> 0, true),
+      // The process's own copy of that page, whose clocks the host advances
+      // from now on (usd-clock.mjs): its address, and the guest clock as
+      // this runtime reads it (`#guestMono`).
+      usd_tick: (at) => {
+        const c = this.#guestClock();
+        this.#env.usdTick?.(addrNum(at), { boot: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n + this.#monoHeld(), scale: c.scale, shift: c.shift });
+      },
       // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
       // address against it at start): 0x7ffe0000 from a shim without the fold.
       kuser_address: () => (e.gex_kuser_address ? e.gex_kuser_address() : 0x7ffe0000) | 0,
