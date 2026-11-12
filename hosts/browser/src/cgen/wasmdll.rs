@@ -1300,6 +1300,36 @@ fn clear(addrs: &[u64]) {
     }
 }
 
+/// A dispatch miss at a native function's table index that a class adapter
+/// serves (`FuncMap::native`: nothing is bound per function, so no bridge
+/// was published with the install): its bridge, queued for every Worker as
+/// [`bind`]'s, and true; the caller has this Worker catch up and go on at
+/// `pc`. False for any other pc, and after three misses in a row at one pc
+/// (the bridge did not take).
+pub(super) fn bridge_native(pc: u64) -> bool {
+    thread_local! {
+        static LAST: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    if pc >= gex_abi::ftab::NATIVE_FN_TOP {
+        return false;
+    }
+    let Some(f) = ftab(|m| m.native(pc)) else { return false };
+    let n = LAST.with(|l| {
+        let (p, n) = l.get();
+        let n = if p == pc { n + 1 } else { 1 };
+        l.set((pc, n));
+        n
+    });
+    if n > 3 {
+        return false;
+    }
+    clear(&[pc]);
+    let alt = lock(&ALT_INSTALLS).contains(&f.install);
+    let (regs, dirs, slots) = super::bridges_mode(&[pc], alt);
+    binds_push(Bind { regs, dirs, slots });
+    true
+}
+
 /// Map `pairs` to slots of `install` and queue their bridges for every
 /// Worker.
 pub(super) fn bind(install: u32, pairs: &[(u64, u32)]) {
@@ -1368,13 +1398,47 @@ pub extern "C" fn gex_wasmdll_installed() {
                 let pending = std::mem::take(&mut wp.pending);
                 let entries = wp.data_exports.get("__gexw_entries").copied();
                 let decl = wp.data_exports.get("__gexw_entries_decl").copied();
-                (wp.install, wp.data, entries.map(|e| (e, decl)), pending, if wp.ptr64 { 8u64 } else { 4 })
+                // the class adapters' directory, its facts and the module's
+                // slot types (`bind_classes`)
+                let classes = wp.data_exports.get("__gexw_adapters").and_then(|&dir| {
+                    let types = gex_dylink::slot_types(&wp.wasm).map_err(|e| crate::warn_line(&format!("gex-pe: {}: slot types: {e:#}\n", wp.file))).ok()?;
+                    Some((dir, wp.data_exports.get("__gexw_facts").copied(), types))
+                });
+                (wp.install, wp.data, entries.map(|e| (e, decl)), pending, if wp.ptr64 { 8u64 } else { 4 }, classes)
             })
             .collect()
     };
-    for (install, data, entries, pending, w) in todo {
+    for (install, data, entries, pending, w, classes) in todo {
         installed_one(install, data, entries, pending, w);
+        if let Some((dir, facts, types)) = classes {
+            bind_classes(install, data, w, dir, facts, &types);
+        }
     }
+}
+
+/// The ICALL pass's class adapters (as the native `bind_classes`): the
+/// directory's `{ adapter, witness, facts }` records and the `{ function,
+/// facts }` records, pointer-sized words; guest calls to the module's
+/// functions find their class's adapter through `FuncMap::get`.
+fn bind_classes(install: u32, data: u64, w: u64, dir: u32, facts: Option<u32>, types: &(Vec<u32>, Vec<Option<String>>)) {
+    let gm = crate::guest();
+    let base = ftab(|m| m.install(install).base);
+    let ptr = |a: u64| if w == 8 { gm.read_u64(a).unwrap_or(0) } else { gm.read_u32(a).unwrap_or(0) as u64 };
+    let records = |off: u32, n: u64| -> Vec<Vec<u32>> {
+        let at = data + off as u64;
+        let (start, stop) = (ptr(at), ptr(at + w));
+        let mut out = Vec::new();
+        let mut a = start;
+        while start != 0 && a + n * w <= stop {
+            out.push((0..n).map(|k| gm.read_u32(a + k * w).unwrap_or(0)).collect());
+            a += n * w;
+        }
+        out
+    };
+    let slot = |f: u32| f.checked_sub(base).filter(|_| f != 0);
+    let adapters: Vec<(u32, u32, u32)> = records(dir, 3).into_iter().filter_map(|r| Some((slot(r[0])?, slot(r[1])?, r[2]))).collect();
+    let facts: Vec<(u32, u32)> = facts.map(|off| records(off, 2).into_iter().filter_map(|r| Some((slot(r[0])?, r[1]))).collect()).unwrap_or_default();
+    ftab(|m| m.set_native(install, &types.0, &types.1, &facts, &adapters));
 }
 
 fn installed_one(install: u32, data: u64, entries: Option<(u32, Option<u32>)>, pending: Vec<(u64, Vec<u8>)>, w: u64) {

@@ -1748,6 +1748,10 @@ static void *gexw_ntdll_proc(const char *name)
             # gexrt's bounds of the entry-thunk pairs (gexw_entries)
             f.write('--export-if-defined=__gexw_entries\n')
             f.write('--export-if-defined=__gexw_entries_decl\n')
+            # the ICALL pass's class adapters' directory and facts (its
+            # GEXW_ENTRY=classes mode), whose bounds its objects define
+            f.write('--export-if-defined=__gexw_adapters\n')
+            f.write('--export-if-defined=__gexw_facts\n')
             # a module with thread-local data (a gexcc-win program's C++
             # runtime): the host gives each thread's instance a block of
             # its own (wasmdll), as wasm-ld's start function does only for

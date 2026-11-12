@@ -484,11 +484,11 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
     /** `src` built with the gexcc-win install GEX_TEST_GEXCC_WIN (a skip
      *  without it) as `out` in the run's directory, beside its .wasm:
      *  `args` the compiler's (g++ for a .cpp). */
-    async gexccWin(src, out, args = []) {
+    async gexccWin(src, out, args = [], { env: more = {} } = {}) {
       const cc = env.GEX_TEST_GEXCC_WIN || t.skip('GEX_TEST_GEXCC_WIN: a gexcc-win install (toolchain/gexcc/windows/install.sh)');
       const exe = join(work, out);
       mkdirSync(join(exe, '..'), { recursive: true });
-      const r = await run([join(cc, 'bin', `x86_64-w64-mingw32-${/\.cpp$/.test(src) ? 'g++' : 'gcc'}`), ...args, '-o', exe, src], { file: `${exe}.build` });
+      const r = await run([join(cc, 'bin', `x86_64-w64-mingw32-${/\.cpp$/.test(src) ? 'g++' : 'gcc'}`), ...args, '-o', exe, src], { file: `${exe}.build`, env: { ...env, ...more } });
       if (r.code !== 0) throw new Error(`gexcc-win ${basename(src)}: ${r.out.trim().split('\n').slice(-5).join(' / ')}`);
       return exe;
     },

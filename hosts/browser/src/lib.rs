@@ -17375,6 +17375,15 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         set_resume_ctx(my_ctx());
         trap();
     }
+    // A native function's table index (guest code calling a function pointer
+    // native code handed it), served by its class's adapter, which has no
+    // bridge until now: this Worker catches up on it and goes on at pc.
+    if !alt && cgen::bridge_native(pc) {
+        miss_way(pc, 6);
+        set_resume(pc);
+        set_resume_ctx(my_ctx());
+        trap();
+    }
     // An ejected project's training run: a pc of a unit image no function
     // holds is a web entry, whether the function JIT (below) or tier-1 then
     // runs it (the AOT-only run would stop here).

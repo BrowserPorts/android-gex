@@ -2160,6 +2160,12 @@ pub extern "C" fn gex_provider_relocated(base: u32) {
 /// training run.
 pub(crate) static ENTRY_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A dispatch miss at a native function's table index served by a class
+/// adapter: its bridge is queued (`wasmdll::bridge_native`).
+pub(crate) fn bridge_native(pc: u64) -> bool {
+    wasmdll::bridge_native(pc)
+}
+
 /// Whether the function table has a function for `pc`.
 pub(crate) fn knows(pc: u64) -> bool {
     ftab(|m| m.get(pc).is_some())
