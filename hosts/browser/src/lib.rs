@@ -14174,6 +14174,11 @@ fn wait_why(r: &Run) -> u8 {
 fn schedule() -> i32 {
     let r = schedule_turn();
     if r == 1 {
+        // A thread runs: a turn that paused this Worker and a later one
+        // that resumes it, with no `gex_wake` between (a blocking call's
+        // park and second ask), left it parked to its processor time, and
+        // the thread's CPU clock stood still.
+        set_paused_to(0);
         cgen::ftab_resume();
     } else {
         cgen::ftab_out(SCHED_OVER.with(|c| c.get()));
