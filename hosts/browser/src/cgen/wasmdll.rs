@@ -1209,6 +1209,26 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
     }
 }
 
+/// `gex.image_floats(fd)` (64-bit Wine's ntdll, in a 64-bit memory, for an
+/// image the server gives an address below 4 GiB): 1 when the image is a
+/// DLL of Wine's core PE module, whose one data block the DLLs it holds
+/// share. That block is in the window at the top of the space, within the
+/// 32-bit RVA reach of the images placed top down below it but of none
+/// lower, so ntdll places such an image top down too, not at its address
+/// (a pin of the prefix's dll-bases). 0 for any other image.
+#[no_mangle]
+pub extern "C" fn gex_image_floats(fd: i32) -> i32 {
+    if !gex_abi::mem64() {
+        return 0;
+    }
+    let Some(file) = crate::fds_free().and_then(|fds| Some(Arc::clone(&fds.get(fd).ok()?.handle))) else { return 0 };
+    let Some((pe, _)) = super::read_pe(&file) else { return 0 };
+    let Some(sec) = pe.sections.iter().find(|s| s.name == ".wasmref") else { return 0 };
+    let raw = pe.data.get(sec.raw_offset as usize..).unwrap_or_default();
+    let module = raw.strip_prefix(&b"GEXWREF1"[..]).and_then(|r| r.split(|&c| c == 0).next());
+    (pe.is64 && module == Some(CORE_MODULE.as_bytes())) as i32
+}
+
 /// In a 64-bit memory, a PE32+ module's data where its skeleton's data
 /// exports reach it, when the window's next would not: the export address
 /// table holds 32-bit RVAs, so a data export is at most 4 GiB above the

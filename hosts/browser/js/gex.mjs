@@ -7243,6 +7243,9 @@ export class Gex {
       // The end of 64-bit Wine's space in a 64-bit memory, in 64 KiB units
       // (shim `gex_space_top`): ntdll's top instead of its probe; 0 to probe.
       space_top: () => (e.gex_space_top?.() ?? 0) | 0,
+      // (shim `gex_image_floats`): 1 when an image the server places below
+      // 4 GiB goes top down instead, a DLL of Wine's core PE module.
+      image_floats: (fd) => (e.gex_image_floats?.(fd) ?? 0) | 0,
       // (shim `gex_host_space`): where its own space below 4 GiB starts, which Wine reports reserved
       host_space: () => (e.gex_host_space?.() ?? 0) | 0,
       // The session mapping, a block of the server's memory (area +128,
