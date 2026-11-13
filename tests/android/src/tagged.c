@@ -6,6 +6,7 @@
 // call (Documentation/arch/arm64/tagged-address-abi.rst). bionic asks at
 // start and, when the kernel agrees, tags what malloc returns with 0xb4.
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,34 @@ int main(void) {
     CHECK(write(fds[1], t + 17, 1) == 1);
     CHECK(read(fds[0], tl, 1) == 1 && local == 'x');
 
+    // A string's address is untagged for any thread, and so is the address
+    // of an address-space call: neither waits for the ABI.
+    char *path = strdup("/dev/null");
+    CHECK(path && tag_of(path) == 0xb4);
+    int fd = open(path, O_RDONLY);
+    CHECK(fd >= 0);
+    close(fd);
+    CHECK(mprotect(t, 4096, PROT_READ) == 0);
+    CHECK(madvise(t, 4096, MADV_NORMAL) == 0);
+
+    // With the ABI off the kernel refuses a tagged pointer it would access
+    // and still takes those. (Nothing is printed until it is back on:
+    // stdio writes from the heap.)
+    CHECK(prctl(PR_SET_TAGGED_ADDR_CTRL, 0, 0, 0, 0) == 0);
+    int off = prctl(PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0);
+    errno = 0;
+    ssize_t wrote = write(fds[1], t + 17, 1);
+    int wrote_errno = errno;
+    int fd_off = open(path, O_RDONLY);
+    int unmapped = munmap(t, 4096);
+    CHECK(prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE, 0, 0, 0) == 0);
+    CHECK(off == 0);
+    CHECK(wrote == -1 && wrote_errno == EFAULT);
+    CHECK(fd_off >= 0);
+    close(fd_off);
+    CHECK(unmapped == 0);
+
+    free(path);
     free(p);
     free(q);
     printf("tagged ok\n");

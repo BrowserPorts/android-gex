@@ -88,9 +88,24 @@ pub use proclive::{KernelProcSource, ProcCell};
 /// asked for (see the span's module).
 pub struct GuestMem<'a> {
     span: gex_atomic::mem::Span<'a>,
-    /// Whether an address loses its tag before it is checked
-    /// ([`Self::set_untag`]).
-    untag: bool,
+    /// Which addresses lose their tag before they are checked
+    /// ([`Self::set_tags`]).
+    tags: Tags,
+}
+
+/// Which of a thread's addresses the kernel takes the tag off, AArch64's
+/// top byte, before it reads or writes there.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Tags {
+    /// None: every thread but an AArch64 one.
+    None,
+    /// A string's, which `strncpy_from_user` and `strnlen_user` untag for
+    /// any AArch64 thread (lib/strncpy_from_user.c, lib/strnlen_user.c).
+    Strings,
+    /// Every address the kernel accesses, a string's included: a thread
+    /// with the tagged address ABI on, whose pointers `access_ok` untags
+    /// (arch/arm64/include/asm/uaccess.h).
+    All,
 }
 
 /// AArch64's `untagged_addr` (arch/arm64/include/asm/memory.h): a user
@@ -103,13 +118,13 @@ pub fn untagged_addr(addr: u64) -> u64 {
 
 impl<'a> GuestMem<'a> {
     pub fn new(bytes: &'a mut [u8]) -> GuestMem<'a> {
-        GuestMem { span: gex_atomic::mem::Span::new(bytes), untag: false }
+        GuestMem { span: gex_atomic::mem::Span::new(bytes), tags: Tags::None }
     }
 
     /// Over a [`gex_atomic::mem::Span`] (the browser's, from address 0 of
     /// its memory).
     pub fn of_span(span: gex_atomic::mem::Span<'a>) -> GuestMem<'a> {
-        GuestMem { span, untag: false }
+        GuestMem { span, tags: Tags::None }
     }
 
     /// The memory as one slice, where it is one (a native host's, a
@@ -131,15 +146,14 @@ impl<'a> GuestMem<'a> {
         self.span.get_mut(r.start, r.len()).ok_or(Errno::EFAULT)
     }
 
-    /// Whether the addresses given from here on are a thread's that has
-    /// AArch64's tagged address ABI on: `access_ok` takes the tag off such
-    /// a thread's pointer before it checks it (arch/arm64/include/asm/uaccess.h).
-    pub fn set_untag(&mut self, on: bool) {
-        self.untag = on;
+    /// Whose addresses are given from here on, for the tags they may
+    /// carry ([`Tags`]).
+    pub fn set_tags(&mut self, tags: Tags) {
+        self.tags = tags;
     }
 
     fn range(&self, addr: u64, len: usize) -> Result<std::ops::Range<usize>, Errno> {
-        let addr = if self.untag { untagged_addr(addr) } else { addr };
+        let addr = if self.tags == Tags::All { untagged_addr(addr) } else { addr };
         let start = addr as usize;
         let end = start.checked_add(len).ok_or(Errno::EFAULT)?;
         if addr > usize::MAX as u64 || end > self.limit() {
@@ -283,6 +297,10 @@ impl<'a> GuestMem<'a> {
     /// no NUL ends it within `buf` (and memory goes on), for the caller to
     /// read it whole.
     pub fn read_cstr_into(&self, addr: u64, buf: &mut [u8]) -> Result<Option<usize>, Errno> {
+        let addr = if self.tags == Tags::None { addr } else { untagged_addr(addr) };
+        if addr > usize::MAX as u64 {
+            return Err(Errno::EFAULT);
+        }
         let start = addr as usize;
         let limit = self.limit();
         if start >= limit {
@@ -301,6 +319,10 @@ impl<'a> GuestMem<'a> {
     }
 
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
+        let addr = if self.tags == Tags::None { addr } else { untagged_addr(addr) };
+        if addr > usize::MAX as u64 {
+            return Err(Errno::EFAULT);
+        }
         let start = addr as usize;
         let limit = self.limit();
         if start >= limit {

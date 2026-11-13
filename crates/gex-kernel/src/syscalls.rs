@@ -7182,6 +7182,32 @@ pub fn a64_thread(compat: bool, wasm32: bool) -> bool {
     !gex_abi::X86 && !compat && !wasm32
 }
 
+/// Which of a thread's addresses lose their tag in its system calls
+/// ([`crate::Tags`]): none but an AArch64 thread's, of whose a string's
+/// always does and the rest when it has the tagged address ABI on.
+pub fn thread_tags(a64: bool, thread: &crate::signal::ThreadSig) -> crate::Tags {
+    match (a64, thread.tagged_addr()) {
+        (false, _) => crate::Tags::None,
+        (true, false) => crate::Tags::Strings,
+        (true, true) => crate::Tags::All,
+    }
+}
+
+/// An AArch64 thread's address-space calls take a tagged address whether
+/// or not the thread has the tagged address ABI on: "user addresses not
+/// accessed by the kernel but used for address space management"
+/// (Documentation/arch/arm64/tagged-address-abi.rst). Each of these
+/// untags its address as it starts: `munmap` (mm/mmap.c), `mprotect`
+/// (mm/mprotect.c), `madvise` (mm/madvise.c), `msync` (mm/msync.c),
+/// `mlock`, `mlock2` and `munlock` (mm/mlock.c), and `mremap`'s old
+/// address (mm/mremap.c). `mmap`, `brk` and `mremap`'s new address are
+/// taken as given, the ABI's exceptions.
+pub fn untag_mapping_args(n: u64, a: &mut [u64; 6]) {
+    if matches!(n, nr::MUNMAP | nr::MPROTECT | nr::MADVISE | nr::MSYNC | nr::MLOCK | nr::MLOCK2 | nr::MUNLOCK | nr::MREMAP) {
+        a[0] = crate::untagged_addr(a[0]);
+    }
+}
+
 /// `prctl(PR_SET_TAGGED_ADDR_CTRL)` and `prctl(PR_GET_TAGGED_ADDR_CTRL)`,
 /// AArch64's tagged address ABI; `None` for any other option.
 ///
@@ -7814,9 +7840,14 @@ impl FreeCall {
 pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
     // As [`Kernel::syscall`]: a thread with AArch64's tagged address ABI
     // on may pass tagged pointers.
-    m.set_untag(a64_thread(f.io.compat, f.io.wasm32) && f.signals.thread().tagged_addr());
+    let a64 = a64_thread(f.io.compat, f.io.wasm32);
+    m.set_tags(thread_tags(a64, f.signals.thread()));
+    let mut call = call;
+    if a64 {
+        untag_mapping_args(call.n, &mut call.a);
+    }
     let out = free_call_untagged(f, m, ctx_addr, call);
-    m.set_untag(false);
+    m.set_tags(crate::Tags::None);
     out
 }
 
@@ -10608,9 +10639,9 @@ impl Kernel {
         self.mem.shared_maps().catch_up(m);
         // A thread with AArch64's tagged address ABI on may pass tagged
         // pointers for the kernel to access (`access_ok`).
-        m.set_untag(a64_thread(self.compat, self.wasm32) && self.signals.thread().tagged_addr());
+        m.set_tags(thread_tags(a64_thread(self.compat, self.wasm32), self.signals.thread()));
         let out = self.syscall_cwd(m, pc);
-        m.set_untag(false);
+        m.set_tags(crate::Tags::None);
         // What a signal that ends the wait makes of it ([`Self::finish_blocking`]).
         if let SyscallOutcome::Blocking(op) = &out {
             self.block_restart = op.restart();
@@ -10667,6 +10698,9 @@ impl Kernel {
                 self.arg(m, 5),
             ]
         };
+        if a64_thread(self.compat, self.wasm32) {
+            untag_mapping_args(raw, &mut a);
+        }
         // The number's register doubles as the result register on x86-64, so
         // keep the raw number where a host can read it after the fact.
         if gex_abi::X86 {
@@ -13553,14 +13587,39 @@ mod tests {
         let mut buf = vec![0u8; 0x1000];
         let mut m = GuestMem::new(&mut buf);
         let tagged = 0xb400_0000_0000_0100u64;
+        assert_eq!(m.write(tagged, &[7]), Err(Errno::EFAULT), "not an AArch64 thread");
+        assert_eq!(m.read_cstr(tagged, 16), Err(Errno::EFAULT));
+        // An AArch64 thread without the ABI: lib/strncpy_from_user.c
+        // untags a string's address all the same.
+        m.set_tags(crate::Tags::Strings);
         assert_eq!(m.write(tagged, &[7]), Err(Errno::EFAULT), "the ABI is off");
-        m.set_untag(true);
+        m.write(0x100, b"name\0").unwrap();
+        assert_eq!(m.read_cstr(tagged, 16).unwrap(), b"name");
+        let mut name = [0u8; 16];
+        assert_eq!(m.read_cstr_into(tagged, &mut name), Ok(Some(4)));
+        m.set_tags(crate::Tags::All);
         m.write(tagged, &[7]).unwrap();
         assert_eq!(m.read(0x100, 1).unwrap(), &[7]);
         assert_eq!(m.read(tagged, 1).unwrap(), &[7]);
         assert_eq!(m.read(0xb480_0000_0000_0100, 1), Err(Errno::EFAULT), "bit 55 set: not a user address");
-        m.set_untag(false);
+        assert_eq!(m.read_cstr(0xb480_0000_0000_0100, 16), Err(Errno::EFAULT));
+        m.set_tags(crate::Tags::None);
         assert_eq!(m.read(tagged, 1), Err(Errno::EFAULT));
+        // The address-space calls untag theirs, mmap and mremap's new
+        // address excepted (Documentation/arch/arm64/tagged-address-abi.rst).
+        for n in [nr::MUNMAP, nr::MPROTECT, nr::MADVISE, nr::MSYNC, nr::MLOCK, nr::MLOCK2, nr::MUNLOCK] {
+            let mut a = [tagged, tagged, 0, 0, 0, 0];
+            untag_mapping_args(n, &mut a);
+            assert_eq!(a, [0x100, tagged, 0, 0, 0, 0], "{n}");
+        }
+        let mut a = [tagged, 0x1000, 0x2000, 3, tagged, 0];
+        untag_mapping_args(nr::MREMAP, &mut a);
+        assert_eq!(a, [0x100, 0x1000, 0x2000, 3, tagged, 0], "mremap's new address is as given");
+        for n in [nr::MMAP, nr::BRK, nr::WRITE] {
+            let mut a = [tagged; 6];
+            untag_mapping_args(n, &mut a);
+            assert_eq!(a, [tagged; 6], "{n}");
+        }
         assert_eq!(crate::untagged_addr(tagged), 0x100);
         assert_eq!(crate::untagged_addr(0xff80_0000_0000_0100), 0xff80_0000_0000_0100);
     }
