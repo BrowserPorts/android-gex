@@ -1153,12 +1153,17 @@ impl<'a> Lifter<'a> {
             }
 
             Inst::LoadExclusivePair { sz, rt, rt2, rn, order } => {
-                self.load_exclusive_pair(sz, rt, rt2, rn, order);
+                self.load_exclusive_pair(sz, rt, rt2, rn, order, pc);
                 Flow::Next
             }
 
             Inst::StoreExclusivePair { sz, rs, rt, rt2, rn, .. } => {
-                self.store_exclusive_pair(sz, rs, rt, rt2, rn);
+                self.store_exclusive_pair(sz, rs, rt, rt2, rn, pc);
+                Flow::Next
+            }
+
+            Inst::CompareSwapPair { sz, rs, rt, rn, .. } => {
+                self.compare_swap_pair(sz, rs, rt, rn, pc);
                 Flow::Next
             }
 
@@ -4732,73 +4737,106 @@ impl<'a> Lifter<'a> {
         self.b.write(GuestReg::MonSize, zero);
     }
 
-    /// `ldxp`: a W pair is one doubleword, monitored whole; an X pair is
-    /// two, of which the monitor keeps the first (see
-    /// [`Self::store_exclusive_pair`]).
-    fn load_exclusive_pair(&mut self, sz: MemSz, rt: RegSel, rt2: RegSel, rn: RegSel, order: IsaOrder) {
+    /// Two W registers as the doubleword they occupy in memory, the first
+    /// in its low half.
+    fn w_pair(&mut self, first: RegSel, second: RegSel) -> Value {
+        let a = self.rd_gp(first, Sz::W);
+        let b = self.rd_gp(second, Sz::W);
+        let a64 = self.b.extend(a, false);
+        let b64 = self.b.extend(b, false);
+        let thirty_two = self.b.const_i64(32);
+        let top = self.b.bin(BinOp::Shl, Ty::I64, b64, thirty_two);
+        self.b.bin(BinOp::Or, Ty::I64, top, a64)
+    }
+
+    /// A doubleword from memory into two W registers, its low half into
+    /// the first.
+    fn set_w_pair(&mut self, first: RegSel, second: RegSel, v: Value) {
+        let lo = self.b.wrap(v);
+        let thirty_two = self.b.const_i64(32);
+        let top = self.b.bin(BinOp::ShrU, Ty::I64, v, thirty_two);
+        let hi = self.b.wrap(top);
+        self.wr_gp(first, Sz::W, lo);
+        self.wr_gp(second, Sz::W, hi);
+    }
+
+    /// A sixteen-byte atomic on X registers, which the host does under the
+    /// lock all of them take (`gex_abi::pair_op`): wasm has no atomic wider
+    /// than eight bytes. The host reads and writes the registers, and the
+    /// monitor, in the context. An address that is not a multiple of sixteen
+    /// is an alignment fault, and both doublewords are loaded here first, so
+    /// that one that is not the guest's faults as any load of it does.
+    fn pair_op(&mut self, op: u32, regs: [RegSel; 3], rn: RegSel, pc: u64) {
         let addr = self.rd_addr(rn);
-        let lo = self.b.def(Expr::Load { addr, offset: 0, sz: gex_ir::MemSz::B8, signed: false, ty: Ty::I64, order: order_of(order) });
-        self.b.write(GuestReg::MonAddr, addr);
-        self.b.write(GuestReg::MonValue, lo);
-        if sz == MemSz::D {
-            let hi = self.b.def(Expr::Load { addr, offset: 8, sz: gex_ir::MemSz::B8, signed: false, ty: Ty::I64, order: order_of(order) });
-            let size = self.b.const_i64(16);
-            self.b.write(GuestReg::MonSize, size);
-            self.wr_gp(rt, Sz::X, lo);
-            self.wr_gp(rt2, Sz::X, hi);
-        } else {
-            let size = self.b.const_i64(8);
-            self.b.write(GuestReg::MonSize, size);
-            let first = self.b.wrap(lo);
-            let thirty_two = self.b.const_i64(32);
-            let top = self.b.bin(BinOp::ShrU, Ty::I64, lo, thirty_two);
-            let second = self.b.wrap(top);
-            self.wr_gp(rt, Sz::W, first);
-            self.wr_gp(rt2, Sz::W, second);
+        let fifteen = self.b.const_i64(15);
+        let low = self.b.bin(BinOp::And, Ty::I64, addr, fifteen);
+        let zero = self.b.const_i64(0);
+        let misaligned = self.b.cmp(CmpOp::Ne, Ty::I64, low, zero);
+        self.b.stmt(Stmt::Trap { cond: misaligned, pc, code: gex_abi::imports::BRK_ALIGNMENT });
+        for offset in [0, 8] {
+            self.b.def(Expr::Load { addr, offset, sz: gex_ir::MemSz::B8, signed: false, ty: Ty::I64, order: Order::Relaxed });
         }
+        let pcv = self.b.const_i64(pc);
+        let [a, b, c] = regs.map(RegSel::number);
+        let id = self.b.const_i32(gex_abi::pair_op::id(op, a, b, c) as u32);
+        self.b.stmt(Stmt::HostCall { func: HostFunc::SysRegWrite, args: vec![pcv, id, addr] });
+    }
+
+    /// `ldxp`: a W pair is one doubleword, loaded and monitored as `ldxr`'s
+    /// is; an X pair is two, which the host loads and monitors together.
+    fn load_exclusive_pair(&mut self, sz: MemSz, rt: RegSel, rt2: RegSel, rn: RegSel, order: IsaOrder, pc: u64) {
+        if sz == MemSz::D {
+            return self.pair_op(gex_abi::pair_op::LOAD, [rt, rt2, RegSel::Zr], rn, pc);
+        }
+        let addr = self.rd_addr(rn);
+        let v = self.b.def(Expr::Load { addr, offset: 0, sz: gex_ir::MemSz::B8, signed: false, ty: Ty::I64, order: order_of(order) });
+        self.b.write(GuestReg::MonAddr, addr);
+        self.b.write(GuestReg::MonValue, v);
+        let size = self.b.const_i64(8);
+        self.b.write(GuestReg::MonSize, size);
+        self.set_w_pair(rt, rt2, v);
     }
 
     /// `stxp`. A W pair is one doubleword, compared and swapped as `stxr`'s
-    /// is. An X pair compares and swaps its first doubleword against the
-    /// monitor and then stores the second: wasm has no 128-bit
-    /// compare-and-swap, so the pair is atomic against another exclusive
-    /// pair only while one thread runs.
-    fn store_exclusive_pair(&mut self, sz: MemSz, rs: RegSel, rt: RegSel, rt2: RegSel, rn: RegSel) {
+    /// is. An X pair is two, which the host stores only if both are still
+    /// what the monitor read.
+    fn store_exclusive_pair(&mut self, sz: MemSz, rs: RegSel, rt: RegSel, rt2: RegSel, rn: RegSel, pc: u64) {
+        if sz == MemSz::D {
+            return self.pair_op(gex_abi::pair_op::STORE, [rs, rt, rt2], rn, pc);
+        }
         let addr = self.rd_addr(rn);
-        let width = if sz == MemSz::D { 16 } else { 8 };
-        let (lo, hi) = if sz == MemSz::D {
-            (self.rd_gp(rt, Sz::X), Some(self.rd_gp(rt2, Sz::X)))
-        } else {
-            let a = self.rd_gp(rt, Sz::W);
-            let b = self.rd_gp(rt2, Sz::W);
-            let a64 = self.b.extend(a, false);
-            let b64 = self.b.extend(b, false);
-            let thirty_two = self.b.const_i64(32);
-            let top = self.b.bin(BinOp::Shl, Ty::I64, b64, thirty_two);
-            (self.b.bin(BinOp::Or, Ty::I64, top, a64), None)
-        };
+        let value = self.w_pair(rt, rt2);
         let mon_addr = self.b.read(GuestReg::MonAddr);
         let mon_size = self.b.read(GuestReg::MonSize);
-        let want_size = self.b.const_i64(width);
+        let want_size = self.b.const_i64(8);
         let addr_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_addr, addr);
         let size_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_size, want_size);
         let armed = self.b.bin(BinOp::And, Ty::I32, addr_ok, size_ok);
         let scratch = self.b.const_i64(gex_abi::EXCLUSIVE_SCRATCH);
         let eff_addr = self.b.select(armed, addr, scratch, Ty::I64);
         let expected = self.b.read(GuestReg::MonValue);
-        let old = self.b.def(Expr::CmpXchg { addr: eff_addr, expected, replacement: lo, sz: gex_ir::MemSz::B8, ty: Ty::I64 });
+        let old = self.b.def(Expr::CmpXchg { addr: eff_addr, expected, replacement: value, sz: gex_ir::MemSz::B8, ty: Ty::I64 });
         let swapped = self.b.cmp(CmpOp::Eq, Ty::I64, old, expected);
         let success = self.b.bin(BinOp::And, Ty::I32, armed, swapped);
-        if let Some(hi) = hi {
-            // The second doubleword lands only with the first.
-            let at = self.b.select(success, addr, scratch, Ty::I64);
-            self.b.stmt(Stmt::Store { addr: at, offset: 8, val: hi, sz: gex_ir::MemSz::B8, order: Order::Relaxed });
-        }
         let one = self.b.const_i32(1);
         let status = self.b.bin(BinOp::Xor, Ty::I32, success, one);
         self.wr_gp(rs, Sz::W, status);
         let zero = self.b.const_i64(0);
         self.b.write(GuestReg::MonSize, zero);
+    }
+
+    /// `casp`. A W pair is one doubleword, compared and swapped whole. An X
+    /// pair is two, which the host compares and swaps.
+    fn compare_swap_pair(&mut self, sz: MemSz, rs: RegSel, rt: RegSel, rn: RegSel, pc: u64) {
+        if sz == MemSz::D {
+            return self.pair_op(gex_abi::pair_op::CAS, [rs, rt, RegSel::Zr], rn, pc);
+        }
+        let addr = self.rd_addr(rn);
+        let expected = self.w_pair(rs, rs.next());
+        let replacement = self.w_pair(rt, rt.next());
+        let old = self.b.def(Expr::CmpXchg { addr, expected, replacement, sz: gex_ir::MemSz::B8, ty: Ty::I64 });
+        // The pair receives what was there, swapped or not.
+        self.set_w_pair(rs, rs.next(), old);
     }
 
     fn atomic_rmw(

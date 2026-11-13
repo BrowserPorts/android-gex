@@ -1591,6 +1591,23 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 reg(rn, Sz::X)
             )
         }
+        Inst::CompareSwapPair { sz, rs, rt, rn, acquire, release } => {
+            let suffix = match (acquire, release) {
+                (false, false) => "",
+                (true, false) => "a",
+                (false, true) => "l",
+                (true, true) => "al",
+            };
+            let rsz = if sz == MemSz::D { Sz::X } else { Sz::W };
+            format!(
+                "casp{suffix} {}, {}, {}, {}, [{}]",
+                reg(rs, rsz),
+                reg(rs.next(), rsz),
+                reg(rt, rsz),
+                reg(rt.next(), rsz),
+                reg(rn, Sz::X)
+            )
+        }
         Inst::CompareSwap {
             sz,
             rs,

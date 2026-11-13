@@ -394,6 +394,10 @@ pub mod ctx {
     pub const MON_ADDR: usize = 37 * 8;
     pub const MON_VALUE: usize = 38 * 8;
     pub const MON_SIZE: usize = 39 * 8;
+    /// AArch64 only: the second doubleword an X-register `ldxp` observed,
+    /// beside `MON_VALUE`'s first. It takes the doubleword x86 keeps
+    /// `EFLAGS_SYS` in, which AArch64 has no use for.
+    pub const MON_VALUE_HI: usize = EFLAGS_SYS;
 
     /// FP control and status registers. On x86-64 `FPCR` holds `MXCSR`.
     pub const FPCR: usize = 40 * 8;
@@ -1026,6 +1030,13 @@ pub mod imports {
     /// the native frames the code was called from, and the import returns.
     pub const BRK_KUSER_UNFOLDED_RESUMABLE: i32 = -9;
 
+    /// Not a `brk`: a `Stmt::Trap` for an alignment fault: an AArch64
+    /// sixteen-byte atomic (`super::pair_op`) at an address that is not a
+    /// multiple of sixteen. Linux reports it as SIGBUS with `BUS_ADRALN` at
+    /// the instruction. The address reported is 0, as for the misaligned
+    /// atomics the engine itself traps on.
+    pub const BRK_ALIGNMENT: i32 = -10;
+
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
     pub const SYSREG_READ: &str = "sysreg_read";
@@ -1119,6 +1130,44 @@ pub mod exports {
 
     /// `(ctx: i32, pc: i64) -> ()`: enter translated code at `pc`.
     pub const ENTER: &str = "enter";
+}
+
+/// AArch64's sixteen-byte atomics: `ldxp`, `stxp` and `casp` on X registers.
+/// Wasm has no atomic wider than eight bytes, so the host does each one
+/// under a lock they all take, which makes them atomic against one another.
+/// The lifter asks through [`imports::SYSREG_WRITE`]: the register number
+/// names the operation and its registers, the value is the address.
+pub mod pair_op {
+    /// `ldxp a, b, [addr]`: both doublewords into `a` and `b`, the monitor
+    /// armed with the address and what was read.
+    pub const LOAD: u32 = 0;
+    /// `stxp a, b, c, [addr]`: `b` and `c` stored if the monitor is armed for
+    /// the address and both doublewords are still what it read; `a` gets 0
+    /// for stored, 1 for not. The monitor is cleared either way.
+    pub const STORE: u32 = 1;
+    /// `casp a, a+1, b, b+1, [addr]`: `b:b+1` stored if the doublewords equal
+    /// `a:a+1`; `a:a+1` get what was there.
+    pub const CAS: u32 = 2;
+
+    /// Set in every pair register number. A real system register's number
+    /// is its sixteen-bit `op0:op1:CRn:CRm:op2`, gex's own are negative.
+    const MARK: i32 = 0x4000_0000;
+
+    /// The register number for `op` on registers `a`, `b` and `c` (0..=31,
+    /// 31 the zero register).
+    pub const fn id(op: u32, a: u8, b: u8, c: u8) -> i32 {
+        MARK | (op as i32) << 15 | (a as i32 & 31) << 10 | (b as i32 & 31) << 5 | (c as i32 & 31)
+    }
+
+    /// The operation and registers of a pair register number, `None` for
+    /// any other number.
+    pub const fn parts(id: i32) -> Option<(u32, u8, u8, u8)> {
+        let op = ((id & !MARK) >> 15) as u32;
+        if id & MARK == 0 || id < 0 || op > CAS {
+            return None;
+        }
+        Some((op, (id >> 10 & 31) as u8, (id >> 5 & 31) as u8, (id & 31) as u8))
+    }
 }
 
 /// Cache-maintenance operation codes passed to [`imports::CACHE_OP`].
@@ -1362,6 +1411,20 @@ mod tests {
         assert!(GUEST_MEM_BYTES.is_multiple_of(WASM_PAGE));
         assert!((POISON_ADDR as u64) >= GUEST_MEM_BYTES);
         assert!((POISON_ADDR as u64) + 16 <= u32::MAX as u64 + 1);
+    }
+
+    #[test]
+    fn pair_register_numbers_round_trip() {
+        for op in [pair_op::LOAD, pair_op::STORE, pair_op::CAS] {
+            for (a, b, c) in [(0, 1, 2), (31, 30, 29), (17, 31, 0)] {
+                assert_eq!(pair_op::parts(pair_op::id(op, a, b, c)), Some((op, a, b, c)));
+            }
+        }
+        // A real register's packing, gex's private numbers, and an
+        // operation that does not exist.
+        for other in [0xde82, -1, -10, -102, -200, 0, 0x4000_0000 | 3 << 15] {
+            assert_eq!(pair_op::parts(other), None, "{other:#x}");
+        }
     }
 
     #[test]

@@ -134,6 +134,7 @@ pub(crate) const NATIVE_SYSCALL: u64 = 1 << 61;
 pub mod signal {
     pub const SIGILL: i32 = 4;
     pub const SIGTRAP: i32 = 5;
+    pub const SIGBUS: i32 = 7;
     pub const SIGFPE: i32 = 8;
     pub const SIGSEGV: i32 = 11;
     pub const SIGSYS: i32 = 31;
@@ -5190,6 +5191,34 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 return Err(StopExecution.into());
             }
+            // An alignment fault (a sixteen-byte atomic off its boundary):
+            // SIGBUS at the instruction.
+            if imm == gex_abi::imports::BRK_ALIGNMENT {
+                let pc = pc as u64;
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
+                let state = caller.data_mut();
+                let mut gm = GuestMem::new(data);
+                match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGBUS as u32, pc, 0)) {
+                    gex_kernel::signal::Delivery::Resume(target) => {
+                        state.resume_cause = Some("SIGBUS".into());
+                        state.resume_at = Some(target)
+                    }
+                    _ => {
+                        state.exit = Some(Exit::Signal {
+                            signal: signal::SIGBUS,
+                            pc,
+                            detail: format!("misaligned sixteen-byte atomic at 0x{pc:x}"),
+                            internal: false,
+                        })
+                    }
+                }
+                return Err(StopExecution.into());
+            }
             // An x87 exception the control word unmasks: not delivered, so
             // the process dies of SIGFPE, saying so.
             if imm == gex_abi::imports::BRK_X87_EXCEPTION {
@@ -5270,6 +5299,21 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let data = memory.bytes();
                 let mut gm = GuestMem::new(data);
                 gex_kernel::x86::serve_cpuid(&mut gm, ctx as u32 as u64, v as u64);
+            }
+            // An AArch64 sixteen-byte atomic, under the host's lock. The
+            // block has loaded from the address already, so it is the
+            // guest's; if it no longer is, the instruction did not run.
+            if let Some((op, a, b, c)) = gex_abi::pair_op::parts(reg).filter(|_| !gex_abi::X86) {
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let mut gm = GuestMem::new(memory.bytes());
+                gex_kernel::a64::serve_pair(&mut gm, ctx as u32 as u64, op, [a, b, c], v as u64).map_err(|e| {
+                    anyhow!("a sixteen-byte atomic at {:#x} in block {:#x} lost its memory ({e:?})", v as u64, pc as u64)
+                })?;
+                return Ok(());
             }
             // An x87 transcendental or remainder, computed on the register
             // stack in the context.

@@ -41,6 +41,25 @@ impl RegSel {
         }
     }
 
+    /// The register after this one, the second of a `casp` pair: after
+    /// `x30` comes the zero register.
+    #[inline]
+    pub fn next(self) -> RegSel {
+        match self {
+            RegSel::Gp(n) => RegSel::gp(n as u32 + 1),
+            other => other,
+        }
+    }
+
+    /// The register field this was decoded from.
+    #[inline]
+    pub fn number(self) -> u8 {
+        match self {
+            RegSel::Gp(n) => n,
+            RegSel::Zr | RegSel::Sp => 31,
+        }
+    }
+
     /// Decode a register field where 31 means the stack pointer.
     #[inline]
     pub fn sp(n: u32) -> RegSel {
@@ -1065,6 +1084,17 @@ pub enum Inst {
     },
     /// `cas`/`casa`/`casl`/`casal` — compare and swap (FEAT_LSE).
     CompareSwap {
+        sz: MemSz,
+        rs: RegSel,
+        rt: RegSel,
+        rn: RegSel,
+        acquire: bool,
+        release: bool,
+    },
+    /// `casp`/`caspa`/`caspl`/`caspal` — compare and swap a pair
+    /// (FEAT_LSE): `rs:rs+1` against two words of `sz` (W or X) at `rn`,
+    /// replaced with `rt:rt+1`. Both first registers are even.
+    CompareSwapPair {
         sz: MemSz,
         rs: RegSel,
         rt: RegSel,

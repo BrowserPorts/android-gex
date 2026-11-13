@@ -15869,7 +15869,7 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             hook_fault(pc, fault_code::INT_OVERFLOW, 0, resumable)
         } else if raw == i::BRK_GENERAL_PROTECTION {
             hook_fault(pc, fault_code::ACCESS_VIOLATION, 0xffff_ffff, resumable)
-        } else if raw != i::BRK_TRAP_PC && raw != i::BRK_BAD_SP && raw != i::BRK_X87_EXCEPTION {
+        } else if raw != i::BRK_TRAP_PC && raw != i::BRK_BAD_SP && raw != i::BRK_X87_EXCEPTION && raw != i::BRK_ALIGNMENT {
             hook_fault(pc + 1, fault_code::BREAKPOINT, pc, resumable)
         } else {
             false
@@ -15942,6 +15942,30 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
     if raw == gex_abi::imports::BRK_GENERAL_PROTECTION {
         trace_line(&format!("gex: general protection fault at pc={pc:#x} (SIGSEGV)\n"));
         set_exit(128 + 11);
+        trap();
+    }
+    // An alignment fault (a sixteen-byte atomic off its boundary): SIGBUS,
+    // to the guest's handler from the state the block wrote back, as for a
+    // misaligned atomic the engine traps on (`gex_guest_trap`), else fatal.
+    if raw == gex_abi::imports::BRK_ALIGNMENT {
+        let mut gm = guest();
+        let c = match my_ctx() {
+            0 => _ctx as u32 as u64,
+            m => m,
+        };
+        match sigs::fault(&mut gm, c, 7, pc as u64, 0) {
+            gex_kernel::signal::Delivery::Resume(target) => {
+                if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
+                    run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
+                }
+                set_resume(target);
+                set_resume_ctx(c);
+            }
+            _ => {
+                trace_line(&format!("gex: misaligned sixteen-byte atomic at pc={pc:#x} (SIGBUS)\n"));
+                exit_here(-7, Some(pc as u64));
+            }
+        }
         trap();
     }
     // An x87 exception the control word unmasks: gex does not deliver
@@ -16087,6 +16111,16 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
         // change of mode the pad, whose miss is served in the new mode
         // (`far_switch`), in wasm.
         FAR_NEXT.with(|c| c.set(if switch { (gex_kernel::x86::FAR_PAD, target) } else { (target, 0) }));
+    }
+    // An AArch64 sixteen-byte atomic, under the host's lock. The block has
+    // loaded from the address already, so it is the guest's; if it no
+    // longer is, the instruction did not run, and going on would be wrong.
+    if let Some((op, a, b, c)) = gex_abi::pair_op::parts(reg).filter(|_| !gex_abi::X86) {
+        let mut gm = guest();
+        if let Err(e) = gex_kernel::a64::serve_pair(&mut gm, ctx as u32 as u64, op, [a, b, c], val as u64) {
+            panic!("gex: a sixteen-byte atomic at {:#x} in block {:#x} lost its memory ({e:?})", val as u64, pc as u64);
+        }
+        return;
     }
     // `cmpxchg16b`, under the host's lock.
     if reg == gex_kernel::x86::SYSREG_CMPXCHG16B {

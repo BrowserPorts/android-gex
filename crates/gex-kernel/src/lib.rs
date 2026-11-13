@@ -64,6 +64,7 @@ pub mod unix;
 /// The x87's extended-precision arithmetic (its own crate, shared with the
 /// IR interpreter and the code generators).
 pub use gex_f80 as f80;
+pub mod a64;
 pub mod x86;
 pub mod i386;
 pub mod darwin;

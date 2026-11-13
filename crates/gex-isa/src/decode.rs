@@ -1233,7 +1233,7 @@ fn decode_ldst_exclusive(raw: u32) -> Inst {
             }
         }
         // Exclusive pair (LDXP/LDAXP/STXP/STLXP), sizes 10 (W) and 11 (X).
-        // Sizes 00 and 01 are CASP, not decoded yet.
+        // Sizes 00 and 01 are CASP, below.
         (0, 1) if size >= 0b10 => {
             let order = match (o0, l) {
                 (1, 1) => Ordering::Acquire,
@@ -1248,7 +1248,21 @@ fn decode_ldst_exclusive(raw: u32) -> Inst {
                 Inst::StoreExclusivePair { sz, rs: RegSel::gp(rs), rt: RegSel::gp(rt), rt2, rn: RegSel::sp(rn), order }
             }
         }
-        (0, 1) => Inst::Unknown { raw },
+        // CASP/CASPA/CASPL/CASPAL, sizes 00 (W) and 01 (X): L is the acquire
+        // bit, o0 the release bit. An odd Rs or Rt is undefined.
+        (0, 1) => {
+            if bits(raw, 14, 10) != 0b11111 || rs & 1 != 0 || rt & 1 != 0 {
+                return Inst::Unknown { raw };
+            }
+            Inst::CompareSwapPair {
+                sz: if size == 0b01 { MemSz::D } else { MemSz::W },
+                rs: RegSel::gp(rs),
+                rt: RegSel::gp(rt),
+                rn: RegSel::sp(rn),
+                acquire: l == 1,
+                release: o0 == 1,
+            }
+        }
         // Load-acquire / store-release register — ordered but not exclusive.
         // Covers LDAR/STLR (o0=1) and LDLAR/STLLR (o0=0, FEAT_LOR); treating
         // the LOR forms as full acquire/release is stronger, hence safe.
@@ -2910,6 +2924,25 @@ mod tests {
             (0x0e30_3800, "saddlv h0, v0.8b"),
         ] {
             assert_eq!(crate::fmt::disasm(&decode(raw, 0), 0), want, "{raw:#x}");
+        }
+    }
+
+    /// The compare-and-swap pairs, as llvm-objdump prints them, and the
+    /// odd first registers that are no instruction.
+    #[test]
+    fn compare_and_swap_pairs_decode() {
+        for (raw, want) in [
+            (0x4820_7c82u32, "casp x0, x1, x2, x3, [x4]"),
+            (0x4860_7c82, "caspa x0, x1, x2, x3, [x4]"),
+            (0x4820_fc82, "caspl x0, x1, x2, x3, [x4]"),
+            (0x4860_fc82, "caspal x0, x1, x2, x3, [x4]"),
+            (0x0826_7fe8, "casp w6, w7, w8, w9, [sp]"),
+            (0x487e_fd5c, "caspal x30, xzr, x28, x29, [x10]"),
+        ] {
+            assert_eq!(crate::fmt::disasm(&decode(raw, 0), 0), want, "{raw:#x}");
+        }
+        for raw in [0x4821_7c82u32, 0x4820_7c83, 0x4820_7482] {
+            assert!(matches!(decode(raw, 0), Inst::Unknown { .. }), "{raw:#x}");
         }
     }
 
