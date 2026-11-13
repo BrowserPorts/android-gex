@@ -113,6 +113,11 @@ const PIECES = {
  *   onCrash({ pid, name, reason, code, signal })
  *              a program of the run crashed (the System's `crash` event,
  *              page/runtime README): it has ended and its windows are gone
+ *   onGlCapture(bytes)
+ *              the GL stream's recording (a .gexgltr file, gl-capture.js),
+ *              asked for with `debug: { glcapture: BYTES }`, once it is that
+ *              long: for the page to save. Without it the recording is POSTed
+ *              to /__gex_capture.
  *   onStoreBusy({ name, signal })
  *              the OPFS store is open in another tab or window of the site
  *              (one page holds a store at a time): the page offers its user
@@ -953,6 +958,7 @@ async function begin(opts, base, at, state, meter, lets) {
         state.error = String(e.error?.stack ?? e.error);
         meter.end('failed', state.error);
       });
+      if (opts.onGlCapture) globalThis.__gexGlCaptureSink = opts.onGlCapture;
       if (opts.onCrash) {
         s.system.addEventListener('crash', ({ pid, name, reason, code, signal }) => opts.onCrash({ pid, name, reason, code, signal }));
       }
