@@ -196,5 +196,6 @@ own tests (`cargo test`). Every other test lives in the gexdev repository.
 ## Licence
 
 gex is free software under the GNU Affero General Public License, version 3
-only (`LICENSE`). Copyright (C) 2026 Puter Technologies Inc. Third-party
-code keeps its own licence; `NOTICE` lists it.
+only (`LICENSE`). Copyright (C) 2026 Puter Technologies Inc. The Android
+work in this fork is Copyright (C) 2026 Ryan Wilson, under the same licence.
+Third-party code keeps its own licence; `NOTICE` lists it.
