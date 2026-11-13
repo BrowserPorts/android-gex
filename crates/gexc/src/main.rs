@@ -723,7 +723,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
     let sysroot = ra.opts.sysroot.clone();
     let program = gex_ld::load_program(&bytes, gex_abi::PIE_BASE, INTERP_BASE, &|guest_path| {
         let host = match &sysroot {
-            Some(root) => root.join(guest_path.trim_start_matches('/')),
+            Some(root) => host_path_in(root, guest_path)?,
             None => std::path::PathBuf::from(guest_path),
         };
         std::fs::read(host).ok()
@@ -1506,13 +1506,7 @@ fn closure_of_all(
     let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
     let root = sysroot.map(str::to_string);
     let read = move |p: &str| -> Option<Vec<u8>> {
-        let r = root.as_deref()?;
-        std::fs::read(format!(
-            "{}/{}",
-            r.trim_end_matches('/'),
-            p.trim_start_matches('/')
-        ))
-        .ok()
+        std::fs::read(host_path_in(std::path::Path::new(root.as_deref()?), p)?).ok()
     };
     let exe = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
     let interp = exe.interp.clone();
@@ -1593,13 +1587,7 @@ fn cmd_closure(args: &[String]) -> Result<()> {
     // runs. Without one there is nowhere to look.
     let root = sysroot.clone();
     let read = move |p: &str| -> Option<Vec<u8>> {
-        let r = root.as_deref()?;
-        std::fs::read(format!(
-            "{}/{}",
-            r.trim_end_matches('/'),
-            p.trim_start_matches('/')
-        ))
-        .ok()
+        std::fs::read(host_path_in(std::path::Path::new(root.as_deref()?), p)?).ok()
     };
 
     let exe = gex_ld::elf::load(&bytes, gex_abi::PIE_BASE)?;
@@ -2571,6 +2559,76 @@ fn stdin_ready() -> bool {
 
 /// `path` with `.` components, repeated slashes and `name/..` pairs removed,
 /// without touching the file system (`..` above the root stays at the root).
+/// Where under the sysroot `root` the guest path `guest` is, its symbolic
+/// links followed as the guest follows them: an absolute link starts again
+/// at the root, and `..` never climbs above it. (Android's
+/// `/system/bin/linker64` is a link to `/apex/com.android.runtime/bin`;
+/// read through the host it names the host's `/apex`.) `None` for a loop.
+fn host_path_in(root: &std::path::Path, guest: &str) -> Option<std::path::PathBuf> {
+    let parts = |p: &str| p.split('/').filter(|c| !c.is_empty()).rev().map(str::to_string).collect::<Vec<_>>();
+    let mut todo = parts(guest);
+    let mut done: Vec<String> = Vec::new();
+    let mut links = 0;
+    while let Some(c) = todo.pop() {
+        match c.as_str() {
+            "." => continue,
+            ".." => {
+                done.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let mut at = root.to_path_buf();
+        at.extend(&done);
+        at.push(&c);
+        match std::fs::read_link(&at) {
+            Ok(target) => {
+                links += 1;
+                if links > 40 {
+                    return None;
+                }
+                let target = target.to_str()?.to_string();
+                if target.starts_with('/') {
+                    done.clear();
+                }
+                todo.extend(parts(&target));
+            }
+            Err(_) => done.push(c),
+        }
+    }
+    let mut at = root.to_path_buf();
+    at.extend(&done);
+    Some(at)
+}
+
+#[cfg(test)]
+mod host_path_in_tests {
+    #[test]
+    fn links_are_followed_inside_the_root() {
+        let root = std::env::temp_dir().join(format!("gexc-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("apex/rt/bin")).unwrap();
+        std::fs::create_dir_all(root.join("system/bin")).unwrap();
+        std::fs::write(root.join("apex/rt/bin/linker64"), b"x").unwrap();
+        let link = |to: &str, at: &str| std::os::unix::fs::symlink(to, root.join(at)).unwrap();
+        link("/apex/rt/bin/linker64", "system/bin/linker64");
+        link("../../apex/rt", "system/bin/rt");
+        link("/../../etc", "system/out");
+        link("loop", "system/loop");
+        link("system", "sys");
+        let at = |g: &str| super::host_path_in(&root, g);
+        assert_eq!(at("/system/bin/linker64"), Some(root.join("apex/rt/bin/linker64")));
+        assert_eq!(at("/system/bin/rt/bin/linker64"), Some(root.join("apex/rt/bin/linker64")));
+        assert_eq!(at("/sys/bin/./linker64"), Some(root.join("apex/rt/bin/linker64")));
+        // Never above the root, by a link or by the path.
+        assert_eq!(at("/system/out/passwd"), Some(root.join("etc/passwd")));
+        assert_eq!(at("/../../etc/passwd"), Some(root.join("etc/passwd")));
+        assert_eq!(at("/system/loop"), None);
+        assert_eq!(at("/system/none"), Some(root.join("system/none")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 fn normal_path(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for c in path.split('/') {
