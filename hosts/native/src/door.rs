@@ -133,6 +133,9 @@ impl Server {
     }
     fn kick(&self) {
         let _ = self.kick.write_at(0, b"k");
+        // Written outside a syscall: wake the pump parked on it now, not at
+        // its next turn.
+        crate::ready::notify();
     }
 }
 
@@ -396,10 +399,15 @@ pub(crate) fn wake_pipe(caller: &mut Caller<'_, HostState>, fd: i32) -> i32 {
 pub(crate) fn wake_write(id: i32, bytes: &[u8]) -> i32 {
     let h = WAKES.lock().unwrap_or_else(|e| e.into_inner()).get(id as usize).cloned().flatten();
     let Some(h) = h else { return -9 }; // EBADF
-    match h.write_at(0, bytes) {
+    let r = match h.write_at(0, bytes) {
         Ok(n) => n as i32,
         Err(e) => -(e.0 as i32),
-    }
+    };
+    // Written outside a syscall, so no syscall exit wakes the client parked
+    // on its wait pipe: wake it here, or it waits out a whole turn of its
+    // wait loop for every wakeup.
+    crate::ready::notify();
+    r
 }
 
 /// `gex.wake_close(id)`: the thread's wait pipe closed.
