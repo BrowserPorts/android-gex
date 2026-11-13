@@ -2,24 +2,34 @@
 # Run the Android programs under gexc and check what each prints and how it
 # exits. Builds them first when bin/ is missing; GEXC picks the runner.
 # With program names, only those run; without, all of them.
+#
+# GEXC=native runs them as they are, which an arm64 Linux host can: the
+# reference they are written against. What they write to stderr goes to
+# bin/, or to the temporary directory when bin/ cannot be written.
 set -u
 
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 ROOT=$(CDPATH='' cd -- "$HERE/../.." && pwd)
 GEXC=${GEXC:-$ROOT/target/release/gexc}
 [ -d "$HERE/bin" ] || "$HERE/build.sh" || exit 1
+ERR=$HERE/bin
+[ -w "$ERR" ] || ERR=${TMPDIR:-/tmp}
 
 fail=0
 
 # check <program> <its last line> <its exit status>
 check() {
-    out=$("$GEXC" run "$HERE/bin/$1" 2>"$HERE/bin/$1.err")
+    if [ "$GEXC" = native ]; then
+        out=$("$HERE/bin/$1" 2>"$ERR/$1.err")
+    else
+        out=$("$GEXC" run "$HERE/bin/$1" 2>"$ERR/$1.err")
+    fi
     status=$?
     last=$(printf '%s\n' "$out" | tail -1)
     if [ "$status" -eq "$3" ] && [ "$last" = "$2" ]; then
         echo "PASS $1"
     else
-        echo "FAIL $1: exit $status, last line '$last' (wanted exit $3, '$2'); stderr in bin/$1.err"
+        echo "FAIL $1: exit $status, last line '$last' (wanted exit $3, '$2'); stderr in $ERR/$1.err"
         fail=1
     fi
 }

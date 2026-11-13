@@ -1,10 +1,12 @@
 #!/bin/sh
 # Build the Android test programs with the NDK into bin/.
 #
-# They are static, position-independent executables: bionic linked in, so
-# they need neither Android's linker nor a system image, and loaded where
-# the kernel puts them (a static executable linked at the NDK's default
-# base lies in gex's reserved low region).
+# They are static executables: bionic linked in, so they need neither
+# Android's linker nor a system image. Static is not position-independent
+# here: bionic's static start-up applies no relocations, and Android builds
+# its own static executables the same way. They are linked at 0x400000
+# rather than the linker's default, 0x200000, which lies in gex's reserved
+# low region; an executable linked there does not load yet.
 #
 # The NDK is ANDROID_NDK_HOME, or the newest one under the SDK
 # (ANDROID_HOME, or the SDK's default place on this host).
@@ -30,5 +32,5 @@ fi
 CC=$ndk/toolchains/llvm/prebuilt/$host/bin/clang
 
 for p in hello tagged thread simd exclusive casp; do
-    "$CC" --target="$TARGET" -O2 -Wall -Werror -static-pie -o "$OUT/$p" "$HERE/src/$p.c"
+    "$CC" --target="$TARGET" -O2 -Wall -Werror -static -Wl,--image-base=0x400000 -o "$OUT/$p" "$HERE/src/$p.c"
 done

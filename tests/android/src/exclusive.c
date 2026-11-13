@@ -1,8 +1,10 @@
 // ldxp/stxp on a W pair and an X pair: each loop reads both halves
 // exclusively and writes them back incremented, as a 128-bit atomic does.
 // The halves must come back as written. A store-exclusive whose monitor
-// does not match (cleared, never set, or set for another address) reports
-// failure and leaves memory as it was.
+// is clear reports failure and leaves memory as it was. One whose monitor
+// was set for another address may do either, as the processor chooses (it
+// stores on Apple's, fails under gex and QEMU): what it reports and what
+// memory holds must agree.
 #include <stdio.h>
 
 static unsigned long pair64[2] __attribute__((aligned(16))) = {1, 0x100000000UL};
@@ -42,12 +44,12 @@ int main(void) {
     if (st != 1 || word != 5) status |= 4;
     // Set for another address.
     __asm__ volatile("ldxr %1, [%3]\n\tstxr %w0, %2, [%4]" : "=&r"(st), "=&r"(v) : "r"(8UL), "r"(&other), "r"(&word) : "memory");
-    if (st != 1 || word != 5 || other != 6) status |= 8;
+    if (st > 1 || word != (st ? 5 : 8) || other != 6) status |= 8;
     // A pair, cleared; a pair set for another address.
     __asm__ volatile("clrex\n\tstxp %w0, %1, %2, [%3]" : "=&r"(st) : "r"(1UL), "r"(2UL), "r"(pair_b) : "memory");
     if (st != 1 || pair_b[0] != 11 || pair_b[1] != 12) status |= 16;
     __asm__ volatile("ldxp %1, %2, [%5]\n\tstxp %w0, %3, %4, [%6]" : "=&r"(st), "=&r"(v), "=&r"(w) : "r"(1UL), "r"(2UL), "r"(pair64), "r"(pair_b) : "memory");
-    if (st != 1 || pair_b[0] != 11 || pair_b[1] != 12) status |= 32;
+    if (st > 1 || pair_b[0] != (st ? 11 : 1) || pair_b[1] != (st ? 12 : 2)) status |= 32;
     if (pair64[0] != 4 || pair64[1] != 0x100000006UL) status |= 1;
     if (pair32[0] != 10 || pair32[1] != 12) status |= 2;
     if (status) {
