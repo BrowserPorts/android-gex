@@ -29,6 +29,6 @@ if [ -z "$ndk" ] || [ ! -d "$ndk/toolchains/llvm/prebuilt/$host/bin" ]; then
 fi
 CC=$ndk/toolchains/llvm/prebuilt/$host/bin/clang
 
-for p in hello tagged thread simd; do
+for p in hello tagged thread simd exclusive; do
     "$CC" --target="$TARGET" -O2 -Wall -Werror -static-pie -o "$OUT/$p" "$HERE/src/$p.c"
 done
