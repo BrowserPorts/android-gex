@@ -31,6 +31,7 @@ run() {
     thread) check thread "thread ok" 0 ;;
     simd) check simd "simd ok" 0 ;;
     exclusive) check exclusive "exclusive ok" 0 ;;
+    casp) check casp "casp ok" 0 ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -43,7 +44,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello tagged thread simd exclusive; do
+    for p in hello tagged thread simd exclusive casp; do
         run "$p"
     done
 fi
