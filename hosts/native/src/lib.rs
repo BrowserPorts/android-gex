@@ -1629,7 +1629,14 @@ fn run_program_with(
             }
             let pid = k.pid;
             drop(k);
-            let exit = Exit::Signal { signal: signal::SIGSEGV, pc: 0, detail: format!("{e:#}"), internal: true };
+            let detail = format!("{e:#}");
+            // A program's own abort is its crash, said as SIGILL's (an
+            // `unreachable` is `ud2`), not as gex's.
+            let exit = if detail.starts_with("the program aborted") {
+                Exit::Signal { signal: signal::SIGILL, pc: 0, detail, internal: false }
+            } else {
+                Exit::Signal { signal: signal::SIGSEGV, pc: 0, detail, internal: true }
+            };
             report_first_end(&spawn, pid, &exit);
             return Ok((exit, Stats::default()));
         }
@@ -2976,7 +2983,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                     // caught, a trap gex has no signal for). Anything else
                     // (an ABI refusal) is said as gex's own and is no crash.
                     if program_failed(&e) {
-                        procs.set_crash_unless_said(pid, format!("\0gex could not run it on: {e:#}").as_bytes());
+                        // A program's own abort is said as its own, not as gex's.
+                        let what = format!("{e:#}");
+                        let note = if what.starts_with("the program aborted") { format!("\0SIGILL: {what}") } else { format!("\0gex could not run it on: {what}") };
+                        procs.set_crash_unless_said(pid, note.as_bytes());
                     } else {
                         eprintln!("gexc: child {pid} failed: {e:#}");
                     }
@@ -7736,6 +7746,12 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
             wasmtime::Trap::IntegerDivisionByZero => {
                 "integer division by zero escaped the lifter's guard".to_string()
             }
+            // A Windows program's own `unreachable` (its fault hook takes
+            // access violations only): the program aborted, as a Rust panic
+            // under panic=abort, abort() or __builtin_trap end one.
+            wasmtime::Trap::UnreachableCodeReached => {
+                "the program aborted: its own code reached an unreachable instruction (an abort: a Rust panic under panic=abort, abort(), __builtin_trap)".to_string()
+            }
             wasmtime::Trap::BadSignature | wasmtime::Trap::TableOutOfBounds | wasmtime::Trap::IndirectCallToNull
                 if crate::dylink::behind(store.data()) =>
             {
@@ -7745,7 +7761,8 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
         };
         // The wasm frames, when the engine kept them (GEX_WASM_BACKTRACE=1).
         let bt = e.downcast_ref::<wasmtime::WasmBacktrace>().map(|b| format!("\n{b:?}")).unwrap_or_default();
-        return anyhow::Error::new(GuestTrap(format!("{detail} (pc≈0x{pc:x}){bt}")));
+        let at = if pc != 0 { format!(" (pc≈0x{pc:x})") } else { String::new() };
+        return anyhow::Error::new(GuestTrap(format!("{detail}{at}{bt}")));
     }
     e
 }

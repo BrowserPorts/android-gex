@@ -8483,6 +8483,16 @@ export class Gex {
             n === -1 || n === 0xffffffff
               ? ''
               : `, ${within ? 'inside' : 'after'} syscall ${n}`);
+          // An `unreachable` in the program's own code that no handler took
+          // (a Windows program's: its fault hook takes access violations only):
+          // the program aborted, as a Rust panic under panic=abort, abort() or
+          // __builtin_trap end one. Its crash, said as such, not the runtime's.
+          if (tsig === 4 && ask(e.gex_trap_in_program, (v) => v) === 1) {
+            throw Object.assign(new Error(
+              `the program aborted: its own code reached an unreachable instruction${at}${nr} ` +
+              '(an abort: a Rust panic under panic=abort, abort(), __builtin_trap); what it said first, ' +
+              'such as a panic message, went to its standard error'), { programAbort: true });
+          }
           if (globalThis.GEX_TRAP_STACK) console.error(err.stack ?? err);
           // Physical size of the linear memory at the trap: a "memory access out
           // of bounds" fires only past this, so it is the ceiling the faulting

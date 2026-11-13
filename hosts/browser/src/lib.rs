@@ -18764,6 +18764,17 @@ pub extern "C" fn gex_native_oob() -> u32 {
     (!own) as u32
 }
 
+/// Whether a trap on this thread now is in the program's own code: not in a
+/// syscall, translating, or after the shim's own panic. For the run loop's
+/// word on an `unreachable` that [`gex_guest_trap`] did not take (a Windows
+/// program's: its fault hook takes access violations only): the program
+/// aborted (a Rust panic under panic=abort, `abort()`, `__builtin_trap`),
+/// its crash, not gex's (gex.mjs).
+#[no_mangle]
+pub extern "C" fn gex_trap_in_program() -> u32 {
+    (gex_native_oob() == 1 && !PANICKED.with(|p| p.get())) as u32
+}
+
 /// The PE images Wine mapped in this process (`gex_image_mapped`): base,
 /// end and file name. Wine maps an image into anonymous memory, so the
 /// memory map has no name for its code; the KUSER lines name it from here.
