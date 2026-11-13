@@ -15,7 +15,7 @@ use crate::errno::Errno;
 use crate::GuestMem;
 use gex_abi::ctx;
 use crate::sync::{Mutex, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Signal numbers.
@@ -484,6 +484,12 @@ pub struct ThreadSig {
     /// `pthread_join` waits on): `CLONE_CHILD_CLEARTID`'s word, or
     /// `set_tid_address`'s. Zero for none.
     clear_child_tid: AtomicU64,
+    /// AArch64's tagged address ABI (`TIF_TAGGED_ADDR`): the thread asked,
+    /// with `prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE)`, for the
+    /// kernel to take tagged pointers in its system calls. Inherited on
+    /// `clone` and `fork` and cleared on `execve`
+    /// (Documentation/arch/arm64/tagged-address-abi.rst).
+    tagged_addr: AtomicBool,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -505,7 +511,20 @@ impl ThreadSig {
             sources: Mutex::new([None; NSIG]),
             own: Mutex::new(Own::default()),
             clear_child_tid: AtomicU64::new(0),
+            tagged_addr: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the thread has the tagged address ABI on
+    /// ([`Self::set_tagged_addr`]).
+    pub fn tagged_addr(&self) -> bool {
+        self.tagged_addr.load(Ordering::Acquire)
+    }
+
+    /// `PR_SET_TAGGED_ADDR_CTRL`, or what a new thread or a forked child
+    /// takes from its creator.
+    pub fn set_tagged_addr(&self, on: bool) {
+        self.tagged_addr.store(on, Ordering::Release);
     }
 
     /// The word the thread's exit clears ([`Self::set_clear_child_tid`]).
@@ -623,6 +642,7 @@ impl Signals {
     pub fn fork(&self) -> Signals {
         let cur = ThreadSig::new_thread(self.blocked());
         cur.own.lock().alt_stack = self.alt_stack();
+        cur.set_tagged_addr(self.cur.tagged_addr());
         Signals {
             proc: Arc::new(ProcSig::with_actions(*self.proc.actions.read())),
             cur: Arc::new(cur),
@@ -643,6 +663,9 @@ impl Signals {
                 *action = SigAction::default();
             }
         }
+        // `flush_thread` -> `flush_tagged_addr_state`: the new program
+        // starts without the tagged address ABI.
+        self.cur.set_tagged_addr(false);
         let mut own = self.cur.own.lock();
         own.alt_stack = SigAltStack::default();
         own.in_handler = false;
@@ -1985,6 +2008,21 @@ mod tests {
         sigreturn(&mut s, &mut m, CTX, false, false).unwrap();
         let (n, z, c, _) = ctx::unpack_nzcv(m.read_u32(CTX + ctx::NZCV as u64).unwrap());
         assert_eq!((n, z, c), (1, 0, 1));
+    }
+
+    #[test]
+    fn the_tagged_address_abi_follows_fork_and_ends_at_exec() {
+        // Documentation/arch/arm64/tagged-address-abi.rst: "thread-scoped,
+        // inherited on clone() and fork() and cleared on exec()".
+        let s = Signals::new();
+        assert!(!s.thread().tagged_addr());
+        assert!(!s.fork().thread().tagged_addr());
+        s.thread().set_tagged_addr(true);
+        let child = s.fork();
+        assert!(child.thread().tagged_addr(), "inherited on fork");
+        child.exec();
+        assert!(!child.thread().tagged_addr(), "cleared on exec");
+        assert!(s.thread().tagged_addr(), "the parent's is its own");
     }
 
     #[test]

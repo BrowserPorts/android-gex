@@ -6601,6 +6601,9 @@ pub struct ThreadMaker<'a> {
     pub threads: &'a crate::signal::ThreadSigs,
     /// The creator's signal mask, which the new thread starts with.
     pub blocked: u64,
+    /// Whether the creator has the tagged address ABI on, which the new
+    /// thread starts with ([`crate::signal::ThreadSig::set_tagged_addr`]).
+    pub tagged_addr: bool,
     /// The creator's fs_struct.
     pub fs: &'a Arc<FsCwd>,
 }
@@ -6766,6 +6769,7 @@ impl ThreadMaker<'_> {
         // The new thread's own state: its creator's mask, nothing pending,
         // and with `CLONE_CHILD_CLEARTID` the word its exit clears.
         let own = crate::signal::ThreadSig::new_thread(self.blocked);
+        own.set_tagged_addr(self.tagged_addr);
         if flags & clone_flags::CHILD_CLEARTID != 0 {
             own.set_clear_child_tid(child_tid);
         }
@@ -7171,6 +7175,43 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
 
 /// A call [`is_quiet`] admits, made: the kernel's arms and [`free_call`]
 /// both answer them here. `ctx_addr` is the calling thread's context.
+/// Whether a thread is an AArch64 one: not an x86 guest's, not a compat
+/// thread, not a wasm32 program's. Only such a thread has AArch64's tagged
+/// address ABI ([`tagged_addr_ctrl`]).
+pub fn a64_thread(compat: bool, wasm32: bool) -> bool {
+    !gex_abi::X86 && !compat && !wasm32
+}
+
+/// `prctl(PR_SET_TAGGED_ADDR_CTRL)` and `prctl(PR_GET_TAGGED_ADDR_CTRL)`,
+/// AArch64's tagged address ABI; `None` for any other option.
+///
+/// As kernel/sys.c and arch/arm64/kernel/process.c have them
+/// (`set_tagged_addr_ctrl`, `get_tagged_addr_ctrl`): the arguments an
+/// option does not take are zero or the call is `EINVAL`, and so is a
+/// control bit the system does not have. There is no memory tagging here,
+/// so `PR_TAGGED_ADDR_ENABLE` is the one valid bit. Elsewhere than on an
+/// AArch64 thread both options are `EINVAL`, as `SET_TAGGED_ADDR_CTRL` is
+/// for an architecture without it and for a compat thread.
+pub fn tagged_addr_ctrl(thread: &crate::signal::ThreadSig, a64: bool, a: [u64; 6]) -> Option<SysResult> {
+    const PR_SET_TAGGED_ADDR_CTRL: u64 = 55;
+    const PR_GET_TAGGED_ADDR_CTRL: u64 = 56;
+    const PR_TAGGED_ADDR_ENABLE: u64 = 1 << 0;
+    match a[0] {
+        PR_SET_TAGGED_ADDR_CTRL => Some(if a[2] != 0 || a[3] != 0 || a[4] != 0 || !a64 || a[1] & !PR_TAGGED_ADDR_ENABLE != 0 {
+            Err(Errno::EINVAL)
+        } else {
+            thread.set_tagged_addr(a[1] & PR_TAGGED_ADDR_ENABLE != 0);
+            Ok(0)
+        }),
+        PR_GET_TAGGED_ADDR_CTRL => Some(if a[1] != 0 || a[2] != 0 || a[3] != 0 || a[4] != 0 || !a64 {
+            Err(Errno::EINVAL)
+        } else {
+            Ok(if thread.tagged_addr() { PR_TAGGED_ADDR_ENABLE } else { 0 })
+        }),
+        _ => None,
+    }
+}
+
 pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
     match n {
         nr::UNAME => uname(m, io.compat, a[0]),
@@ -7771,6 +7812,15 @@ impl FreeCall {
 /// call ([`FdIo`], [`sigprocmask`]), the park included, and the signal that
 /// is due at a syscall's end.
 pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
+    // As [`Kernel::syscall`]: a thread with AArch64's tagged address ABI
+    // on may pass tagged pointers.
+    m.set_untag(a64_thread(f.io.compat, f.io.wasm32) && f.signals.thread().tagged_addr());
+    let out = free_call_untagged(f, m, ctx_addr, call);
+    m.set_untag(false);
+    out
+}
+
+fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
     let FreeCall { n, raw, mut a } = call;
     if let Some(v) = f.io.shared {
         v.catch_up(m);
@@ -7883,7 +7933,11 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
     } else if is_quiet(n, compat) {
-        let r = quiet_call(&f.io, f.procs, f.futex.tid as i32, m, ctx_addr, n, a);
+        let tagged = if n == nr::PRCTL { tagged_addr_ctrl(f.signals.thread(), a64_thread(compat, f.io.wasm32), a) } else { None };
+        let r = match tagged {
+            Some(r) => r,
+            None => quiet_call(&f.io, f.procs, f.futex.tid as i32, m, ctx_addr, n, a),
+        };
         if n == nr::PRCTL && a[0] == crate::proc::PR_GEX_SHORT && outgrow_take_end(f.pid) {
             f.signals.raise(crate::signal::sig::SIGKILL);
         }
@@ -7903,6 +7957,7 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
             thread_fs: f.thread_fs,
             threads: f.threads,
             blocked: f.signals.blocked(),
+            tagged_addr: f.signals.thread().tagged_addr(),
             fs: &f.path.fs,
         };
         match ca.and_then(|ca| maker.make(m, ctx_addr, ca)) {
@@ -9887,9 +9942,12 @@ impl Kernel {
         self.block_restart = call.block_restart;
         self.block_pc = call.block_pc;
         let blocked = self.signals.blocked();
-        let next = self
-            .thread_signals
-            .get_or_insert_with(tid, || Arc::new(crate::signal::ThreadSig::new_thread(blocked)));
+        let tagged = self.signals.thread().tagged_addr();
+        let next = self.thread_signals.get_or_insert_with(tid, || {
+            let t = crate::signal::ThreadSig::new_thread(blocked);
+            t.set_tagged_addr(tagged);
+            Arc::new(t)
+        });
         self.signals.switch_to(next);
         self.sig_tid = tid;
     }
@@ -9908,8 +9966,12 @@ impl Kernel {
             return cur;
         }
         let blocked = self.signals.blocked();
-        self.thread_signals
-            .get_or_insert_with(tid, || Arc::new(signal::ThreadSig::new_thread(blocked)))
+        let tagged = self.signals.thread().tagged_addr();
+        self.thread_signals.get_or_insert_with(tid, || {
+            let t = signal::ThreadSig::new_thread(blocked);
+            t.set_tagged_addr(tagged);
+            Arc::new(t)
+        })
     }
 
     /// The signal state after `execve` ([`Signals::exec`]): the other
@@ -10529,6 +10591,7 @@ impl Kernel {
             thread_fs: &self.thread_fs,
             threads: &self.thread_signals,
             blocked: self.signals.blocked(),
+            tagged_addr: self.signals.thread().tagged_addr(),
             fs,
         }
     }
@@ -10543,7 +10606,11 @@ impl Kernel {
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         // Other processes' write-backs into this one's shared mappings.
         self.mem.shared_maps().catch_up(m);
+        // A thread with AArch64's tagged address ABI on may pass tagged
+        // pointers for the kernel to access (`access_ok`).
+        m.set_untag(a64_thread(self.compat, self.wasm32) && self.signals.thread().tagged_addr());
         let out = self.syscall_cwd(m, pc);
+        m.set_untag(false);
         // What a signal that ends the wait makes of it ([`Self::finish_blocking`]).
         if let SyscallOutcome::Blocking(op) = &out {
             self.block_restart = op.restart();
@@ -11289,7 +11356,11 @@ impl Kernel {
             // The calls that need nothing of the process ([`quiet_call`],
             // the free path's code).
             n if is_quiet(n, self.compat) => {
-                let r = quiet_call(&self.fd_io(), &self.procs, self.tid, m, self.ctx_addr, n, a);
+                let tagged = if n == nr::PRCTL { tagged_addr_ctrl(self.signals.thread(), a64_thread(self.compat, self.wasm32), a) } else { None };
+                let r = match tagged {
+                    Some(r) => r,
+                    None => quiet_call(&self.fd_io(), &self.procs, self.tid, m, self.ctx_addr, n, a),
+                };
                 if n == nr::PRCTL && a[0] == crate::proc::PR_GEX_SHORT && outgrow_take_end(self.pid) {
                     self.signals.raise(crate::signal::sig::SIGKILL);
                 }
@@ -13448,6 +13519,52 @@ mod tests {
     /// 8-byte fsid, then f_namelen, f_frsize, f_flags. The name length was
     /// one field late (in f_frsize's place), so programs saw a 4096-byte
     /// name limit and a fragment size of 0.
+    #[test]
+    fn tagged_addr_ctrl_answers_as_arm64_does() {
+        // kernel/sys.c and arch/arm64/kernel/process.c: the arguments an
+        // option does not take are zero, PR_TAGGED_ADDR_ENABLE is the one
+        // bit without memory tagging, and only an AArch64 thread has it.
+        const SET: u64 = 55;
+        const GET: u64 = 56;
+        let t = crate::signal::ThreadSig::new_thread(0);
+        let call = |a: [u64; 6], a64: bool| tagged_addr_ctrl(&t, a64, a);
+        assert_eq!(call([GET, 0, 0, 0, 0, 0], true), Some(Ok(0)), "off until asked for");
+        assert_eq!(call([SET, 1, 1, 0, 0, 0], true), Some(Err(Errno::EINVAL)), "arg3 is zero");
+        assert_eq!(call([SET, 1, 0, 0, 1, 0], true), Some(Err(Errno::EINVAL)), "arg5 is zero");
+        assert_eq!(call([SET, 2, 0, 0, 0, 0], true), Some(Err(Errno::EINVAL)), "PR_MTE_TCF_SYNC without MTE");
+        assert_eq!(call([SET, 1, 0, 0, 0, 0], false), Some(Err(Errno::EINVAL)), "no such ABI off AArch64");
+        assert!(!t.tagged_addr(), "a refused call changes nothing");
+        assert_eq!(call([SET, 1, 0, 0, 0, 0], true), Some(Ok(0)));
+        assert!(t.tagged_addr());
+        assert_eq!(call([GET, 0, 0, 0, 0, 0], true), Some(Ok(1)));
+        assert_eq!(call([GET, 1, 0, 0, 0, 0], true), Some(Err(Errno::EINVAL)), "arg2 is zero");
+        assert_eq!(call([GET, 0, 0, 0, 0, 0], false), Some(Err(Errno::EINVAL)));
+        assert_eq!(call([SET, 0, 0, 0, 0, 0], true), Some(Ok(0)), "and off again");
+        assert!(!t.tagged_addr());
+        assert_eq!(call([15, 0, 0, 0, 0, 0], true), None, "PR_SET_NAME is not its");
+    }
+
+    #[test]
+    fn a_tagged_pointer_is_checked_without_its_tag() {
+        // arch/arm64/include/asm/uaccess.h, `access_ok`: the tag comes off
+        // a thread's pointer when the thread has the ABI on, and not
+        // otherwise. arch/arm64/include/asm/memory.h, `untagged_addr`: a
+        // kernel address (bit 55 set) keeps its top byte.
+        let mut buf = vec![0u8; 0x1000];
+        let mut m = GuestMem::new(&mut buf);
+        let tagged = 0xb400_0000_0000_0100u64;
+        assert_eq!(m.write(tagged, &[7]), Err(Errno::EFAULT), "the ABI is off");
+        m.set_untag(true);
+        m.write(tagged, &[7]).unwrap();
+        assert_eq!(m.read(0x100, 1).unwrap(), &[7]);
+        assert_eq!(m.read(tagged, 1).unwrap(), &[7]);
+        assert_eq!(m.read(0xb480_0000_0000_0100, 1), Err(Errno::EFAULT), "bit 55 set: not a user address");
+        m.set_untag(false);
+        assert_eq!(m.read(tagged, 1), Err(Errno::EFAULT));
+        assert_eq!(crate::untagged_addr(tagged), 0x100);
+        assert_eq!(crate::untagged_addr(0xff80_0000_0000_0100), 0xff80_0000_0000_0100);
+    }
+
     #[test]
     fn statfs_fields_are_where_linux_puts_them() {
         let mut buf = vec![0u8; 0x1000];

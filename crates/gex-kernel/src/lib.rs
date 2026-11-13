@@ -87,17 +87,28 @@ pub use proclive::{KernelProcSource, ProcCell};
 /// asked for (see the span's module).
 pub struct GuestMem<'a> {
     span: gex_atomic::mem::Span<'a>,
+    /// Whether an address loses its tag before it is checked
+    /// ([`Self::set_untag`]).
+    untag: bool,
+}
+
+/// AArch64's `untagged_addr` (arch/arm64/include/asm/memory.h): a user
+/// address, bit 55 clear, without its top byte; a kernel one, bit 55 set,
+/// as it is.
+#[inline(always)]
+pub fn untagged_addr(addr: u64) -> u64 {
+    addr & (((addr << 8) as i64) >> 8) as u64
 }
 
 impl<'a> GuestMem<'a> {
     pub fn new(bytes: &'a mut [u8]) -> GuestMem<'a> {
-        GuestMem { span: gex_atomic::mem::Span::new(bytes) }
+        GuestMem { span: gex_atomic::mem::Span::new(bytes), untag: false }
     }
 
     /// Over a [`gex_atomic::mem::Span`] (the browser's, from address 0 of
     /// its memory).
     pub fn of_span(span: gex_atomic::mem::Span<'a>) -> GuestMem<'a> {
-        GuestMem { span }
+        GuestMem { span, untag: false }
     }
 
     /// The memory as one slice, where it is one (a native host's, a
@@ -119,7 +130,15 @@ impl<'a> GuestMem<'a> {
         self.span.get_mut(r.start, r.len()).ok_or(Errno::EFAULT)
     }
 
+    /// Whether the addresses given from here on are a thread's that has
+    /// AArch64's tagged address ABI on: `access_ok` takes the tag off such
+    /// a thread's pointer before it checks it (arch/arm64/include/asm/uaccess.h).
+    pub fn set_untag(&mut self, on: bool) {
+        self.untag = on;
+    }
+
     fn range(&self, addr: u64, len: usize) -> Result<std::ops::Range<usize>, Errno> {
+        let addr = if self.untag { untagged_addr(addr) } else { addr };
         let start = addr as usize;
         let end = start.checked_add(len).ok_or(Errno::EFAULT)?;
         if addr > usize::MAX as u64 || end > self.limit() {
