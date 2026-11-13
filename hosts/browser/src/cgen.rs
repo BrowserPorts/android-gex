@@ -897,7 +897,7 @@ pub(crate) fn read_pe(f: &Arc<dyn gex_kernel::vfs::FileHandle>) -> Option<(gex_l
     let mut b = vec![0u8; size];
     let at = read_full(&**f, 0, &mut b);
     b.truncate(at);
-    gex_ld::pe::parse(&b).ok().map(|pe| (pe, None))
+    gex_ld::pe::parse_owned(b).ok().map(|pe| (pe, None))
 }
 
 /// Bytes of `f` from `off` into `buf`, as many as there are.
