@@ -446,6 +446,19 @@ pub fn set_trap_pc(pc: u64) {
 /// rather than a write into the runtime.
 static GUARD_LIMIT: AtomicU64 = AtomicU64::new(GUEST_LIMIT);
 
+/// Whether a data address's top byte is ignored: AArch64's Top Byte Ignore,
+/// which Linux turns on for every user address ("translations made via
+/// TTBR0 ... have the top byte (bits 63:56) of the virtual address ignored
+/// by the translation hardware", Documentation/arch/arm64/tagged-pointers.rst).
+/// A tagged pointer, such as bionic's heap pointers, names the memory its
+/// low 56 bits do.
+pub fn tbi() -> bool {
+    !gex_abi::X86
+}
+
+/// The bits of an address that name memory under [`tbi`].
+const TBI_ADDR_MASK: u64 = (1 << 56) - 1;
+
 pub fn set_guard_limit(limit: u64) {
     GUARD_LIMIT.store(limit.min(GUEST_LIMIT), Ordering::Relaxed);
 }
@@ -1549,12 +1562,14 @@ impl<'a> Emitter<'a> {
         if gex_abi::mem64() {
             if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
                 let ea = c.wrapping_add(offset as u64);
+                let ea = if tbi() { ea & TBI_ADDR_MASK } else { ea };
                 // Below the null guard: an address past every memory's end.
                 let ea = if null_guard && ea < gex_abi::NULL_GUARD { u64::MAX - 15 } else { ea };
                 self.f.i64_const(ea as i64);
                 return 0;
             }
             self.push(addr);
+            self.drop_tag();
             let max_static: i64 = if gex_abi::X86 { 0xffff } else if on { u32::MAX as i64 - gex_abi::NULL_GUARD as i64 } else { u32::MAX as i64 };
             if null_guard {
                 // memory64's effective address does not wrap: (a - G) + G
@@ -1582,6 +1597,9 @@ impl<'a> Emitter<'a> {
         // references) and need no guard at all.
         if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
             let mut ea = c.wrapping_add(offset as u64);
+            if tbi() {
+                ea &= TBI_ADDR_MASK;
+            }
             // 32-bit Wine: Windows' KUSER_SHARED_DATA page is 32-bit Wine's (`gex_abi::WINE32_KUSER`).
             if let Some(f) = gex_abi::fold_kuser(ea) {
                 gex_ir::note_kuser_fold();
@@ -1742,6 +1760,7 @@ impl<'a> Emitter<'a> {
     /// the null guard leaves out (the thread's context).
     fn guard_to_i32_above(&mut self, floor: u64) {
         if gex_abi::mem64() {
+            self.drop_tag();
             return;
         }
         if Self::no_guard() {
@@ -1755,6 +1774,13 @@ impl<'a> Emitter<'a> {
 
     /// `t - floor <u limit - floor`, with `t` (the i64 address) in the
     /// scratch local and the comparison's operands pushed.
+    ///
+    /// Under [`tbi`] the comparison is of the address without its top
+    /// byte: both sides shifted left by it, which costs one shift where a
+    /// mask would cost a nine-byte constant. (The truncation to the
+    /// memory's 32 bits drops the byte from the address itself.) An
+    /// address whose low 56 bits are below the floor wraps to the top of
+    /// those 56 bits and fails, as it does without the shift.
     fn guard_range(&mut self, floor: u64) {
         let t = self.scratch_i64;
         self.f.local_get(t);
@@ -1762,7 +1788,26 @@ impl<'a> Emitter<'a> {
             self.f.i64_const(floor as i64);
             self.f.byte(0x7d); // i64.sub
         }
-        self.f.i64_const(guard_limit().saturating_sub(floor) as i64);
+        let room = guard_limit().saturating_sub(floor);
+        if tbi() {
+            self.f.i64_const(8);
+            self.f.byte(code::I64_SHL);
+            self.f.i64_const((room << 8) as i64);
+        } else {
+            self.f.i64_const(room as i64);
+        }
+    }
+
+    /// Under [`tbi`], the i64 address on the stack without its top byte:
+    /// for a memory64 guest memory, whose instructions take the address as
+    /// it stands.
+    fn drop_tag(&mut self) {
+        if tbi() {
+            self.f.i64_const(8);
+            self.f.byte(code::I64_SHL);
+            self.f.i64_const(8);
+            self.f.byte(code::I64_SHR_U);
+        }
     }
 
     fn guard_to_i32_inner(&mut self, floor: u64) {
