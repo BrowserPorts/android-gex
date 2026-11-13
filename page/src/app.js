@@ -1041,6 +1041,12 @@ async function begin(opts, base, at, state, meter, lets) {
         desk.style.height = `${h}px`;
         desktop?.resizeOutput?.(w, h);
       } else {
+        // The canvas's CSS size too: the compositor sizes only its pixels,
+        // and a canvas keeps the size it was laid out at.
+        if (canvas) {
+          canvas.style.width = `${w}px`;
+          canvas.style.height = `${h}px`;
+        }
         sys?.compositor?.resize?.(w, h);
       }
       return { w, h };
