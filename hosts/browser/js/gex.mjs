@@ -5303,10 +5303,13 @@ export class Gex {
     // The key from the shim (`gex_cgen_pmod_wasm_key`) where it makes one,
     // and the bytes copied out only when the page has no module for it.
     const plen = wasmdll ? e.gex_cgen_pmod_wasm_len(prov) >>> 0 : 0;
-    // A wasm32 program's bytes as a copy the shim made for this Worker
-    // (`gex_wasmprog_owned`): another Worker of the process may release
-    // the shim's own while this one copies.
+    // Wine's PE module's and a wasm32 library's bytes from their file
+    // (`#pmodRead`), never held in the shim's heap; a wasm32 program's as a
+    // copy the shim made for this Worker (`gex_wasmprog_owned`): another
+    // Worker of the process may release the shim's own while this one copies.
     const pcopy = () => {
+      const read = this.#pmodRead(prov, plen);
+      if (read) return read;
       const own = wasmprog && e.gex_wasmprog_owned ? e.gex_wasmprog_owned(prov) >>> 0 : 0;
       if (wasmprog && e.gex_wasmprog_owned && !own) throw new Error(`wasm32 module ${prov}: its bytes are gone`);
       const at = own || (e.gex_cgen_pmod_wasm_ptr(prov) >>> 0);
@@ -5323,7 +5326,10 @@ export class Gex {
     let packed = false;
     // Wine's PE module too: copied and hashed here, its 9 MB were 28 copies
     // and hashes in one demo's boot.
-    if ((wasmprog || (wasmdll && !libprov)) && e.gex_cgen_pmod_wasm_key) {
+    // (no key, both lanes 0: a file the shim could not read to make one)
+    const keyed = (wasmprog || (wasmdll && !libprov)) && e.gex_cgen_pmod_wasm_key
+      && (e.gex_cgen_pmod_wasm_key(prov, 0) !== 0n || e.gex_cgen_pmod_wasm_key(prov, 1) !== 0n);
+    if (keyed) {
       const lane = (n) => BigInt.asUintN(64, BigInt(e.gex_cgen_pmod_wasm_key(prov, n)));
       pkey = `wasm:${plen}:${lane(0)}:${lane(1)}`;
       if (wasmprog && !w64 && !logNamed('nodlpack')) {
@@ -5992,6 +5998,33 @@ export class Gex {
    *  once per process and offered to the siblings. Synchronous. */
   /** The last `#cgenFileModule`'s compile, ms; -1 when the Worker had it. */
   #fileModuleMs = -1;
+  /** Provider module `prov`'s `len` bytes read from its file
+   *  (`gex_cgen_pmod_read`), through a window of 1 MiB of the shim's memory
+   *  into bytes of the page's own: a program's module is hundreds of MiB,
+   *  and the shim's heap never gives a span back. null for a module with no
+   *  file to read (a program's, whose bytes are its image's). */
+  #pmodRead(prov, len) {
+    const e = this.#shim.exports;
+    if (!e.gex_cgen_pmod_read || !len) return null;
+    const win = Math.min(len, 1 << 20);
+    const at = e.gex_alloc(win) >>> 0;
+    try {
+      let out = null;
+      for (let off = 0; off < len;) {
+        const n = e.gex_cgen_pmod_read(prov, BigInt(off), at, Math.min(win, len - off));
+        if (n === -1 && off === 0) return null;
+        if (n === -2) throw new Error(`${this.#cgenStr(e.gex_cgen_pmod_file, prov)}: changed since it was loaded`);
+        if (n <= 0) throw new Error(`${this.#cgenStr(e.gex_cgen_pmod_file, prov)}: ends at ${off} of its ${len} bytes`);
+        out ??= new Uint8Array(len);
+        out.set(new Uint8Array(this.#memory.buffer, at, n), off);
+        off += n;
+      }
+      return out;
+    } finally {
+      e.gex_free(at, win);
+    }
+  }
+
   #cgenFileModule(file, bytes = null, key = null) {
     const name = key ?? `cgenfile:${file}`;
     let mod = this.#sharedModules.get(name);
