@@ -176,10 +176,14 @@ const FRAMES_KEPT = 4;
 // a launch fetched the same frames over and over (Notepad++ in the Wine
 // desktop page: 33 fetches of 17 frames, about 43 MB for 24).
 const packed = new Map();
-const PACKED_BUDGET = 96 << 20;
+// (a test sets GEX_PACKED_BUDGET, to fill it with a small bundle)
+const PACKED_BUDGET = globalThis.GEX_PACKED_BUDGET ?? 96 << 20;
 let packedBytes = 0;
 function keepPacked(key, z) {
   if (z.length > PACKED_BUDGET) return;
+  // (a read's frame is kept here before its store; a store that fails keeps it again)
+  const old = packed.get(key);
+  if (old) { packed.delete(key); packedBytes -= old.length; }
   packed.set(key, z);
   packedBytes += z.length;
   for (const [k, v] of packed) {

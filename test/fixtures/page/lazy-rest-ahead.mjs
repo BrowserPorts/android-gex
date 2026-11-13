@@ -14,7 +14,9 @@
  *   - a read of a frame near the end while the download is about 10% through: its own ranged request at once,
  *     not 'low'; the bytes sent twice at most the window in flight then;
  *   - a first visit cut short, then a second: the second asks only for the frames the first did not keep;
- *   - a page cache that refuses every frame (its quota): every byte still sent once, and no refetch loop.
+ *   - a page cache that refuses every frame (its quota): every byte still sent once, and no refetch loop;
+ *   - and with no download, reads of every frame one by one: the last ones read again from the kept bytes
+ *     (a frame kept before its store fails, and kept again then, counted once against the budget).
  *
  * Usage: node test/fixtures/page/lazy-rest-ahead.mjs
  */
@@ -85,12 +87,13 @@ if (isMainThread) {
   const { HEAD } = await import(gexUrl('hosts/browser/js/lazy-cache.mjs'));
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // owner options: delayMs a chunk (a quarter frame), store: a page cache to start from (a later visit's),
-  // quota: every put refused, cut: [request number, bytes]: that request ends in an error after so many bytes
-  const run = async ({ delayMs = 5, store = [], quota = false, cut = null } = {}) => {
+  // quota: every put refused, cut: [request number, bytes]: that request ends in an error after so many bytes,
+  // budget: the bytes kept packed (GEX_PACKED_BUDGET)
+  const run = async ({ delayMs = 5, store = [], quota = false, cut = null, budget } = {}) => {
     const log = new Int32Array(new SharedArrayBuffer(4 * (1 + F * LOG)));
     const ctl = new SharedArrayBuffer(HEAD + 32 * 1056);
     const memory = new WebAssembly.Memory({ initial: 4, maximum: 4, shared: true });
-    const owner = new Worker(new URL(import.meta.url), { workerData: { role: 'owner', log, delayMs, store, quota, cut, window: WINDOW } });
+    const owner = new Worker(new URL(import.meta.url), { workerData: { role: 'owner', log, delayMs, store, quota, cut, window: WINDOW, budget } });
     owner.on('error', (e) => { console.log(`FAIL owner: ${e?.message ?? e}`); process.exit(1); });
     const msgs = [];
     owner.on('message', (m) => msgs.push(m));
@@ -231,6 +234,22 @@ if (isMainThread) {
     check(`reads after it right, from the kept bytes (${r.reqs().length - n0} requests)`, (await readsRight(r, 1)) && r.reqs().length === n0);
     await r.owner.terminate();
   }
+
+  // -- that cache, no download, kept bytes for 8 frames: each frame read in turn, then the last 6 again ------
+  {
+    const r = await run({ quota: true, budget: 8 * frames[0][1] });
+    for (let k = 0; k < NFRAMES; k++) {
+      await r.read(k * FRAME + 3, 16, 4096);
+      await sleep(20);
+    }
+    const n0 = r.reqs().length;
+    let right = true;
+    for (let k = NFRAMES - 6; k < NFRAMES; k++) {
+      right = (await r.read(k * FRAME + 3, 16, 4096)) === 16 && r.mem.subarray(4096, 4112).every((x, j) => x === want[k * FRAME + 3 + j]) && right;
+    }
+    check(`the last 6 frames read again from the kept bytes (${r.reqs().length - n0} requests, after ${n0})`, right && n0 === NFRAMES && r.reqs().length === n0);
+    await r.owner.terminate();
+  }
   console.log(bad ? `${bad} FAILED` : 'lazy rest ahead check ok');
   process.exit(bad ? 1 : 0);
 } else if (workerData.role === 'owner') {
@@ -278,6 +297,7 @@ if (isMainThread) {
   globalThis.self = { postMessage: (m) => parentPort.postMessage(m) };
   globalThis.GEX_BASE = BASE;
   globalThis.GEX_AHEAD_WINDOW = workerData.window;
+  if (workerData.budget) globalThis.GEX_PACKED_BUDGET = workerData.budget;
   await import(gexUrl('page/src/lazy-cache-worker.js'));
   parentPort.on('message', (data) => {
     if (data?.kind === 'dump') parentPort.postMessage({ kind: 'store', entries: [...store].filter(([k]) => k.includes('f=')) });
