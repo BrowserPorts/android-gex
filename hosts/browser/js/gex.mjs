@@ -5837,6 +5837,10 @@ export class Gex {
           ? ` (arena taken: maps ${e.gex_arena_spent_mib(0)}, heap ${e.gex_arena_spent_mib(1)}, ` +
             `stacks ${e.gex_arena_spent_mib(2)} MiB, memory ${Math.round(this.#memory.buffer.byteLength / 1048576)} MiB)`
           : '';
+        // A process that can move to a 64-bit memory outgrew this one (lib.rs
+        // `gex_outgrew`): said as the trap path says it.
+        if (e.gex_outgrew?.() === 1)
+          throw Object.assign(new Error('its memory ran out: gex could not grow its own memory for it below the 32-bit ceiling'), { outgrew: true });
         throw new Error(`gex-pe: no memory for a provider stack${a}`);
       }
       this.#provStack = new WebAssembly.Global({ value: 'i32', mutable: true }, base + size - 16);
@@ -5852,7 +5856,11 @@ export class Gex {
       const size = 1 << 20;
       const e = this.#shim.exports;
       const base = e.gex_provider_stack(size) >>> 0;
-      if (!base) throw new Error('gex: no memory for a provider stack');
+      if (!base) {
+        if (e.gex_outgrew?.() === 1)
+          throw Object.assign(new Error('its memory ran out: gex could not grow its own memory for it below the 32-bit ceiling'), { outgrew: true });
+        throw new Error('gex: no memory for a provider stack');
+      }
       this.#provStackLo = BigInt(base);
       this.#provStack64 = new WebAssembly.Global({ value: 'i64', mutable: true }, BigInt(base + size - 16));
     }

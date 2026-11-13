@@ -3131,6 +3131,13 @@ static ARENA_NEXT: std::sync::atomic::AtomicU64 =
 /// process outgrowing its lowered memory ([`runtime_outgrow`]).
 static RUNTIME_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// gex's own memory for this process (a provider's heap or stack, mapped
+/// as guest memory) could not have `len` bytes: recorded as a runtime
+/// shortfall ([`RUNTIME_SHORT`]), as the arena's own refusal is.
+pub(crate) fn runtime_short(len: u64) {
+    RUNTIME_SHORT.fetch_max(len.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Take `len` bytes of arena for this module's heap.
 fn arena_take(len: u64) -> Option<u64> {
     arena_take_for(len, false)
@@ -3303,7 +3310,7 @@ fn arena_take_for(len: u64, guest: bool) -> Option<u64> {
         // a 64-bit memory: the trap that follows is its outgrowing the
         // lowered one, which the kernel's line says (`runtime_outgrow`).
         // SAFETY: `warn` and `debug` read the bytes and keep none of them.
-        if !guest && gex_kernel::syscalls::outgrow_armed(my_pid(), WASM32.load(std::sync::atomic::Ordering::Acquire)) {
+        if !guest && gex_kernel::syscalls::outgrow_armed(my_pid(), guest32()) {
             unsafe { debug(b.0.as_ptr() as u32, b.1 as u32) };
         } else {
             unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
@@ -9699,6 +9706,16 @@ fn frames_stay() -> bool {
 /// (`frames_stay`). Set where the kernel's is, and by `set_host`.
 pub(crate) static WASM32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// This process's wasm32 program was built LP64 and lowered (64-bit Wine):
+/// a 32-bit guest by its memory only, which a 64-bit memory can run.
+pub(crate) static LOWERED64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process is a 32-bit guest for moving it to a 64-bit memory
+/// (`note_runtime_short`): a wasm32 program not lowered from wasm64.
+fn guest32() -> bool {
+    WASM32.load(std::sync::atomic::Ordering::Acquire) && !LOWERED64.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A thread or a fork a wasm32 program's syscall staged without trapping
 /// (`gex_wasmprog_staged`).
 ///
@@ -12185,6 +12202,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     // Set again when a wasm32 program is published (cgen/wasmprog.rs).
     h.kernel.wasm32 = false;
     WASM32.store(false, std::sync::atomic::Ordering::Release);
+    LOWERED64.store(false, std::sync::atomic::Ordering::Release);
     cgen::wasmprog::stage(program.as_ref());
     h.kernel.live_threads.store(1, std::sync::atomic::Ordering::Release);
     // Clones above the context this program goes on, which is the exec'ing
@@ -17235,6 +17253,13 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         stop_gone();
         trap();
     }
+    // gex's own memory for this process could not grow (a dispatch table's
+    // slot map, say), and the process can move to a 64-bit memory: it ends
+    // here, as a trap, and the Worker records it for its next start
+    // (`gex_outgrew`). Translating on would miss here for good.
+    if gex_outgrew() == 1 {
+        warch::unreachable();
+    }
     if gex_abi::X86 && pc == gex_kernel::x86::FAR_PAD {
         return far_switch(_ctx);
     }
@@ -20718,7 +20743,7 @@ fn outgrow_end(pid: i32, status: i32) {
 /// its next start (`outgrow_ending`, which [`outgrow_end`] calls next).
 fn runtime_outgrow(pid: i32) -> bool {
     let len = RUNTIME_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if len == 0 || !gex_kernel::syscalls::note_runtime_short(pid, len, WASM32.load(std::sync::atomic::Ordering::Acquire)) {
+    if len == 0 || !gex_kernel::syscalls::note_runtime_short(pid, len, guest32()) {
         return false;
     }
     if let Some(home) = sigs::home() {
@@ -20735,7 +20760,7 @@ fn runtime_outgrow(pid: i32) -> bool {
 #[no_mangle]
 pub extern "C" fn gex_outgrew() -> i32 {
     (RUNTIME_SHORT.load(std::sync::atomic::Ordering::Relaxed) != 0
-        && gex_kernel::syscalls::outgrow_armed(my_pid(), WASM32.load(std::sync::atomic::Ordering::Acquire))) as i32
+        && gex_kernel::syscalls::outgrow_armed(my_pid(), guest32())) as i32
 }
 
 /// Record a guest exit, and say so where a trap handler can see it.

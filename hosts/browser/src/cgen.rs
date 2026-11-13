@@ -2007,6 +2007,7 @@ pub extern "C" fn gex_provider_alloc_top(size: u32) -> u32 {
         Ok(a) => a as u32,
         Err(e) => {
             crate::warn_line(&format!("gex-pe: provider_alloc_top({size:#x}): {e}\n"));
+            crate::runtime_short(size as u64);
             0
         }
     }
