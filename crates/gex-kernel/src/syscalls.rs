@@ -13059,9 +13059,11 @@ impl Kernel {
 }
 
 /// `statfs` and `fstatfs`: one answer for every filesystem (tmpfs's
-/// magic, a 4 GiB volume half free). `f_flags` has ST_VALID, as Linux's
-/// always does: glibc's `statvfs` otherwise looks the mount flags up in
-/// /proc/mounts.
+/// magic, a 256 GiB volume with 192 GiB free). Installers refuse to start
+/// when the free space is below what they will lay down, and large ones
+/// ask for several GiB; a write past what the host can hold still fails
+/// at the write. `f_flags` has ST_VALID, as Linux's always does: glibc's
+/// `statvfs` otherwise looks the mount flags up in /proc/mounts.
 pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     if buf == 0 {
         return Err(Errno::EFAULT);
@@ -13072,9 +13074,9 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     };
     put(&mut out, 0, 0x0102_1994); // f_type: TMPFS_MAGIC
     put(&mut out, 8, 4096); // f_bsize
-    put(&mut out, 16, 1 << 20); // f_blocks
-    put(&mut out, 24, 1 << 19); // f_bfree
-    put(&mut out, 32, 1 << 19); // f_bavail
+    put(&mut out, 16, 1 << 26); // f_blocks
+    put(&mut out, 24, 3 << 24); // f_bfree
+    put(&mut out, 32, 3 << 24); // f_bavail
     put(&mut out, 40, 1 << 18); // f_files
     put(&mut out, 48, 1 << 17); // f_ffree
     // f_fsid (8 bytes) at 56
@@ -13458,6 +13460,7 @@ mod tests {
         statfs(&mut GuestMem::new(&mut buf), false, 0x100).unwrap();
         let q = |at: usize| u64::from_le_bytes(buf[0x100 + at..0x108 + at].try_into().unwrap());
         assert_eq!(q(8), 4096, "f_bsize");
+        assert!(q(32) * q(8) >= 64 << 30, "f_bavail: room for a large installer");
         assert_eq!(q(56), 0, "f_fsid");
         assert_eq!(q(64), 255, "f_namelen");
         assert_eq!(q(72), 4096, "f_frsize");
