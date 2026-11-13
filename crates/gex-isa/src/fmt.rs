@@ -1069,14 +1069,18 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 (VAcrossOp::FMaxNm, true) => "fmaxnmp",
                 (VAcrossOp::FMinNm, false) => "fminnmv",
                 (VAcrossOp::FMinNm, true) => "fminnmp",
+                (VAcrossOp::SAddL, _) => "saddlv",
+                (VAcrossOp::UAddL, _) => "uaddlv",
             };
             let src = VArr {
                 scalar: false,
                 ..arr
             };
+            // The long sums' destination is one lane of twice the size.
+            let long = matches!(op, VAcrossOp::SAddL | VAcrossOp::UAddL);
             format!(
                 "{m} {}{}, v{}.{}",
-                lane_letter(arr.lane_bytes),
+                lane_letter(if long { arr.lane_bytes * 2 } else { arr.lane_bytes }),
                 vd.0,
                 vn.0,
                 src.suffix()

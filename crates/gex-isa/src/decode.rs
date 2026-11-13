@@ -2249,6 +2249,8 @@ fn decode_simd_across(raw: u32, q: bool, u: u32) -> Inst {
         (0b11010, 0) => VAcrossOp::SMin,
         (0b11010, _) => VAcrossOp::UMin,
         (0b11011, 0) => VAcrossOp::Add,
+        (0b00011, 0) => VAcrossOp::SAddL,
+        (0b00011, _) => VAcrossOp::UAddL,
         _ => return Inst::Unknown { raw },
     };
     let lane_bytes = match bits(raw, 23, 22) {

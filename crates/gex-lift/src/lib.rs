@@ -2193,12 +2193,57 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            Inst::VAcross { op: op @ (VAcrossOp::SAddL | VAcrossOp::UAddL), arr, vd, vn } => {
+                // SADDLV and UADDLV: each lane is widened to twice its
+                // size before it is added, so the sum cannot be folded in
+                // the lanes' own width as the others are. The lanes are
+                // read out and summed as scalars; the sum of sixteen bytes
+                // or eight halfwords fits 32 bits, and words are summed in
+                // 64.
+                let signed = op == VAcrossOp::SAddL;
+                let lb = arr.lane_bytes;
+                let wide = lb == 4;
+                let src = self.b.read(GuestReg::V128(vn.0));
+                let mut sum = None;
+                for l in 0..arr.lanes() {
+                    let x = self.b.def(Expr::VExtract {
+                        a: src,
+                        lane: l,
+                        lane_bytes: lb,
+                        signed,
+                        ty: Ty::I32,
+                    });
+                    let x = if wide { self.b.def(Expr::Extend { a: x, signed }) } else { x };
+                    sum = Some(match sum {
+                        None => x,
+                        Some(s) => self.b.def(Expr::Bin {
+                            op: BinOp::Add,
+                            ty: if wide { Ty::I64 } else { Ty::I32 },
+                            a: s,
+                            b: x,
+                        }),
+                    });
+                }
+                // The destination is one lane of twice the size, the rest
+                // of the register zero.
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                let out = self.b.def(Expr::VReplace {
+                    a: zero,
+                    lane: 0,
+                    lane_bytes: lb * 2,
+                    val: sum.expect("a vector has lanes"),
+                });
+                self.b.write(GuestReg::V128(vd.0), out);
+                Flow::Next
+            }
+
             Inst::VAcross { op, arr, vd, vn } => {
                 // Wasm has no horizontal reduction, so fold the vector in
                 // half repeatedly: log2(lanes) shuffles and lane-wise ops
                 // leave the answer in lane 0.
                 let lane = Self::lane_of(arr);
                 let bin = match op {
+                    VAcrossOp::SAddL | VAcrossOp::UAddL => unreachable!("the long sums are lifted above"),
                     VAcrossOp::Add => VLaneBinOp::Add,
                     // As with the three-same forms, the `nm` variants share a
                     // lowering with the plain ones: wasm's max/min already
