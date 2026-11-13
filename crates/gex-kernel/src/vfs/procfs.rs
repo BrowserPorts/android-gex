@@ -241,8 +241,8 @@ pub fn status_ids(creds: &[u8]) -> (String, String, String) {
         format!("Gid:\t{gr}\t{ge}\t{gs}\t{ge}\n"),
         format!(
             "CapInh:\t{inh:016x}\nCapPrm:\t{perm:016x}\nCapEff:\t{eff:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}\n",
-            crate::syscalls::CAPS_ALL,
-            0
+            c.bounding(),
+            c.ambient()
         ),
     )
 }

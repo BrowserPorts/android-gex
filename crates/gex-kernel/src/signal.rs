@@ -183,6 +183,9 @@ pub struct ProcSig {
     /// thread of this process), target thread (0 for `kill`), signal. What
     /// says which thread of a process sent its own death.
     fault_send: Mutex<Option<(i32, i32, i32, u32)>>,
+    /// What the process has set with `prctl`: flags of its address space
+    /// and its `signal_struct`.
+    prctl: Mutex<crate::prctl::Proc>,
 }
 
 impl std::fmt::Debug for ProcSig {
@@ -206,7 +209,17 @@ impl ProcSig {
             fatal: Mutex::new(None),
             handled: Mutex::new(None),
             fault_send: Mutex::new(None),
+            prctl: Mutex::new(crate::prctl::Proc::default()),
         }
+    }
+
+    /// What the process has set with `prctl` ([`crate::prctl::Proc`]).
+    pub fn prctl(&self) -> crate::prctl::Proc {
+        *self.prctl.lock()
+    }
+
+    pub fn update_prctl(&self, f: impl FnOnce(&mut crate::prctl::Proc)) {
+        f(&mut self.prctl.lock())
     }
 
     /// The signal a delivery found fatal, its sender and whether it was the
@@ -490,6 +503,9 @@ pub struct ThreadSig {
     /// `clone` and `fork` and cleared on `execve`
     /// (Documentation/arch/arm64/tagged-address-abi.rst).
     tagged_addr: AtomicBool,
+    /// What the thread has set about itself with `prctl`
+    /// ([`crate::prctl::Task`]).
+    prctl: Mutex<crate::prctl::Task>,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -512,7 +528,25 @@ impl ThreadSig {
             own: Mutex::new(Own::default()),
             clear_child_tid: AtomicU64::new(0),
             tagged_addr: AtomicBool::new(false),
+            prctl: Mutex::new(crate::prctl::Task::default()),
         }
+    }
+
+    /// What the thread has set with `prctl`.
+    pub fn prctl(&self) -> crate::prctl::Task {
+        *self.prctl.lock()
+    }
+
+    pub fn update_prctl(&self, f: impl FnOnce(&mut crate::prctl::Task)) {
+        f(&mut self.prctl.lock())
+    }
+
+    /// What a thread or a forked child this one makes starts with of the
+    /// state no `ThreadSig::new_thread` argument carries: the tagged
+    /// address ABI and the `prctl` settings ([`crate::prctl::Task::child`]).
+    pub fn inherit(&self, creator: &ThreadSig) {
+        self.set_tagged_addr(creator.tagged_addr());
+        *self.prctl.lock() = creator.prctl().child();
     }
 
     /// Whether the thread has the tagged address ABI on
@@ -642,11 +676,10 @@ impl Signals {
     pub fn fork(&self) -> Signals {
         let cur = ThreadSig::new_thread(self.blocked());
         cur.own.lock().alt_stack = self.alt_stack();
-        cur.set_tagged_addr(self.cur.tagged_addr());
-        Signals {
-            proc: Arc::new(ProcSig::with_actions(*self.proc.actions.read())),
-            cur: Arc::new(cur),
-        }
+        cur.inherit(&self.cur);
+        let proc = ProcSig::with_actions(*self.proc.actions.read());
+        *proc.prctl.lock() = self.proc.prctl().fork();
+        Signals { proc: Arc::new(proc), cur: Arc::new(cur) }
     }
 
     /// The signal state after `execve`.
@@ -666,6 +699,10 @@ impl Signals {
         // `flush_thread` -> `flush_tagged_addr_state`: the new program
         // starts without the tagged address ABI.
         self.cur.set_tagged_addr(false);
+        // A new address space ([`crate::prctl::Proc::exec`]). What the
+        // thread set about itself stays.
+        let after = self.proc.prctl().exec();
+        *self.proc.prctl.lock() = after;
         let mut own = self.cur.own.lock();
         own.alt_stack = SigAltStack::default();
         own.in_handler = false;
@@ -909,7 +946,14 @@ impl Signals {
         }
         let alt = self.alt_stack();
         let (mine, shared) = if pending { (self.cur.pending(), self.proc.shared()) } else { (0, 0) };
-        for w in [self.blocked(), alt.sp, alt.flags as u64, alt.size, mine, shared] {
+        // The `prctl` settings and the tagged address ABI as they are: a
+        // fork child's are its parent's, and an `execve` changes its own
+        // ([`Signals::exec`], which the new program's kernel runs).
+        let (task, proc) = (self.cur.prctl(), self.proc.prctl());
+        let task = if pending { task } else { task.child() };
+        let proc = if pending { proc } else { proc.fork() };
+        let flags = task.flags() << 1 | self.cur.tagged_addr() as u64;
+        for w in [self.blocked(), alt.sp, alt.flags as u64, alt.size, mine, shared, task.timer_slack_ns, task.default_timer_slack_ns, flags, proc.word()] {
             v.extend_from_slice(&w.to_le_bytes());
         }
         v
@@ -930,8 +974,11 @@ impl Signals {
         let cur = ThreadSig::new_thread(w(o));
         cur.own.lock().alt_stack = SigAltStack { sp: w(o + 1), flags: w(o + 2) as u32, size: w(o + 3) };
         cur.pending.store(w(o + 4), Ordering::Release);
+        cur.set_tagged_addr(w(o + 8) & 1 != 0);
+        *cur.prctl.lock() = crate::prctl::Task::from_words(w(o + 6), w(o + 7), w(o + 8) >> 1);
         let proc = ProcSig::with_actions(actions);
         proc.shared.store(w(o + 5), Ordering::Release);
+        *proc.prctl.lock() = crate::prctl::Proc::from_word(w(o + 9));
         Some(Signals { proc: Arc::new(proc), cur: Arc::new(cur) })
     }
 }
@@ -954,8 +1001,9 @@ pub enum Restart {
 }
 
 /// The length of [`Signals::to_bytes`]: four words a disposition, then the
-/// mask, the alternate stack's three and the two pending sets.
-const STATE_BYTES: usize = (NSIG * 4 + 6) * 8;
+/// mask, the alternate stack's three, the two pending sets, and four for
+/// the `prctl` settings and the tagged address ABI.
+const STATE_BYTES: usize = (NSIG * 4 + 10) * 8;
 
 /// A process that sent a signal, for its siginfo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

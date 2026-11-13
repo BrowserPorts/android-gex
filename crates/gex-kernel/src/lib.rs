@@ -48,6 +48,7 @@ pub mod win;
 pub mod pipe;
 pub mod phase;
 pub mod pidfd;
+pub mod prctl;
 pub mod proc;
 pub mod pty;
 pub mod signal;

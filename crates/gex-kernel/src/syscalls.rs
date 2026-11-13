@@ -4430,6 +4430,10 @@ pub struct MapIo<'a> {
     /// The call's pc: a mapping the dynamic loader asks for stays below
     /// 4 GiB, since it will hold code.
     pub pc: u64,
+    /// `PR_SET_MDWE`'s `PR_MDWE_REFUSE_EXEC_GAIN`
+    /// ([`crate::prctl::Proc::denies_write_exec`]): no mapping is made
+    /// writable and executable, and none made executable that was not.
+    pub deny_write_exec: bool,
 }
 
 impl MapIo<'_> {
@@ -4481,6 +4485,20 @@ impl MapIo<'_> {
 
     /// `mprotect`.
     pub fn mprotect(&self, m: &GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        // Under `PR_SET_MDWE` the mappings up to the first that may not
+        // have the protection get it, and the call is `EACCES`, as the
+        // kernel's walk leaves them (mm/mprotect.c).
+        if self.deny_write_exec {
+            let denied = self.mem.lock().denied_exec_gain(a[0], a[1], a[2] as u32);
+            if let Some(at) = denied {
+                if at > a[0] && a[0].is_multiple_of(crate::mem::PAGE_SIZE) {
+                    let mut before = a;
+                    before[1] = at - a[0];
+                    MapIo { deny_write_exec: false, ..*self }.mprotect(m, before)?;
+                }
+                return Err(Errno::EACCES);
+            }
+        }
         // Losing execute retires the translations as surely as
         // unmapping does: `ld.so` applies RELRO by dropping write,
         // but a JIT in the guest flips a page from executable back to
@@ -4672,6 +4690,12 @@ impl MapIo<'_> {
     pub fn mmap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         let (addr, len, prot_bits, flags, fd, offset) =
             (a[0], a[1], a[2] as u32, a[3], a[4] as i32, a[5]);
+        // `PR_SET_MDWE`: no mapping both writable and executable
+        // (`map_deny_write_exec`, after `do_mmap` has refused no length).
+        let wx = crate::mem::prot::WRITE | crate::mem::prot::EXEC;
+        if self.deny_write_exec && prot_bits & wx == wx && len != 0 {
+            return Err(Errno::EACCES);
+        }
         // A fixed mapping over code replaces it, as an unmap would (Wine's
         // VirtualFree decommits by mapping over the range).
         if flags & mflags::FIXED != 0 {
@@ -6176,9 +6200,31 @@ pub struct Creds {
     gid: [std::sync::atomic::AtomicU32; 3],
     /// Effective, permitted, inheritable.
     caps: [std::sync::atomic::AtomicU64; 3],
-    /// `PR_SET_KEEPCAPS`: a uid change away from root keeps the permitted
-    /// set (it clears at exec).
-    keep_caps: std::sync::atomic::AtomicBool,
+    /// The bounding set (`PR_CAPBSET_DROP` takes from it) and the ambient
+    /// set (`PR_CAP_AMBIENT`).
+    bounding: std::sync::atomic::AtomicU64,
+    ambient: std::sync::atomic::AtomicU64,
+    /// `PR_SET_SECUREBITS`'s bits ([`secbit`]). `PR_SET_KEEPCAPS` is one of
+    /// them: a uid change away from root keeps the permitted set (it
+    /// clears at exec).
+    securebits: std::sync::atomic::AtomicU32,
+}
+
+/// The securebits (include/uapi/linux/securebits.h): each has a lock bit
+/// one above it.
+pub mod secbit {
+    pub const NOROOT: u32 = 1 << 0;
+    pub const NO_SETUID_FIXUP: u32 = 1 << 2;
+    pub const KEEP_CAPS: u32 = 1 << 4;
+    pub const KEEP_CAPS_LOCKED: u32 = 1 << 5;
+    pub const NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
+    pub const EXEC_RESTRICT_FILE: u32 = 1 << 8;
+    pub const EXEC_DENY_INTERACTIVE: u32 = 1 << 10;
+    pub const ALL_BITS: u32 = NOROOT | NO_SETUID_FIXUP | KEEP_CAPS | NO_CAP_AMBIENT_RAISE | EXEC_RESTRICT_FILE | EXEC_DENY_INTERACTIVE;
+    pub const ALL_LOCKS: u32 = ALL_BITS << 1;
+    /// The bits a process restricts only itself with, which need no
+    /// privilege to set.
+    pub const ALL_UNPRIVILEGED: u32 = EXEC_RESTRICT_FILE | EXEC_DENY_INTERACTIVE;
 }
 
 /// Every capability Linux 6.x has (`CAP_LAST_CAP` 40): root's sets.
@@ -6195,7 +6241,9 @@ impl Creds {
             uid: [uid.into(), uid.into(), uid.into()],
             gid: [gid.into(), gid.into(), gid.into()],
             caps: [0.into(), 0.into(), 0.into()],
-            keep_caps: false.into(),
+            bounding: CAPS_ALL.into(),
+            ambient: 0.into(),
+            securebits: 0.into(),
         }
     }
 
@@ -6276,21 +6324,23 @@ impl Creds {
     }
 
     /// The ids and sets as bytes, for a process another memory goes on in
-    /// (the browser's fork and exec): 6 `u32`s, 3 `u64`s and a flag byte.
+    /// (the browser's fork and exec): 6 `u32`s, 5 `u64`s (the effective,
+    /// permitted, inheritable, bounding and ambient sets) and the
+    /// securebits, a `u32`.
     pub fn save(&self) -> Vec<u8> {
         let mut v = Vec::with_capacity(Self::SAVED);
         for id in self.uids().into_iter().chain(self.gids()) {
             v.extend_from_slice(&id.to_le_bytes());
         }
-        for c in self.caps() {
+        for c in self.caps().into_iter().chain([self.bounding(), self.ambient()]) {
             v.extend_from_slice(&c.to_le_bytes());
         }
-        v.push(self.keep_caps.load(std::sync::atomic::Ordering::Acquire) as u8);
+        v.extend_from_slice(&self.securebits().to_le_bytes());
         v
     }
 
     /// The length of [`Creds::save`]'s bytes.
-    pub const SAVED: usize = 6 * 4 + 3 * 8 + 1;
+    pub const SAVED: usize = 6 * 4 + 5 * 8 + 4;
 
     /// [`Creds::save`]'s bytes back; anything else changes nothing.
     pub fn restore(&self, b: &[u8]) {
@@ -6304,45 +6354,132 @@ impl Creds {
         }
         let c = |i: usize| u64::from_le_bytes(b[24 + i * 8..32 + i * 8].try_into().unwrap());
         self.set_caps([c(0), c(1), c(2)]);
-        self.keep_caps.store(b[48] != 0, std::sync::atomic::Ordering::Release);
+        self.bounding.store(c(3), std::sync::atomic::Ordering::Release);
+        self.ambient.store(c(4), std::sync::atomic::Ordering::Release);
+        self.securebits.store(u32::from_le_bytes(b[64..68].try_into().unwrap()), std::sync::atomic::Ordering::Release);
     }
 
     /// The capabilities an `execve` leaves, as Linux computes them for a
-    /// file with none of its own: everything for a program run by root
-    /// (real or effective), effective only when the effective uid is;
-    /// nothing otherwise. The inheritable set stays; `PR_SET_KEEPCAPS`
-    /// clears.
+    /// file with none of its own and no change of id
+    /// (`cap_bprm_creds_from_file`): for a program run by root (real or
+    /// effective, unless `SECBIT_NOROOT`) the bounding and inheritable
+    /// sets, effective when the effective uid is root; nothing otherwise;
+    /// and the ambient set either way, effective too. The inheritable,
+    /// bounding and ambient sets stay; `PR_SET_KEEPCAPS` clears.
     pub fn exec(&self) {
         let [r, e, _] = self.uids();
         let [_, _, inh] = self.caps();
-        let permitted = if r == 0 || e == 0 { CAPS_ALL } else { 0 };
-        let effective = if e == 0 { permitted } else { 0 };
+        let ambient = self.ambient();
+        let root = self.securebits() & secbit::NOROOT == 0;
+        let permitted = if root && (r == 0 || e == 0) { self.bounding() | inh } else { 0 } | ambient;
+        let effective = if root && e == 0 { permitted } else { ambient };
         self.set_caps([effective, permitted, inh]);
-        self.keep_caps.store(false, std::sync::atomic::Ordering::Release);
+        self.securebits.fetch_and(!secbit::KEEP_CAPS, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Whether the effective set holds capability number `cap`.
+    pub fn capable(&self, cap: u64) -> bool {
+        self.caps()[0] >> cap & 1 != 0
+    }
+
+    /// The bounding set.
+    pub fn bounding(&self) -> u64 {
+        self.bounding.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// `PR_CAPBSET_DROP`, the caller having checked it may.
+    pub fn drop_bounding(&self, cap: u64) {
+        self.bounding.fetch_and(!(1 << cap), std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The ambient set.
+    pub fn ambient(&self) -> u64 {
+        self.ambient.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn clear_ambient(&self) {
+        self.ambient.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// `PR_CAP_AMBIENT_RAISE`: only a capability both permitted and
+    /// inheritable, and not with `SECBIT_NO_CAP_AMBIENT_RAISE`.
+    pub fn raise_ambient(&self, cap: u64) -> Result<(), Errno> {
+        let [_, perm, inh] = self.caps();
+        if (perm & inh) >> cap & 1 == 0 || self.securebits() & secbit::NO_CAP_AMBIENT_RAISE != 0 {
+            return Err(Errno::EPERM);
+        }
+        self.ambient.fetch_or(1 << cap, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub fn lower_ambient(&self, cap: u64) {
+        self.ambient.fetch_and(!(1 << cap), std::sync::atomic::Ordering::AcqRel);
+    }
+
+    pub fn securebits(&self) -> u32 {
+        self.securebits.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// `PR_SET_SECUREBITS` (`cap_task_prctl`): no locked bit changes, no
+    /// lock opens, no bit that is none of them; and without `CAP_SETPCAP`
+    /// only the bits a process restricts itself with, and only a change.
+    pub fn set_securebits(&self, want: u64) -> Result<(), Errno> {
+        let old = self.securebits() as u64;
+        let (locks, bits) = (secbit::ALL_LOCKS as u64, secbit::ALL_BITS as u64);
+        if (old & locks) >> 1 & (old ^ want) != 0 || old & locks & !want != 0 || want & !(locks | bits) != 0 {
+            return Err(Errno::EPERM);
+        }
+        if !self.capable(8) {
+            let unprivileged = secbit::ALL_UNPRIVILEGED as u64;
+            let changed = old ^ want;
+            if changed == 0 || changed & !(unprivileged | unprivileged << 1) != 0 {
+                return Err(Errno::EPERM);
+            }
+        }
+        self.securebits.store(want as u32, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// `prctl(PR_GET_KEEPCAPS)` / `PR_SET_KEEPCAPS`.
     pub fn keep_caps(&self) -> bool {
-        self.keep_caps.load(std::sync::atomic::Ordering::Acquire)
+        self.securebits() & secbit::KEEP_CAPS != 0
     }
 
     pub fn set_keep_caps(&self, on: bool) {
-        self.keep_caps.store(on, std::sync::atomic::Ordering::Release);
+        if on {
+            self.securebits.fetch_or(secbit::KEEP_CAPS, std::sync::atomic::Ordering::AcqRel);
+        } else {
+            self.securebits.fetch_and(!secbit::KEEP_CAPS, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    /// `PR_SET_KEEPCAPS`, which `SECBIT_KEEP_CAPS_LOCKED` refuses.
+    pub fn set_keep_caps_checked(&self, on: bool) -> Result<(), Errno> {
+        if self.securebits() & secbit::KEEP_CAPS_LOCKED != 0 {
+            return Err(Errno::EPERM);
+        }
+        self.set_keep_caps(on);
+        Ok(())
     }
 
     /// The capability changes a uid change makes (Linux's
-    /// `cap_emulate_setxuid`): leaving root altogether (no id 0 left)
-    /// drops the permitted and effective sets, unless `PR_SET_KEEPCAPS`
-    /// keeps the permitted; an effective uid leaving 0 drops the effective
-    /// set, and one becoming 0 takes the permitted set as effective.
+    /// `cap_emulate_setxuid`, which `SECBIT_NO_SETUID_FIXUP` turns off):
+    /// leaving root altogether (no id 0 left) drops the permitted and
+    /// effective sets, unless `PR_SET_KEEPCAPS` keeps them, and the ambient
+    /// set always; an effective uid leaving 0 drops the effective set, and
+    /// one becoming 0 takes the permitted set as effective.
     fn after_uid_change(&self, old: [u32; 3]) {
+        if self.securebits() & secbit::NO_SETUID_FIXUP != 0 {
+            return;
+        }
         let new = self.uids();
         let [mut eff, mut perm, inh] = self.caps();
         if old.contains(&0) && !new.contains(&0) {
             if !self.keep_caps() {
                 perm = 0;
+                eff = 0;
             }
-            eff = 0;
+            self.clear_ambient();
         }
         if old[1] == 0 && new[1] != 0 {
             eff = 0;
@@ -6389,16 +6526,20 @@ impl Creds {
         self.caps()
     }
 
-    /// `capset`: the inheritable set within the old inheritable and
-    /// permitted (any, with CAP_SETPCAP), the permitted within the old
+    /// `capset` (`cap_capset`): the inheritable set within the old
+    /// inheritable and permitted (any, with CAP_SETPCAP) and within the old
+    /// inheritable and the bounding set, the permitted within the old
     /// permitted, the effective within the new permitted; `EPERM` else.
+    /// The ambient set keeps only what is still both permitted and
+    /// inheritable.
     pub fn capset(&self, eff: u64, perm: u64, inh: u64) -> Result<(), Errno> {
         let [ceff, cperm, cinh] = self.caps();
         let inh_room = if ceff & CAP_SETPCAP != 0 { CAPS_ALL } else { cinh | cperm };
-        if inh & !inh_room != 0 || perm & !cperm != 0 || eff & !perm != 0 {
+        if inh & !inh_room != 0 || inh & !(cinh | self.bounding()) != 0 || perm & !cperm != 0 || eff & !perm != 0 {
             return Err(Errno::EPERM);
         }
         self.set_caps([eff, perm, inh]);
+        self.ambient.fetch_and(perm & inh, std::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
 }
@@ -6601,9 +6742,11 @@ pub struct ThreadMaker<'a> {
     pub threads: &'a crate::signal::ThreadSigs,
     /// The creator's signal mask, which the new thread starts with.
     pub blocked: u64,
-    /// Whether the creator has the tagged address ABI on, which the new
-    /// thread starts with ([`crate::signal::ThreadSig::set_tagged_addr`]).
-    pub tagged_addr: bool,
+    /// The creator's own state, of which the new thread starts with the
+    /// tagged address ABI and the `prctl` settings
+    /// ([`crate::signal::ThreadSig::inherit`]), and its process's, whose
+    /// futex hash a new thread may grow.
+    pub creator: &'a Signals,
     /// The creator's fs_struct.
     pub fs: &'a Arc<FsCwd>,
 }
@@ -6769,7 +6912,9 @@ impl ThreadMaker<'_> {
         // The new thread's own state: its creator's mask, nothing pending,
         // and with `CLONE_CHILD_CLEARTID` the word its exit clears.
         let own = crate::signal::ThreadSig::new_thread(self.blocked);
-        own.set_tagged_addr(self.tagged_addr);
+        own.inherit(self.creator.thread());
+        let threads = self.live.load(Ordering::Acquire);
+        self.creator.process().update_prctl(|p| p.thread_made(threads, crate::cpus::count() as u32));
         if flags & clone_flags::CHILD_CLEARTID != 0 {
             own.set_clear_child_tid(child_tid);
         }
@@ -7182,6 +7327,20 @@ pub fn a64_thread(compat: bool, wasm32: bool) -> bool {
     !gex_abi::X86 && !compat && !wasm32
 }
 
+/// `prctl` for the thread `signals` is at: the tagged address ABI
+/// ([`tagged_addr_ctrl`]), then everything [`crate::prctl::call`] answers.
+/// `None` for what [`quiet_call`] does: the thread's name and gex's own
+/// options.
+fn prctl_call(signals: &Signals, creds: &Creds, pid: i32, a64: bool, mem: &crate::mem::Mm, m: &mut GuestMem<'_>, a: [u64; 6]) -> Option<SysResult> {
+    if a[0] as u32 as u64 == crate::prctl::pr::SET_VMA {
+        return Some(crate::prctl::set_vma(mem, m, a));
+    }
+    tagged_addr_ctrl(signals.thread(), a64, a).or_else(|| {
+        let cx = crate::prctl::Cx { thread: signals.thread(), process: signals.process(), creds, pid, a64 };
+        crate::prctl::call(&cx, m, a)
+    })
+}
+
 /// Which of a thread's addresses lose their tag in its system calls
 /// ([`crate::Tags`]): none but those of an AArch64 thread that has the
 /// tagged address ABI on.
@@ -7241,14 +7400,11 @@ pub fn tagged_addr_ctrl(thread: &crate::signal::ThreadSig, a64: bool, a: [u64; 6
 pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'_>, ctx_addr: u64, n: u64, a: [u64; 6]) -> SysResult {
     match n {
         nr::UNAME => uname(m, io.compat, a[0]),
-        // The capability options ([`Creds`]): `PR_GET_KEEPCAPS` and
-        // `PR_SET_KEEPCAPS`, and the bounding set, every capability (a
-        // drop is not kept; `PR_CAPBSET_READ` of one past the last is
-        // `EINVAL`, which libcap counts them by). Names, death signals,
-        // dumpability and the rest: all things a process may set about
-        // itself that change nothing observable here. A thread's name
-        // (`PR_SET_NAME`, `PR_GET_NAME`: what `pthread_setname_np` and
-        // `_getname_np` make) is the table's, for `/proc/<pid>/task/<tid>/comm`.
+        // `prctl`'s options that need nothing of the thread's or the
+        // process's own state; every other one is [`crate::prctl::call`]'s,
+        // which both callers ask first. A thread's name (`PR_SET_NAME`,
+        // `PR_GET_NAME`: what `pthread_setname_np` and `_getname_np` make)
+        // is the table's, for `/proc/<pid>/task/<tid>/comm`.
         nr::PRCTL => match a[0] {
             15 => {
                 // at most 15 bytes, cut there when no NUL comes sooner
@@ -7268,14 +7424,6 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
                 m.write(a[1], &out)?;
                 Ok(0)
             }
-            7 => Ok(io.creds.keep_caps() as u64),
-            8 if a[1] <= 1 => {
-                io.creds.set_keep_caps(a[1] == 1);
-                Ok(0)
-            }
-            8 => Err(Errno::EINVAL),
-            23 if a[1] <= 40 => Ok(1),
-            23 => Err(Errno::EINVAL),
             // gex's own: the process has crashed, and says how (the report
             // its exit makes, `ProcTable::set_crash`).
             crate::proc::PR_GEX_CRASH => {
@@ -7293,7 +7441,7 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
                 }
                 Ok(0)
             }
-            _ => Ok(0),
+            _ => Err(Errno::EINVAL),
         },
         // Everything written made durable: the block store's dirty blocks
         // written out and the store flushed (vfs::sync_all); with the files
@@ -7964,7 +8112,7 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
         let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
     } else if is_quiet(n, compat) {
-        let tagged = if n == nr::PRCTL { tagged_addr_ctrl(f.signals.thread(), a64_thread(compat, f.io.wasm32), a) } else { None };
+        let tagged = if n == nr::PRCTL { prctl_call(f.signals, f.creds, f.pid, a64_thread(compat, f.io.wasm32), f.map.mem, m, a) } else { None };
         let r = match tagged {
             Some(r) => r,
             None => quiet_call(&f.io, f.procs, f.futex.tid as i32, m, ctx_addr, n, a),
@@ -7988,7 +8136,7 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
             thread_fs: f.thread_fs,
             threads: f.threads,
             blocked: f.signals.blocked(),
-            tagged_addr: f.signals.thread().tagged_addr(),
+            creator: f.signals,
             fs: &f.path.fs,
         };
         match ca.and_then(|ca| maker.make(m, ctx_addr, ca)) {
@@ -9973,10 +10121,10 @@ impl Kernel {
         self.block_restart = call.block_restart;
         self.block_pc = call.block_pc;
         let blocked = self.signals.blocked();
-        let tagged = self.signals.thread().tagged_addr();
+        let creator = Arc::clone(self.signals.thread());
         let next = self.thread_signals.get_or_insert_with(tid, || {
             let t = crate::signal::ThreadSig::new_thread(blocked);
-            t.set_tagged_addr(tagged);
+            t.inherit(&creator);
             Arc::new(t)
         });
         self.signals.switch_to(next);
@@ -9997,10 +10145,10 @@ impl Kernel {
             return cur;
         }
         let blocked = self.signals.blocked();
-        let tagged = self.signals.thread().tagged_addr();
+        let creator = Arc::clone(self.signals.thread());
         self.thread_signals.get_or_insert_with(tid, || {
             let t = signal::ThreadSig::new_thread(blocked);
-            t.set_tagged_addr(tagged);
+            t.inherit(&creator);
             Arc::new(t)
         })
     }
@@ -10622,7 +10770,7 @@ impl Kernel {
             thread_fs: &self.thread_fs,
             threads: &self.thread_signals,
             blocked: self.signals.blocked(),
-            tagged_addr: self.signals.thread().tagged_addr(),
+            creator: &self.signals,
             fs,
         }
     }
@@ -11161,7 +11309,14 @@ impl Kernel {
 
     /// The mapping calls' part of this kernel ([`MapIo`]).
     pub fn map_io(&self) -> MapIo<'_> {
-        MapIo { mem: &self.mem, fds: &self.fds, pins: &self.pins, place: self.place.as_ref(), pc: self.syscall_pc }
+        MapIo {
+            mem: &self.mem,
+            fds: &self.fds,
+            pins: &self.pins,
+            place: self.place.as_ref(),
+            pc: self.syscall_pc,
+            deny_write_exec: self.signals.process().prctl().denies_write_exec(),
+        }
     }
 
     /// Note that `[addr, addr + len)` no longer holds the code it did
@@ -11390,7 +11545,7 @@ impl Kernel {
             // The calls that need nothing of the process ([`quiet_call`],
             // the free path's code).
             n if is_quiet(n, self.compat) => {
-                let tagged = if n == nr::PRCTL { tagged_addr_ctrl(self.signals.thread(), a64_thread(self.compat, self.wasm32), a) } else { None };
+                let tagged = if n == nr::PRCTL { prctl_call(&self.signals, &self.creds, self.pid, a64_thread(self.compat, self.wasm32), &self.mem, m, a) } else { None };
                 let r = match tagged {
                     Some(r) => r,
                     None => quiet_call(&self.fd_io(), &self.procs, self.tid, m, self.ctx_addr, n, a),
@@ -15199,6 +15354,73 @@ mod tests {
         let b = Creds::new(0, 0);
         b.restore(&c.save());
         assert_eq!((b.uids(), b.gids(), b.caps()), (c.uids(), c.gids(), c.caps()));
+    }
+
+    /// The bounding and ambient sets and the securebits, as
+    /// security/commoncap.c has them.
+    #[test]
+    fn the_bounding_and_ambient_sets_and_securebits_follow_commoncap() {
+        let all = CAPS_ALL;
+        let (net_raw, net_bind) = (13u64, 10u64);
+        // A dropped bounding capability is gone from what root's exec gets,
+        // unless it is inheritable.
+        let r = Creds::new(0, 0);
+        r.drop_bounding(net_raw);
+        assert_eq!(r.bounding(), all & !(1 << net_raw));
+        assert_eq!(r.caps(), [all, all, 0], "the sets it has stay");
+        r.exec();
+        assert_eq!(r.caps(), [all & !(1 << net_raw), all & !(1 << net_raw), 0]);
+        // Nor can it be made inheritable any more.
+        assert_eq!(r.capset(r.caps()[0], r.caps()[1], 1 << net_raw), Err(Errno::EPERM));
+        // Ambient: only what is permitted and inheritable; kept by exec for
+        // a user who is not root; lost when capset takes either away.
+        let a = Creds::new(0, 0);
+        assert_eq!(a.raise_ambient(net_bind), Err(Errno::EPERM), "not inheritable");
+        a.capset(all, all, 1 << net_bind).unwrap();
+        a.raise_ambient(net_bind).unwrap();
+        a.set_keep_caps(true);
+        a.setid(false, 1000);
+        a.after_uid_change([0; 3]);
+        assert_eq!(a.ambient(), 0, "leaving root clears it");
+        a.capset(1 << net_bind, 1 << net_bind, 1 << net_bind).unwrap();
+        a.raise_ambient(net_bind).unwrap();
+        a.exec();
+        assert_eq!((a.caps(), a.ambient()), ([1 << net_bind; 3], 1 << net_bind), "ambient survives exec");
+        a.capset(1 << net_bind, 1 << net_bind, 0).unwrap();
+        assert_eq!(a.ambient(), 0);
+        // Securebits.
+        let s = Creds::new(0, 0);
+        assert_eq!(s.set_securebits(1 << 12), Err(Errno::EPERM), "no such bit");
+        s.set_securebits((secbit::NOROOT | secbit::NOROOT << 1 | secbit::NO_CAP_AMBIENT_RAISE) as u64).unwrap();
+        assert_eq!(s.set_securebits(secbit::NO_CAP_AMBIENT_RAISE as u64), Err(Errno::EPERM), "a locked bit, and its lock");
+        assert_eq!(s.set_securebits((secbit::NOROOT | secbit::NOROOT << 1) as u64), Ok(()));
+        s.capset(all, all, 1 << net_bind).unwrap();
+        s.set_securebits((secbit::NOROOT | secbit::NOROOT << 1 | secbit::NO_CAP_AMBIENT_RAISE) as u64).unwrap();
+        assert_eq!(s.raise_ambient(net_bind), Err(Errno::EPERM));
+        s.exec();
+        assert_eq!(s.caps(), [0, 0, 1 << net_bind], "root is no one special with SECBIT_NOROOT");
+        // Without CAP_SETPCAP only the unprivileged bits, and only a change.
+        assert_eq!(s.set_securebits(s.securebits() as u64), Err(Errno::EPERM));
+        assert_eq!(s.set_securebits((s.securebits() | secbit::KEEP_CAPS) as u64), Err(Errno::EPERM));
+        assert_eq!(s.set_securebits((s.securebits() | secbit::EXEC_RESTRICT_FILE) as u64), Ok(()));
+        // PR_SET_KEEPCAPS is a securebit, cleared by exec, refused when locked.
+        let k = Creds::new(0, 0);
+        k.set_keep_caps_checked(true).unwrap();
+        assert_eq!(k.securebits(), secbit::KEEP_CAPS);
+        k.exec();
+        assert!(!k.keep_caps());
+        k.set_securebits(secbit::KEEP_CAPS_LOCKED as u64).unwrap();
+        assert_eq!(k.set_keep_caps_checked(true), Err(Errno::EPERM));
+        // With SECBIT_NO_SETUID_FIXUP a uid change leaves the sets alone.
+        let n = Creds::new(0, 0);
+        n.set_securebits(secbit::NO_SETUID_FIXUP as u64).unwrap();
+        n.setid(false, 1000);
+        n.after_uid_change([0; 3]);
+        assert_eq!(n.caps(), [all, all, 0]);
+        // All of it crosses to another memory.
+        let b = Creds::new(0, 0);
+        b.restore(&s.save());
+        assert_eq!((b.caps(), b.bounding(), b.ambient(), b.securebits()), (s.caps(), s.bounding(), s.ambient(), s.securebits()));
     }
 
     /// `kill`, `tkill` and `tgkill` answer as the kernel's arms do,

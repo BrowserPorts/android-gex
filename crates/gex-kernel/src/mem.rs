@@ -129,6 +129,9 @@ pub struct Vma {
     /// may change again with no more than another such `mprotect`, so it
     /// stays [`MemoryMap::volatile_code`] once made executable only.
     pub patched: bool,
+    /// The name `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)` gave an anonymous
+    /// mapping, which `/proc/<pid>/maps` shows as `[anon:name]`.
+    pub anon_name: Option<std::sync::Arc<str>>,
 }
 
 impl Vma {
@@ -143,6 +146,7 @@ impl Vma {
         };
         self.prot == next.prot
             && self.name == next.name
+            && self.anon_name == next.anon_name
             && self.patched == next.patched
             && continues(&self.origin, &next.origin)
             && continues(&self.code, &next.code)
@@ -165,6 +169,7 @@ impl Vma {
                 .map(|(id, off)| (id.clone(), off + (start - self.start))),
             namings: self.namings,
             patched: self.patched,
+            anon_name: self.anon_name.clone(),
         }
     }
 }
@@ -1254,6 +1259,7 @@ impl MemoryMap {
             code,
             namings: 0,
             patched: false,
+            anon_name: None,
         });
         self.vmas.sort_by_key(|v| v.start);
     }
@@ -1316,6 +1322,7 @@ impl MemoryMap {
             origin,
             namings: 0,
             patched: false,
+            anon_name: None,
         });
         // Sorted already but for the one just pushed: move it into place.
         let at = self.vmas[..self.vmas.len() - 1].partition_point(|v| v.start < aligned);
@@ -1894,6 +1901,87 @@ impl MemoryMap {
         }
     }
 
+    /// `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, addr, len, name)`: name the
+    /// anonymous mappings in a range, or with `None` take their names away
+    /// (`madvise_set_anon_name`, mm/madvise.c). A mapping of a file in the
+    /// range is `EBADF`, there and then; a gap is `ENOMEM`, once the
+    /// mappings around it are named.
+    pub fn set_anon_name(&mut self, addr: u64, len: u64, name: Option<&str>) -> Result<(), Errno> {
+        if !addr.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::EINVAL);
+        }
+        let rounded = len.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        if len != 0 && rounded == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = addr.checked_add(rounded).ok_or(Errno::EINVAL)?;
+        if end == addr {
+            return Ok(());
+        }
+        let name: Option<std::sync::Arc<str>> = name.map(Into::into);
+        let mut out = Vec::with_capacity(self.vmas.len() + 2);
+        let (mut at, mut gap, mut bad) = (addr, false, false);
+        for v in std::mem::take(&mut self.vmas) {
+            if bad || v.end <= addr || v.start >= end {
+                out.push(v);
+                continue;
+            }
+            gap |= v.start > at;
+            at = v.end;
+            if v.name.starts_with('/') {
+                bad = true;
+                out.push(v);
+                continue;
+            }
+            if v.start < addr {
+                out.push(v.slice(v.start, addr, v.prot));
+            }
+            let mut piece = v.slice(v.start.max(addr), v.end.min(end), v.prot);
+            piece.anon_name = name.clone();
+            out.push(piece);
+            if v.end > end {
+                out.push(v.slice(end, v.end, v.prot));
+            }
+        }
+        gap |= at < end;
+        out.sort_by_key(|v| v.start);
+        let mut merged: Vec<Vma> = Vec::with_capacity(out.len());
+        for v in out {
+            if let Some(last) = merged.last_mut() {
+                if last.end == v.start && (addr..=end).contains(&v.start) && last.joins(&v) {
+                    last.end = v.end;
+                    continue;
+                }
+            }
+            merged.push(v);
+        }
+        self.vmas = merged;
+        self.generation += 1;
+        self.publish();
+        if bad {
+            Err(Errno::EBADF)
+        } else if gap {
+            Err(Errno::ENOMEM)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The first mapping in `[addr, addr + len)` that `mprotect` to `new`
+    /// may not be given under `PR_SET_MDWE` (`map_deny_write_exec`): any,
+    /// when `new` is writable and executable; one that is not executable
+    /// now, when `new` is executable.
+    pub fn denied_exec_gain(&self, addr: u64, len: u64, new: u32) -> Option<u64> {
+        if new & prot::EXEC == 0 {
+            return None;
+        }
+        let end = addr.saturating_add(page_align_up(len));
+        self.vmas
+            .iter()
+            .find(|v| v.end > addr && v.start < end && (new & prot::WRITE != 0 || v.prot & prot::EXEC == 0))
+            .map(|v| v.start.max(addr))
+    }
+
     /// True when every page in the range is mapped with at least `need`.
     pub fn check_access(&self, addr: u64, len: u64, need: u32) -> bool {
         if len == 0 {
@@ -1992,12 +2080,15 @@ impl MemoryMap {
                 if v.prot & prot::READ != 0 { 'r' } else { '-' },
                 if v.prot & prot::WRITE != 0 { 'w' } else { '-' },
                 if v.prot & prot::EXEC != 0 { 'x' } else { '-' },
-                if v.name.is_empty() {
+                if v.name.is_empty() && v.anon_name.is_none() {
                     ""
                 } else {
                     "                    "
                 },
-                v.name,
+                match &v.anon_name {
+                    Some(n) if v.name.is_empty() => format!("[anon:{n}]"),
+                    _ => v.name.clone(),
+                },
             ));
         }
         s
@@ -2007,6 +2098,51 @@ impl MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PR_SET_VMA_ANON_NAME` names the anonymous mappings of a range,
+    /// splitting at its ends, and `/proc/self/maps` shows the name; a file's
+    /// mapping stops it and a gap is reported once the rest is named.
+    #[test]
+    fn anonymous_mappings_take_a_name() {
+        let mut m = MemoryMap::new(0x100_0000);
+        let anon = flags::PRIVATE | flags::ANONYMOUS | flags::FIXED;
+        let at = MMAP_BOTTOM;
+        m.mmap(at, 0x4000, prot::READ | prot::WRITE, anon, "").unwrap();
+        assert_eq!(m.set_anon_name(at + 0x800, 0x1000, Some("x")), Err(Errno::EINVAL), "not on a page");
+        assert_eq!(m.set_anon_name(at, 0, Some("x")), Ok(()));
+        assert_eq!(m.set_anon_name(at, u64::MAX, Some("x")), Err(Errno::EINVAL));
+        assert_eq!(m.set_anon_name(at + 0x1000, 0x1001, Some("scudo:primary")), Ok(()));
+        let named: Vec<_> = m.vmas().iter().map(|v| (v.start - at, v.end - at, v.anon_name.as_deref().map(str::to_string))).collect();
+        assert_eq!(named, vec![(0, 0x1000, None), (0x1000, 0x3000, Some("scudo:primary".into())), (0x3000, 0x4000, None)]);
+        assert!(m.proc_maps().contains("[anon:scudo:primary]"), "{}", m.proc_maps());
+        // Taken away, the mapping is whole again.
+        assert_eq!(m.set_anon_name(at + 0x1000, 0x2000, None), Ok(()));
+        assert_eq!(m.vmas().iter().filter(|v| v.start >= at && v.end <= at + 0x4000).count(), 1);
+        // A gap: what is mapped is named, and the call says so.
+        assert_eq!(m.set_anon_name(at + 0x3000, 0x3000, Some("tail")), Err(Errno::ENOMEM));
+        assert_eq!(m.vma_at(at + 0x3000).unwrap().anon_name.as_deref(), Some("tail"));
+        assert_eq!(m.set_anon_name(at + 0x10_0000, 0x1000, Some("nothing")), Err(Errno::ENOMEM));
+        // A file's mapping is not anonymous.
+        m.mmap(at + 0x4000, 0x1000, prot::READ, anon, "/lib/x.so").unwrap();
+        assert_eq!(m.set_anon_name(at + 0x3000, 0x2000, Some("both")), Err(Errno::EBADF));
+        assert_eq!(m.vma_at(at + 0x3000).unwrap().anon_name.as_deref(), Some("both"), "named up to the file's");
+        assert_eq!(m.vma_at(at + 0x4000).unwrap().anon_name, None);
+    }
+
+    /// `PR_SET_MDWE`: which `mprotect` gains execute where it may not.
+    #[test]
+    fn execute_is_not_gained_under_mdwe() {
+        let mut m = MemoryMap::new(0x100_0000);
+        let anon = flags::PRIVATE | flags::ANONYMOUS | flags::FIXED;
+        let at = MMAP_BOTTOM;
+        m.mmap(at, 0x1000, prot::READ | prot::EXEC, anon, "").unwrap();
+        m.mmap(at + 0x1000, 0x1000, prot::READ | prot::WRITE, anon, "").unwrap();
+        let rx = prot::READ | prot::EXEC;
+        assert_eq!(m.denied_exec_gain(at, 0x2000, prot::READ), None, "no execute asked");
+        assert_eq!(m.denied_exec_gain(at, 0x1000, rx), None, "executable already");
+        assert_eq!(m.denied_exec_gain(at, 0x2000, rx), Some(at + 0x1000), "the second was not");
+        assert_eq!(m.denied_exec_gain(at, 0x1000, rx | prot::WRITE), Some(at), "never writable too");
+    }
 
     /// A page of mapped code made writable no longer names the file as its
     /// code's source; the rest of the mapping still does.
