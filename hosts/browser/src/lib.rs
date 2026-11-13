@@ -235,6 +235,17 @@ impl net::Transport for PageStream {
         id != 0 && unsafe { net_avail(id) } != 0
     }
 
+    /// The bytes waiting (`net_avail`: -1 is the end, which has none). A
+    /// program sizes its read by `FIONREAD`: Qt reads that many each time it
+    /// hears the socket is readable, so 1 here cost a wakeup a byte.
+    fn available(&self) -> usize {
+        let id = self.id.load(std::sync::atomic::Ordering::Acquire);
+        if id == 0 {
+            return 0;
+        }
+        unsafe { net_avail(id) }.max(0) as usize
+    }
+
     fn close(&self) {
         let id = self.id.swap(0, std::sync::atomic::Ordering::AcqRel);
         if id != 0 {

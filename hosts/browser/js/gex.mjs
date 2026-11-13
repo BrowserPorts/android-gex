@@ -2461,7 +2461,13 @@ export class Gex {
           if (!this.#net.peek) return -2;
           return frameOf((o) => this.#net.peek(id, o), (o) => this.#net.recv(id, o), out, take !== 0);
         },
-        net_avail: (id) => (this.#net ? (this.#net.available(id) ? 1 : 0) : 1),
+        // The bytes a read finds (`FIONREAD`), -1 for the end, 0 for none yet (net.js
+        // `available`; a network answering true or false: true is a byte at least).
+        net_avail: (id) => {
+          if (!this.#net) return -1;
+          const v = this.#net.available(id);
+          return v === true ? 1 : v === false || v == null ? 0 : v | 0;
+        },
         net_close: (id) => this.#net?.close(id),
         // Another holder of a stream (a socket passed to another process).
         net_dup: (id) => (this.#netShared && this.#net?.dup ? this.#net.dup(id) : 0),
