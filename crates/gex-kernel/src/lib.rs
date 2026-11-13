@@ -98,14 +98,14 @@ pub struct GuestMem<'a> {
 /// top byte, before it reads or writes there.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Tags {
-    /// None: every thread but an AArch64 one.
+    /// None: a thread that is not AArch64's, and an AArch64 one without
+    /// the tagged address ABI, whose tagged pointer `access_ok` refuses.
     None,
-    /// A string's, which `strncpy_from_user` and `strnlen_user` untag for
-    /// any AArch64 thread (lib/strncpy_from_user.c, lib/strnlen_user.c).
-    Strings,
     /// Every address the kernel accesses, a string's included: a thread
     /// with the tagged address ABI on, whose pointers `access_ok` untags
-    /// (arch/arm64/include/asm/uaccess.h).
+    /// (arch/arm64/include/asm/uaccess.h). A string is no exception with
+    /// the ABI off: `strncpy_from_user` untags the address it measures the
+    /// string's room by, but reads through `access_ok` like any other.
     All,
 }
 
@@ -298,7 +298,7 @@ impl<'a> GuestMem<'a> {
     /// no NUL ends it within `buf` (and memory goes on), for the caller to
     /// read it whole.
     pub fn read_cstr_into(&self, addr: u64, buf: &mut [u8]) -> Result<Option<usize>, Errno> {
-        let addr = if self.tags == Tags::None { addr } else { untagged_addr(addr) };
+        let addr = if self.tags == Tags::All { untagged_addr(addr) } else { addr };
         if addr > usize::MAX as u64 {
             return Err(Errno::EFAULT);
         }
@@ -320,7 +320,7 @@ impl<'a> GuestMem<'a> {
     }
 
     pub fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>, Errno> {
-        let addr = if self.tags == Tags::None { addr } else { untagged_addr(addr) };
+        let addr = if self.tags == Tags::All { untagged_addr(addr) } else { addr };
         if addr > usize::MAX as u64 {
             return Err(Errno::EFAULT);
         }

@@ -7183,13 +7183,13 @@ pub fn a64_thread(compat: bool, wasm32: bool) -> bool {
 }
 
 /// Which of a thread's addresses lose their tag in its system calls
-/// ([`crate::Tags`]): none but an AArch64 thread's, of whose a string's
-/// always does and the rest when it has the tagged address ABI on.
+/// ([`crate::Tags`]): none but those of an AArch64 thread that has the
+/// tagged address ABI on.
 pub fn thread_tags(a64: bool, thread: &crate::signal::ThreadSig) -> crate::Tags {
-    match (a64, thread.tagged_addr()) {
-        (false, _) => crate::Tags::None,
-        (true, false) => crate::Tags::Strings,
-        (true, true) => crate::Tags::All,
+    if a64 && thread.tagged_addr() {
+        crate::Tags::All
+    } else {
+        crate::Tags::None
     }
 }
 
@@ -13589,15 +13589,15 @@ mod tests {
         let tagged = 0xb400_0000_0000_0100u64;
         assert_eq!(m.write(tagged, &[7]), Err(Errno::EFAULT), "not an AArch64 thread");
         assert_eq!(m.read_cstr(tagged, 16), Err(Errno::EFAULT));
-        // An AArch64 thread without the ABI: lib/strncpy_from_user.c
-        // untags a string's address all the same.
-        m.set_tags(crate::Tags::Strings);
-        assert_eq!(m.write(tagged, &[7]), Err(Errno::EFAULT), "the ABI is off");
+        // A string's is no exception: lib/strncpy_from_user.c reads it
+        // through `access_ok` (a kernel refuses `open` of a tagged path
+        // from a thread with the ABI off).
         m.write(0x100, b"name\0").unwrap();
-        assert_eq!(m.read_cstr(tagged, 16).unwrap(), b"name");
         let mut name = [0u8; 16];
-        assert_eq!(m.read_cstr_into(tagged, &mut name), Ok(Some(4)));
+        assert_eq!(m.read_cstr_into(tagged, &mut name), Err(Errno::EFAULT));
         m.set_tags(crate::Tags::All);
+        assert_eq!(m.read_cstr(tagged, 16).unwrap(), b"name");
+        assert_eq!(m.read_cstr_into(tagged, &mut name), Ok(Some(4)));
         m.write(tagged, &[7]).unwrap();
         assert_eq!(m.read(0x100, 1).unwrap(), &[7]);
         assert_eq!(m.read(tagged, 1).unwrap(), &[7]);
