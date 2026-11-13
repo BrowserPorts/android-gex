@@ -678,6 +678,13 @@ fn install_module(
     later: &std::collections::HashSet<String>,
     busy: &mut Vec<String>,
 ) -> Result<usize, String> {
+    // whether it has a memory64 build: the outgrow record's (a program's
+    // own module, built for a wasm32 memory only, cannot move)
+    if !gex_abi::mem64() {
+        let ns = crate::sigs::proc_home().ns();
+        let m64 = ns.open(&format!("{file}.m64"), gex_kernel::fs::oflags::O_RDONLY, 0).is_ok();
+        gex_kernel::syscalls::outgrow_module(crate::my_pid(), &file, m64);
+    }
     // The module's memory must be this process's: a wasm32 one in a
     // 64-bit memory fails to instantiate (a LinkError, deep in the
     // runtime), so it is said here, with what is missing.
