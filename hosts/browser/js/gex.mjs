@@ -7254,7 +7254,7 @@ export class Gex {
       // this runtime reads it (`#guestMono`).
       usd_tick: (at) => {
         const c = this.#guestClock();
-        this.#env.usdTick?.(addrNum(at), { boot: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n + this.#monoHeld(), scale: c.scale, shift: c.shift });
+        this.#env.usdTick?.(addrNum(at), { boot: BigInt(this.#kernel?.k_boot_secs?.(0) ?? 0) * 1000000000n + this.#monoHeld(), scale: c.scale, shift: c.shift }, this.memory);
       },
       // Where i386 code reads KUSER_SHARED_DATA (32-bit Wine checks its own
       // address against it at start): 0x7ffe0000 from a shim without the fold.

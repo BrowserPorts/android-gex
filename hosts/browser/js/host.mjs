@@ -26,6 +26,7 @@ function narrate(text) {
 import { single } from './single.mjs';
 import { SP_CODE } from './mode.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
+import { UsdClock } from './usd-clock.mjs';
 import { HELPER_STACK_COUNT, wasmMemory } from './lazy-fetch.mjs';
 import { logNamed, logOn, logQuiet, logRoutine } from './log.mjs';
 import { XC_STOP, xcBusy, xcGate, xcSleep } from './xcache.mjs';
@@ -1656,18 +1657,36 @@ export class ProcessHost {
 
   /** The one Worker that advances every Wine process's KUSER_SHARED_DATA
    *  clocks (usd-clock.mjs), made at the first process that asks
-   *  (`gex.usd_tick`); it holds no runtime. */
+   *  (`gex.usd_tick`); it holds no runtime. In the single-thread build, the
+   *  clock itself, driven the same way. */
   #usdClock = null;
   #usdPids = new Set();
   #usdTick(pid, m) {
     if (!(m.memory instanceof WebAssembly.Memory)) return;
     const proc = Number(String(pid).split(':')[0]);
     if (!this.#usdClock) {
-      this.#usdClock = this.#makeWorker();
+      // The single-thread build's processes are fibers of this realm: the
+      // clock is here, its timer stopped with the host (a fiber's end would
+      // leave it running, and Node's run with it).
+      this.#usdClock = SP_CODE && single.on ? UsdClock.inRealm() : this.#makeWorker();
       if (this.#door) this.#usdClock.postMessage({ kind: 'usdClock', op: 'door', door: this.#door });
     }
     this.#usdPids.add(proc);
     this.#usdClock.postMessage({ kind: 'usdClock', op: 'add', pid: proc, memory: m.memory, at: m.at, clock: m.clock });
+  }
+  /** The Worker `pid` ended (no other Worker carries its process on): the
+   *  process has ended when that was its own Worker, or a thread's with
+   *  none of the process's other threads left (its first thread had gone
+   *  before it). A thread that ends while its process runs leaves the page. */
+  #usdEnded(pid) {
+    const key = String(pid), proc = key.split(':')[0];
+    if (key !== proc) {
+      for (const k of this.#workers.keys()) {
+        const o = String(k);
+        if (o !== key && o.split(':')[0] === proc && !o.includes(':spare')) return;
+      }
+    }
+    this.#usdDrop(Number(proc));
   }
   /** Process proc ended: its page is no longer written (nor its memory held). */
   #usdDrop(proc) {
@@ -2123,7 +2142,7 @@ export class ProcessHost {
           for (const [, other] of this.#workers) other.postMessage({ kind: 'door', door: null });
           this.#usdClock?.postMessage({ kind: 'usdClock', op: 'door', door: null });
         }
-        this.#usdDrop(Number(String(pid).split(':')[0]));
+        this.#usdEnded(pid);
         // Kept for the page flavour's fork children only.
         if (m.recycle instanceof WebAssembly.Memory && !this.#foreign(pid)) this.#keepMemory(m.recycle);
         if (this.#extra?.exitTrace) {

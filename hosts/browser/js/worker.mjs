@@ -679,8 +679,9 @@ async function handle(msg) {
     }
     // This process's KUSER_SHARED_DATA copy (`gex.usd_tick`): up to the
     // host, whose clock advances it from now on.
-    usdTick(at, clock) {
-      port.post({ kind: 'usdTick', at, clock, memory: workerGex?.memory });
+    // (Its own memory: the single-thread build's fibers share this module.)
+    usdTick(at, clock, memory) {
+      port.post({ kind: 'usdTick', at, clock, memory: memory ?? workerGex?.memory });
     }
     // The wineserver published its door: up to
     // the host, which hands it to every Worker of the session.

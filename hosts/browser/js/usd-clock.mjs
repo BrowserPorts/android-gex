@@ -53,7 +53,32 @@ export class UsdClock {
   add(pid, memory, at, clock) {
     this.#pages.set(pid, { memory, at: Number(at), clock });
     this.#tickOne(this.#pages.get(pid), nowNs(), true);
-    this.#timer ??= setInterval(() => this.tick(), USD_TICK_MS);
+    if (this.#timer === null) {
+      this.#timer = setInterval(() => this.tick(), USD_TICK_MS);
+      // (Node: the clock alone keeps no run going.)
+      this.#timer.unref?.();
+    }
+  }
+
+  /** Every page forgotten and the timer stopped: the host has stopped. */
+  stop() {
+    this.#pages.clear();
+    if (this.#timer !== null) { clearInterval(this.#timer); this.#timer = null; }
+  }
+
+  /** The clock in this realm, driven as its Worker is (`{kind: 'usdClock',
+   *  op, ...}` messages, `terminate`): the single-thread build's, whose
+   *  processes are fibers of this realm. */
+  static inRealm() {
+    const c = new UsdClock();
+    return {
+      postMessage: (m) => {
+        if (m.op === 'add') c.add(m.pid, m.memory, m.at, m.clock);
+        else if (m.op === 'drop') c.drop(m.pid);
+        else if (m.op === 'door') c.door(m.door);
+      },
+      terminate: () => c.stop(),
+    };
   }
 
   /** The process ended (or its memory is gone): its page is no longer written. */

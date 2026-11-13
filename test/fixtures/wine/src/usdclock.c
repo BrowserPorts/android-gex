@@ -2,8 +2,10 @@
  * while it spins: SystemTime, InterruptTime and TickCount must advance at
  * about the rate of the elapsed time (QueryPerformanceCounter) and never be
  * seen half written (a KSYSTEM_TIME read High1Time, LowPart, High2Time, again
- * while the highs differ, never goes backwards). The host advances a Wine
- * process's copy of the page (gex.usd_tick).
+ * while the highs differ, never goes backwards); and, after one of its threads
+ * has ended, across a 50 ms waitable timer's wait GetTickCount64 must have
+ * moved by about 50 ms, as sync's "timer fires" reads it. The host advances a
+ * Wine process's copy of the page (gex.usd_tick).
  *
  *   usdclock [SECS]   spin SECS seconds (default 2), then say each check
  *
@@ -33,6 +35,8 @@ static ULONGLONG ksystem_time(ULONG off, unsigned *spins) {
         (*spins)++;
     }
 }
+
+static DWORD WINAPI quit(void *arg) { (void)arg; return 0; }
 
 int main(int argc, char **argv) {
     double secs = argc > 1 ? atof(argv[1]) : 2.0;
@@ -71,6 +75,35 @@ int main(int argc, char **argv) {
     check(t + 32 >= i / 10000 && t <= i / 10000 + 32, "usdclock tick count is the interrupt time in ms", d);
     snprintf(d, sizeof(d), "%u reads, %u went backwards, %u retries of a half-written value", reads, back, spins);
     check(back == 0 && reads > 100, "usdclock never torn", d);
+
+    /* A 50 ms waitable timer, ten times, after a thread of the process has
+     * ended (its end is not the process's): the tick count across each wait
+     * (the page moves every 16 ms, a timer's tick late by some ms more: 25
+     * ms at the least) and the elapsed time */
+    {
+        HANDLE th = CreateThread(0, 0, quit, 0, 0, 0);
+        WaitForSingleObject(th, INFINITE);
+        CloseHandle(th);
+        HANDLE wt = CreateWaitableTimerW(0, FALSE, 0);
+        LARGE_INTEGER due = {.QuadPart = -500000};
+        ULONGLONG lo = ~0ull, hi = 0;
+        int n = 0;
+        char *o = d;
+        for (int k = 0; k < 10; k++) {
+            ULONGLONG a = GetTickCount64(), b;
+            QueryPerformanceCounter(&q0);
+            SetWaitableTimer(wt, &due, 0, 0, 0, FALSE);
+            if (WaitForSingleObject(wt, 5000) != WAIT_OBJECT_0) continue;
+            b = GetTickCount64();
+            QueryPerformanceCounter(&q);
+            if (b - a < lo) lo = b - a;
+            if (b - a > hi) hi = b - a;
+            if (o < d + sizeof(d) - 24) o += snprintf(o, d + sizeof(d) - o, "%s%llu/%.0f", k ? " " : "", b - a, (q.QuadPart - q0.QuadPart) * 1000.0 / f.QuadPart);
+            n++;
+        }
+        CloseHandle(wt);
+        check(n == 10 && lo >= 25 && hi <= 200, "usdclock a 50 ms timer's wait moves the tick count (tick ms/elapsed ms)", d);
+    }
     printf("%d failures\n", failures);
     return failures != 0;
 }
