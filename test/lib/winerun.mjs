@@ -25,7 +25,7 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync,
+  appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync,
   renameSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { basename, join } from 'node:path';
@@ -378,20 +378,30 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
       if (!existsSync(gexc)) t.skip(`${gexc} is not built`);
       const p = pfx(`${name}-pfx`, files, { userReg, from });
       await setup?.(p);
+      let wl;
       if (wayland) {
-        const wl = join(work, `${name}-wl`);
-        rmSync(wl, { recursive: true, force: true });
-        mkdirSync(wl);
-        // (--wayland names the socket, in a directory of the run's own)
-        flags = [...flags, '--wayland', join(wl, 'wayland-0'), '--wayland-size', wayland.size ?? '640x480', '--wayland-out', wayland.out ?? 'null'];
+        // --wayland names the socket, in a directory of the run's own. A socket's path must fit sun_path (108
+        // bytes with its NUL), which a deep work dir overflows, and then Wine's driver cannot connect and falls
+        // back to no display: the directory is a short one under /tmp, removed after the run.
+        wl = mkdtempSync('/tmp/gexwl-');
+        const sock = join(wl, 'wayland-0');
+        if (Buffer.byteLength(sock) + 1 > 108) {
+          rmSync(wl, { recursive: true, force: true });
+          throw new Error(`the Wayland socket path ${sock} is ${Buffer.byteLength(sock) + 1} bytes with its NUL, over sun_path's 108`);
+        }
+        flags = [...flags, '--wayland', sock, '--wayland-size', wayland.size ?? '640x480', '--wayland-out', wayland.out ?? 'null'];
       }
       const we = { WINEPREFIX: p, ...WENV, ...wineEnv };
       const argv = [gexc, 'run', ...flags, ...Object.entries(we).flatMap(([k, v]) => ['--env', `${k}=${v}`]), loader, ...args.map(String)];
       // Not the host's display: gexc --wayland sets WAYLAND_DISPLAY and
       // XDG_RUNTIME_DIR to its own compositor only when they are not given.
       const { WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DISPLAY, ...host } = base;
-      const r = await run(argv, { cwd: cwd ?? join(p, 'drive_c'), env: { ...host, ...more }, timeout, until, file: join(work, `${name}.log`), ...(split && { errFile: join(work, `${name}.err`) }) });
-      return { ...r, pfx: p };
+      try {
+        const r = await run(argv, { cwd: cwd ?? join(p, 'drive_c'), env: { ...host, ...more }, timeout, until, file: join(work, `${name}.log`), ...(split && { errFile: join(work, `${name}.err`) }) });
+        return { ...r, pfx: p };
+      } finally {
+        if (wl) rmSync(wl, { recursive: true, force: true });
+      }
     },
     /**
      * Wine on the page's x86 shared shim with `args`: the install at
