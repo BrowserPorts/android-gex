@@ -28,3 +28,5 @@ anyhow = "1"
 [features]
 # Build a gexc for x86-64 guests. See `gex_abi::X86`.
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-native/x86", "gex-eject/x86"]
+# A gexc whose 64-bit guest memory is 64 GiB. See `gex-abi`'s `big64`.
+big64 = ["gex-abi/big64"]

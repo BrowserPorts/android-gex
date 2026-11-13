@@ -123,8 +123,10 @@ pub fn mem64() -> bool {
 
 /// The size of an [`MemFlavor::M64`] memory: 16 GiB, V8's memory64 cap
 /// (262144 pages), used natively too so that every module declares the same
-/// maximum and runs on either host.
-pub const LIMIT64: u64 = 16 << 30;
+/// maximum and runs on either host. With the `big64` cargo feature, 64 GiB,
+/// for the native host alone: room for a stock Android process, whose libc
+/// reserves over 10 GiB of addresses as it starts.
+pub const LIMIT64: u64 = if cfg!(feature = "big64") { 64 << 30 } else { 16 << 30 };
 
 /// Wasm pages in [`LIMIT64`].
 pub const LIMIT64_PAGES: u64 = LIMIT64 / WASM_PAGE;

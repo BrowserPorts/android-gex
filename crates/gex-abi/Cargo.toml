@@ -12,3 +12,10 @@ description = "Shared layout contract between gex's compiler, kernel and runtime
 # choice because the instruction alignment (dispatch slot granularity) and the
 # syscall register convention are constants the emitter, kernel and shims bake in.
 x86 = []
+# A 64 GiB 64-bit guest memory in place of the 16 GiB one. For the native
+# host only: no browser engine has a memory64 that large, so what is built
+# with this runs nowhere else. A stock Android AArch64 process needs it:
+# bionic's allocator reserves 8.25 GiB of address space in one piece and
+# its CFI shadow 2 GiB more before `main`, and the 16 GiB memory, its
+# tables in the middle, has no hole that long.
+big64 = []
