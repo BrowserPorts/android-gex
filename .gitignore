@@ -22,3 +22,6 @@ hs_err_pid*.log
 TestResults.qpa
 page/public/pkgs/
 page/public/gex-apt/
+
+# The Android test programs, built with the NDK (tests/android/build.sh)
+tests/android/bin/
