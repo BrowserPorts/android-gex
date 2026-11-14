@@ -10,9 +10,8 @@
 //! An option this kernel has but gex has not the machinery for is refused
 //! as a kernel built without it refuses it, `EINVAL`, and says so once
 //! ([`refuse`]): a call that reported success and did nothing would be
-//! believed. Those are a parent-death signal, a child subreaper, seccomp,
-//! `PR_SET_MM`, a faulting `rdtsc`, syscall user dispatch and restored
-//! timer ids.
+//! believed. Those are seccomp, `PR_SET_MM`, a faulting `rdtsc`, syscall
+//! user dispatch and restored timer ids.
 
 use crate::errno::SysResult;
 use crate::signal::{ProcSig, ThreadSig};
@@ -152,25 +151,29 @@ pub struct Task {
     pub mce: u8,
     /// `PR_SET_IO_FLUSHER`.
     pub io_flusher: bool,
+    /// `PR_SET_PDEATHSIG`: the signal sent when the parent ends, 0 for
+    /// none.
+    pub pdeathsig: u8,
 }
 
 impl Default for Task {
     fn default() -> Task {
-        Task { timer_slack_ns: TIMER_SLACK_NS, default_timer_slack_ns: TIMER_SLACK_NS, no_new_privs: false, mce: 0, io_flusher: false }
+        Task { timer_slack_ns: TIMER_SLACK_NS, default_timer_slack_ns: TIMER_SLACK_NS, no_new_privs: false, mce: 0, io_flusher: false, pdeathsig: 0 }
     }
 }
 
 impl Task {
-    /// What a task this one makes starts with (`copy_process`): all of it,
-    /// its default slack the creator's slack now.
+    /// What a task this one makes starts with (`copy_process`): all of it
+    /// but the parent-death signal, its default slack the creator's slack
+    /// now.
     pub fn child(&self) -> Task {
-        Task { default_timer_slack_ns: self.timer_slack_ns, ..*self }
+        Task { default_timer_slack_ns: self.timer_slack_ns, pdeathsig: 0, ..*self }
     }
 
     /// As one word, for a state that crosses to another memory
     /// ([`crate::signal::Signals::to_bytes`]), with the slacks beside it.
     pub fn flags(&self) -> u64 {
-        self.no_new_privs as u64 | (self.mce as u64) << 1 | (self.io_flusher as u64) << 3
+        self.no_new_privs as u64 | (self.mce as u64) << 1 | (self.io_flusher as u64) << 3 | (self.pdeathsig as u64) << 4
     }
 
     pub fn from_words(slack: u64, default_slack: u64, flags: u64) -> Task {
@@ -180,6 +183,7 @@ impl Task {
             no_new_privs: flags & 1 != 0,
             mce: (flags >> 1 & 3) as u8,
             io_flusher: flags >> 3 & 1 != 0,
+            pdeathsig: (flags >> 4 & 0x7f) as u8,
         }
     }
 }
@@ -206,11 +210,14 @@ pub struct Proc {
     /// `PR_SET_MDWE`'s bits, which are never cleared.
     pub mdwe: u8,
     pub futex_hash: Option<FutexHash>,
+    /// `PR_SET_CHILD_SUBREAPER` (its `signal_struct`'s: an `execve` keeps
+    /// it, a child does not have it).
+    pub subreaper: bool,
 }
 
 impl Default for Proc {
     fn default() -> Proc {
-        Proc { dumpable: 1, thp_disable: 0, mdwe: 0, futex_hash: None }
+        Proc { dumpable: 1, thp_disable: 0, mdwe: 0, futex_hash: None, subreaper: false }
     }
 }
 
@@ -231,7 +238,7 @@ impl Proc {
 
     /// A forked child's.
     pub fn fork(&self) -> Proc {
-        self.new_mm()
+        Proc { subreaper: false, ..self.new_mm() }
     }
 
     /// After an `execve` that changed no id: dumpable again
@@ -263,7 +270,7 @@ impl Proc {
             Some(h) => (h.slots as u64, h.custom as u64, 1),
             None => (0, 0, 0),
         };
-        self.dumpable as u64 | (self.thp_disable as u64) << 2 | (self.mdwe as u64) << 4 | set << 6 | custom << 7 | slots << 8
+        self.dumpable as u64 | (self.thp_disable as u64) << 2 | (self.mdwe as u64) << 4 | set << 6 | custom << 7 | slots << 8 | (self.subreaper as u64) << 40
     }
 
     pub fn from_word(w: u64) -> Proc {
@@ -272,6 +279,7 @@ impl Proc {
             thp_disable: (w >> 2 & 3) as u8,
             mdwe: (w >> 4 & 3) as u8,
             futex_hash: (w >> 6 & 1 != 0).then_some(FutexHash { slots: (w >> 8) as u32, custom: w >> 7 & 1 != 0 }),
+            subreaper: w >> 40 & 1 != 0,
         }
     }
 }
@@ -281,6 +289,8 @@ pub struct Cx<'a> {
     pub thread: &'a ThreadSig,
     pub process: &'a ProcSig,
     pub creds: &'a Creds,
+    /// The process table, which is told what a parent's end is to do.
+    pub procs: &'a crate::proc::ProcTable,
     pub pid: i32,
     /// An AArch64 thread; otherwise x86's rules (x86-64, i386 and a wasm32
     /// program, which runs on i386's ABI).
@@ -384,14 +394,18 @@ pub fn call(cx: &Cx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> Option<SysResult>
         pr::SET_PDEATHSIG => {
             if arg2 > 64 {
                 Err(Errno::EINVAL)
-            } else if arg2 == 0 {
-                // None is what every task has.
-                Ok(0)
             } else {
-                refuse(cx, 0, "PR_SET_PDEATHSIG (a signal when the parent dies)")
+                // The thread's, for it to read back; the process table
+                // sends it, to the process, when the parent process ends
+                // (Linux sends it at the end of the thread that made this
+                // one, which is the parent's end for a parent of one
+                // thread).
+                cx.thread.update_prctl(|t| t.pdeathsig = arg2 as u8);
+                cx.procs.set_pdeathsig(cx.pid, arg2 as u32);
+                Ok(0)
             }
         }
-        pr::GET_PDEATHSIG => put_u32(m, arg2, 0),
+        pr::GET_PDEATHSIG => put_u32(m, arg2, cx.thread.prctl().pdeathsig as u32),
         pr::GET_DUMPABLE => Ok(cx.process.prctl().dumpable as u64),
         pr::SET_DUMPABLE => {
             if arg2 > 1 {
@@ -459,13 +473,13 @@ pub fn call(cx: &Cx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> Option<SysResult>
             }
         }
         pr::SET_CHILD_SUBREAPER => {
-            if arg2 == 0 {
-                Ok(0)
-            } else {
-                refuse(cx, 4, "PR_SET_CHILD_SUBREAPER")
-            }
+            // The process's, and the process table's, which gives it its
+            // descendants' orphans.
+            cx.process.update_prctl(|p| p.subreaper = arg2 != 0);
+            cx.procs.set_subreaper(cx.pid, arg2 != 0);
+            Ok(0)
         }
-        pr::GET_CHILD_SUBREAPER => put_u32(m, arg2, 0),
+        pr::GET_CHILD_SUBREAPER => put_u32(m, arg2, cx.process.prctl().subreaper as u32),
         pr::SET_NO_NEW_PRIVS => {
             if arg2 != 1 || arg3 | arg4 | arg5 != 0 {
                 Err(Errno::EINVAL)
@@ -685,7 +699,8 @@ mod tests {
     use crate::signal::Signals;
 
     fn run(s: &Signals, creds: &Creds, a64: bool, m: &mut GuestMem<'_>, a: [u64; 5]) -> SysResult {
-        let cx = Cx { thread: s.thread(), process: s.process(), creds, pid: 1, a64 };
+        let procs = crate::proc::ProcTable::new();
+        let cx = Cx { thread: s.thread(), process: s.process(), creds, procs: &procs, pid: 1, a64 };
         call(&cx, m, [a[0], a[1], a[2], a[3], a[4], 0]).expect("an option of this module's")
     }
 
@@ -711,6 +726,10 @@ mod tests {
         assert_eq!(p([pr::SET_PDEATHSIG, 65, 0, 0, 0]), inval);
         assert_eq!(p([pr::GET_PDEATHSIG, 0x1ff_ffff_ffff, 0, 0, 0]), Err(Errno::EFAULT));
         assert_eq!(p([pr::GET_PDEATHSIG, 0x1000, 0, 0, 0]), Ok(0));
+        assert_eq!(p([pr::SET_PDEATHSIG, 15, 0, 0, 0]), Ok(0));
+        assert_eq!(p([pr::GET_PDEATHSIG, 0x1900, 0, 0, 0]), Ok(0));
+        assert_eq!(p([pr::SET_PDEATHSIG, 0, 0, 0, 0]), Ok(0));
+        assert_eq!(p([pr::GET_PDEATHSIG, 0x1904, 0, 0, 0]), Ok(0));
         assert_eq!(p([pr::SET_DUMPABLE, 2, 0, 0, 0]), inval);
         assert_eq!(p([pr::SET_DUMPABLE, 0, 0, 0, 0]), Ok(0));
         assert_eq!(p([pr::GET_DUMPABLE, 0, 0, 0, 0]), Ok(0));
@@ -735,6 +754,11 @@ mod tests {
         assert_eq!(p([pr::MCE_KILL, 2, 0, 0, 0]), inval);
         assert_eq!(p([pr::GET_CHILD_SUBREAPER, 0x1000, 0, 0, 0]), Ok(0));
         assert_eq!(p([pr::SET_CHILD_SUBREAPER, 0, 0, 0, 0]), Ok(0));
+        // Any value but 0 turns it on, and it reads back as 1.
+        assert_eq!(p([pr::SET_CHILD_SUBREAPER, 7, 0, 0, 0]), Ok(0));
+        assert_eq!(p([pr::GET_CHILD_SUBREAPER, 0x1908, 0, 0, 0]), Ok(0));
+        assert_eq!(p([pr::SET_CHILD_SUBREAPER, 0, 0, 0, 0]), Ok(0));
+        assert_eq!(p([pr::GET_CHILD_SUBREAPER, 0x190c, 0, 0, 0]), Ok(0));
         assert_eq!(p([pr::GET_NO_NEW_PRIVS, 0, 0, 0, 0]), Ok(0));
         assert_eq!(p([pr::SET_NO_NEW_PRIVS, 0, 0, 0, 0]), inval);
         assert_eq!(p([pr::SET_NO_NEW_PRIVS, 1, 0, 0, 1]), inval);
@@ -778,10 +802,8 @@ mod tests {
         assert_eq!(p([pr::FUTEX_HASH, 3, 0, 0, 0]), inval);
         // What gex has not, refused and never claimed.
         for a in [
-            [pr::SET_PDEATHSIG, 9, 0, 0, 0],
             [pr::SET_SECCOMP, 1, 0, 0, 0],
             [pr::SET_MM, 1, 0, 0, 0],
-            [pr::SET_CHILD_SUBREAPER, 1, 0, 0, 0],
             [pr::TIMER_CREATE_RESTORE_IDS, pr::TIMER_CREATE_RESTORE_IDS_ON, 0, 0, 0],
         ] {
             assert_eq!(p(a), inval, "{a:?}");
@@ -798,6 +820,9 @@ mod tests {
         assert_eq!(m.read(0x1800, 11).unwrap(), [6, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0xff]);
         assert_eq!(m.read(0x1000, 10).unwrap(), [6, 0, 0, 0, 0, 0, 0, 0, 0, 0x10]);
         assert_eq!(m.read(0x1000 + SAVED_AUXV_BYTES as u64 - 1, 1).unwrap(), [0]);
+        // What the parent-death signal and subreaper questions wrote.
+        let words: Vec<u32> = (0..4).map(|i| m.read_u32(0x1900 + 4 * i).unwrap()).collect();
+        assert_eq!(words, [15, 0, 1, 0]);
     }
 
     /// x86's own options, and AArch64's refused there.
@@ -843,11 +868,13 @@ mod tests {
 
     #[test]
     fn state_follows_fork_and_exec_as_the_kernel_has_it() {
-        let t = Task { timer_slack_ns: 9, default_timer_slack_ns: 50_000, no_new_privs: true, mce: 3, io_flusher: true };
-        assert_eq!(t.child(), Task { default_timer_slack_ns: 9, ..t });
+        let t = Task { timer_slack_ns: 9, default_timer_slack_ns: 50_000, no_new_privs: true, mce: 3, io_flusher: true, pdeathsig: 64 };
+        // (a child has no parent-death signal until it asks for one)
+        assert_eq!(t.child(), Task { default_timer_slack_ns: 9, pdeathsig: 0, ..t });
         assert_eq!(Task::from_words(t.timer_slack_ns, t.default_timer_slack_ns, t.flags()), t);
-        let p = Proc { dumpable: 0, thp_disable: 3, mdwe: 1, futex_hash: Some(FutexHash { slots: 32, custom: true }) };
-        assert_eq!(p.fork(), Proc { futex_hash: None, ..p });
+        let p = Proc { dumpable: 0, thp_disable: 3, mdwe: 1, futex_hash: Some(FutexHash { slots: 32, custom: true }), subreaper: true };
+        // (a subreaper's child is not one; the program it runs still is)
+        assert_eq!(p.fork(), Proc { futex_hash: None, subreaper: false, ..p });
         assert_eq!(p.exec(), Proc { dumpable: 1, futex_hash: None, ..p });
         assert_eq!(Proc { mdwe: 3, ..p }.fork().mdwe, 0, "set not to be inherited");
         assert_eq!(Proc::from_word(p.word()), p);

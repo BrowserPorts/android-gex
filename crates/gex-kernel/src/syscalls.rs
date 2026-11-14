@@ -7594,12 +7594,13 @@ pub fn a64_thread(compat: bool, wasm32: bool) -> bool {
 /// ([`tagged_addr_ctrl`]), then everything [`crate::prctl::call`] answers.
 /// `None` for what [`quiet_call`] does: the thread's name and gex's own
 /// options.
-fn prctl_call(signals: &Signals, creds: &Creds, pid: i32, a64: bool, mem: &crate::mem::Mm, m: &mut GuestMem<'_>, a: [u64; 6]) -> Option<SysResult> {
+#[allow(clippy::too_many_arguments)]
+fn prctl_call(signals: &Signals, creds: &Creds, procs: &ProcTable, pid: i32, a64: bool, mem: &crate::mem::Mm, m: &mut GuestMem<'_>, a: [u64; 6]) -> Option<SysResult> {
     if a[0] as u32 as u64 == crate::prctl::pr::SET_VMA {
         return Some(crate::prctl::set_vma(mem, m, a));
     }
     tagged_addr_ctrl(signals.thread(), a64, a).or_else(|| {
-        let cx = crate::prctl::Cx { thread: signals.thread(), process: signals.process(), creds, pid, a64 };
+        let cx = crate::prctl::Cx { thread: signals.thread(), process: signals.process(), creds, procs, pid, a64 };
         crate::prctl::call(&cx, m, a)
     })
 }
@@ -8428,7 +8429,7 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
         let Some(r) = f.path.call(m, n, a) else { unreachable!("free_class admitted a call PathIo does not make") };
         r
     } else if is_quiet(n, compat) {
-        let tagged = if n == nr::PRCTL { prctl_call(f.signals, f.creds, f.pid, a64_thread(compat, f.io.wasm32), f.map.mem, m, a) } else { None };
+        let tagged = if n == nr::PRCTL { prctl_call(f.signals, f.creds, f.procs, f.pid, a64_thread(compat, f.io.wasm32), f.map.mem, m, a) } else { None };
         let r = match tagged {
             Some(r) => r,
             None => quiet_call(&f.io, f.procs, f.futex.tid as i32, m, ctx_addr, n, a),
@@ -11945,7 +11946,7 @@ impl Kernel {
             // The calls that need nothing of the process ([`quiet_call`],
             // the free path's code).
             n if is_quiet(n, self.compat) => {
-                let tagged = if n == nr::PRCTL { prctl_call(&self.signals, &self.creds, self.pid, a64_thread(self.compat, self.wasm32), &self.mem, m, a) } else { None };
+                let tagged = if n == nr::PRCTL { prctl_call(&self.signals, &self.creds, &self.procs, self.pid, a64_thread(self.compat, self.wasm32), &self.mem, m, a) } else { None };
                 let r = match tagged {
                     Some(r) => r,
                     None => quiet_call(&self.fd_io(), &self.procs, self.tid, m, self.ctx_addr, n, a),

@@ -1893,6 +1893,18 @@ pub extern "C" fn k_kill_group(caller: i32, pgid: i32, signo: u32) -> i32 {
     }
 }
 
+/// `PR_SET_PDEATHSIG` for `pid`: the signal it is sent when its parent ends.
+#[no_mangle]
+pub extern "C" fn k_set_pdeathsig(pid: i32, signo: u32) {
+    procs().set_pdeathsig(pid, signo);
+}
+
+/// `PR_SET_CHILD_SUBREAPER` for `pid`.
+#[no_mangle]
+pub extern "C" fn k_set_subreaper(pid: i32, on: i32) {
+    procs().set_subreaper(pid, on != 0);
+}
+
 /// Take everything pending for `pid`, as a bitmask of `1 << (signo - 1)`.
 #[no_mangle]
 pub extern "C" fn k_take_signals(pid: i32) -> u64 {

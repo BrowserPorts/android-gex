@@ -474,6 +474,8 @@ extern "C" {
     fn k_has_children(ppid: i32) -> i32;
     fn k_kill(caller: i32, target: i32, signo: u32) -> i32;
     fn k_kill_group(caller: i32, pgid: i32, signo: u32) -> i32;
+    fn k_set_pdeathsig(pid: i32, signo: u32);
+    fn k_set_subreaper(pid: i32, on: i32);
     /// How many signals have been sent to anyone. One relaxed load, so a
     /// safepoint can ask "has anything happened" without taking the process
     /// table's lock a thousand times a second.
@@ -940,6 +942,12 @@ extern "C" fn r_kill_group(caller: i32, pgid: i32, signo: u32) -> i32 {
     signal_note("group", caller, pgid, signo);
     unsafe { k_kill_group(caller, pgid, signo) }
 }
+extern "C" fn r_set_pdeathsig(pid: i32, signo: u32) {
+    unsafe { k_set_pdeathsig(pid, signo) }
+}
+extern "C" fn r_set_subreaper(pid: i32, on: i32) {
+    unsafe { k_set_subreaper(pid, on) }
+}
 extern "C" fn r_take_signals(pid: i32) -> u64 {
     unsafe { k_take_signals(pid) }
 }
@@ -1053,6 +1061,8 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             has_children: r_has_children,
             kill: r_kill,
             kill_group: r_kill_group,
+            set_pdeathsig: r_set_pdeathsig,
+            set_subreaper: r_set_subreaper,
             take_signals: r_take_signals,
             take_kill_signals: r_take_kill_signals,
             kill_sender: r_kill_sender,

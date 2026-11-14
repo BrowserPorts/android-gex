@@ -49,6 +49,9 @@ pub struct Remote {
     /// has no negative spelling -- and the demos run a shell as pid 1, so `^C`
     /// to the foreground group is exactly this case.
     pub kill_group: extern "C" fn(caller: i32, pgid: i32, signo: u32) -> i32,
+    /// [`ProcTable::set_pdeathsig`] and [`ProcTable::set_subreaper`].
+    pub set_pdeathsig: extern "C" fn(pid: i32, signo: u32),
+    pub set_subreaper: extern "C" fn(pid: i32, on: i32),
     pub take_signals: extern "C" fn(pid: i32) -> u64,
     /// Of `taken`, the signals `kill` sent (see [`ProcTable::take_kill_senders`]).
     pub take_kill_signals: extern "C" fn(pid: i32, taken: u64) -> u64,
@@ -376,6 +379,15 @@ struct Proc {
     /// Its address space, for another process's `process_vm_readv` and
     /// `process_vm_writev`: see [`ProcTable::set_vm`]. `None` once it exits.
     vm: Option<Arc<PeerVm>>,
+    /// The signal it is sent when its parent ends (`PR_SET_PDEATHSIG`), or
+    /// 0 for none. A new process has none.
+    pdeathsig: u32,
+    /// `PR_SET_CHILD_SUBREAPER`: its descendants whose parents end are
+    /// given to it, not to init.
+    subreaper: bool,
+    /// Whether it has ended (a zombie until collected): no reaper of
+    /// orphans then.
+    ended: bool,
     /// Started by the host as a child of the virtual init, which the host
     /// collects (with `wait` as pid 1) rather than the table at its exit.
     host_child: bool,
@@ -652,6 +664,9 @@ impl ProcTable {
                     info: Vec::new(),
                     creds: Vec::new(),
                     vm: None,
+                    pdeathsig: 0,
+                    subreaper: false,
+                    ended: false,
                     host_child: false,
                     usage: Usage::default(),
                     crash: Vec::new(),
@@ -699,6 +714,9 @@ impl ProcTable {
             info: Vec::new(),
             creds,
             vm: None,
+            pdeathsig: 0,
+            subreaper: false,
+            ended: false,
             host_child,
             usage: Usage::default(),
             crash: Vec::new(),
@@ -957,8 +975,34 @@ impl ProcTable {
         self.lock().procs.iter().any(|p| p.ppid == ppid)
     }
 
+    /// `PR_SET_PDEATHSIG` for `pid`: the signal it is sent when its parent
+    /// ends, 0 for none.
+    pub fn set_pdeathsig(&self, pid: i32, signo: u32) {
+        if let Some(r) = self.remote {
+            return (r.set_pdeathsig)(pid, signo);
+        }
+        if signo > 64 {
+            return;
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.pdeathsig = signo;
+        }
+    }
+
+    /// `PR_SET_CHILD_SUBREAPER` for `pid`: whether its descendants'
+    /// orphans are given to it.
+    pub fn set_subreaper(&self, pid: i32, on: bool) {
+        if let Some(r) = self.remote {
+            return (r.set_subreaper)(pid, on as i32);
+        }
+        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
+            p.subreaper = on;
+        }
+    }
+
     /// Record that `pid` has exited, wake anyone waiting on it, and give its
-    /// surviving children to init.
+    /// surviving children to the one that reaps them: a subreaper among
+    /// its ancestors, else init.
     pub fn exit(&self, pid: i32, status: i32) {
         if let Some(r) = self.remote {
             return (r.exit)(pid, status);
@@ -982,14 +1026,43 @@ impl ProcTable {
         let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
-            let mut orphans = Vec::new();
-            for p in t.procs.iter_mut() {
-                if p.ppid == pid {
-                    p.ppid = INIT_PID;
-                    if virtual_init {
-                        orphans.push((p.pid, Arc::clone(&p.child.status)));
+            // Who its children go to (`find_new_reaper`): the nearest of
+            // its ancestors that is still running and has asked for its
+            // descendants' orphans (`PR_SET_CHILD_SUBREAPER`), else init.
+            let reaper = {
+                let mut at = ppid.unwrap_or(INIT_PID);
+                loop {
+                    match t.procs.iter().find(|p| p.pid == at) {
+                        Some(p) if p.pid == INIT_PID => break INIT_PID,
+                        Some(p) if p.subreaper && !p.ended => break p.pid,
+                        Some(p) => at = p.ppid,
+                        None => break INIT_PID,
                     }
                 }
+            };
+            let mut orphans = Vec::new();
+            let mut signalled = false;
+            for p in t.procs.iter_mut() {
+                if p.ppid == pid {
+                    p.ppid = reaper;
+                    if virtual_init && reaper == INIT_PID {
+                        orphans.push((p.pid, Arc::clone(&p.child.status)));
+                    }
+                    // The signal it asked for at its parent's end
+                    // (`forget_original_parent`): to the process, from the
+                    // parent, as `kill` sends one.
+                    if p.pdeathsig != 0 && !p.ended {
+                        let bit = 1u64 << (p.pdeathsig - 1);
+                        p.killed |= bit;
+                        p.senders[p.pdeathsig as usize - 1] = pid;
+                        p.pending.fetch_or(bit, Ordering::AcqRel);
+                        p.queue.notify();
+                        signalled = true;
+                    }
+                }
+            }
+            if signalled {
+                SIGNAL_SEQ.fetch_add(1, Ordering::Release);
             }
             // Its threads went with it.
             let gone: Vec<i32> = t.threads.iter().filter(|&(_, &p)| p == pid).map(|(&tid, _)| tid).collect();
@@ -1001,6 +1074,7 @@ impl ProcTable {
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
                     p.vm = None;
+                    p.ended = true;
                     (Arc::clone(&p.child.status), Arc::clone(&p.child.done), ppid, p.queue.id(), orphans)
                 }
                 None => return,
@@ -1864,6 +1938,56 @@ mod tests {
         // And init can now see it as something to wait for.
         let seen: Vec<i32> = t.children(INIT_PID).iter().map(|c| c.pid).collect();
         assert!(seen.contains(&orphan));
+    }
+
+    /// A subreaper is given its descendants' orphans, while it runs: the
+    /// nearest one above the parent that ended. One that has ended itself
+    /// is passed over.
+    #[test]
+    fn orphans_go_to_the_nearest_subreaper_that_is_running() {
+        let t = ProcTable::new();
+        let outer = t.spawn(INIT_PID);
+        let inner = t.spawn(outer);
+        let parent = t.spawn(inner);
+        let orphan = t.spawn(parent);
+        t.set_subreaper(outer, true);
+        t.set_subreaper(inner, true);
+        t.exit(parent, 0);
+        assert_eq!(t.ppid(orphan), inner);
+        assert!(t.children(inner).iter().any(|c| c.pid == orphan));
+        // The inner one ends: its own child, and what it was given, go up.
+        t.exit(inner, 0);
+        assert_eq!(t.ppid(orphan), outer);
+        // Turned off, the next orphan is init's.
+        let second = t.spawn(orphan);
+        t.set_subreaper(outer, false);
+        t.exit(orphan, 0);
+        assert_eq!(t.ppid(second), INIT_PID);
+    }
+
+    /// `PR_SET_PDEATHSIG`: the signal a process named is pending for it
+    /// when its parent ends, sent by the parent; a process that named none
+    /// gets nothing, and one that has ended already is not signalled.
+    #[test]
+    fn a_parents_end_sends_the_signal_its_child_asked_for() {
+        let t = ProcTable::new();
+        let parent = t.spawn(INIT_PID);
+        let (asked, plain, gone) = (t.spawn(parent), t.spawn(parent), t.spawn(parent));
+        t.set_pdeathsig(asked, 15);
+        t.set_pdeathsig(gone, 15);
+        t.set_pdeathsig(plain, 65);
+        t.exit(gone, 0);
+        t.exit(parent, 0);
+        assert_eq!(t.take_signals(asked), 1 << 14);
+        assert_eq!(t.kill_sender(asked, 15), parent);
+        assert_eq!(t.take_signals(plain), 0);
+        assert_eq!(t.take_signals(gone), 0);
+        // Taken back, nothing is sent.
+        let (p2, c2) = { let p = t.spawn(INIT_PID); (p, t.spawn(p)) };
+        t.set_pdeathsig(c2, 9);
+        t.set_pdeathsig(c2, 0);
+        t.exit(p2, 0);
+        assert_eq!(t.take_signals(c2), 0);
     }
 
     #[test]
