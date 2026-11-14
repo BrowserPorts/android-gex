@@ -177,7 +177,9 @@ fn find(s: &Server, path: &str) -> Option<Found> {
     // (`sel_make_classes`): each class's, then its `perms`.
     let class_dirs_from = || ((classes().len() as u64 + 2) * CLASS_STRIDE) | CLASS_OFFSET;
     match parts.as_slice() {
-        [] => Found::dir(2, DIRS.len() as u32),
+        // The root is inode 1, as every filesystem made by the kernel's
+        // `simple_fill_super` has it; its files are numbered from 3.
+        [] => Found::dir(1, DIRS.len() as u32),
         ["null"] => Found::file(Kind::Null, NULL_INO, 0o666),
         [name] => {
             if let Some(&(_, ino)) = DIRS.iter().find(|(n, _)| n == name) {
@@ -209,6 +211,19 @@ fn find(s: &Server, path: &str) -> Option<Found> {
         }
         _ => None,
     }
+}
+
+/// Why `path` names nothing: a name under something that is no directory
+/// is `ENOTDIR`, any other `ENOENT`.
+fn missing(s: &Server, path: &str) -> Errno {
+    let mut at = path;
+    while let Some((parent, _)) = at.rsplit_once('/') {
+        if let Some(found) = find(s, parent) {
+            return if found.kind == Kind::Dir { Errno::ENOENT } else { Errno::ENOTDIR };
+        }
+        at = parent;
+    }
+    Errno::ENOENT
 }
 
 /// The names in the directory `path` is.
@@ -279,7 +294,7 @@ impl FileSystem for SelinuxFs {
             // Nothing is made here: the directories have no way to.
             let parent = path.rsplit_once('/').map_or("", |(dir, _)| dir);
             let makes = flags & crate::fs::oflags::O_CREAT != 0 && find(&s, parent).is_some_and(|p| p.kind == Kind::Dir);
-            return Err(if makes { Errno::EACCES } else { Errno::ENOENT });
+            return Err(if makes { Errno::EACCES } else { missing(&s, path) });
         };
         let metadata = found.metadata();
         match found.kind {
@@ -288,7 +303,7 @@ impl FileSystem for SelinuxFs {
                     return Err(Errno::EISDIR);
                 }
                 let parent = path.rsplit_once('/').map_or("", |(dir, _)| dir);
-                let parent_ino = find(&s, parent).map_or(2, |p| p.ino);
+                let parent_ino = find(&s, parent).map_or(1, |p| p.ino);
                 let mut entries = vec![
                     DirEntry { name: ".".into(), file_type: FileType::Directory, ino: found.ino },
                     DirEntry { name: "..".into(), file_type: FileType::Directory, ino: parent_ino },
@@ -324,7 +339,8 @@ impl FileSystem for SelinuxFs {
     }
 
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
-        find(&self.lock(), path).map(|f| f.metadata()).ok_or(Errno::ENOENT)
+        let s = self.lock();
+        find(&s, path).map(|f| f.metadata()).ok_or_else(|| missing(&s, path))
     }
 
     // A directory here can have nothing made in it, taken from it or
@@ -649,7 +665,7 @@ mod tests {
         assert_eq!(list(&fs, "ss"), ["sidtab_hash_stats"]);
         assert_eq!(list(&fs, "policy_capabilities").len(), 14);
         let stat = |path: &str| fs.metadata(path).map(|m| (m.file_type, m.mode, m.ino, m.nlink));
-        assert_eq!(stat(""), Ok((FileType::Directory, 0o555, 2, 8)));
+        assert_eq!(stat(""), Ok((FileType::Directory, 0o555, 1, 8)));
         assert_eq!(stat("load"), Ok((FileType::Regular, 0o600, 3, 1)));
         assert_eq!(stat("enforce"), Ok((FileType::Regular, 0o644, 4, 1)));
         assert_eq!(stat("access"), Ok((FileType::Regular, 0o666, 6, 1)));
@@ -663,7 +679,8 @@ mod tests {
         assert_eq!(stat("class"), Ok((FileType::Directory, 0o555, 31, 2)));
         assert_eq!(stat("initial_contexts/kernel"), Ok((FileType::Regular, 0o444, 0x0100_0001, 1)));
         assert_eq!(stat("policy_capabilities/open_perms"), Ok((FileType::Regular, 0o444, 0x0800_0001, 1)));
-        assert_eq!((stat("nothing"), stat("class/file"), stat("booleans/x"), stat("load/x")), (Err(Errno::ENOENT), Err(Errno::ENOENT), Err(Errno::ENOENT), Err(Errno::ENOENT)));
+        assert_eq!((stat("nothing"), stat("class/file"), stat("booleans/x"), stat("class/file/index")), (Err(Errno::ENOENT), Err(Errno::ENOENT), Err(Errno::ENOENT), Err(Errno::ENOENT)));
+        assert_eq!((stat("load/x"), stat("null/x/y"), fs.open("enforce/x", 0, 0).err()), (Err(Errno::ENOTDIR), Err(Errno::ENOTDIR), Some(Errno::ENOTDIR)));
         // What they read.
         for (path, want) in [("enforce", "0"), ("policyvers", "35"), ("mls", "0"), ("deny_unknown", "1"), ("reject_unknown", "0"), ("checkreqprot", "0")] {
             assert_eq!(read(&fs, path).as_deref(), Ok(want.as_bytes()), "{path}");
