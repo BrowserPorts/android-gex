@@ -31,6 +31,6 @@ if [ -z "$ndk" ] || [ ! -d "$ndk/toolchains/llvm/prebuilt/$host/bin" ]; then
 fi
 CC=$ndk/toolchains/llvm/prebuilt/$host/bin/clang
 
-for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe; do
+for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault; do
     "$CC" --target="$TARGET" -O2 -Wall -Werror -static -Wl,--image-base=0x400000 -o "$OUT/$p" "$HERE/src/$p.c"
 done
