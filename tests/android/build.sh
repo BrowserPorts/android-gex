@@ -4,9 +4,13 @@
 # They are static executables: bionic linked in, so they need neither
 # Android's linker nor a system image. Static is not position-independent
 # here: bionic's static start-up applies no relocations, and Android builds
-# its own static executables the same way. They are linked at 0x400000
-# rather than the linker's default, 0x200000, which lies in gex's reserved
-# low region; an executable linked there does not load yet.
+# its own static executables the same way.
+#
+# Each is built twice. bin/ has it linked at 0x400000, above where a 32-bit
+# guest memory keeps gex's own tables, so it runs in either memory. bin/low/
+# has it at the linker's default, 0x200000, where Android's own static
+# executables are (first-stage init among them): it needs a 64-bit memory,
+# which gexc gives it.
 #
 # The NDK is ANDROID_NDK_HOME, or the newest one under the SDK
 # (ANDROID_HOME, or the SDK's default place on this host).
@@ -15,7 +19,7 @@ set -eu
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 OUT=$HERE/bin
 TARGET=${GEX_ANDROID_TARGET:-aarch64-linux-android30}
-mkdir -p "$OUT"
+mkdir -p "$OUT/low"
 
 case $(uname -s) in
 Darwin) host=darwin-x86_64 sdk=${ANDROID_HOME:-$HOME/Library/Android/sdk} ;;
@@ -33,4 +37,5 @@ CC=$ndk/toolchains/llvm/prebuilt/$host/bin/clang
 
 for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault; do
     "$CC" --target="$TARGET" -O2 -Wall -Werror -static -Wl,--image-base=0x400000 -o "$OUT/$p" "$HERE/src/$p.c"
+    "$CC" --target="$TARGET" -O2 -Wall -Werror -static -o "$OUT/low/$p" "$HERE/src/$p.c"
 done
