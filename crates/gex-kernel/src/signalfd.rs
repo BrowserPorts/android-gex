@@ -55,6 +55,19 @@ fn note(signals: &Signals) {
     });
 }
 
+/// Have the kernel note its running thread from now, as a signalfd makes
+/// it: for a file that has to know who writes it.
+pub fn note_running() {
+    IN_USE.store(true, Ordering::Relaxed);
+}
+
+/// Whether the thread the kernel is running a call of belongs to process
+/// `p`. `None` where the kernel has not noted one (nothing had asked it to
+/// when the call began).
+pub fn running_process_is(p: &std::sync::Arc<crate::signal::ProcSig>) -> Option<bool> {
+    CURRENT.with(|c| c.borrow().as_ref().map(|s| std::sync::Arc::ptr_eq(s.process(), p)))
+}
+
 /// A mask as a signalfd keeps it: SIGKILL and SIGSTOP are never in it.
 fn masked(mask: u64) -> u64 {
     mask & !(1 << (SIGKILL - 1) | 1 << (SIGSTOP - 1))

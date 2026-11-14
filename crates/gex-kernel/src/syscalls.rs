@@ -6482,6 +6482,11 @@ pub struct Creds {
     /// them: a uid change away from root keeps the permitted set (it
     /// clears at exec).
     securebits: std::sync::atomic::AtomicU32,
+    /// SELinux's ids for the process, as `/proc/<pid>/attr` shows them
+    /// ([`crate::selinux::procattr`]): what it is, what it was before its
+    /// last exec, and what it has asked for its next exec and for the
+    /// files, keys and sockets it makes (0: nothing asked).
+    sec: [std::sync::atomic::AtomicU32; 6],
 }
 
 /// The securebits (include/uapi/linux/securebits.h): each has a lock bit
@@ -6518,7 +6523,34 @@ impl Creds {
             bounding: CAPS_ALL.into(),
             ambient: 0.into(),
             securebits: 0.into(),
+            sec: crate::selinux::procattr::INITIAL.map(std::sync::atomic::AtomicU32::new),
         }
+    }
+
+    /// SELinux's ids for the process ([`crate::selinux::procattr::NAMES`]).
+    pub fn sec(&self) -> [u32; 6] {
+        std::array::from_fn(|i| Self::ld32(&self.sec[i]))
+    }
+
+    /// Set one of them.
+    pub fn set_sec(&self, which: usize, sid: u32) {
+        Self::st32(&self.sec[which], sid);
+    }
+
+    /// They as an `execve` leaves them ([`crate::selinux::procattr::exec`]).
+    pub fn exec_sec(&self) {
+        for (i, sid) in crate::selinux::procattr::exec(self.sec()).into_iter().enumerate() {
+            Self::st32(&self.sec[i], sid);
+        }
+    }
+
+    /// SELinux's ids in [`Creds::save`]'s bytes, as the process table
+    /// keeps another process's.
+    pub fn sec_of_saved(b: &[u8]) -> Option<[u32; 6]> {
+        if b.len() != Self::SAVED {
+            return None;
+        }
+        Some(std::array::from_fn(|i| u32::from_le_bytes(b[68 + i * 4..72 + i * 4].try_into().unwrap())))
     }
 
     pub fn new(uid: u32, gid: u32) -> Arc<Creds> {
@@ -6610,11 +6642,14 @@ impl Creds {
             v.extend_from_slice(&c.to_le_bytes());
         }
         v.extend_from_slice(&self.securebits().to_le_bytes());
+        for sid in self.sec() {
+            v.extend_from_slice(&sid.to_le_bytes());
+        }
         v
     }
 
     /// The length of [`Creds::save`]'s bytes.
-    pub const SAVED: usize = 6 * 4 + 5 * 8 + 4;
+    pub const SAVED: usize = 6 * 4 + 5 * 8 + 4 + 6 * 4;
 
     /// [`Creds::save`]'s bytes back; anything else changes nothing.
     pub fn restore(&self, b: &[u8]) {
@@ -6631,6 +6666,9 @@ impl Creds {
         self.bounding.store(c(3), std::sync::atomic::Ordering::Release);
         self.ambient.store(c(4), std::sync::atomic::Ordering::Release);
         self.securebits.store(u32::from_le_bytes(b[64..68].try_into().unwrap()), std::sync::atomic::Ordering::Release);
+        for (i, sid) in Self::sec_of_saved(b).into_iter().flatten().enumerate() {
+            Self::st32(&self.sec[i], sid);
+        }
     }
 
     /// The capabilities an `execve` leaves, as Linux computes them for a
@@ -10656,6 +10694,14 @@ impl Kernel {
             self.vfs.put_cwd(cwd);
         }
         self.signals.exec();
+        // SELinux: the process is what it asked to be, and its requests
+        // are forgotten.
+        let asked = self.creds.sec()[crate::selinux::procattr::EXEC] != 0;
+        self.creds.exec_sec();
+        self.procs.set_creds(self.pid, &self.creds.save());
+        if !asked {
+            crate::selinux::procattr::warn_exec_by_label();
+        }
         let cur = Arc::clone(self.signals.thread());
         // The other threads are gone, and their ids with them.
         for t in self.thread_signals.tids() {

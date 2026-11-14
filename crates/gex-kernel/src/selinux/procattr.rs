@@ -14,7 +14,9 @@
 //! lets a process set (the `process` class's `setexec`, `setcurrent`,
 //! `dyntransition` and the rest), which waits for the hooks; and the
 //! transition an `execve` makes by the program's own label, which waits
-//! for files to have labels.
+//! for files to have labels (an `execve` that would need it says so,
+//! once). The ids are a process's here, where on Linux each thread has
+//! its own.
 
 use super::server::{Error, Server, SID_KERNEL};
 use crate::errno::Errno;
@@ -95,6 +97,17 @@ pub fn written(s: &mut Server, which: usize, value: &[u8], mac_admin: bool) -> R
         return Err(Errno::EINVAL);
     }
     Ok((sid, size as u64))
+}
+
+/// Said once, at an `execve` that asked for no context while a policy is
+/// loaded: the policy may give the program's label a transition, and no
+/// file has a label yet, so the process stays what it was.
+pub fn warn_exec_by_label() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let loaded = super::kernel_server().lock().unwrap_or_else(|e| e.into_inner()).policy().is_some();
+    if loaded && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[gex] selinux: execve with a policy loaded keeps the process's context: files have no labels yet, so no transition by a program's label is made");
+    }
 }
 
 /// A process's ids after an `execve`: it is what it asked to be, or what

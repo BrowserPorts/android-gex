@@ -104,6 +104,26 @@ impl ProcSource for KernelProcSource {
     fn pid(&self) -> i32 {
         self.0.get().map_or(0, |l| l.pid)
     }
+    fn attr_ids(&self) -> Option<[u32; 6]> {
+        self.0.get().map(|l| l.creds.sec())
+    }
+    fn attr_writer(&self) -> Result<bool, crate::errno::Errno> {
+        /// `CAP_MAC_ADMIN`.
+        const CAP_MAC_ADMIN: u64 = 33;
+        let l = self.0.get().ok_or(crate::errno::Errno::ESRCH)?;
+        // Another process with a descriptor of this one's file is not it.
+        if crate::signalfd::running_process_is(&l.process) == Some(false) {
+            return Err(crate::errno::Errno::EPERM);
+        }
+        Ok(l.creds.capable(CAP_MAC_ADMIN))
+    }
+    fn set_attr_id(&self, which: usize, sid: u32) {
+        if let Some(l) = self.0.get() {
+            l.creds.set_sec(which, sid);
+            // What another process's /proc/<pid>/attr reads.
+            l.procs.set_creds(l.pid, &l.creds.save());
+        }
+    }
     fn maps(&self) -> String {
         let Some(l) = self.0.get() else { return String::new() };
         let mut cache = self.0.maps.lock().unwrap_or_else(|e| e.into_inner());

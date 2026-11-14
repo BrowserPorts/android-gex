@@ -8,6 +8,7 @@
 
 use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata};
 use crate::errno::{Errno, SysResult};
+use crate::selinux::procattr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -17,6 +18,22 @@ use std::sync::Arc;
 /// a reference back into the whole kernel, which would be a borrow knot.
 pub trait ProcSource: Send + Sync {
     fn pid(&self) -> i32;
+    /// The process's SELinux ids, as `attr` shows them
+    /// ([`crate::selinux::procattr::NAMES`]). `None`: a source with no
+    /// process behind it, whose `attr` is not there.
+    fn attr_ids(&self) -> Option<[u32; 6]> {
+        None
+    }
+    /// For a write to one of `attr`'s files: whether the process has
+    /// `CAP_MAC_ADMIN`, or `EPERM` when it is not the process itself that
+    /// writes (a descriptor another process came by).
+    fn attr_writer(&self) -> Result<bool, Errno> {
+        Err(Errno::EPERM)
+    }
+    /// Set one of the process's SELinux ids.
+    fn set_attr_id(&self, which: usize, sid: u32) {
+        let _ = (which, sid);
+    }
     fn maps(&self) -> String;
     fn cmdline(&self) -> Vec<u8>;
     fn environ(&self) -> Vec<u8>;
@@ -389,6 +406,23 @@ impl ProcFs {
         Ok((path, tid))
     }
 
+    /// For a path in a process's `attr` (canonical: `self/…` for the
+    /// source's own): whose it is, `None` for the source's own, and the
+    /// file's name, empty for the directory. `None` for any other path, a
+    /// process that is not there, and a source with no process.
+    fn attr_of<'a>(&self, path: &'a str) -> Option<(Option<i32>, &'a str)> {
+        let (first, rest) = path.split_once('/')?;
+        let name = if rest == "attr" { "" } else { rest.strip_prefix("attr/")? };
+        if first == "self" {
+            self.source.attr_ids()?;
+            return Some((None, name));
+        }
+        let pid: i32 = first.parse().ok()?;
+        let e = self.source.others().into_iter().find(|e| e.pid == pid)?;
+        crate::syscalls::Creds::sec_of_saved(&e.creds)?;
+        Some((Some(pid), name))
+    }
+
     /// The tasks of `self` or of process `<pid>`: its first thread, then the
     /// others. Just the first where the table does not list it.
     fn tasks_of(&self, who: &str) -> Vec<i32> {
@@ -538,6 +572,19 @@ impl FileSystem for ProcFs {
                 seen: AtomicU64::new(seen),
             }));
         }
+        if let Some((who, name)) = self.attr_of(&path) {
+            if name.is_empty() {
+                let mut out = base_entries();
+                out.extend(procattr::NAMES.iter().map(|n| DirEntry { name: n.to_string(), file_type: FileType::Regular, ino: 1 }));
+                return Ok(Arc::new(GenDir { entries: out }));
+            }
+            let which = procattr::which(name).ok_or(Errno::ENOENT)?;
+            if super::writes(flags) {
+                // Who writes it is the kernel's to know from now.
+                crate::signalfd::note_running();
+            }
+            return Ok(Arc::new(Attr { source: Arc::clone(&self.source), who, which }));
+        }
         if let Some(data) = self.generate(&path, tid) {
             return Ok(Arc::new(Generated { data }));
         }
@@ -547,7 +594,7 @@ impl FileSystem for ProcFs {
             }
             let mut out = base_entries();
             let names: &[&str] = match rest.as_str() {
-                "" => &["stat", "status", "statm", "cmdline", "comm", "environ", "maps", "task"],
+                "" => &["stat", "status", "statm", "cmdline", "comm", "environ", "maps", "task", "attr"],
                 "task" => {
                     for t in e.tasks() {
                         out.push(DirEntry { name: t.to_string(), file_type: FileType::Directory, ino: 1 });
@@ -557,7 +604,7 @@ impl FileSystem for ProcFs {
                 _ => return Err(Errno::ENOENT),
             };
             for name in names {
-                let file_type = if *name == "task" { FileType::Directory } else { FileType::Regular };
+                let file_type = if matches!(*name, "task" | "attr") { FileType::Directory } else { FileType::Regular };
                 out.push(DirEntry { name: name.to_string(), file_type, ino: 1 });
             }
             return Ok(Arc::new(GenDir { entries: out }));
@@ -594,7 +641,7 @@ impl FileSystem for ProcFs {
             }
             "self" => vec![
                 "maps", "cmdline", "environ", "auxv", "stat", "status", "statm", "comm", "exe", "cwd", "fd",
-                "fdinfo", "task", "mountinfo", "mounts",
+                "fdinfo", "task", "mountinfo", "mounts", "attr",
             ],
             "self/fd" => {
                 let mut out = base_entries();
@@ -626,7 +673,7 @@ impl FileSystem for ProcFs {
         for name in entries {
             out.push(DirEntry {
                 name: name.to_string(),
-                file_type,
+                file_type: if path == "self" && name == "attr" { FileType::Directory } else { file_type },
                 ino: 1,
             });
         }
@@ -635,6 +682,13 @@ impl FileSystem for ProcFs {
 
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
         let (path, tid) = self.canonical(path)?;
+        if let Some((_, name)) = self.attr_of(&path) {
+            if name.is_empty() {
+                return Ok(Metadata { mode: 0o555, ..Metadata::dir() });
+            }
+            let which = procattr::which(name).ok_or(Errno::ENOENT)?;
+            return Ok(attr_metadata(which));
+        }
         if self.generate(&path, tid).is_some() {
             return Ok(Metadata {
                 file_type: FileType::Regular,
@@ -698,6 +752,63 @@ impl FileSystem for ProcFs {
                 Err(Errno::EINVAL)
             }
         }
+    }
+}
+
+fn attr_metadata(which: usize) -> Metadata {
+    Metadata { file_type: FileType::Regular, size: 0, mode: procattr::mode(which), ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default() }
+}
+
+/// A file of a process's `attr`, open: its SELinux context, or one it has
+/// asked for ([`crate::selinux::procattr`]). It reads what is so when it
+/// is read, and only the process itself writes it.
+struct Attr {
+    source: Arc<dyn ProcSource>,
+    /// Another process's, by its pid; `None` for the source's own.
+    who: Option<i32>,
+    which: usize,
+}
+
+impl std::fmt::Debug for Attr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "proc attr/{}", procattr::NAMES[self.which])
+    }
+}
+
+impl FileHandle for Attr {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        let ids = match self.who {
+            None => self.source.attr_ids(),
+            Some(pid) => self.source.others().into_iter().find(|e| e.pid == pid).and_then(|e| crate::syscalls::Creds::sec_of_saved(&e.creds)),
+        }
+        .ok_or(Errno::ESRCH)?;
+        let server = crate::selinux::kernel_server();
+        let all = procattr::read(&server.lock().unwrap_or_else(|e| e.into_inner()), ids[self.which])?;
+        let from = offset.min(all.len() as u64) as usize;
+        let n = buf.len().min(all.len() - from);
+        buf[..n].copy_from_slice(&all[from..from + n]);
+        Ok(n as u64)
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> SysResult {
+        // A task writes only its own, and from the file's start.
+        if self.who.is_some() {
+            return Err(Errno::EPERM);
+        }
+        let mac_admin = self.source.attr_writer()?;
+        if offset != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let buf = &buf[..buf.len().min(4096)];
+        let server = crate::selinux::kernel_server();
+        let (sid, n) = procattr::written(&mut server.lock().unwrap_or_else(|e| e.into_inner()), self.which, buf, mac_admin)?;
+        self.source.set_attr_id(self.which, sid);
+        Ok(n)
+    }
+    fn write_keeps_position(&self) -> bool {
+        true
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(attr_metadata(self.which))
     }
 }
 
