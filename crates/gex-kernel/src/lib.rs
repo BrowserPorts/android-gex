@@ -52,6 +52,7 @@ pub mod prctl;
 pub mod proc;
 pub mod pty;
 pub mod signal;
+pub mod selinux;
 pub mod signalfd;
 pub mod stdio;
 pub mod sync;
