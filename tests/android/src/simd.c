@@ -1,7 +1,11 @@
 // SADDLV and UADDLV: every lane widened to twice its size and summed, for
 // each arrangement the instructions have (8B, 16B, 4H, 8H, 4S). clang makes
 // UADDLV of a population count, which is how bionic meets it.
+//
+// And the scalar floating-point multiplies by a vector's element (fmla,
+// fmls, fmul, fmulx), the accumulating ones fused.
 #include <arm_neon.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -65,6 +69,32 @@ int main(void) {
 
     volatile uint64_t x = 0xf0f0f0f0f0f0f0f0ull;
     CHECK(__builtin_popcountll(x) == 32);
+
+    // The scalar multiplies by one lane of a vector. fmla and fmls round
+    // once, as fma does: with these operands a product rounded first loses
+    // the whole answer. The result is a scalar, the register's rest zero.
+    volatile double da = 1.0 + 0x1p-30, db = 1.0 - 0x1p-30, dacc = -1.0;
+    register float64x2_t vd __asm__("v4") = vdupq_n_f64(dacc);
+    register float64x2_t vn __asm__("v2") = vdupq_n_f64(da);
+    register float64x2_t vm __asm__("v3") = vsetq_lane_f64(db, vdupq_n_f64(99.0), 1);
+    vd = vsetq_lane_f64(7.0, vd, 1);
+    __asm__("fmla d4, d2, v3.d[1]" : "+w"(vd) : "w"(vn), "w"(vm));
+    CHECK(vgetq_lane_f64(vd, 0) == fma(da, db, dacc) && vgetq_lane_f64(vd, 0) == -0x1p-60 && vgetq_lane_f64(vd, 1) == 0);
+    vd = vdupq_n_f64(1.0);
+    __asm__("fmls d4, d2, v3.d[1]" : "+w"(vd) : "w"(vn), "w"(vm));
+    CHECK(vgetq_lane_f64(vd, 0) == fma(-da, db, 1.0) && vgetq_lane_f64(vd, 0) == 0x1p-60 && vgetq_lane_f64(vd, 1) == 0);
+    vd = vdupq_n_f64(5.0);
+    __asm__("fmul d4, d2, v3.d[0]" : "+w"(vd) : "w"(vn), "w"(vm));
+    CHECK(vgetq_lane_f64(vd, 0) == da * 99.0 && vgetq_lane_f64(vd, 1) == 0);
+    volatile float fa = 1.0f + 0x1p-12f, fb = 1.0f - 0x1p-12f;
+    register float32x4_t wd __asm__("v4") = vdupq_n_f32(-1.0f);
+    register float32x4_t wn __asm__("v2") = vdupq_n_f32(fa);
+    register float32x4_t wm __asm__("v3") = vsetq_lane_f32(fb, vdupq_n_f32(3.0f), 3);
+    __asm__("fmla s4, s2, v3.s[3]" : "+w"(wd) : "w"(wn), "w"(wm));
+    CHECK(vgetq_lane_f32(wd, 0) == fmaf(fa, fb, -1.0f) && vgetq_lane_f32(wd, 0) == -0x1p-24f && vgetq_lane_f32(wd, 1) == 0 && vgetq_lane_f32(wd, 3) == 0);
+    wd = vdupq_n_f32(2.0f);
+    __asm__("fmulx s4, s2, v3.s[0]" : "+w"(wd) : "w"(wn), "w"(wm));
+    CHECK(vgetq_lane_f32(wd, 0) == fa * 3.0f && vgetq_lane_f32(wd, 2) == 0);
 
     printf("simd ok\n");
     return 0;
