@@ -69,7 +69,7 @@ pub mod av {
 /// A set of small numbers (`struct ebitmap`): bit `n` is value `n + 1` of
 /// whatever it is a set of. Sparse, as the kernel's is: a policy may say
 /// its highest bit is anything.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Bitmap {
     /// 64 bits a word, by the word's place; none is zero.
     words: std::collections::BTreeMap<u32, u64>,
@@ -268,13 +268,13 @@ pub struct Type {
 }
 
 /// A sensitivity and its categories (`struct mls_level`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Level {
     pub sens: u32,
     pub cats: Bitmap,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Range {
     pub low: Level,
     pub high: Level,
@@ -308,7 +308,7 @@ pub struct Category {
     pub alias: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Context {
     pub user: u32,
     pub role: u32,
@@ -1365,6 +1365,60 @@ impl Policy {
         Some(new)
     }
 
+    /// Whether something of `class` may be relabelled from `old` to `new`
+    /// by a process of `task`: every validatetrans rule of the class
+    /// holds of the three (`security_validate_transition`, which a program
+    /// asks through selinuxfs's `validatetrans`). `None` for a class the
+    /// policy has not.
+    pub fn validate_transition(&self, old: &Context, new: &Context, task: &Context, class: u32) -> Option<bool> {
+        let c = self.classes.get(class.checked_sub(1)? as usize)?;
+        Some(c.validatetrans.iter().all(|rule| self.constraint_holds(&rule.expr, old, new, Some(task))))
+    }
+
+    /// A context of policy `old` in this policy's terms, name by name
+    /// (`convert_context`, when one policy takes another's place): its
+    /// user, role and type, and with MLS its sensitivities and categories.
+    /// `None` where this policy lacks one of the names. The result may be
+    /// a context this policy does not allow ([`Policy::context_ok`]).
+    pub fn convert_context(&self, old: &Policy, c: &Context) -> Option<Context> {
+        let at = |n: u32| n.checked_sub(1).map(|i| i as usize);
+        let user = &old.users.get(at(c.user)?)?.name;
+        let role = &old.roles.get(at(c.role)?)?.name;
+        let ty = &old.types.get(at(c.ty)?)?.name;
+        let mut new = Context {
+            user: self.users.iter().position(|u| u.name == *user)? as u32 + 1,
+            role: self.roles.iter().position(|r| r.name == *role)? as u32 + 1,
+            // A type's name may now be an alias, or an attribute's.
+            ty: match self.types.iter().position(|t| t.name == *ty) {
+                Some(i) => i as u32 + 1,
+                None => *self.type_aliases.get(ty)?,
+            },
+            range: Range::default(),
+        };
+        if !self.mls {
+            return Some(new);
+        }
+        if !old.mls {
+            // From a policy with no levels: the unlabeled SID's range.
+            new.range = self.initial_sids.iter().find_map(|o| match o {
+                OContext::InitialSid { sid: 3, context } => Some(context.range.clone()),
+                _ => None,
+            })?;
+            return Some(new);
+        }
+        let level = |l: &Level| -> Option<Level> {
+            let sens = &old.sensitivities.iter().find(|s| !s.alias && s.level.sens == l.sens)?.name;
+            let mut out = Level { sens: self.sensitivities.iter().find(|s| s.name == *sens)?.level.sens, cats: Bitmap::default() };
+            for bit in l.cats.bits() {
+                let name = &old.categories.iter().find(|(v, c)| !c.alias && *v == bit + 1)?.1.name;
+                out.cats.set(self.categories.iter().find(|(_, c)| c.name == *name)?.0 - 1);
+            }
+            Some(out)
+        };
+        new.range = Range { low: level(&c.range.low)?, high: level(&c.range.high)? };
+        Some(new)
+    }
+
     /// The booleans as the policy starts them.
     pub fn bool_defaults(&self) -> Vec<bool> {
         self.bools.iter().map(|b| b.state).collect()
@@ -1809,6 +1863,11 @@ mod tests {
                     let new = p.compute_context(&context(s), &context(t), p.class_named(class).unwrap(), specified, name.first().copied(), &bools);
                     new.map_or("errno EINVAL".to_string(), |c| p.context_string(&c))
                 }
+                ["validatetrans", old, new, class, task] => match p.validate_transition(&context(old), &context(new), &context(task), p.class_named(class).unwrap()) {
+                    Some(true) => "ok".to_string(),
+                    Some(false) => "errno EPERM".to_string(),
+                    None => "errno EINVAL".to_string(),
+                },
                 // What selinuxfs's own files read: not this module's yet.
                 ["read", ..] => continue,
                 _ => panic!("{question}"),
