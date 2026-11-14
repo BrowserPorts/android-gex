@@ -537,9 +537,8 @@ mod tests {
     /// selinuxfs's files before a policy, as Linux 6.8 was seen to have
     /// them (but `policyvers`, which is the newest this reads: 35, as on
     /// Linux 7.0 and android17-6.18, where 6.8 read 33). The NUL a
-    /// context ends in and a capability's 0 are the reference's as read:
-    /// the kernel's answers were kept without the one, and not asked for
-    /// the other.
+    /// context ends in and a capability's 0 are as Linux 7.0 has them
+    /// (tests/android/src/selinuxfs.c, which passes there, looks).
     #[test]
     fn before_a_policy_its_files_read_as_a_kernels() {
         let s = Server::default();
@@ -599,9 +598,9 @@ mod tests {
         let before = s.status();
         s.set_bool("other_thing", false).unwrap();
         assert_eq!(s.status(), [1, before[1] + 2, 0, before[3] + 1, 1]);
-        // From the reference, not yet seen: a value written and not
-        // committed reads beside the one in force and changes nothing,
-        // and a commit puts it in force, counted even with nothing new.
+        // A value written and not committed reads beside the one in
+        // force and changes nothing, and a commit puts it in force,
+        // counted even with nothing new (as on Linux 7.0: selinuxfs.c).
         s.set_pending_bool("other_thing", true).unwrap();
         assert_eq!(s.file("booleans/other_thing"), Some((0o644, Ok(b"0 1".to_vec()))));
         assert_eq!(s.status(), [1, before[1] + 2, 0, before[3] + 1, 1]);
@@ -610,7 +609,8 @@ mod tests {
         assert_eq!(s.file("booleans/other_thing"), Some((0o644, Ok(b"1 1".to_vec()))));
         s.commit_bools();
         assert_eq!(s.status(), [1, before[1] + 6, 0, before[3] + 3, 1]);
-        // Nor seen: enforcing set is a change, and set to what it is
+        // From the reference, not seen (the kernel asked was never made
+        // to enforce): enforcing set is a change, and set to what it is
         // already is none.
         s.set_enforcing(true);
         s.set_enforcing(true);
@@ -697,9 +697,9 @@ mod tests {
         assert_eq!(s.transact("access", "system_u:system_r:init_t:s0"), Some(Err(Error::Invalid)));
         assert_eq!(s.transact("create", "a b 1 %4"), Some(Err(Error::Invalid)));
         assert_eq!(s.transact("enforce", "1"), None);
-        // From the reference's sscanf, not seen: a number is the digits
-        // its word starts with, kept to sixteen bits, and what is left of
-        // the word is the next one.
+        // A number is the digits its word starts with, kept to sixteen
+        // bits, and what is left of the word is the next one (the
+        // kernel's sscanf; `odd_questions_answer_as_a_kernels`).
         assert_eq!(scanned("a  b\t12abc d"), Some(("a", "b", 12, "abc d")));
         assert_eq!(scanned("a b 65538"), Some(("a", "b", 2, "")));
         assert_eq!((scanned("a b"), scanned("a b x1"), scanned("")), (None, None, None));
@@ -712,8 +712,42 @@ mod tests {
         assert_eq!(percent_decoded("a+b%2fc%00d").as_deref(), Some(&b"a b/c"[..]));
     }
 
-    /// Before a policy the question files answer too, from the reference
-    /// (not put to a kernel): everything is allowed, a name of one of the
+    /// Questions in odd forms, as Linux 7.0 answered them with test.33
+    /// loaded: a class's number is the digits its word starts with, kept
+    /// to sixteen bits, and what is left of the word is the next word; a
+    /// class the policy has not allows nothing, and something new of one
+    /// is labelled as what it is made in; a name's percent coding; and a
+    /// context with anything around it is no context.
+    #[test]
+    fn odd_questions_answer_as_a_kernels() {
+        let mut s = Server::default();
+        s.load(V33).unwrap();
+        let (k, f, e, i) = ("system_u:system_r:kernel_t:s0", "system_u:object_r:file_t:s0", "system_u:object_r:exec_t:s0", "system_u:system_r:init_t:s0");
+        let mut ask = |file: &str, text: String| s.transact(file, &text).unwrap().map(|bytes| String::from_utf8(bytes).unwrap());
+        for (class, want) in [("2", Ok("5 ffffffff 0 ffffffff 1 0")), ("2junk", Ok("5 ffffffff 0 ffffffff 1 0")), ("65538", Ok("5 ffffffff 0 ffffffff 1 0")), ("x2", Err(Error::Invalid)), ("0", Ok("0 ffffffff 0 ffffffff 1 0")), ("999", Ok("0 ffffffff 0 ffffffff 1 0"))] {
+            assert_eq!(ask("access", format!("{k} {f} {class}")).as_deref(), want.as_deref().map_err(|e: &Error| e), "access {class}");
+        }
+        let app = "system_u:app_r:app_t:s1:c0,c1\0";
+        let file = "system_u:object_r:file_t:s0\0";
+        let exec = "system_u:object_r:exec_t:s0\0";
+        assert_eq!(ask("create", format!("{i} {e} 1")).as_deref(), Ok(app));
+        assert_eq!(ask("create", format!("{i} {e} 65537 ignored more")).as_deref(), Ok(app));
+        for rest in ["2special", "2 special", "2 sp%65cial", "2 special%00junk", "0", "999"] {
+            assert_eq!(ask("create", format!("{k} {f} {rest}")).as_deref(), Ok(file), "create {rest}");
+        }
+        assert_eq!(ask("create", format!("{k} {f} 2 %4")), Err(Error::Invalid));
+        assert_eq!(ask("relabel", format!("{k} {e} 2junk")).as_deref(), Ok(exec));
+        assert_eq!(ask("member", format!("{k} {e} 3 extra")).as_deref(), Ok(exec));
+        assert_eq!(ask("context", format!("{f}\n")), Err(Error::Invalid));
+        assert_eq!(ask("context", format!(" {f}")), Err(Error::Invalid));
+        assert_eq!(ask("validatetrans", format!("{f} {f} 2{k}")).as_deref(), Ok(""));
+        assert_eq!(ask("validatetrans", format!("{f} {f} 2 {k} more")).as_deref(), Ok(""));
+        assert_eq!(ask("validatetrans", format!("{f} {f} 0 {k}")), Err(Error::Invalid));
+        assert_eq!(ask("validatetrans", format!("{f} {f} 999 {k}")), Err(Error::Invalid));
+    }
+
+    /// Before a policy the question files answer too, as Linux 7.0's did
+    /// (selinuxfs.c): everything is allowed, a name of one of the
     /// kernel's SIDs is that SID and any other text the kernel's, and
     /// something new is labelled as its maker if it is a process (class
     /// 2) and as what it is made in if not.

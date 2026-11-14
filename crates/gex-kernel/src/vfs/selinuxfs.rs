@@ -177,9 +177,10 @@ fn find(s: &Server, path: &str) -> Option<Found> {
     // (`sel_make_classes`): each class's, then its `perms`.
     let class_dirs_from = || ((classes().len() as u64 + 2) * CLASS_STRIDE) | CLASS_OFFSET;
     match parts.as_slice() {
-        // The root is inode 1, as every filesystem made by the kernel's
-        // `simple_fill_super` has it; its files are numbered from 3.
-        [] => Found::dir(1, DIRS.len() as u32),
+        // The root is inode 1 and 0755, as every filesystem made by the
+        // kernel's `simple_fill_super` has it; its files are numbered
+        // from 3, and the directories in it are 0555.
+        [] => Some(Found { kind: Kind::Dir, ino: 1, mode: 0o755, subdirs: DIRS.len() as u32 }),
         ["null"] => Found::file(Kind::Null, NULL_INO, 0o666),
         [name] => {
             if let Some(&(_, ino)) = DIRS.iter().find(|(n, _)| n == name) {
@@ -665,7 +666,7 @@ mod tests {
         assert_eq!(list(&fs, "ss"), ["sidtab_hash_stats"]);
         assert_eq!(list(&fs, "policy_capabilities").len(), 14);
         let stat = |path: &str| fs.metadata(path).map(|m| (m.file_type, m.mode, m.ino, m.nlink));
-        assert_eq!(stat(""), Ok((FileType::Directory, 0o555, 1, 8)));
+        assert_eq!(stat(""), Ok((FileType::Directory, 0o755, 1, 8)));
         assert_eq!(stat("load"), Ok((FileType::Regular, 0o600, 3, 1)));
         assert_eq!(stat("enforce"), Ok((FileType::Regular, 0o644, 4, 1)));
         assert_eq!(stat("access"), Ok((FileType::Regular, 0o666, 6, 1)));
