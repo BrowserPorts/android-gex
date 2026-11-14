@@ -62,6 +62,7 @@ run() {
     sigframe) check "$1" "sigframe ok" 0 ;;
     execfault) check "$1" "execfault ok" 0 ;;
     efault) check "$1" "efault ok" 0 ;;
+    pdeath) check "$1" "pdeath ok" 0 ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -74,7 +75,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath"
     for p in $all; do
         run "$p"
     done
