@@ -118,6 +118,9 @@ pub struct StackLayout {
     pub low: u64,
     /// The bytes to place, starting at [`StackLayout::low`].
     pub bytes: Vec<u8>,
+    /// The auxiliary vector as it was written, its `AT_NULL` pair included:
+    /// what Linux keeps as the address space's `saved_auxv`.
+    pub auxv: Vec<u8>,
 }
 
 /// Construct the initial stack for a process.
@@ -243,7 +246,9 @@ pub fn build_initial_stack(
     let blob_off = (blob_addr - low) as usize;
     bytes[blob_off..blob_off + blob.len()].copy_from_slice(&blob);
 
-    StackLayout { sp, low, bytes }
+    let auxv_at = (n_words - 2 * auxv_pairs.len()) * ws as usize;
+    let auxv = bytes[auxv_at..n_words * ws as usize].to_vec();
+    StackLayout { sp, low, bytes, auxv }
 }
 
 #[cfg(test)]

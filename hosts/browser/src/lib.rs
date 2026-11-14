@@ -6351,6 +6351,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         },
     );
     data.write(layout.low, &layout.bytes).expect("the new stack outside memory");
+    kernel.signals.set_saved_auxv(&layout.auxv);
     kernel.mem.lock().insert(
         gex_abi::STACK_TOP - gex_abi::STACK_SIZE,
         gex_abi::STACK_TOP,
@@ -12308,6 +12309,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         data.zero_dirty(stack_lo as u64, gex_abi::STACK_TOP as usize - stack_lo).expect("the new stack outside memory");
     }
     data.write(layout.low, &layout.bytes).expect("the new stack outside memory");
+    h.kernel.signals.set_saved_auxv(&layout.auxv);
     h.kernel.mem.lock().insert(
         gex_abi::STACK_TOP - gex_abi::STACK_SIZE,
         gex_abi::STACK_TOP,

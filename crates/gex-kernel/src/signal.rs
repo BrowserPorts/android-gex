@@ -186,6 +186,9 @@ pub struct ProcSig {
     /// What the process has set with `prctl`: flags of its address space
     /// and its `signal_struct`.
     prctl: Mutex<crate::prctl::Proc>,
+    /// The auxiliary vector the program was started with, zero after its
+    /// end (Linux's `mm->saved_auxv`, which `PR_GET_AUXV` reads).
+    saved_auxv: Mutex<[u8; crate::prctl::SAVED_AUXV_BYTES]>,
 }
 
 impl std::fmt::Debug for ProcSig {
@@ -210,7 +213,22 @@ impl ProcSig {
             handled: Mutex::new(None),
             fault_send: Mutex::new(None),
             prctl: Mutex::new(crate::prctl::Proc::default()),
+            saved_auxv: Mutex::new([0; crate::prctl::SAVED_AUXV_BYTES]),
         }
+    }
+
+    /// The saved auxiliary vector, all of its fixed size.
+    pub fn saved_auxv(&self) -> [u8; crate::prctl::SAVED_AUXV_BYTES] {
+        *self.saved_auxv.lock()
+    }
+
+    /// Keep the auxiliary vector a new program's stack was given
+    /// (`create_elf_tables`): `auxv` as written there, `AT_NULL` included.
+    pub fn set_saved_auxv(&self, auxv: &[u8]) {
+        let mut saved = [0; crate::prctl::SAVED_AUXV_BYTES];
+        let n = auxv.len().min(saved.len());
+        saved[..n].copy_from_slice(&auxv[..n]);
+        *self.saved_auxv.lock() = saved;
     }
 
     /// What the process has set with `prctl` ([`crate::prctl::Proc`]).
@@ -679,7 +697,14 @@ impl Signals {
         cur.inherit(&self.cur);
         let proc = ProcSig::with_actions(*self.proc.actions.read());
         *proc.prctl.lock() = self.proc.prctl().fork();
+        // The child's address space is a copy, its saved vector with it.
+        *proc.saved_auxv.lock() = self.proc.saved_auxv();
         Signals { proc: Arc::new(proc), cur: Arc::new(cur) }
+    }
+
+    /// Keep a new program's auxiliary vector ([`ProcSig::set_saved_auxv`]).
+    pub fn set_saved_auxv(&self, auxv: &[u8]) {
+        self.proc.set_saved_auxv(auxv);
     }
 
     /// The signal state after `execve`.
@@ -956,6 +981,9 @@ impl Signals {
         for w in [self.blocked(), alt.sp, alt.flags as u64, alt.size, mine, shared, task.timer_slack_ns, task.default_timer_slack_ns, flags, proc.word()] {
             v.extend_from_slice(&w.to_le_bytes());
         }
+        // The saved auxiliary vector: a fork child's is its parent's, and a
+        // new program's is set when its stack is built.
+        v.extend_from_slice(&self.proc.saved_auxv());
         v
     }
 
@@ -979,6 +1007,7 @@ impl Signals {
         let proc = ProcSig::with_actions(actions);
         proc.shared.store(w(o + 5), Ordering::Release);
         *proc.prctl.lock() = crate::prctl::Proc::from_word(w(o + 9));
+        proc.set_saved_auxv(&b[(o + 10) * 8..]);
         Some(Signals { proc: Arc::new(proc), cur: Arc::new(cur) })
     }
 }
@@ -1002,8 +1031,9 @@ pub enum Restart {
 
 /// The length of [`Signals::to_bytes`]: four words a disposition, then the
 /// mask, the alternate stack's three, the two pending sets, and four for
-/// the `prctl` settings and the tagged address ABI.
-const STATE_BYTES: usize = (NSIG * 4 + 10) * 8;
+/// the `prctl` settings and the tagged address ABI; then the saved
+/// auxiliary vector.
+const STATE_BYTES: usize = (NSIG * 4 + 10) * 8 + crate::prctl::SAVED_AUXV_BYTES;
 
 /// A process that sent a signal, for its siginfo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1914,8 +1944,11 @@ mod tests {
         s.set_alt_stack(SigAltStack { sp: 0x7000, flags: 0, size: 0x2000 });
         s.raise(sig::SIGUSR2);
         s.raise_shared(sig::SIGHUP, None);
+        s.set_saved_auxv(&[6, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0]);
         // As a fork child: no pending.
         let f = Signals::from_bytes(&s.to_bytes(false)).unwrap();
+        assert_eq!(f.proc.saved_auxv(), s.proc.saved_auxv());
+        assert_eq!(s.fork().proc.saved_auxv()[..10], [6, 0, 0, 0, 0, 0, 0, 0, 0, 0x10]);
         assert_eq!(f.action(sig::SIGUSR1).handler, 0x1234);
         assert_eq!(f.action(sig::SIGUSR1).mask, 1 << 3);
         assert_eq!(f.action(sig::SIGPIPE).handler, SIG_IGN);

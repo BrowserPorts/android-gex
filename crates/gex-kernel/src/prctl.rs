@@ -11,8 +11,8 @@
 //! as a kernel built without it refuses it, `EINVAL`, and says so once
 //! ([`refuse`]): a call that reported success and did nothing would be
 //! believed. Those are a parent-death signal, a child subreaper, seccomp,
-//! `PR_SET_MM`, the saved auxiliary vector, a faulting `rdtsc`, syscall
-//! user dispatch and restored timer ids.
+//! `PR_SET_MM`, a faulting `rdtsc`, syscall user dispatch and restored
+//! timer ids.
 
 use crate::errno::SysResult;
 use crate::signal::{ProcSig, ThreadSig};
@@ -287,6 +287,12 @@ pub struct Cx<'a> {
     pub a64: bool,
 }
 
+/// The size of Linux's `mm->saved_auxv`: `AT_VECTOR_SIZE` words of the
+/// kernel's, which is twice `AT_VECTOR_SIZE_ARCH + AT_VECTOR_SIZE_BASE + 1`
+/// (include/linux/auxvec.h's 24 at android17-6.18; 2 for arm64, 3 for an
+/// x86-64 kernel that runs 32-bit programs).
+pub const SAVED_AUXV_BYTES: usize = 2 * (if gex_abi::X86 { 3 } else { 2 } + 24 + 1) * 8;
+
 /// Capabilities by number (include/uapi/linux/capability.h).
 const CAP_SETPCAP: u64 = 8;
 const CAP_SYS_RESOURCE: u64 = 24;
@@ -560,10 +566,18 @@ pub fn call(cx: &Cx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> Option<SysResult>
             }
         }
         pr::GET_AUXV => {
+            // `prctl_get_auxv`: as much of the saved vector as `arg3` bytes
+            // hold, and the size of all of it either way.
             if arg4 | arg5 != 0 {
                 Err(Errno::EINVAL)
             } else {
-                refuse(cx, 6, "PR_GET_AUXV")
+                let saved = cx.process.saved_auxv();
+                let n = arg3.min(saved.len() as u64) as usize;
+                if n > 0 && m.write(arg2, &saved[..n]).is_err() {
+                    Err(Errno::EFAULT)
+                } else {
+                    Ok(saved.len() as u64)
+                }
             }
         }
         pr::TIMER_CREATE_RESTORE_IDS => {
@@ -683,6 +697,8 @@ mod tests {
         let s = Signals::new();
         let root = Creds::new(0, 0);
         let inval = Err(Errno::EINVAL);
+        m.write(0x180a, &[0xff]).unwrap();
+        s.set_saved_auxv(&[6, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0]);
         let mut p = |a: [u64; 5]| run(&s, &root, true, &mut m, a);
         // No option 0, nor one past the last, nor another architecture's.
         for o in [0, 5, 6, 9, 10, 11, 12, 17, 18, 19, 20, 25, 26, 40, 43, 44, 45, 46, 48, 49, 50, 51, 54, 59, 60, 61, 62, 63, 64, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 79, 0x5961_6d61] {
@@ -766,11 +782,22 @@ mod tests {
             [pr::SET_SECCOMP, 1, 0, 0, 0],
             [pr::SET_MM, 1, 0, 0, 0],
             [pr::SET_CHILD_SUBREAPER, 1, 0, 0, 0],
-            [pr::GET_AUXV, 0x1000, 64, 0, 0],
             [pr::TIMER_CREATE_RESTORE_IDS, pr::TIMER_CREATE_RESTORE_IDS_ON, 0, 0, 0],
         ] {
             assert_eq!(p(a), inval, "{a:?}");
         }
+        // The saved auxiliary vector: the size of all of it is the answer,
+        // and no more is copied than was asked for.
+        let size = Ok(SAVED_AUXV_BYTES as u64);
+        assert_eq!(p([pr::GET_AUXV, 0x1800, 10, 0, 0]), size);
+        assert_eq!(p([pr::GET_AUXV, 0x1800, 10, 1, 0]), inval);
+        assert_eq!(p([pr::GET_AUXV, 0x1800, 10, 0, 1]), inval);
+        assert_eq!(p([pr::GET_AUXV, 0x1ff_ffff_ffff, 8, 0, 0]), Err(Errno::EFAULT));
+        assert_eq!(p([pr::GET_AUXV, 0x1ff_ffff_ffff, 0, 0, 0]), size);
+        assert_eq!(p([pr::GET_AUXV, 0x1000, u64::MAX, 0, 0]), size);
+        assert_eq!(m.read(0x1800, 11).unwrap(), [6, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0xff]);
+        assert_eq!(m.read(0x1000, 10).unwrap(), [6, 0, 0, 0, 0, 0, 0, 0, 0, 0x10]);
+        assert_eq!(m.read(0x1000 + SAVED_AUXV_BYTES as u64 - 1, 1).unwrap(), [0]);
     }
 
     /// x86's own options, and AArch64's refused there.

@@ -4393,6 +4393,7 @@ fn place_image(
 
     let stack_low = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
     store.data_mut().with_kernel(|k| {
+        k.signals.set_saved_auxv(&layout.auxv);
         let mut mm = k.mem.lock();
         mm.insert(
             stack_low,
