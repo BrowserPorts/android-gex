@@ -4974,6 +4974,7 @@ impl MapIo<'_> {
             let len_aligned = crate::mem::page_align_up(len);
             let file = self.fds.get(fd)?;
             let name = file.path.clone();
+            file.handle.may_map(offset, len_aligned, prot_bits)?;
             if file.handle.maps_own_memory() {
                 let start = self.mem.lock().mmap(addr, len, prot_bits, flags | mflags::ANONYMOUS, &name)?;
                 file.handle.mapped(start, len);
@@ -9291,7 +9292,7 @@ fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool, seen: Option<u64>
     }
     const P: u64 = crate::mem::PAGE_SIZE;
     // Only what the file holds (a page past its end is not the file's).
-    let held = map.len.min(md.size.saturating_sub(map.offset));
+    let held = map.len.min(map.file.handle.mapped_len().unwrap_or(md.size).saturating_sub(map.offset));
     let mut buf = vec![0u8; P as usize];
     let mut page = 0u64;
     let mut kept = false;

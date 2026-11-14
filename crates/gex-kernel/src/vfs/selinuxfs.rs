@@ -11,6 +11,15 @@
 //! Every mount is the one filesystem, as on Linux, where it has a single
 //! superblock: [`SelinuxFs::of_kernel`] is over the kernel's own server.
 //!
+//! `status` is a page of the kernel's that a program maps, to see a
+//! policy load or a change of `enforce` without a system call. A mapping
+//! in this kernel is a copy, so a program's is brought up to date at its
+//! next system call after the change (as every shared mapping here is),
+//! not at the instant: a program that only reads the page and makes no
+//! call at all meanwhile sees the change late. The mapping cannot be made
+//! writable when it is made; that `mprotect` cannot make it so later is
+//! not held.
+//!
 //! A write here is a command, taken whole: the policy in one write to
 //! `load`, a number to `enforce` or a boolean, a question to `access` and
 //! its kind, whose answer the same open file then reads. None moves the
@@ -87,6 +96,9 @@ const POLICYCAP_OFFSET: u64 = 0x0800_0000;
 const CLASS_STRIDE: u64 = 33;
 /// `sizeof(struct selinux_kernel_status)`: what `status` reads.
 const STATUS_LEN: usize = 20;
+/// What [`crate::locks::note_written`] is told when the status page has
+/// changed: no file's path, and all that matters is that it was told.
+const STATUS_CHANGED: &str = "selinuxfs:status";
 /// The page a write is copied into: one that would fill it is `ENOMEM`.
 const PAGE: usize = 4096;
 /// `SIMPLE_TRANSACTION_LIMIT`: the longest answer a question file gives;
@@ -498,6 +510,51 @@ impl FileHandle for File {
             return Ok(count);
         }
         let mut s = self.lock();
+        let status = s.status();
+        let done = self.command(&mut s, offset, buf, &text);
+        if s.status() != status {
+            // Every process's mapping of the status page is behind: have
+            // each look at its next system call.
+            crate::locks::note_written(STATUS_CHANGED);
+        }
+        done.map(|()| count)
+    }
+    fn write_keeps_position(&self) -> bool {
+        true
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(self.metadata.clone())
+    }
+    /// For `status`, how many times the page has changed, and one: never
+    /// 0, which would be no count.
+    fn changes(&self) -> u64 {
+        if self.path != "status" {
+            return 0;
+        }
+        self.lock().status()[1] as u64 / 2 + 1
+    }
+    fn mapped_len(&self) -> Option<u64> {
+        (self.path == "status").then_some(STATUS_LEN as u64)
+    }
+    /// Only `status` has a mapping: its one page, from its start, and not
+    /// for writing (`sel_mmap_handle_status`).
+    fn may_map(&self, offset: u64, len: u64, prot: u32) -> Result<(), Errno> {
+        if self.path != "status" {
+            return Err(Errno::ENODEV);
+        }
+        if offset != 0 || len != PAGE as u64 {
+            return Err(Errno::EIO);
+        }
+        if prot & crate::mem::prot::WRITE != 0 {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
+    }
+}
+
+impl File {
+    /// A write to a file that takes a command and gives no answer.
+    fn command(&self, s: &mut Server, offset: u64, buf: &[u8], text: &str) -> Result<(), Errno> {
         match self.path.as_str() {
             "load" => {
                 // The policy whole, in one write.
@@ -525,7 +582,7 @@ impl FileHandle for File {
                 if offset != 0 {
                     return Err(Errno::EINVAL);
                 }
-                s.transact("validatetrans", &text).ok_or(Errno::EINVAL)?.map_err(errno)?;
+                s.transact("validatetrans", text).ok_or(Errno::EINVAL)?.map_err(errno)?;
             }
             "disable" | "checkreqprot" => warn_no_longer_supported(&self.path),
             path => match path.strip_prefix("booleans/") {
@@ -536,7 +593,7 @@ impl FileHandle for File {
                     if offset != 0 {
                         return Err(Errno::EINVAL);
                     }
-                    self.still_its_boolean(&s)?;
+                    self.still_its_boolean(s)?;
                     let value = scanned_int(buf).ok_or(Errno::EINVAL)? != 0;
                     s.set_pending_bool(name, value).map_err(errno)?;
                 }
@@ -544,13 +601,7 @@ impl FileHandle for File {
                 None => return Err(Errno::EINVAL),
             },
         }
-        Ok(count)
-    }
-    fn write_keeps_position(&self) -> bool {
-        true
-    }
-    fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(self.metadata.clone())
+        Ok(())
     }
 }
 
@@ -762,6 +813,18 @@ mod tests {
         let mut one = [0u8; 4];
         assert_eq!((of.read(&mut one), one[0], of.read(&mut one)), (Ok(1), b'1', Ok(0)));
         assert_eq!(of.write(b"0"), Err(Errno::EINVAL), "but a read does, and a write is from the start");
+        // The status page: mapped whole, from its start, read-only, and
+        // counted as changed when it changes. Nothing else maps.
+        let status = open("status");
+        let (r, w) = (crate::mem::prot::READ, crate::mem::prot::WRITE);
+        assert_eq!((status.may_map(0, 4096, r), status.may_map(4096, 4096, r), status.may_map(0, 8192, r), status.may_map(0, 4096, r | w)), (Ok(()), Err(Errno::EIO), Err(Errno::EIO), Err(Errno::EPERM)));
+        assert_eq!((enforce.may_map(0, 4096, r), enforce.changes(), status.mapped_len()), (Err(Errno::ENODEV), 0, Some(20)));
+        let was = status.changes();
+        assert_eq!(enforce.write_at(0, b"1"), Ok(1));
+        assert_eq!(status.changes(), was, "enforce as it was is no change");
+        let seq = crate::locks::write_seq();
+        assert_eq!(enforce.write_at(0, b"0"), Ok(1));
+        assert!(status.changes() == was + 1 && crate::locks::write_seq() > seq);
     }
 
     /// Nothing is made, removed or moved here, and what is not here yet

@@ -607,6 +607,22 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// Whether the file may be mapped so: `len` bytes (whole pages) from
+    /// `offset` with protection `prot`. A file that is a page of the
+    /// kernel's lets only that page be mapped, and not for writing; one
+    /// with no mapping at all is `ENODEV`.
+    fn may_map(&self, offset: u64, len: u64, prot: u32) -> Result<(), Errno> {
+        let _ = (offset, len, prot);
+        Ok(())
+    }
+
+    /// How much of the file a mapping holds, for a file whose size does
+    /// not say: one that reads more than its size of 0 (selinuxfs's
+    /// `status`). `None`: its size.
+    fn mapped_len(&self) -> Option<u64> {
+        None
+    }
+
     /// Where a mapping of the device's own memory landed, and its length.
     fn mapped(&self, start: u64, len: u64) {
         let _ = (start, len);
