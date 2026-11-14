@@ -426,11 +426,13 @@ pub fn call(cx: &Cx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> Option<SysResult>
         // No filter is installed, and none can be: no CONFIG_SECCOMP.
         pr::GET_SECCOMP => Ok(0),
         pr::SET_SECCOMP => refuse(cx, 1, "PR_SET_SECCOMP"),
-        // The time stamp counter is x86's.
-        pr::GET_TSC if !cx.a64 => put_u32(m, arg2, pr::TSC_ENABLE as u32),
-        pr::SET_TSC if !cx.a64 => match arg2 {
+        // Whether reading the time stamp counter faults: x86's rdtsc, and
+        // since Linux 6.12 arm64's counter registers too (`get_tsc_mode`
+        // in arch/arm64/kernel/process.c). Reads never fault here.
+        pr::GET_TSC => put_u32(m, arg2, pr::TSC_ENABLE as u32),
+        pr::SET_TSC => match arg2 {
             pr::TSC_ENABLE => Ok(0),
-            pr::TSC_SIGSEGV => refuse(cx, 2, "PR_SET_TSC with PR_TSC_SIGSEGV (a faulting rdtsc)"),
+            pr::TSC_SIGSEGV => refuse(cx, 2, "PR_SET_TSC with PR_TSC_SIGSEGV (a faulting read of the counter)"),
             _ => Err(Errno::EINVAL),
         },
         pr::GET_TIMERSLACK => Ok(cx.thread.prctl().timer_slack_ns),
@@ -716,10 +718,14 @@ mod tests {
         s.set_saved_auxv(&[6, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0]);
         let mut p = |a: [u64; 5]| run(&s, &root, true, &mut m, a);
         // No option 0, nor one past the last, nor another architecture's.
-        for o in [0, 5, 6, 9, 10, 11, 12, 17, 18, 19, 20, 25, 26, 40, 43, 44, 45, 46, 48, 49, 50, 51, 54, 59, 60, 61, 62, 63, 64, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 79, 0x5961_6d61] {
+        for o in [0, 5, 6, 9, 10, 11, 12, 17, 18, 19, 20, 40, 43, 44, 45, 46, 48, 49, 50, 51, 54, 59, 60, 61, 62, 63, 64, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 79, 0x5961_6d61] {
             assert_eq!(p([o, 0, 0, 0, 0]), inval, "option {o}");
             assert_eq!(p([o, 0x1000, 8, 0, 0]), inval, "option {o}");
         }
+        // The counter's switch is arm64's too, since Linux 6.12.
+        assert_eq!(p([pr::GET_TSC, 0x1100, 0, 0, 0]), Ok(0));
+        assert_eq!(p([pr::SET_TSC, pr::TSC_ENABLE, 0, 0, 0]), Ok(0));
+        assert_eq!(p([pr::SET_TSC, 3, 0, 0, 0]), inval);
         // The option is an int: its high half is not looked at.
         assert_eq!(p([1 << 32 | pr::GET_DUMPABLE, 0, 0, 0, 0]), Ok(1));
         assert_eq!(p([pr::SET_PDEATHSIG, 0, 0, 0, 0]), Ok(0));
