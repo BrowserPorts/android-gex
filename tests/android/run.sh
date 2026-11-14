@@ -23,10 +23,14 @@ mkdir -p "$ERR/low"
 
 fail=0
 
-# check <program> <its last line> <its exit status>
+# check <program> <its last line> <its exit status> [root]
+# With "root", gexc runs it as uid 0; run as it is, it says for itself
+# when it lacks the right (exit 77).
 check() {
     if [ "$GEXC" = native ]; then
         out=$("$HERE/bin/$1" 2>"$ERR/$1.err")
+    elif [ "${4:-}" = root ]; then
+        out=$("$GEXC" run --uid 0 "$HERE/bin/$1" 2>"$ERR/$1.err")
     else
         out=$("$GEXC" run "$HERE/bin/$1" 2>"$ERR/$1.err")
     fi
@@ -98,6 +102,7 @@ run() {
     efault) check "$1" "efault ok" 0 ;;
     pdeath) check "$1" "pdeath ok" 0 ;;
     signalfd) check "$1" "signalfd ok" 0 ;;
+    mknod) check "$1" "mknod ok" 0 root ;;
     binder) check "$1" "binder ok" 0 ;;
     binderwork) check "$1" "binderwork ok" 0 ;;
     binderfreeze) check "$1" "binderfreeze ok" 0 ;;
@@ -117,7 +122,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd binder binderwork binderfreeze binderfs bindersg binderctx"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx"
     for p in $all; do
         run "$p"
     done
