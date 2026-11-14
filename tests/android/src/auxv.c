@@ -2,8 +2,10 @@
 // kernel saved it. Every pair up to AT_NULL is what getauxval answers, and
 // what follows is zero. The call returns the size of all of it whatever
 // length is asked for, and copies no more than that length. A forked child
-// has its parent's, and a program it then runs has its own.
+// has its parent's, and a program it then runs has its own. /proc/self/auxv
+// is the same vector, through its AT_NULL pair.
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/auxv.h>
@@ -49,6 +51,12 @@ int main(int argc, char **argv) {
     if (prctl(PR_GET_AUXV, v, sizeof v, 1, 0) != -1 || errno != EINVAL) status |= 16;
     errno = 0;
     if (prctl(PR_GET_AUXV, v, sizeof v, 0, 1) != -1 || errno != EINVAL) status |= 16;
+
+    unsigned char file[1024];
+    int fd = open("/proc/self/auxv", O_RDONLY);
+    long got = read(fd, file, sizeof file);
+    if (got != (pairs + 1) * 16 || memcmp(file, v, got)) status |= 64;
+    close(fd);
 
     // Run again by the child below: the checks above were the new program's.
     if (argc > 1) return status ? 1 : 0;
