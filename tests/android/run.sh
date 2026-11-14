@@ -57,6 +57,7 @@ run() {
     protect) check protect "protect ok" 0 ;;
     sigframe) check sigframe "sigframe ok" 0 ;;
     execfault) check execfault "execfault ok" 0 ;;
+    efault) check efault "efault ok" 0 ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -69,7 +70,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault; do
+    for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault; do
         run "$p"
     done
 fi
