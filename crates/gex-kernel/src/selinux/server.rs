@@ -279,36 +279,38 @@ impl Server {
             let sid = self.context_to_sid(question.trim_end_matches('\0'))?;
             return context(self, sid);
         }
-        let words: Vec<&str> = question.trim_end_matches('\0').split_ascii_whitespace().collect();
-        let class = |word: &str| word.parse::<u16>().map(u32::from).map_err(|_| Error::Invalid);
-        match (file, words.as_slice()) {
+        // Two contexts and a class's number, as the kernel's `sscanf`
+        // takes them, and what follows.
+        let (scon, tcon, class, rest) = scanned(question.trim_end_matches('\0')).ok_or(Error::Invalid)?;
+        let (word, _) = word(rest);
+        match file {
             // What follows the class is not read.
-            ("access", [scon, tcon, tclass, ..]) => {
+            "access" => {
                 let (ssid, tsid) = (self.context_to_sid(scon)?, self.context_to_sid(tcon)?);
-                let d = self.compute_av(ssid, tsid, class(tclass)?);
+                let d = self.compute_av(ssid, tsid, class);
                 Ok(format!("{:x} {:x} {:x} {:x} {} {:x}", d.allowed, !0u32, d.auditallow, d.auditdeny, self.seqno, d.flags).into_bytes())
             }
             // A new object's name may follow, with `+` for a space and
             // `%xx` for any byte. One that is not text is no name a policy
             // here has, which is as if none were given.
-            ("create", [scon, tcon, tclass, ..]) => {
-                let name = match words.get(3) {
-                    Some(coded) => String::from_utf8(percent_decoded(coded).ok_or(Error::Invalid)?).ok(),
-                    None => None,
+            "create" => {
+                let name = match word {
+                    "" => None,
+                    coded => String::from_utf8(percent_decoded(coded).ok_or(Error::Invalid)?).ok(),
                 };
                 let (ssid, tsid) = (self.context_to_sid(scon)?, self.context_to_sid(tcon)?);
-                let sid = self.compute_sid(ssid, tsid, class(tclass)?, av::TRANSITION, name.as_deref())?;
+                let sid = self.compute_sid(ssid, tsid, class, av::TRANSITION, name.as_deref())?;
                 context(self, sid)
             }
-            ("member" | "relabel", [scon, tcon, tclass, ..]) => {
+            "member" | "relabel" => {
                 let specified = if file == "member" { av::MEMBER } else { av::CHANGE };
                 let (ssid, tsid) = (self.context_to_sid(scon)?, self.context_to_sid(tcon)?);
-                let sid = self.compute_sid(ssid, tsid, class(tclass)?, specified, None)?;
+                let sid = self.compute_sid(ssid, tsid, class, specified, None)?;
                 context(self, sid)
             }
-            ("validatetrans", [oldcon, newcon, tclass, taskcon, ..]) => {
-                let class = class(tclass)?;
-                let (old, new, task) = (self.context_to_sid(oldcon)?, self.context_to_sid(newcon)?, self.context_to_sid(taskcon)?);
+            // Old, new, the class, and the task's after it.
+            "validatetrans" if !word.is_empty() => {
+                let (old, new, task) = (self.context_to_sid(scon)?, self.context_to_sid(tcon)?, self.context_to_sid(word)?);
                 self.validate_transition(old, new, task, class).map(|()| Vec::new())
             }
             _ => Err(Error::Invalid),
@@ -431,6 +433,30 @@ impl Server {
         self.commit_bools();
         Ok(())
     }
+}
+
+/// The next word of `text` (`%s`: white space passed over, then all that
+/// is not), and what follows it.
+fn word(text: &str) -> (&str, &str) {
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
+    let text = text.trim_start_matches(space);
+    text.split_at(text.find(space).unwrap_or(text.len()))
+}
+
+/// `sscanf(text, "%s %s %hu", ...)` and the rest of the text: two words
+/// and a number, which is the digits a third word starts with (at least
+/// one), kept to sixteen bits. So `12abc` is 12 and `abc` follows.
+fn scanned(text: &str) -> Option<(&str, &str, u32, &str)> {
+    let (first, rest) = word(text);
+    let (second, rest) = word(rest);
+    let (third, _) = word(rest);
+    let rest = &rest[rest.len() - rest.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']).len()..];
+    let digits = third.bytes().take_while(u8::is_ascii_digit).count();
+    if first.is_empty() || second.is_empty() || digits == 0 {
+        return None;
+    }
+    let number = third[..digits].bytes().fold(0u64, |n, d| n.wrapping_mul(10).wrapping_add((d - b'0') as u64));
+    Some((first, second, number as u16 as u32, &rest[digits..]))
 }
 
 /// A name as `create` takes it: `+` a space, `%xx` a byte, and the name
@@ -659,6 +685,18 @@ mod tests {
         assert_eq!(s.transact("access", "system_u:system_r:init_t:s0"), Some(Err(Error::Invalid)));
         assert_eq!(s.transact("create", "a b 1 %4"), Some(Err(Error::Invalid)));
         assert_eq!(s.transact("enforce", "1"), None);
+        // From the reference's sscanf, not seen: a number is the digits
+        // its word starts with, kept to sixteen bits, and what is left of
+        // the word is the next one.
+        assert_eq!(scanned("a  b\t12abc d"), Some(("a", "b", 12, "abc d")));
+        assert_eq!(scanned("a b 65538"), Some(("a", "b", 2, "")));
+        assert_eq!((scanned("a b"), scanned("a b x1"), scanned("")), (None, None, None));
+        let (init, exec) = ("system_u:system_r:init_t:s0", "system_u:object_r:exec_t:s0");
+        let plain = s.transact("create", &format!("{init} {exec} 1")).unwrap();
+        assert!(plain.is_ok());
+        assert_eq!(s.transact("create", &format!("{init} {exec} 65537 ignored more")).unwrap().is_ok(), true);
+        assert_eq!(s.transact("relabel", &format!("{init} {exec} 1junk")).unwrap().is_ok(), true);
+        assert_eq!(s.transact("validatetrans", &format!("{exec} {exec} 1")), Some(Err(Error::Invalid)), "no task");
         assert_eq!(percent_decoded("a+b%2fc%00d").as_deref(), Some(&b"a b/c"[..]));
     }
 
