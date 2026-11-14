@@ -249,6 +249,34 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 
+/// [`Kernel::flush_perms`], for a caller with the map and no kernel
+/// ([`free_call`]). The table is the kernel's own to write.
+pub fn flush_perms(mem: &crate::mem::Mm, m: &mut GuestMem<'_>, pid: i32) {
+    let mut mm = mem.lock();
+    if !mm.keeps_perms() {
+        return;
+    }
+    let table = gex_abi::perm_table();
+    let t0 = std::time::Instant::now();
+    let writes = mm.take_perm_writes();
+    if !writes.is_empty() {
+        use std::sync::atomic::Ordering::Relaxed;
+        PERM_STATS[0].fetch_add(1, Relaxed);
+        PERM_STATS[1].fetch_add(writes.iter().map(|(_, b)| b.len() as u64).sum(), Relaxed);
+        PERM_STATS[2].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    }
+    let user = m.take_user();
+    for (page, bytes) in writes {
+        if m.write(table + page, &bytes).is_err() {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[gex:{pid}] the protection table's bytes for page {page:#x} are past the end of the guest's memory: accesses there fault");
+            }
+        }
+    }
+    m.set_user(user);
+}
+
 /// Counts of the protection table's upkeep, for GEX_PERM_STATS: writes of
 /// it, their bytes, the nanoseconds working them out, and failed checks
 /// the host was asked about.
@@ -2021,9 +2049,12 @@ impl FdIo<'_> {
         // A shared mapping's bytes past the new end are no longer the file's:
         // zero, as the file now reads there once it grows again.
         if any_shared(self.shared) {
+            // (the kernel's own writes to the mappings, whatever they allow)
+            let user = m.take_user();
             for (at, _, k) in shared_spans(self.shared, f, len, u64::MAX - len) {
                 let _ = m.zero(at, k as usize);
             }
+            m.set_user(user);
         }
         Ok(0)
     }
@@ -4500,8 +4531,17 @@ pub struct MapIo<'a> {
 }
 
 impl MapIo<'_> {
-    /// The mapping call `n` (canonical), or `None` for any other.
+    /// The mapping call `n` (canonical), or `None` for any other. What it
+    /// writes is the kernel's own filling of the pages it maps, whatever
+    /// they allow the program (`GuestMem::take_user`).
     pub fn call(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
+        let user = m.take_user();
+        let r = self.call_own(m, n, a);
+        m.set_user(user);
+        r
+    }
+
+    fn call_own(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
         Some(match n {
             nr::BRK => {
                 // Zeroed, because Linux zeroes it and libc counts on that.
@@ -8251,6 +8291,12 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     let a64 = a64_thread(f.io.compat, f.io.wasm32);
     let tags = thread_tags(a64, f.signals.thread());
     m.set_tags(tags);
+    // And its addresses held to what its pages allow, as there.
+    let user = a64 && f.map.mem.lock().keeps_perms();
+    if user {
+        flush_perms(f.map.mem, m, f.pid);
+    }
+    m.set_user(user);
     let mut call = call;
     if a64 {
         untag_mapping_args(call.n, &mut call.a);
@@ -8259,7 +8305,10 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         untag_futex_args(call.n, &mut call.a);
     }
     let out = free_call_untagged(f, m, ctx_addr, call);
+    m.set_user(false);
     m.set_tags(crate::Tags::None);
+    // A change the call made to the map is in force when it returns.
+    flush_perms(f.map.mem, m, f.pid);
     match out {
         FreeOutcome::Blocking(op, mask) if tags == crate::Tags::All => FreeOutcome::Blocking(op.untagged(), mask),
         out => out,
@@ -8830,8 +8879,9 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
             // has: glibc aborts on a futex error it does not recognise,
             // and `EAGAIN` (word changed, so re-read and loop) is on its
             // recognised list while `EINVAL` is not. An address the
-            // process lacks is still `EFAULT`.
-            Err(if mapped { Errno::EAGAIN } else { Errno::EFAULT })
+            // process lacks is still `EFAULT`, and so is a word it has
+            // and may not read (`get_user` in `futex_wait_setup`).
+            Err(if mapped && m.read_u32(uaddr).is_ok() { Errno::EAGAIN } else { Errno::EFAULT })
         }
         futex::op::WAKE | futex::op::WAKE_BITSET => Ok(cx.table.wake(uaddr, val)),
         // Take the lock if it is free. Held, the waiters bit goes on
@@ -8996,6 +9046,14 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
 /// Write a shared mapping's changed pages over guest `[lo, hi)` back to its
 /// file ([`MapIo::flush_shared`]).
 fn write_back(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result<(), Errno> {
+    // The kernel's own reading of the mapping, whatever it allows.
+    let user = m.take_user();
+    let r = write_back_own(m, map, lo, hi);
+    m.set_user(user);
+    r
+}
+
+fn write_back_own(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result<(), Errno> {
     // A mapping of a descriptor opened read-only has nothing to
     // write back (Linux refuses it PROT_WRITE): its stores are
     // the process's own, as Wine's relocations of an image view
@@ -9167,6 +9225,13 @@ fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool, seen: Option<u64>
 /// `seen`: the file's change count as the lock call that granted the lock
 /// answered it (the page's global kernel does), which spares asking again.
 pub fn sync_shared_file(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, file: &OpenFile, sync: MapSync, seen: Option<u64>) {
+    // The kernel's own reading and writing of the mappings.
+    let user = m.take_user();
+    sync_shared_file_own(shared, m, file, sync, seen);
+    m.set_user(user);
+}
+
+fn sync_shared_file_own(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, file: &OpenFile, sync: MapSync, seen: Option<u64>) {
     let Some(view) = shared else { return };
     let maps = view.get();
     if maps.is_empty() || file.handle.is_stream() {
@@ -9223,17 +9288,23 @@ fn shared_spans(shared: Option<&SharedMapView>, file: &OpenFile, off: u64, n: u6
 /// After a read of `n` bytes at `off` into `buf`: the mapped parts as the
 /// mappings hold them.
 fn shared_after_read(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, file: &OpenFile, off: u64, buf: u64, n: u64) {
+    // The kernel's own copies between a buffer the call already used and
+    // the mappings, whatever those allow the program.
+    let user = m.take_user();
     for (at, r, k) in shared_spans(shared, file, off, n) {
         let _ = m.copy_within(at, buf + r, k as usize);
     }
+    m.set_user(user);
 }
 
 /// After a write of `n` bytes at `off` from `buf`: the same bytes in the
 /// mappings.
 fn shared_after_write(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, file: &OpenFile, off: u64, buf: u64, n: u64) {
+    let user = m.take_user();
     for (at, r, k) in shared_spans(shared, file, off, n) {
         let _ = m.copy_within(buf + r, at, k as usize);
     }
+    m.set_user(user);
 }
 
 /// Whether `shared` has any mapping (the fast path's one test).
@@ -10037,6 +10108,13 @@ impl SharedMapView {
     /// a process that maps nothing shared; one more (the global kernel's
     /// count, in the page a call) for one that does.
     pub fn catch_up(&self, m: &mut GuestMem<'_>) {
+        // The kernel's own writes to the mappings, whatever they allow.
+        let user = m.take_user();
+        self.catch_up_own(m);
+        m.set_user(user);
+    }
+
+    fn catch_up_own(&self, m: &mut GuestMem<'_>) {
         use std::sync::atomic::Ordering::{AcqRel, Relaxed};
         if !self.any.load(Relaxed) {
             return;
@@ -11076,7 +11154,15 @@ impl Kernel {
         // pointers for the kernel to access (`access_ok`).
         let tags = thread_tags(a64_thread(self.compat, self.wasm32), self.signals.thread());
         m.set_tags(tags);
+        // And its addresses are held to what its pages allow, by a table
+        // that is as the map stands.
+        let user = self.holds_user();
+        if user {
+            self.flush_perms(m);
+        }
+        m.set_user(user);
         let out = self.syscall_cwd(m, pc);
+        m.set_user(false);
         m.set_tags(crate::Tags::None);
         // A wait is run by the host, later and with no thread's ABI.
         let out = match out {
@@ -11743,7 +11829,13 @@ impl Kernel {
         // The rest of the thread's call, under the thread's ABI as its
         // start was ([`Self::syscall`]).
         m.set_tags(thread_tags(a64_thread(self.compat, self.wasm32), self.signals.thread()));
+        let user = self.holds_user();
+        if user {
+            self.flush_perms(m);
+        }
+        m.set_user(user);
         let out = self.finish_blocking_tagged(m, r);
+        m.set_user(false);
         m.set_tags(crate::Tags::None);
         self.flush_perms(m);
         out
@@ -12168,27 +12260,14 @@ impl Kernel {
     /// runs. Under the map's lock, so that two threads' writes land in the
     /// order of the changes they describe.
     pub fn flush_perms(&mut self, m: &mut GuestMem<'_>) {
-        let mut mm = self.mem.lock();
-        if !mm.keeps_perms() {
-            return;
-        }
-        let table = gex_abi::perm_table();
-        let t0 = std::time::Instant::now();
-        let writes = mm.take_perm_writes();
-        if !writes.is_empty() {
-            use std::sync::atomic::Ordering::Relaxed;
-            PERM_STATS[0].fetch_add(1, Relaxed);
-            PERM_STATS[1].fetch_add(writes.iter().map(|(_, b)| b.len() as u64).sum(), Relaxed);
-            PERM_STATS[2].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
-        }
-        for (page, bytes) in writes {
-            if m.write(table + page, &bytes).is_err() {
-                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!("[gex:{}] the protection table's bytes for page {page:#x} are past the end of the guest's memory: accesses there fault", self.pid);
-                }
-            }
-        }
+        flush_perms(&self.mem, m, self.pid);
+    }
+
+    /// Whether the calling thread's addresses are held to its pages'
+    /// protections while its call runs (`GuestMem::set_user`): an AArch64
+    /// thread's, in a process that keeps a protection table.
+    fn holds_user(&self) -> bool {
+        a64_thread(self.compat, self.wasm32) && self.mem.lock().keeps_perms()
     }
 
     /// An access check failed (`gex_abi::cache_op::PERM_READ`,

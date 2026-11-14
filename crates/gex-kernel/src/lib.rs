@@ -93,6 +93,9 @@ pub struct GuestMem<'a> {
     /// Which addresses lose their tag before they are checked
     /// ([`Self::set_tags`]).
     tags: Tags,
+    /// Whether the addresses given are a program's own, held to what its
+    /// pages allow ([`Self::set_user`]).
+    user: std::cell::Cell<bool>,
 }
 
 /// Which of a thread's addresses the kernel takes the tag off, AArch64's
@@ -120,13 +123,13 @@ pub fn untagged_addr(addr: u64) -> u64 {
 
 impl<'a> GuestMem<'a> {
     pub fn new(bytes: &'a mut [u8]) -> GuestMem<'a> {
-        GuestMem { span: gex_atomic::mem::Span::new(bytes), tags: Tags::None }
+        GuestMem { span: gex_atomic::mem::Span::new(bytes), tags: Tags::None, user: std::cell::Cell::new(false) }
     }
 
     /// Over a [`gex_atomic::mem::Span`] (the browser's, from address 0 of
     /// its memory).
     pub fn of_span(span: gex_atomic::mem::Span<'a>) -> GuestMem<'a> {
-        GuestMem { span, tags: Tags::None }
+        GuestMem { span, tags: Tags::None, user: std::cell::Cell::new(false) }
     }
 
     /// The memory as one slice, where it is one (a native host's, a
@@ -154,14 +157,80 @@ impl<'a> GuestMem<'a> {
         self.tags = tags;
     }
 
-    fn range(&self, addr: u64, len: usize) -> Result<std::ops::Range<usize>, Errno> {
+    /// Hold the addresses given from here on to their pages' protections
+    /// (`gex_abi::perm_table`), as a system call's are held: a read of
+    /// what the program may not read, or a write of what it may not write,
+    /// is `EFAULT` (the fault `copy_from_user` and `copy_to_user` take).
+    /// For a thread whose own accesses are checked
+    /// (`gex_abi::access_checks`), while its call runs. The kernel's own
+    /// use of the memory, what it maps and fills, is made with this off
+    /// ([`Self::take_user`]).
+    pub fn set_user(&self, on: bool) {
+        self.user.set(on);
+    }
+
+    /// Turn [`Self::set_user`] off for the kernel's own accesses, and say
+    /// what it was, to be set again after them.
+    pub fn take_user(&self) -> bool {
+        self.user.replace(false)
+    }
+
+    /// Whether a program may do `need` (`gex_abi::perm`) to every byte of
+    /// `r`: always, unless its addresses are being held to its pages
+    /// ([`Self::set_user`]). The runtime's thread contexts are let through:
+    /// every call reads its arguments there and writes its result.
+    fn allowed(&self, r: &std::ops::Range<usize>, need: u8) -> bool {
+        if !self.user.get() || r.is_empty() {
+            return true;
+        }
+        let (lo, hi) = (r.start as u64, r.end as u64 - 1);
+        if lo >= gex_abi::RESERVED_BASE && hi < gex_abi::RESERVED_END {
+            return true;
+        }
+        if hi >= gex_abi::perm_limit() {
+            return false;
+        }
+        let (first, last) = (lo >> gex_abi::PERM_PAGE_SHIFT, hi >> gex_abi::PERM_PAGE_SHIFT);
+        match self.span.get((gex_abi::perm_table() + first) as usize, (last - first + 1) as usize) {
+            Some(bytes) => bytes.iter().all(|b| b & need != 0),
+            None => false,
+        }
+    }
+
+    /// Where the bytes a program may read from `start` on end, no further
+    /// than `cap`: `cap` itself unless its addresses are being held to its
+    /// pages, and `start` when its first page may not be read.
+    fn readable_to(&self, start: usize, cap: usize) -> usize {
+        if !self.user.get() || (start as u64 >= gex_abi::RESERVED_BASE && (cap as u64) <= gex_abi::RESERVED_END) {
+            return cap;
+        }
+        let shift = gex_abi::PERM_PAGE_SHIFT;
+        let mut page = start as u64 >> shift;
+        while (page << shift) < cap as u64 {
+            let readable = (page << shift) < gex_abi::perm_limit()
+                && self.span.get((gex_abi::perm_table() + page) as usize, 1).is_some_and(|b| b[0] & gex_abi::perm::READ != 0);
+            if !readable {
+                break;
+            }
+            page += 1;
+        }
+        ((page << shift) as usize).clamp(start, cap)
+    }
+
+    /// `len` bytes at `addr` as a range of the memory, for an access that
+    /// needs `need` of its pages (`gex_abi::perm`).
+    fn range(&self, addr: u64, len: usize, need: u8) -> Result<std::ops::Range<usize>, Errno> {
         let addr = if self.tags == Tags::All { untagged_addr(addr) } else { addr };
         let start = addr as usize;
         let end = start.checked_add(len).ok_or(Errno::EFAULT)?;
         if addr > usize::MAX as u64 || end > self.limit() {
             return Err(Errno::EFAULT);
         }
-        Ok(start..end)
+        let r = start..end;
+        if !self.allowed(&r, need) {
+            return Err(Errno::EFAULT);
+        }
+        Ok(r)
     }
 
     /// How far the memory may be addressed: the length it was made with,
@@ -204,12 +273,12 @@ impl<'a> GuestMem<'a> {
         if addr % 4 != 0 {
             return None;
         }
-        let r = self.range(addr, 4).ok()?;
+        let r = self.range(addr, 4, gex_abi::perm::READ).ok()?;
         self.slice_mut(r).ok()
     }
 
     pub fn read(&self, addr: u64, len: usize) -> Result<&[u8], Errno> {
-        let r = self.range(addr, len)?;
+        let r = self.range(addr, len, gex_abi::perm::READ)?;
         self.slice(r)
     }
 
@@ -219,12 +288,12 @@ impl<'a> GuestMem<'a> {
     /// in -- and the guest chooses the size; that made one `apt-get update`
     /// claim 117 arena spans (1,872 MiB). See task 140.
     pub fn read_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], Errno> {
-        let r = self.range(addr, len)?;
+        let r = self.range(addr, len, gex_abi::perm::WRITE)?;
         self.slice_mut(r)
     }
 
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Errno> {
-        let r = self.range(addr, data.len())?;
+        let r = self.range(addr, data.len(), gex_abi::perm::WRITE)?;
         self.slice_mut(r)?.copy_from_slice(data);
         Ok(())
     }
@@ -232,7 +301,7 @@ impl<'a> GuestMem<'a> {
     #[track_caller]
     pub fn zero(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         big_op("zero", len);
-        let r = self.range(addr, len)?;
+        let r = self.range(addr, len, gex_abi::perm::WRITE)?;
         self.slice_mut(r)?.fill(0);
         Ok(())
     }
@@ -243,8 +312,8 @@ impl<'a> GuestMem<'a> {
     #[track_caller]
     pub fn copy_within(&mut self, src: u64, dst: u64, len: usize) -> Result<(), Errno> {
         big_op("copy_within", len);
-        let s = self.range(src, len)?;
-        let d = self.range(dst, len)?;
+        let s = self.range(src, len, gex_abi::perm::READ)?;
+        let d = self.range(dst, len, gex_abi::perm::WRITE)?;
         if !self.span.copy_within(s.start, d.start, len) {
             return Err(Errno::EFAULT);
         }
@@ -259,7 +328,7 @@ impl<'a> GuestMem<'a> {
     #[track_caller]
     pub fn zero_dirty(&mut self, addr: u64, len: usize) -> Result<(), Errno> {
         big_op("zero_dirty", len);
-        let r = self.range(addr, len)?;
+        let r = self.range(addr, len, gex_abi::perm::WRITE)?;
         zero_dirty_bytes(self.slice_mut(r)?);
         Ok(())
     }
@@ -308,13 +377,20 @@ impl<'a> GuestMem<'a> {
         if start >= limit {
             return Err(Errno::EFAULT);
         }
-        let end = (start + buf.len()).min(limit);
+        // As far as the program may read: a string that runs into a page
+        // it may not is `EFAULT` (`strncpy_from_user`).
+        let readable = self.readable_to(start, limit);
+        if readable == start {
+            return Err(Errno::EFAULT);
+        }
+        let end = (start + buf.len()).min(readable);
         let slice = self.slice(start..end)?;
         match slice.iter().position(|b| *b == 0) {
             Some(n) => {
                 buf[..n].copy_from_slice(&slice[..n]);
                 Ok(Some(n))
             }
+            None if end == readable && readable < limit => Err(Errno::EFAULT),
             None if end == limit => Err(Errno::ENAMETOOLONG),
             None => Ok(None),
         }
@@ -333,10 +409,16 @@ impl<'a> GuestMem<'a> {
         // Clamped to what exists, not what the view claims: a path near the top
         // of the stack is within a page of memory's end, and scanning `max`
         // bytes ran off into pages never mapped.
-        let end = (start + max).min(limit);
+        let readable = self.readable_to(start, limit);
+        if readable == start {
+            return Err(Errno::EFAULT);
+        }
+        let end = (start + max).min(readable);
         let slice = self.slice(start..end)?;
         match slice.iter().position(|b| *b == 0) {
             Some(n) => Ok(slice[..n].to_vec()),
+            // (it ran into a page the program may not read)
+            None if end == readable && readable < limit && end < start + max => Err(Errno::EFAULT),
             None => Err(Errno::ENAMETOOLONG),
         }
     }
