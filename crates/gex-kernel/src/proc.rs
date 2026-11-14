@@ -363,6 +363,12 @@ struct Proc {
     /// raised), and the pid that sent each. Under the table's lock.
     killed: u64,
     senders: [i32; 64],
+    /// The child whose end raised the SIGCHLD in `pending`: its `si_code`
+    /// (CLD_EXITED, CLD_KILLED, CLD_DUMPED), pid, real uid and `si_status`.
+    /// The first since the signal was last taken, as a signal that is
+    /// pending keeps the `siginfo` it was first raised with. Under the
+    /// table's lock.
+    child_end: Option<(i32, i32, u32, u32)>,
     /// Signals `tgkill` sent to one thread of this process from another
     /// process: (tid, signo, sender), in the order sent. Thread ids are the
     /// process's own, so the table cannot check one; a thread that is gone
@@ -659,6 +665,7 @@ impl ProcTable {
                     pending: Arc::new(AtomicU64::new(0)),
                     killed: 0,
                     senders: [0; 64],
+                    child_end: None,
                     to_threads: Vec::new(),
                     queue: crate::wait::Queue::new(),
                     info: Vec::new(),
@@ -709,6 +716,7 @@ impl ProcTable {
             pending: Arc::new(AtomicU64::new(0)),
             killed: 0,
             senders: [0; 64],
+            child_end: None,
             to_threads: Vec::new(),
             queue: crate::wait::Queue::new(),
             info: Vec::new(),
@@ -1107,6 +1115,8 @@ impl ProcTable {
         // dbus-daemon's activation helper does).
         let parent_q = {
             let mut t = self.lock();
+            // Its real uid, the first of its saved ids (`Creds::save`).
+            let child_uid = t.procs.iter().find(|p| p.pid == pid).and_then(|p| p.creds.get(..4)).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
             // its parent now (it may have been given to init since), or, if
             // a parked `wait4` has collected it already, the one it had
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid).or(was_ppid);
@@ -1123,9 +1133,22 @@ impl ProcTable {
                     }
                     None => 0,
                 },
-                _ => match ppid.and_then(|ppid| t.procs.iter().find(|p| p.pid == ppid)) {
+                _ => match ppid.and_then(|ppid| t.procs.iter_mut().find(|p| p.pid == ppid)) {
                 Some(parent) => {
-                    parent.pending.fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
+                    let was = parent.pending.fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
+                    if was & (1u64 << (SIGCHLD - 1)) == 0 {
+                        // CLD_EXITED with the exit code, CLD_KILLED or
+                        // CLD_DUMPED with the signal.
+                        let word = status as u32;
+                        let (code, value) = if word & 0x7f == 0 {
+                            (1, (word >> 8) & 0xff)
+                        } else if word & 0x80 != 0 {
+                            (3, word & 0x7f)
+                        } else {
+                            (2, word & 0x7f)
+                        };
+                        parent.child_end = Some((code, pid, child_uid, value));
+                    }
                     SIGNAL_SEQ.fetch_add(1, Ordering::Release);
                     parent.queue.id()
                 }
@@ -1491,6 +1514,19 @@ impl ProcTable {
             Some(p) => p.pending.swap(0, Ordering::AcqRel),
             None => 0,
         }
+    }
+
+    /// The child whose end raised the SIGCHLD that `pid` has just taken
+    /// ([`ProcTable::take_signals`]), as the signal's sender. `None` when
+    /// something else raised it, and where the table is another kernel's,
+    /// which does not say.
+    pub fn take_child_end(&self, pid: i32) -> Option<crate::signal::Source> {
+        if self.remote.is_some() {
+            return None;
+        }
+        let mut t = self.lock();
+        let (code, pid, uid, value) = t.procs.iter_mut().find(|p| p.pid == pid)?.child_end.take()?;
+        Some(crate::signal::Source { code, pid, uid, value: value as u64 })
     }
 
     /// Of the signals in `taken` (what [`ProcTable::take_signals`] just

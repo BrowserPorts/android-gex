@@ -513,6 +513,10 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_memfd(self: Arc<Self>) -> Option<Arc<crate::unix::MemFd>> {
         None
     }
+    /// A signalfd, whose mask `signalfd4` on it changes.
+    fn as_signalfd(self: Arc<Self>) -> Option<Arc<crate::signalfd::SignalFd>> {
+        None
+    }
     /// An open of a binder device, whose ioctls need to know their caller
     /// and may wait ([`crate::binder::BinderFile::ioctl`]).
     fn as_binder(self: Arc<Self>) -> Option<Arc<crate::binder::BinderFile>> {

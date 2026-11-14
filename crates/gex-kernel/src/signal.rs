@@ -415,6 +415,10 @@ impl ProcSig {
                 *slot = Some(Source { code: SI_USER, pid, uid, value: 0 });
             }
         }
+        // A child's end, with which child and how it ended.
+        if inbox & (1u64 << (sig::SIGCHLD - 1)) != 0 && sources[sig::SIGCHLD as usize].is_none() {
+            sources[sig::SIGCHLD as usize] = procs.take_child_end(pid);
+        }
         for signo in 1..=64u32 {
             if inbox & (1u64 << (signo - 1)) != 0 {
                 self.raise(signo, sources[signo as usize]);
@@ -875,7 +879,10 @@ impl Signals {
     /// process's set, and a `tgkill` taken by `sigtimedwait` said `SI_KERNEL`.
     pub fn claim_in(&self, set: u64) -> Option<(u32, Option<Source>)> {
         loop {
-            let ready = self.pending_raw() & set;
+            // The thread's own before its process's, the lowest number
+            // first in each (`dequeue_signal`).
+            let own = self.cur.pending() & set;
+            let ready = if own != 0 { own } else { self.proc.shared() & set };
             if ready == 0 {
                 return None;
             }

@@ -177,6 +177,7 @@ pub mod nr {
     pub const FLOCK: u64 = 32;
     pub const FALLOCATE: u64 = 47;
     pub const EVENTFD2: u64 = 19;
+    pub const SIGNALFD4: u64 = 74;
     pub const EPOLL_CREATE1: u64 = 20;
     pub const INOTIFY_INIT1: u64 = 26;
     pub const INOTIFY_ADD_WATCH: u64 = 27;
@@ -7343,8 +7344,33 @@ fn cred_change(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>,
 pub fn is_signal_call(n: u64) -> bool {
     matches!(
         n,
-        nr::KILL | nr::TKILL | nr::TGKILL | nr::RT_SIGQUEUEINFO | nr::RT_TGSIGQUEUEINFO | nr::RT_SIGTIMEDWAIT | nr::RT_SIGSUSPEND | nr::RT_SIGRETURN | nr::PIDFD_OPEN | nr::PIDFD_SEND_SIGNAL
+        nr::KILL | nr::TKILL | nr::TGKILL | nr::RT_SIGQUEUEINFO | nr::RT_TGSIGQUEUEINFO | nr::RT_SIGTIMEDWAIT | nr::RT_SIGSUSPEND | nr::RT_SIGRETURN | nr::PIDFD_OPEN | nr::PIDFD_SEND_SIGNAL | nr::SIGNALFD4
     )
+}
+
+/// `signalfd4(fd, mask, sizemask, flags)`: a descriptor that reads the
+/// pending signals of `mask` ([`crate::signalfd`]), or with `fd` one
+/// already, another mask for it. `SFD_NONBLOCK` and `SFD_CLOEXEC` are
+/// `O_NONBLOCK` and `O_CLOEXEC`. For the kernel's arm and [`free_call`]
+/// alike.
+pub fn signalfd4(fds: &FdTable, signals: &Signals, m: &GuestMem<'_>, a: [u64; 6]) -> SysResult {
+    let (fd, flags) = (a[0] as i32, a[3] & 0xffff_ffff);
+    if a[2] != 8 {
+        return Err(Errno::EINVAL);
+    }
+    let mask = m.read_u64(a[1])?;
+    if flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if fd == -1 {
+        let handle = Arc::new(crate::signalfd::SignalFd::new(mask, signals));
+        let file = OpenFile::new(handle, "anon_inode:[signalfd]".to_string(), (flags & oflags::O_NONBLOCK) | oflags::O_RDWR, true, true);
+        return fds.insert(file, flags & oflags::O_CLOEXEC != 0);
+    }
+    let file = fds.get(fd)?;
+    let signalfd = Arc::clone(&file.handle).as_signalfd().ok_or(Errno::EINVAL)?;
+    signalfd.set_mask(mask);
+    Ok(fd as u64)
 }
 
 /// `pidfd_open` and `pidfd_send_signal` (`crate::pidfd`), for the kernel's
@@ -7405,6 +7431,12 @@ pub fn sigtimedwait(signals: &Signals, m: &mut GuestMem<'_>, compat: bool, a: [u
                 m.write_u32(a[1] + 8, src.code as u32)?;
                 m.write_u32(fields, src.pid as u32)?;
                 m.write_u32(fields + 4, src.uid)?;
+                // What came with it: `sigqueue`'s value, a child's status.
+                if compat {
+                    m.write_u32(fields + 8, src.value as u32)?;
+                } else {
+                    m.write_u64(fields + 8, src.value)?;
+                }
             }
             None => m.write_u32(a[1] + 8, 0x80)?, // SI_KERNEL
         }
@@ -7519,7 +7551,11 @@ pub fn sigqueue_call(to: &KillTo<'_>, m: &GuestMem<'_>, n: u64, a: [u64; 6], wid
             if signo > 0 {
                 match t {
                     Some(t) => t.raise_from(signo, source),
-                    None => to.signals.raise_from(signo, source),
+                    // `rt_tgsigqueueinfo` to the caller is the thread's
+                    // own; `rt_sigqueueinfo` is its process's, for any
+                    // thread to take.
+                    None if thread => to.signals.raise_from(signo, source),
+                    None => to.signals.process().raise(signo, Some(source)),
                 }
             }
             Ok(0)
@@ -8302,6 +8338,8 @@ impl FreeCall {
 /// call ([`FdIo`], [`sigprocmask`]), the park included, and the signal that
 /// is due at a syscall's end.
 pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
+    // As [`Kernel::syscall`]: a signalfd answers for whoever asks it.
+    crate::signalfd::enter(f.signals);
     // As [`Kernel::syscall`]: a thread with AArch64's tagged address ABI
     // on may pass tagged pointers.
     let a64 = a64_thread(f.io.compat, f.io.wasm32);
@@ -8546,6 +8584,7 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
                 let to = KillTo { signals: f.signals, threads: f.threads, procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds };
                 pidfd_call(f.io.fds, f.procs, &to, n, a)
             }
+            nr::SIGNALFD4 => signalfd4(f.io.fds, f.signals, m, a),
             nr::RT_SIGQUEUEINFO | nr::RT_TGSIGQUEUEINFO => {
                 let to = KillTo { signals: f.signals, threads: f.threads, procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds };
                 sigqueue_call(&to, m, n, a, !compat)
@@ -11172,6 +11211,8 @@ impl Kernel {
 
     /// Handle one system call (`svc #0`, or `syscall`).
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
+        // A signalfd answers for whoever asks it.
+        crate::signalfd::enter(&self.signals);
         // Other processes' write-backs into this one's shared mappings.
         self.mem.shared_maps().catch_up(m);
         // A thread with AArch64's tagged address ABI on may pass tagged
@@ -12068,6 +12109,7 @@ impl Kernel {
             }
             nr::PPOLL | nr::PSELECT6 => self.fd_io().poll_now(m, n, a),
             nr::STATFS | nr::FSTATFS => self.sys_statfs(m, n, a[0], a[1]),
+            nr::SIGNALFD4 => signalfd4(&self.fds, &self.signals, m, a),
             // There is one process's view of the world and nothing consults
             // a umask, but a program that sets one wants the old value back.
 
@@ -14124,6 +14166,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::CLOSE => "close",
         nr::PIPE2 => "pipe2",
         nr::EVENTFD2 => "eventfd2",
+        nr::SIGNALFD4 => "signalfd4",
         nr::INOTIFY_INIT1 => "inotify_init1",
         nr::INOTIFY_ADD_WATCH => "inotify_add_watch",
         nr::INOTIFY_RM_WATCH => "inotify_rm_watch",

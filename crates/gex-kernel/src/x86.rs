@@ -350,11 +350,13 @@ pub mod raw {
     pub const UTIMENSAT: u64 = 280;
     pub const EPOLL_PWAIT: u64 = 281;
     pub const TIMERFD_CREATE: u64 = 283;
+    pub const SIGNALFD: u64 = 282;
     pub const EVENTFD: u64 = 284;
     pub const FALLOCATE: u64 = 285;
     pub const TIMERFD_SETTIME: u64 = 286;
     pub const TIMERFD_GETTIME: u64 = 287;
     pub const ACCEPT4: u64 = 288;
+    pub const SIGNALFD4: u64 = 289;
     pub const EVENTFD2: u64 = 290;
     pub const INOTIFY_INIT: u64 = 253;
     pub const INOTIFY_ADD_WATCH: u64 = 254;
@@ -687,6 +689,12 @@ pub fn translate(
         x::TIMERFD_GETTIME => nr::TIMERFD_GETTIME,
         x::ACCEPT4 => nr::ACCEPT4,
         x::EVENTFD2 => nr::EVENTFD2,
+        // `signalfd(fd, mask, sizemask)`: signalfd4 with no flags.
+        x::SIGNALFD => {
+            *a = [a[0], a[1], a[2], 0, 0, 0];
+            nr::SIGNALFD4
+        }
+        x::SIGNALFD4 => nr::SIGNALFD4,
         x::EPOLL_CREATE1 => nr::EPOLL_CREATE1,
         x::INOTIFY_INIT => {
             *a = [0; 6];
