@@ -13,7 +13,7 @@
 //! policy has the names for but does not allow, is the reference's as
 //! read, not yet as seen.
 
-use crate::selinux::policy::{Context, Decision, OContext, Policy};
+use crate::selinux::policy::{Context, Decision, OContext, Policy, POLICY_CAPABILITIES, VERSION_MAX};
 use std::collections::HashMap;
 
 /// `SECINITSID_NUM`: the last of the kernel's own SIDs.
@@ -236,6 +236,74 @@ impl Server {
         Ok(l.sid_of(new))
     }
 
+    /// What a file of selinuxfs that only reads its state reads, and its
+    /// mode (security/selinux/selinuxfs.c): `enforce`, `policyvers`,
+    /// `mls`, `deny_unknown`, `reject_unknown`, `checkreqprot`, and the
+    /// files under [`Server::dir`]'s directories. A number is its digits
+    /// with no newline; a context ends in a NUL. `None` for any other
+    /// name: the files that take a question, `load`, `status` and `policy`
+    /// are the filesystem's to answer.
+    pub fn file(&self, path: &str) -> Option<(u32, Result<Vec<u8>, Error>)> {
+        let policy = self.policy();
+        let number = |mode: u32, n: u32| Some((mode, Ok(n.to_string().into_bytes())));
+        match path.split('/').collect::<Vec<_>>().as_slice() {
+            ["enforce"] => number(0o644, self.enforcing as u32),
+            // The newest policy this reads, whatever is loaded.
+            ["policyvers"] => number(0o444, VERSION_MAX),
+            ["mls"] => number(0o444, policy.is_some_and(|p| p.mls) as u32),
+            // Before a policy nothing is unknown to it: denied, as a
+            // policy that says nothing would have it.
+            ["deny_unknown"] => number(0o444, !policy.is_some_and(|p| p.allow_unknown) as u32),
+            ["reject_unknown"] => number(0o444, policy.is_some_and(|p| p.reject_unknown) as u32),
+            // What mmap's PROT_EXEC is checked by: the kernel no longer
+            // lets it be anything but what the program asked for.
+            ["checkreqprot"] => number(0o644, 0),
+            ["class", class, "index"] => number(0o444, policy?.class_named(class)?),
+            ["class", class, "perms", perm] => {
+                let policy = policy?;
+                let perms = policy.perms_of(policy.class_named(class)?);
+                number(0o444, perms.iter().find(|(_, name)| name == perm)?.0)
+            }
+            // Its value, and the one that waits for a commit: one is not
+            // kept waiting here ([`Server::set_bool`] is the commit).
+            ["booleans", name] => {
+                let l = self.loaded.as_ref()?;
+                let state = l.bools[l.policy.bools.iter().position(|b| b.name == *name)?] as u8;
+                Some((0o644, Ok(format!("{state} {state}").into_bytes())))
+            }
+            ["initial_contexts", name] => {
+                let sid = INITIAL_SID_NAMES.iter().position(|n| n.as_deref() == Some(*name))? as u32;
+                Some((0o444, self.sid_to_context(sid, false).map(|text| [text.as_bytes(), b"\0"].concat())))
+            }
+            ["policy_capabilities", name] => {
+                let bit = POLICY_CAPABILITIES.iter().position(|c| c == name)? as u32;
+                number(0o444, policy.is_some_and(|p| p.policycaps.get(bit)) as u32)
+            }
+            _ => None,
+        }
+    }
+
+    /// The names in a directory of selinuxfs that the policy fills, or
+    /// the kernel's own lists: `class`, `class/<name>`,
+    /// `class/<name>/perms`, `booleans`, `initial_contexts`,
+    /// `policy_capabilities`. Before a policy `class` and `booleans` are
+    /// empty. Each is mode 0555.
+    pub fn dir(&self, path: &str) -> Option<Vec<String>> {
+        let policy = self.policy();
+        match path.split('/').collect::<Vec<_>>().as_slice() {
+            ["class"] => Some(policy.map(|p| p.classes.iter().map(|c| c.name.clone()).collect()).unwrap_or_default()),
+            ["class", class] => policy?.class_named(class).map(|_| vec!["index".to_string(), "perms".to_string()]),
+            ["class", class, "perms"] => {
+                let policy = policy?;
+                Some(policy.perms_of(policy.class_named(class)?).into_iter().map(|(_, name)| name.to_string()).collect())
+            }
+            ["booleans"] => Some(policy.map(|p| p.bools.iter().map(|b| b.name.clone()).collect()).unwrap_or_default()),
+            ["initial_contexts"] => Some(INITIAL_SID_NAMES.iter().flatten().map(|n| n.to_string()).collect()),
+            ["policy_capabilities"] => Some(POLICY_CAPABILITIES.iter().map(|n| n.to_string()).collect()),
+            _ => None,
+        }
+    }
+
     /// Set a boolean, by name (`booleans/<name>` and `commit_pending_bools`).
     pub fn set_bool(&mut self, name: &str, value: bool) -> Result<(), Error> {
         let l = self.loaded.as_mut().ok_or(Error::Invalid)?;
@@ -295,6 +363,74 @@ mod tests {
         // the range is the transition's): given while not enforcing.
         let new = s.compute_sid(init, exec, 1, av::TRANSITION, None).unwrap();
         assert_eq!(s.sid_to_context(new, false).as_deref(), Ok("system_u:app_r:app_t:s1:c0,c1"));
+    }
+
+    /// selinuxfs's files before a policy, as Linux 6.8 was seen to have
+    /// them (but `policyvers`, which is the newest this reads: 35, as on
+    /// Linux 7.0 and android17-6.18, where 6.8 read 33). The NUL a
+    /// context ends in and a capability's 0 are the reference's as read:
+    /// the kernel's answers were kept without the one, and not asked for
+    /// the other.
+    #[test]
+    fn before_a_policy_its_files_read_as_a_kernels() {
+        let s = Server::default();
+        let read = |path: &str| s.file(path).map(|(mode, bytes)| (mode, String::from_utf8(bytes.unwrap()).unwrap()));
+        for (path, mode, want) in [
+            ("enforce", 0o644, "0"),
+            ("policyvers", 0o444, "35"),
+            ("mls", 0o444, "0"),
+            ("deny_unknown", 0o444, "1"),
+            ("reject_unknown", 0o444, "0"),
+            ("checkreqprot", 0o644, "0"),
+            ("initial_contexts/file", 0o444, "file\0"),
+            ("initial_contexts/devnull", 0o444, "devnull\0"),
+            ("policy_capabilities/open_perms", 0o444, "0"),
+        ] {
+            assert_eq!(read(path), Some((mode, want.to_string())), "{path}");
+        }
+        assert_eq!(s.dir("class"), Some(vec![]));
+        assert_eq!(s.dir("booleans"), Some(vec![]));
+        let mut names = s.dir("initial_contexts").unwrap();
+        names.sort();
+        assert_eq!(names.join(" "), "any_socket devnull file init kernel netif netmsg node port security unlabeled");
+        assert_eq!(s.dir("policy_capabilities").unwrap().len(), 14);
+        assert_eq!((read("class/file/index"), read("booleans/allow_stuff"), read("load"), read("initial_contexts/nothing")), (None, None, None, None));
+    }
+
+    /// And with test.33 loaded: every file the kernel's answers have
+    /// (testdata/answers.txt's `read` lines), after the booleans it had
+    /// set by then.
+    #[test]
+    fn with_a_policy_its_files_read_as_a_kernels() {
+        let mut s = Server::default();
+        s.load(V33).unwrap();
+        let mut read = 0;
+        for line in include_str!("testdata/answers.txt").lines() {
+            let Some((question, want)) = line.split_once(" => ") else { continue };
+            match question.split_whitespace().collect::<Vec<_>>().as_slice() {
+                ["bool", name, value] => s.set_bool(name, *value == "1").unwrap(),
+                // 6.8's newest policy, not this one's.
+                ["read", "policyvers"] => assert_eq!(want, "33"),
+                // A process's own, which is not selinuxfs's.
+                ["read", path] if path.starts_with('/') => {}
+                ["read", path] => {
+                    let (_, bytes) = s.file(path).unwrap_or_else(|| panic!("{path}"));
+                    let text = String::from_utf8(bytes.unwrap()).unwrap();
+                    assert_eq!(text.ends_with('\0'), path.starts_with("initial_contexts/"), "{path}");
+                    assert_eq!(text.trim_end_matches('\0'), want, "{path}");
+                    read += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(read >= 15, "{read} files");
+        // In the policy's order of them, which is not the alphabet's.
+        assert_eq!(s.dir("booleans"), Some(vec!["other_thing".to_string(), "allow_stuff".to_string()]));
+        assert_eq!(s.dir("class/file"), Some(vec!["index".to_string(), "perms".to_string()]));
+        let perms = s.dir("class/file/perms").unwrap();
+        assert_eq!((perms[0].as_str(), perms[6].as_str()), ("read", "open"), "by number, as class/file/perms/* read");
+        assert!(s.dir("class").unwrap().contains(&"binder".to_string()));
+        assert_eq!((s.dir("class/nothing"), s.file("class/file/perms/nothing").map(|f| f.0)), (None, None));
     }
 
     /// When another policy takes a policy's place, a SID keeps its number
