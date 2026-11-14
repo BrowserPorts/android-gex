@@ -571,7 +571,11 @@ impl FileSystem for ProcFs {
                     out.push(DirEntry { name: pid.to_string(), file_type: FileType::Directory, ino: 1 });
                 }
                 for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "mounts", "sys"] {
-                    let file_type = if matches!(name, "self" | "sys") { FileType::Directory } else { FileType::Regular };
+                    let file_type = match name {
+                        "self" => FileType::Symlink,
+                        "sys" => FileType::Directory,
+                        _ => FileType::Regular,
+                    };
                     out.push(DirEntry { name: name.to_string(), file_type, ino: 1 });
                 }
                 return Ok(Arc::new(GenDir { entries: out }));
@@ -661,6 +665,11 @@ impl FileSystem for ProcFs {
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {
+        // `/proc/self` is a link to the caller's own directory, by name
+        // (fs/proc/self.c). Paths through it are resolved here all the same.
+        if path.trim_matches('/') == "self" {
+            return Ok(self.source.pid().to_string());
+        }
         let (path, _) = self.canonical(path)?;
         match path.as_str() {
             "self/exe" => Ok(self.source.exe()),

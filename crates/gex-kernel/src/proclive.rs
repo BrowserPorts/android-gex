@@ -151,7 +151,43 @@ impl ProcSource for KernelProcSource {
         if !path.starts_with('/') {
             return Some(crate::pty::link_name(&path));
         }
-        let canon = l.vfs.upgrade().map_or_else(|| path.clone(), |v| v.get().canonical(&path));
+        let canon = l.vfs.upgrade().map_or_else(
+            || path.clone(),
+            |v| {
+                // The root filesystem's links, then a link another mount
+                // names: `/proc/self/exe` opened is the program's file, and
+                // its descriptor says so (bionic's loader learns the
+                // program's path this way). Linux shows where the walk
+                // ended; a bound on it stands in for `ELOOP`.
+                let v = v.get();
+                let mut at = v.canonical(&path);
+                for _ in 0..40 {
+                    let Ok(to) = v.read_link(&at) else { break };
+                    // A relative link is from the directory it is in.
+                    let to = if to.starts_with('/') {
+                        to
+                    } else {
+                        let dir = at.rsplit_once('/').map_or("", |(d, _)| d);
+                        let mut parts: Vec<&str> = dir.split('/').filter(|c| !c.is_empty()).collect();
+                        for c in to.split('/') {
+                            match c {
+                                "" | "." => {}
+                                ".." => {
+                                    parts.pop();
+                                }
+                                c => parts.push(c),
+                            }
+                        }
+                        format!("/{}", parts.join("/"))
+                    };
+                    if to == at {
+                        break;
+                    }
+                    at = v.canonical(&to);
+                }
+                at
+            },
+        );
         Some(crate::pty::link_name(&canon))
     }
     fn fd_info(&self, fd: i32) -> Option<String> {
