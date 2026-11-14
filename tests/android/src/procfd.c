@@ -1,7 +1,8 @@
 // A descriptor's name in /proc/self/fd is where the open ended, not what
 // was asked for: /proc/self/exe opened is the program's file. bionic's
 // loader finds the program's real path this way, and its linker
-// configuration by that path.
+// configuration by that path. /proc/self/maps lists the program's own
+// code by the same path.
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -41,6 +42,21 @@ int main(void) {
     fd = open("/proc/self", O_PATH | O_DIRECTORY);
     if (fd < 0 || name_of(fd, by_fd) || strncmp(by_fd, "/proc/", 6) || !strcmp(by_fd, "/proc/self")) status |= 16;
     close(fd);
+
+    // The mapping this function is in is listed by the program's file.
+    static char line[PATH_MAX + 128];
+    int named = 0;
+    FILE *maps = fopen("/proc/self/maps", "re");
+    while (maps && fgets(line, sizeof line, maps)) {
+        unsigned long lo, hi;
+        size_t n = strlen(line), k = strlen(exe);
+        if (n && line[n - 1] == '\n') line[--n] = 0;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && lo <= (unsigned long)&main && (unsigned long)&main < hi) {
+            named = n >= k && !strcmp(line + n - k, exe);
+        }
+    }
+    if (maps) fclose(maps);
+    if (!named) status |= 32;
 
     if (status) {
         printf("procfd %d (%s, %s)\n", status, exe, by_fd);
