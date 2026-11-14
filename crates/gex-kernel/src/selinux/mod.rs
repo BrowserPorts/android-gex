@@ -11,12 +11,16 @@
 //! the policy lets be made (security/selinux/ss/services.c).
 //! [`server::Server`] is the policy that is loaded: the SIDs it has given
 //! out, its booleans, and what becomes of both when another policy takes
-//! its place. Their answers are checked against a Linux kernel's.
+//! its place. It also says what selinuxfs's files hold: what each that
+//! only reads its state reads, the words of the status page, and the
+//! answer to a question written to `context`, `access`, `create`,
+//! `member`, `relabel` or `validatetrans`. Their answers are checked
+//! against a Linux kernel's.
 //!
-//! Still to come, and nothing here pretends otherwise: selinuxfs,
-//! `/proc/<pid>/attr`, the labels of files, and the hooks that ask. Until
-//! then no file of selinuxfs exists, and a program that looks for SELinux
-//! finds it absent.
+//! Still to come, and nothing here pretends otherwise: the selinuxfs
+//! filesystem that serves those files, `/proc/<pid>/attr`, the labels of
+//! files, and the hooks that ask. Until then no file of selinuxfs exists,
+//! and a program that looks for SELinux finds it absent.
 
 pub mod policy;
 pub mod server;

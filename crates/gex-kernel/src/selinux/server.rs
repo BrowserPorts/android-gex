@@ -8,7 +8,8 @@
 //!
 //! Its tests are what Linux 7.0 was seen to show, before a policy, with
 //! one, and with another in its place (`initial_contexts`, a process's
-//! `attr/current`, the status page's count of loads). What it does for a
+//! `attr/current`, the status page's words), and the answers a kernel
+//! gave through selinuxfs with a policy loaded. What it does for a
 //! context that finds its names again in a later policy, and for one a
 //! policy has the names for but does not allow, is the reference's as
 //! read, not yet as seen.
