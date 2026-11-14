@@ -643,7 +643,18 @@ mod tests {
                 ["access", sc, tc, cl] => ("access", format!("{sc} {tc} {} ffffffff", class(&s, cl))),
                 [kind @ ("create" | "member" | "relabel"), sc, tc, cl, name @ ..] => (*kind, format!("{sc} {tc} {} {}", class(&s, cl), name.join(" ")).trim_end().to_string()),
                 ["validatetrans", old, new, cl, task] => ("validatetrans", format!("{old} {new} {} {task}", class(&s, cl))),
-                ["read", ..] => continue,
+                // A process's own, which is not selinuxfs's.
+                ["read", path] if path.starts_with('/') => continue,
+                // The asked kernel's newest policy: this one's, unless it
+                // was Linux 6.8.
+                ["read", "policyvers"] if want == "33" => continue,
+                ["read", path] => {
+                    let (_, bytes) = s.file(path).unwrap_or_else(|| panic!("{path}"));
+                    let text = String::from_utf8(bytes.unwrap()).unwrap();
+                    assert_eq!(text.trim_end_matches('\0'), want, "{path}");
+                    asked += 1;
+                    continue;
+                }
                 _ => panic!("{question}"),
             };
             let got = match s.transact(file, &text).unwrap() {
