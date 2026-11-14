@@ -919,6 +919,9 @@ impl<'a> Emitter<'a> {
                     self.line(format!("*(volatile {ut} *)({p}) = ({nt}){v};"));
                 }
             }
+            // A C unit is built without access checks
+            // (`gex_abi::set_access_checks`): nothing lifts one for it.
+            Stmt::MemCheck { pc, .. } => bail!("an access check (the instruction at {pc:#x}) in a C unit, which has no lowering for one"),
             Stmt::Trap { cond, pc, code } => {
                 // tier-1's lowering: only the faulting path writes back
                 // (everything, flags too: the host raises a signal from this

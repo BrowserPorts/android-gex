@@ -81,6 +81,11 @@ fn real_main() -> Result<ExitCode> {
                 .join()
                 .unwrap_or_else(|p| std::panic::resume_unwind(p));
             prof::finish();
+            // GEX_PERM_STATS: what keeping the protection table cost.
+            if std::env::var_os("GEX_PERM_STATS").is_some() {
+                let [writes, bytes, nanos, asked] = [0, 1, 2, 3].map(|i| gex_kernel::syscalls::PERM_STATS[i].load(std::sync::atomic::Ordering::Relaxed));
+                eprintln!("[gex] protection table: {writes} writes of {bytes} bytes in {:.3}s; {asked} failed checks", nanos as f64 / 1e9);
+            }
             r
         }
         "build" => cmd_build(&argv[2..]).map(|_| ExitCode::SUCCESS),
@@ -181,6 +186,9 @@ usage:
                                    --no-validate: write the module even if it
                                    is not valid wasm, for inspecting one that
                                    is not;
+                                   --access-checks: hold AArch64 code to its
+                                   pages' protections, as `run` does, for a
+                                   host that keeps the protection table;
                                    --closure --sysroot DIR: translate the
                                    program *and* every object it reaches
                                    through DT_NEEDED, each at the base a
@@ -694,6 +702,10 @@ fn choose_mem(ra: &mut RunArgs, wide: bool) -> Result<()> {
     ra.opts.mem = if m64 { gex_abi::MemFlavor::M64 } else { gex_abi::MemFlavor::M32 };
     // Everything translated in this process targets it.
     gex_abi::set_mem_flavor(ra.opts.mem);
+    // AArch64 code is held to its pages' protections, as on hardware.
+    // GEX_UNSAFE_NO_ACCESS_CHECKS=1 leaves the checks out, to price them:
+    // a bad access then goes through, or is the engine's trap.
+    gex_abi::set_access_checks(!gex_abi::X86 && std::env::var_os("GEX_UNSAFE_NO_ACCESS_CHECKS").is_none());
     // Its first program may be told later that it needs a 64-bit memory
     // (an exec that asks for one): the run then starts again with one
     // (`gex_native::restart_mem64`), unless the flavour was given.
@@ -947,6 +959,11 @@ fn cmd_build(args: &[String]) -> Result<()> {
                 pe_base = Some(u64::from_str_radix(v.trim_start_matches("0x"), 16).context("--pe-base expects hex")?);
             }
             "--no-shared-memory" => shared_memory = false,
+            // The module `gexc run` would translate: AArch64 code held to
+            // its pages' protections (`gex_abi::access_checks`). Not the
+            // default, because a module built here is for a host that
+            // keeps no protection table unless it is asked to.
+            "--access-checks" => gex_abi::set_access_checks(true),
             // Only for looking at a module that is known not to validate.
             "--mem64" => gex_abi::set_mem_flavor(gex_abi::MemFlavor::M64),
             "--no-validate" => no_validate = true,
@@ -1081,6 +1098,11 @@ fn cmd_build(args: &[String]) -> Result<()> {
             100.0 * guard as f64 / total as f64,
             guard,
         );
+        if gex_abi::access_checks() {
+            let checks = gex_emit::tier1::CHECK_BYTES.load(Relaxed);
+            let sites = gex_emit::tier1::CHECK_SITES.load(Relaxed);
+            eprintln!("  access checks: {:.0}% ({} bytes, {} accesses)", 100.0 * checks as f64 / total as f64, checks, sites);
+        }
     }
     // Which registers make up that percentage.
     if std::env::var_os("GEX_REG_HISTOGRAM").is_some() {

@@ -1028,6 +1028,16 @@ pub enum Stmt {
     /// `if cond { write back; store pc; breakpoint(ctx, pc, code) }`, the
     /// host raising the fault from `breakpoint`.
     Trap { cond: Value, pc: u64, code: i32 },
+    /// The check of the access that follows, `size` bytes at `addr + offset`
+    /// made by the instruction at `pc`, against its pages' protections
+    /// (`gex_abi::perm_table`): `need` is the `gex_abi::perm` bits it takes
+    /// (a load's read, a store's write, an atomic's both). Where a page of
+    /// it does not allow them, the instruction faults there, nothing of it
+    /// done: like a [`Stmt::Trap`] it reads every register, the context
+    /// holding the state before the instruction and `PC` its address. The
+    /// builder puts one before every guest access when asked to
+    /// ([`Builder::check_accesses`]).
+    MemCheck { addr: Value, offset: i64, size: u32, need: u8, pc: u64 },
     /// Store the low `bytes` bytes of a vector to guest memory.
     VStore {
         addr: Value,
@@ -1194,6 +1204,7 @@ impl Stmt {
             Stmt::HostCall { args, .. } => args.iter().copied().for_each(f),
             Stmt::X87 { args, .. } => args.iter().copied().for_each(f),
             Stmt::Trap { cond, .. } => f(*cond),
+            Stmt::MemCheck { addr, .. } => f(*addr),
             Stmt::VStore { addr, val, .. } => {
                 f(*addr);
                 f(*val);
@@ -1241,6 +1252,7 @@ impl Stmt {
             Stmt::Store { .. }
             | Stmt::HostCall { .. }
             | Stmt::Trap { .. }
+            | Stmt::MemCheck { .. }
             | Stmt::VStore { .. }
             | Stmt::MemCopy { .. }
             | Stmt::MemFill { .. }
@@ -1343,17 +1355,103 @@ impl Block {
 /// Incrementally builds a [`Block`]. The lifter's only interface to GIR.
 pub struct Builder {
     block: Block,
+    /// Whether each guest access gets its [`Stmt::MemCheck`], and the
+    /// address of the instruction being lifted.
+    checks: bool,
+    insn: u64,
+    /// How many statements the block had when that instruction began.
+    insn_at: usize,
 }
 
 impl Builder {
     pub fn new(start: u64) -> Builder {
         Builder {
             block: Block::new(start),
+            checks: false,
+            insn: start,
+            insn_at: 0,
         }
+    }
+
+    /// Put a [`Stmt::MemCheck`] before every guest access from now on
+    /// (`gex_abi::access_checks`).
+    pub fn check_accesses(&mut self) {
+        self.checks = true;
+    }
+
+    /// The instruction at `pc` is being lifted: its accesses' checks fault
+    /// there.
+    pub fn set_insn(&mut self, pc: u64) {
+        self.insn = pc;
+        self.insn_at = self.block.stmts.len();
+    }
+
+    /// The check of an access, before it. One that continues or overlaps
+    /// an earlier access of the same instruction's, through the same
+    /// address and needing the same, widens that one's check instead (a
+    /// pair's two registers, a vector's): the instruction faults whole, at
+    /// the first of its bytes a page does not allow, before any of it is
+    /// done.
+    fn check(&mut self, addr: Value, offset: i64, size: u32, need: u8) {
+        let pc = self.insn;
+        let from = self.insn_at.min(self.block.stmts.len());
+        for s in &mut self.block.stmts[from..] {
+            let Stmt::MemCheck { addr: a, offset: o, size: z, need: n, pc: p } = s else { continue };
+            if *a != addr || *n != need || *p != pc {
+                continue;
+            }
+            let (lo, hi) = ((*o).min(offset), (*o + *z as i64).max(offset + size as i64));
+            // (no gap between the two, and still a small access)
+            if hi - lo <= *z as i64 + size as i64 && hi - lo <= 256 {
+                (*o, *z) = (lo, (hi - lo) as u32);
+                return;
+            }
+        }
+        self.block.stmts.push(Stmt::MemCheck { addr, offset, size, need, pc });
+    }
+
+    /// The check of an access the builder does not see as one: what a host
+    /// call does at `addr` for the instruction (a sixteen-byte atomic, a
+    /// block zeroed), or the guest's side of an access made through a
+    /// chosen address ([`Builder::def_unchecked`]). Nothing unless accesses
+    /// are checked.
+    pub fn check_access(&mut self, addr: Value, offset: i64, size: u32, need: u8) {
+        if self.checks {
+            self.check(addr, offset, size, need);
+        }
+    }
+
+    /// [`Builder::stmt`] with no check of the statement's own access: the
+    /// runtime's, in memory the instruction does not name (operands spilled
+    /// for a host call).
+    pub fn stmt_unchecked(&mut self, s: Stmt) {
+        let checks = std::mem::replace(&mut self.checks, false);
+        self.stmt(s);
+        self.checks = checks;
+    }
+
+    /// [`Builder::def`] with no check of the expression's own access: one
+    /// [`Builder::check_access`] already covers, or whose address is not
+    /// always the guest's (a store-exclusive's, the runtime's scratch word
+    /// when its monitor does not match).
+    pub fn def_unchecked(&mut self, expr: Expr) -> Value {
+        let checks = std::mem::replace(&mut self.checks, false);
+        let v = self.def(expr);
+        self.checks = checks;
+        v
     }
 
     /// Append a value-producing expression and return its handle.
     pub fn def(&mut self, expr: Expr) -> Value {
+        if self.checks {
+            use gex_abi::perm;
+            match &expr {
+                Expr::Load { addr, offset, sz, .. } => self.check(*addr, *offset, sz.bytes(), perm::READ),
+                Expr::VLoad { addr, offset, bytes, .. } => self.check(*addr, *offset, *bytes, perm::READ),
+                Expr::Rmw { addr, sz, .. } | Expr::CmpXchg { addr, sz, .. } => self.check(*addr, 0, sz.bytes(), perm::READ | perm::WRITE),
+                _ => {}
+            }
+        }
         let v = Value(self.block.n_values);
         self.block.n_values += 1;
         self.block.stmts.push(Stmt::Def { dst: v, expr });
@@ -1369,6 +1467,13 @@ impl Builder {
     }
 
     pub fn stmt(&mut self, s: Stmt) {
+        if self.checks {
+            match &s {
+                Stmt::Store { addr, offset, sz, .. } => self.check(*addr, *offset, sz.bytes(), gex_abi::perm::WRITE),
+                Stmt::VStore { addr, offset, bytes, .. } => self.check(*addr, *offset, *bytes, gex_abi::perm::WRITE),
+                _ => {}
+            }
+        }
         self.block.stmts.push(s);
     }
 

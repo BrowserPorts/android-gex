@@ -2338,6 +2338,11 @@ fn run_thread_loop(
     }
     let mut pc = entry;
     let gate = store.data().spawn.as_ref().map(|s| Arc::clone(&s.gate));
+    // The protection table as the map stands, before the first instruction:
+    // what the loader placed, or a thread's stack its maker mapped.
+    if let Some(memory) = store.data().memory.clone() {
+        store.data_mut().with_kernel(|k| k.flush_perms(&mut GuestMem::new(memory.bytes())));
+    }
     loop {
         if let Some(g) = &gate {
             g.enter();
@@ -2822,7 +2827,9 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // An M64 memory's directory and patched bits are its dense tables
         // above 4 GiB instead.
         if gex_abi::mem64() {
-            let (a, b) = (gex_abi::DISPATCH_DIR64 as usize, gex_abi::HIGH_TABLES_END as usize);
+            // (not the protection table after them: the child's kernel
+            // writes its own, `Kernel::flush_perms`)
+            let (a, b) = (gex_abi::DISPATCH_DIR64 as usize, gex_abi::PERM_TABLE64 as usize);
             dst[a..b].copy_from_slice(&src[a..b]);
         }
         let mut sparse = SparseCopy::new();
@@ -2847,6 +2854,8 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     }
     drop(paused);
     publish_vm(&child_kernel, &child_mem);
+    // The child's protection table, before it runs: its memory is new.
+    child_kernel.flush_perms(&mut GuestMem::new(child_mem.bytes()));
 
     if std::env::var_os("GEX_WASM_TRACE").is_some() {
         eprintln!(
@@ -4456,6 +4465,40 @@ fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64
     Err(StopExecution.into())
 }
 
+/// An access check failed (`cache_op::PERM_READ`, `PERM_WRITE`): the
+/// instruction at `pc`, whose registers the context holds, would load from
+/// or store to the `size` bytes at `addr`. The kernel decides (`Kernel::access_fault`): the
+/// instruction runs again, its handler runs, or the process ends.
+fn access_fault(caller: &mut Caller<'_, HostState>, addr: u64, pc: u64, size: u32, write: bool) -> Result<()> {
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    let state = caller.data_mut();
+    let mut gm = GuestMem::new(memory.bytes());
+    let what = if write { "a store" } else { "a load" };
+    match state.with_kernel(|k| k.access_fault(&mut gm, pc, addr, size, write)) {
+        gex_kernel::syscalls::AccessFault::Retry => {
+            let _ = gm.write_u64(state.thread.ctx_addr + ctx::PC as u64, pc);
+            state.resume_cause = Some("an access the map allows".into());
+            state.resume_at = Some(pc);
+        }
+        gex_kernel::syscalls::AccessFault::Raised(gex_kernel::signal::Delivery::Resume(target)) => {
+            if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
+                eprintln!("gex: {what} at {addr:#x} its page does not allow, at pc {pc:#x}: SIGSEGV to the handler at {target:#x}");
+            }
+            state.resume_cause = Some("SIGSEGV".into());
+            state.resume_at = Some(target);
+        }
+        gex_kernel::syscalls::AccessFault::Raised(_) => {
+            state.exit = Some(Exit::Signal {
+                signal: signal::SIGSEGV,
+                pc,
+                detail: format!("{what} at {addr:#x}, which its page does not allow"),
+                internal: false,
+            })
+        }
+    }
+    Err(StopExecution.into())
+}
+
 /// A far transfer to a selector that names no user code segment: the #GP
 /// Windows delivers as an access violation, SIGSEGV here.
 /// A far transfer to a selector that is no code segment: #GP, which the
@@ -5420,6 +5463,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         m,
         imports::CACHE_OP,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64, op: i32, addr: i64| -> wasmtime::Result<()> { crate::host((|| -> anyhow::Result<()> {
+            if let Some((write, size)) = gex_abi::cache_op::perm_of(op) {
+                let pc = pc as u64 & !gex_cgen::RESUMABLE_PC;
+                return access_fault(&mut caller, addr as u64, pc, size, write);
+            }
             if op == gex_abi::cache_op::DC_ZVA {
                 let memory = caller
                     .data()

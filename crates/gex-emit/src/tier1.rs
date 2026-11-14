@@ -268,6 +268,7 @@ fn t1_fold() -> bool {
 pub fn knobs() -> u8 {
     inline_dispatch() as u8 | (t1_fold() as u8) << 1 | (gex_abi::kuser_fold() as u8) << 2 | (null_guard_on() as u8) << 3
         | (gex_ir::mxcsr_exact() as u8) << 4
+        | (gex_abi::access_checks() as u8) << 5
 }
 
 /// Whether the translators put the null guard (`gex_abi::NULL_GUARD`) on
@@ -708,6 +709,18 @@ struct Emitter<'a> {
     /// i32 scratches the wasm32 path uses. Zero, and never declared, unless
     /// the memory is 64-bit: a wasm32 function keeps exactly its locals.
     scratch_addr: (u32, u32),
+    /// An access being checked (`Stmt::MemCheck`): its first byte's
+    /// address, and for a bulk operation's range its last page and the page
+    /// the check has reached. Zero, and never declared, unless accesses are
+    /// checked (`gex_abi::access_checks`).
+    scratch_check: [u32; 3],
+    /// The protection bits an access is being held to, with them (an i32).
+    scratch_mask: u32,
+    /// The accesses checked so far in this block with nothing since that
+    /// could change the map (a host call): the value each was made
+    /// through, its offset and size, and what was needed. A later access
+    /// within one of them, needing no more, is not checked again.
+    pub(crate) checked: Vec<(Value, i64, u32, u8)>,
     /// Scratch for the safepoint counter.
     scratch_i32: u32,
     /// Scratch for the dispatch page index.
@@ -822,8 +835,13 @@ impl<'a> Emitter<'a> {
         } else {
             (0, 0)
         };
+        let scratch_check = if gex_abi::access_checks() { [(); 3].map(|_| f.add_local(ValType::I64)) } else { [0; 3] };
+        let scratch_mask = if gex_abi::access_checks() { f.add_local(ValType::I32) } else { 0 };
         Emitter {
             scratch_addr,
+            scratch_check,
+            scratch_mask,
+            checked: Vec::new(),
             f,
             cx,
             ctx_local: 0,
@@ -1043,6 +1061,7 @@ impl<'a> Emitter<'a> {
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
         self.value_ctx = vec![false; n];
+        self.checked.clear();
         self.value_ty = vec![Ty::I64; n];
         let dying = dying_after(block);
         self.prof_entry(block);
@@ -1117,6 +1136,7 @@ impl<'a> Emitter<'a> {
         self.value_local = vec![None; n];
         self.value_const = vec![None; n];
         self.value_ctx = vec![false; n];
+        self.checked.clear();
         self.value_ty = vec![Ty::I64; n];
 
         let dying = dying_after(block);
@@ -1540,6 +1560,199 @@ impl<'a> Emitter<'a> {
         debug_assert_eq!(off, 0);
     }
 
+    /// The protection byte ([`gex_abi::perm`]) of the page the address in
+    /// the i64 local `at` is in, or of the page numbered there (`page`):
+    /// byte 0, which refuses everything, for one past what the table covers.
+    fn perm_byte(&mut self, at: u32, page: bool) {
+        use gex_abi::PERM_PAGE_SHIFT;
+        let limit = gex_abi::perm_limit();
+        self.f.local_get(at);
+        if !page {
+            self.f.i64_const(PERM_PAGE_SHIFT as i64);
+            self.f.byte(code::I64_SHR_U);
+        }
+        self.f.i64_const(0);
+        self.f.local_get(at);
+        self.f.i64_const(if page { limit >> PERM_PAGE_SHIFT } else { limit } as i64);
+        self.f.byte(code::I64_LT_U);
+        self.f.select();
+        if gex_abi::mem64() {
+            self.f.load64(0x2d, 0, gex_abi::PERM_TABLE64); // i32.load8_u
+        } else {
+            self.f.byte(code::I32_WRAP_I64);
+            self.f.load(0x2d, 0, gex_abi::PERM_TABLE as u32); // i32.load8_u
+        }
+    }
+
+    /// Whether the protection byte on the stack lacks any of `bits`.
+    fn perm_lacks(&mut self, bits: i32) {
+        self.f.i32_const(bits);
+        self.f.byte(0x71); // i32.and
+        if bits.count_ones() == 1 {
+            self.f.byte(code::I32_EQZ);
+        } else {
+            self.f.i32_const(bits);
+            self.f.byte(0x47); // i32.ne
+        }
+    }
+
+    /// An access check's failure, inside the branch that found it: the
+    /// registers written back and the host asked (`cache_op::PERM_READ` or
+    /// `PERM_WRITE`, with the access's size) about the access whose first
+    /// byte `addr` pushes. It raises the fault at the instruction (`pc`,
+    /// which it writes to the context), or runs the instruction again where
+    /// the process's map allows the access after all; it does not return to
+    /// tier 1, and a function leaves for the context's PC, as from a trap.
+    fn perm_fault(&mut self, need: u8, size: u32, pc: u64, addr: impl FnOnce(&mut Self)) {
+        self.flush_conditional();
+        self.f.local_get(self.ctx_local);
+        self.f.i64_const((pc | self.resumable_pc) as i64);
+        self.f.i32_const(gex_abi::cache_op::perm(need & gex_abi::perm::WRITE != 0, size));
+        addr(self);
+        self.f.call(self.cx.cache_op);
+        if self.resumable_pc != 0 {
+            self.f.i32_const(0);
+            self.f.ret();
+        } else {
+            self.f.unreachable();
+        }
+    }
+
+    /// An access check ([`Stmt::MemCheck`]): the page of the access's first
+    /// byte looked up in the process's protection table
+    /// (`gex_abi::perm_table`), and held to `need` -- for an access that
+    /// runs into the next page, to what that page and the next both allow.
+    /// One that fails goes to the host ([`Self::perm_fault`]). Not for the
+    /// thread's own context, which is the runtime's.
+    fn emit_mem_check(&mut self, addr: Value, offset: i64, size: u32, need: u8, pc: u64) {
+        use gex_abi::{perm, PERM_PAGE, PERM_PAGE_SHIFT};
+        if self.is_ctx(addr) {
+            return;
+        }
+        // Checked already, through the same value, with nothing between
+        // that changes what a page allows.
+        if self.checked.iter().any(|&(v, o, z, n)| v == addr && o <= offset && offset + size as i64 <= o + z as i64 && n & need == need) {
+            return;
+        }
+        self.checked.push((addr, offset, size, need));
+        let [t, _, _] = self.scratch_check;
+        let before = self.f.code.len();
+        // The first byte, as `emit_address` makes it: without its top byte.
+        if let Some(c) = self.value_const.get(addr.0 as usize).copied().flatten() {
+            let ea = c.wrapping_add(offset as u64);
+            let ea = if tbi() { ea & TBI_ADDR_MASK } else { ea };
+            // A load from the instruction's own page (a literal): the page
+            // was executable when this was translated, and so readable.
+            let page = |a: u64| a >> PERM_PAGE_SHIFT;
+            if need == perm::READ && page(ea) == page(pc) && page(ea.wrapping_add(size as u64 - 1)) == page(pc) {
+                return;
+            }
+            self.f.i64_const(ea as i64);
+        } else {
+            self.push(addr);
+            self.drop_tag();
+            if offset != 0 {
+                self.f.i64_const(offset);
+                self.f.byte(0x7c); // i64.add
+            }
+        }
+        self.f.local_set(t);
+        self.perm_byte(t, false);
+        if size == 1 {
+            self.perm_lacks(need as i32);
+        } else {
+            // The bits to hold the byte to: `need`, moved up to what the
+            // page and the next both allow when the access's last byte is
+            // in the next page (its offset in the page and the bytes after
+            // its first come to a page or more: at most two, and bit 12 of
+            // the sum is then set).
+            debug_assert!((size as u64) < PERM_PAGE);
+            let mask = self.scratch_mask;
+            self.f.i32_const(need as i32);
+            self.f.local_get(t);
+            self.f.byte(code::I32_WRAP_I64);
+            self.f.i32_const(PERM_PAGE as i32 - 1);
+            self.f.byte(0x71); // i32.and
+            self.f.i32_const(size as i32 - 1);
+            self.f.byte(0x6a); // i32.add
+            self.f.i32_const(PERM_PAGE_SHIFT as i32 - 2);
+            self.f.byte(0x76); // i32.shr_u
+            self.f.i32_const(perm::BOTH_SHIFT as i32);
+            self.f.byte(0x71); // i32.and
+            self.f.byte(0x74); // i32.shl
+            self.f.local_tee(mask);
+            self.f.byte(0x71); // i32.and
+            self.f.local_get(mask);
+            self.f.byte(0x47); // i32.ne
+        }
+        self.f.if_void();
+        self.perm_fault(need, size, pc, |e| e.f.local_get(t));
+        self.f.end();
+        CHECK_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
+        CHECK_SITES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The check of a bulk operation's range, `len` bytes at `addr`, before
+    /// it: every page of it looked up, and the fault at the first byte of
+    /// the range in the first page that lacks `need`, with nothing of the
+    /// operation done (the function it stands for, `memcpy` or `memset`,
+    /// would have done what came before that page). `PC` is the
+    /// statement's, or the block's: the function's entry.
+    fn emit_range_check(&mut self, addr: Value, len: Value, need: u8) {
+        use gex_abi::PERM_PAGE_SHIFT;
+        let [t, last, p] = self.scratch_check;
+        let pc = self.stmt_pc.unwrap_or(self.block_start);
+        let before = self.f.code.len();
+        self.f.block_void();
+        // Nothing of an empty range is touched.
+        self.push(len);
+        self.f.byte(code::I64_EQZ);
+        self.f.br_if(0);
+        self.push(addr);
+        self.drop_tag();
+        self.f.local_tee(t);
+        self.push(len);
+        self.f.byte(0x7c); // i64.add
+        self.f.i64_const(1);
+        self.f.byte(0x7d); // i64.sub
+        self.f.i64_const(PERM_PAGE_SHIFT as i64);
+        self.f.byte(code::I64_SHR_U);
+        self.f.local_set(last);
+        self.f.local_get(t);
+        self.f.i64_const(PERM_PAGE_SHIFT as i64);
+        self.f.byte(code::I64_SHR_U);
+        self.f.local_set(p);
+        self.f.loop_void();
+        self.perm_byte(p, true);
+        self.perm_lacks(need as i32);
+        self.f.if_void();
+        self.perm_fault(need, 1, pc, |e| {
+            // The later of the range's first byte and the page's.
+            let page_start = |e: &mut Self| {
+                e.f.local_get(p);
+                e.f.i64_const(PERM_PAGE_SHIFT as i64);
+                e.f.byte(code::I64_SHL);
+            };
+            e.f.local_get(t);
+            page_start(e);
+            e.f.local_get(t);
+            page_start(e);
+            e.f.byte(code::I64_GT_U);
+            e.f.select();
+        });
+        self.f.end();
+        self.f.local_get(p);
+        self.f.i64_const(1);
+        self.f.byte(0x7c); // i64.add
+        self.f.local_tee(p);
+        self.f.local_get(last);
+        self.f.byte(0x58); // i64.le_u
+        self.f.br_if(0);
+        self.f.end();
+        self.f.end();
+        CHECK_BYTES.fetch_add(self.f.code.len() - before, Ordering::Relaxed);
+    }
+
     /// Whether `v` is the context address plus offsets (`value_ctx`).
     fn is_ctx(&self, v: Value) -> bool {
         self.value_ctx.get(v.0 as usize).copied().unwrap_or(false)
@@ -1935,6 +2148,30 @@ impl<'a> Emitter<'a> {
     // -- statements --------------------------------------------------------
 
     fn stmt(&mut self, s: &Stmt, block: &Block) {
+        // Under access checks a bulk operation's range is checked before
+        // it, where its extent is what the function it stands for touches
+        // (`memcpy`, `memset`). A comparison's is not (it stops at the first
+        // difference), and no AArch64 code makes one or a string operation.
+        if gex_abi::access_checks() {
+            // What was checked holds until the host runs: a system call
+            // may change the map.
+            match s {
+                Stmt::Def { expr, .. } if !matches!(expr, Expr::HostCall { .. }) => {}
+                Stmt::WriteReg { .. } | Stmt::Store { .. } | Stmt::VStore { .. } | Stmt::MemCheck { .. } | Stmt::Trap { .. } | Stmt::Fence => {}
+                _ => self.checked.clear(),
+            }
+            match s {
+                Stmt::MemCopy { dst, src, len } => {
+                    self.emit_range_check(*src, *len, gex_abi::perm::READ);
+                    self.emit_range_check(*dst, *len, gex_abi::perm::WRITE);
+                }
+                Stmt::MemFill { dst, len, .. } => self.emit_range_check(*dst, *len, gex_abi::perm::WRITE),
+                Stmt::MemCmp { .. } | Stmt::StrOp { .. } => {
+                    panic!("a bulk comparison in the block at {:#x}: its range cannot be checked against the pages' protections", self.block_start)
+                }
+                _ => {}
+            }
+        }
         match s {
             Stmt::Def { dst, expr } => self.def(*dst, expr),
             Stmt::WriteReg { reg, val } => {
@@ -1970,6 +2207,7 @@ impl<'a> Emitter<'a> {
                 self.host_call(*func, args, None, block);
             }
             Stmt::X87 { op, args, outs } => self.emit_x87(*op, args, outs),
+            Stmt::MemCheck { addr, offset, size, need, pc } => self.emit_mem_check(*addr, *offset, *size, *need, *pc),
             Stmt::Trap { cond, pc, code } => {
                 // Only the faulting path writes the registers back, so they
                 // stay dirty for the path that carries on.
@@ -5878,6 +6116,11 @@ pub static SAFEPOINT_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// Bytes emitted proving a guest address is inside guest memory, on every
 /// load and store whose address is not a literal constant.
 pub static GUARD_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Bytes of emitted code that check an access against its pages'
+/// protections (`gex_abi::access_checks`).
+pub static CHECK_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// How many accesses those bytes check.
+pub static CHECK_SITES: AtomicUsize = AtomicUsize::new(0);
 /// Bytes emitted choosing where to go next: the directory load, the slot
 /// arithmetic, the table selection and the indirect tail call.
 pub static DISPATCH_BYTES: AtomicUsize = AtomicUsize::new(0);

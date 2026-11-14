@@ -159,8 +159,51 @@ pub const DISPATCH_MAX_PAGES64: u64 = LIMIT64 / DISPATCH_PAGE;
 /// The M64 [`PATCHED_PAGES`]: one bit per page of [`DISPATCH_MAX_PAGES64`].
 pub const PATCHED_PAGES64: u64 = DISPATCH_DIR64 + DISPATCH_MAX_PAGES64 * 4;
 
+/// An M64 process's page protections ([`perm`]): one byte for each
+/// [`PERM_PAGE`] of [`LIMIT64`], after [`PATCHED_PAGES64`]. An M32 process's
+/// are [`PERM_TABLE`]; see [`perm_table`].
+pub const PERM_TABLE64: u64 = PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8;
+
+/// Bytes in [`PERM_TABLE64`].
+pub const PERM_TABLE64_BYTES: u64 = LIMIT64 >> PERM_PAGE_SHIFT;
+
+/// The page a protection table has a byte for: Linux's 4 KiB.
+pub const PERM_PAGE_SHIFT: u32 = 12;
+pub const PERM_PAGE: u64 = 1 << PERM_PAGE_SHIFT;
+
+/// What a process's own code may do to each page of its memory, as the
+/// translated code checks before every access ([`access_checks`]) and the
+/// process's kernel writes as its map changes, before the change returns to
+/// the program: a byte a page, in [`perm_table`].
+///
+/// A byte's low four bits are 0 where nothing is mapped, else [`MAPPED`]
+/// with what the mapping's protection lets a program do there ([`READ`],
+/// [`WRITE`]) and whether it may run there ([`EXEC`]). Its high four
+/// ([`BOTH_SHIFT`]) are what this page and the next both allow, so an access
+/// that may reach the next page is let through with one look. Page 0 is
+/// never mapped, so byte 0 always refuses: an address past the table is
+/// looked up there.
+pub mod perm {
+    pub const READ: u8 = 1;
+    pub const WRITE: u8 = 2;
+    pub const EXEC: u8 = 4;
+    pub const MAPPED: u8 = 8;
+    /// Where in a byte what the page and the next both allow is.
+    pub const BOTH_SHIFT: u32 = 4;
+
+    /// A page's bits for a mapping with protection `prot` (`PROT_*`): what
+    /// an AArch64 Linux process may do there. A page that may be written or
+    /// run may be read (a write-only mapping's pages are readable, and so
+    /// are an execute-only one's on a processor without EPAN, which is the
+    /// one gex is).
+    pub const fn of_prot(prot: u32) -> u8 {
+        let p = (prot & 7) as u8;
+        MAPPED | (p & (WRITE | EXEC)) | if p != 0 { READ } else { 0 }
+    }
+}
+
 /// End of the M64 tables, rounded to 1 MiB.
-pub const HIGH_TABLES_END: u64 = (PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 + 0xf_ffff) & !0xf_ffff;
+pub const HIGH_TABLES_END: u64 = (PERM_TABLE64 + PERM_TABLE64_BYTES + 0xf_ffff) & !0xf_ffff;
 
 /// The bottom of the part of an M64 process's high arena ([`IMAGE_ZONE64`])
 /// above the M64 tables: what the memory grows over as that part is used.
@@ -189,6 +232,47 @@ pub fn page_gen() -> u64 {
 #[inline]
 pub fn patched_pages() -> u64 {
     if mem64() { PATCHED_PAGES64 } else { PATCHED_PAGES }
+}
+
+/// The protection table of this process's memory flavour ([`perm`]).
+#[inline]
+pub fn perm_table() -> u64 {
+    if mem64() { PERM_TABLE64 } else { PERM_TABLE }
+}
+
+/// One past the highest address [`perm_table`] has a byte for: the end of
+/// what an M32 address can name, or of an M64 memory.
+#[inline]
+pub fn perm_limit() -> u64 {
+    if mem64() { LIMIT64 } else { PERM_TABLE_BYTES << PERM_PAGE_SHIFT }
+}
+
+static ACCESS_CHECKS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Hold translated code to its pages' protections from now on: every load
+/// and store is checked against [`perm_table`] first, and one its page does
+/// not allow is the fault Linux raises (SIGSEGV, `SEGV_MAPERR` where nothing
+/// is mapped, `SEGV_ACCERR` where the protection refuses it), at the
+/// instruction, with the address. Set before anything is translated or
+/// mapped; the process's kernel keeps the table from then on.
+///
+/// AArch64 guests only, and tier 1 and the function JIT only: a C unit is
+/// built without the checks, and x86 code has none.
+pub fn set_access_checks(on: bool) {
+    ACCESS_CHECKS.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether accesses are checked ([`set_access_checks`]).
+#[inline]
+pub fn access_checks() -> bool {
+    !X86 && ACCESS_CHECKS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The lowest address a guest mapping may have: [`GUEST_FLOOR`], or the end
+/// of an M32 process's protection table, which lies just above it.
+#[inline]
+pub fn guest_floor() -> u64 {
+    if access_checks() && !mem64() { PERM_TABLE + PERM_TABLE_BYTES } else { GUEST_FLOOR }
 }
 
 /// The directory's byte range `[dispatch_dir(), end)`.
@@ -572,6 +656,18 @@ pub const DISPATCH_DIR_BYTES: u64 = DISPATCH_MAX_PAGES * 4;
 
 /// First guest address above the dispatch directory.
 pub const DISPATCH_DIR_END: u64 = DISPATCH_DIR + DISPATCH_DIR_BYTES;
+
+/// An M32 process's page protections ([`perm`]), when its accesses are
+/// checked ([`access_checks`]): a byte for each [`PERM_PAGE`] of the 4 GiB
+/// its addresses can name, in the megabyte between the dispatch directory
+/// and the lowest address an image is linked at ([`EXEC_BASE`]). Nothing is
+/// mapped there. (A Windows image's import placeholders are numbered from
+/// the same range, in a process that has no table: addresses, not memory.)
+pub const PERM_TABLE: u64 = DISPATCH_DIR_END;
+
+/// Bytes in [`PERM_TABLE`].
+pub const PERM_TABLE_BYTES: u64 = (1 << 32) >> PERM_PAGE_SHIFT;
+const _: () = assert!(PERM_TABLE + PERM_TABLE_BYTES == EXEC_BASE);
 
 /// Ceiling on one dispatch table (10M slots ≈ 38 MiB of guest text). The
 /// table grows from the image's size, so the ceiling costs nothing until used.
@@ -1220,6 +1316,30 @@ pub mod cache_op {
     /// host lets tier-1 have the address: the miss that follows translates
     /// it and its block takes the slot.
     pub const FTAB_TIER1: i32 = 14;
+    /// Not a cache operation: an access check failed for a load
+    /// ([`super::access_checks`]) whose first byte is at `addr`; the
+    /// context's registers are those before the instruction at `pc`. The
+    /// host asks the process's map: an access it allows after all (the
+    /// table was behind) runs again, any other is the fault. The operation
+    /// carries the access's size above its low byte ([`perm`]).
+    pub const PERM_READ: i32 = 15;
+    /// The same for a store, or an atomic access.
+    pub const PERM_WRITE: i32 = 16;
+
+    /// The operation for a failed check of an access of `size` bytes.
+    pub const fn perm(write: bool, size: u32) -> i32 {
+        (if write { PERM_WRITE } else { PERM_READ }) | ((size - 1) << 8) as i32
+    }
+
+    /// A failed access check's operation as whether it was a store's and
+    /// the access's size, or `None` for any other operation.
+    pub const fn perm_of(op: i32) -> Option<(bool, u32)> {
+        match op & 0xff {
+            PERM_READ => Some((false, (op as u32 >> 8) + 1)),
+            PERM_WRITE => Some((true, (op as u32 >> 8) + 1)),
+            _ => None,
+        }
+    }
 }
 
 /// The lowest address a guest access may name: below it are the runtime's
@@ -1470,7 +1590,14 @@ mod tests {
         // `[4 GiB, 8 GiB)`, below the arena.
         assert!(DISPATCH_DIR64 >= GUEST_LIMIT && DISPATCH_DIR64 >= 8 << 30);
         assert!(DISPATCH_MAX_PAGES64 * DISPATCH_PAGE == LIMIT64);
-        assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= HIGH_TABLES_END);
+        assert!(PATCHED_PAGES64 + DISPATCH_MAX_PAGES64 / 8 <= PERM_TABLE64);
+        assert!(PERM_TABLE64 + PERM_TABLE64_BYTES <= HIGH_TABLES_END);
+        // Byte 0 refuses: page 0 is below everything a guest maps.
+        assert!(RESERVED_BASE >= PERM_PAGE && PERM_TABLE + PERM_TABLE_BYTES <= EXEC_BASE);
+        assert_eq!(perm::of_prot(0), perm::MAPPED);
+        assert_eq!(perm::of_prot(1), perm::MAPPED | perm::READ);
+        assert_eq!(perm::of_prot(2), perm::MAPPED | perm::READ | perm::WRITE);
+        assert_eq!(perm::of_prot(4), perm::MAPPED | perm::READ | perm::EXEC);
         assert!(HIGH_ARENA_BASE < LIMIT64 && HIGH_ARENA_BASE % WASM_PAGE == 0);
     }
 }

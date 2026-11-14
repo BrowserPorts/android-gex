@@ -16458,9 +16458,55 @@ fn heal_dirs(start: u64) {
     }
 }
 
+/// An access check failed (`cache_op::PERM_READ`, `PERM_WRITE`): the
+/// instruction at `pc`, whose state the context holds, would load from or
+/// store to `addr`. The process's map decides (`Kernel::access_verdict`):
+/// the instruction runs again, or the fault goes to the guest's handler
+/// from that state, else it is fatal. Trapped out of either way, as for an
+/// alignment fault.
+fn access_fault(ctx: i32, pc: u64, addr: u64, size: u32, write: bool) -> ! {
+    let mut gm = guest();
+    let c = match my_ctx() {
+        0 => ctx as u32 as u64,
+        m => m,
+    };
+    let resume = |target: u64| {
+        if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
+            run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
+        }
+        set_resume(target);
+        set_resume_ctx(c);
+    };
+    match with_exec_lock(|h| h.kernel.access_verdict(&mut guest(), pc, addr, size, write)) {
+        None => {
+            let _ = gm.write_u64(c + ctx::PC as u64, pc);
+            resume(pc)
+        }
+        Some((at, fault)) => match sigs::fault_as(&mut gm, c, 11, Some(fault), pc, at) {
+            gex_kernel::signal::Delivery::Resume(target) => resume(target),
+            _ => {
+                trace_line(&format!("gex: {} at {addr:#x} its page does not allow, at pc={pc:#x} (SIGSEGV)\n", if write { "a store" } else { "a load" }));
+                exit_here(-11, Some(pc));
+            }
+        },
+    }
+    trap();
+}
+
+/// `gex_set_access_checks(1)`, before anything is translated or mapped:
+/// AArch64 code held to its pages' protections (`gex_abi::access_checks`).
+/// Off unless asked for here: the page's host has not been run with it.
+#[no_mangle]
+pub extern "C" fn gex_set_access_checks(on: u32) {
+    gex_abi::set_access_checks(on != 0);
+}
+
 #[no_mangle]
 pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
     let _pc = fault_pc(_pc);
+    if let Some((write, size)) = gex_abi::cache_op::perm_of(op) {
+        access_fault(_ctx, _pc as u64, addr as u64, size, write);
+    }
     if op == gex_abi::cache_op::LOW_ACCESS {
         low_access("a locked access", addr as u64, _ctx, _pc as u64);
     }

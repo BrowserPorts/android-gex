@@ -377,10 +377,127 @@ impl std::fmt::Debug for Mm {
 /// (see `MemoryMap::grows_on_demand`).
 pub const BACKED_ISLAND: u64 = u64::MAX;
 
+/// A process's page protections as its table (`gex_abi::perm_table`) was
+/// last written, for a process whose accesses are checked
+/// (`gex_abi::access_checks`): what a change to the map has still to write
+/// there is how the map differs from this.
+#[derive(Debug, Default)]
+pub struct Perms {
+    /// Each mapped range and its [`gex_abi::perm`] bits as the table has
+    /// them, in order, neighbours with the same bits as one.
+    shown: Vec<(u64, u64, u8)>,
+    /// The map's generation then; `None` when the table may not hold even
+    /// that (a new program's memory may be the old one or a new one): every
+    /// range it had or now has is to be written.
+    at: Option<u64>,
+}
+
+impl Clone for Perms {
+    /// A copy of the map is another memory's (a fork child's), whose table
+    /// holds nothing yet: all of the map is to be written.
+    fn clone(&self) -> Perms {
+        Perms::default()
+    }
+}
+
+impl Perms {
+    /// The table's bytes for what has changed in `vmas`, the map at
+    /// `generation`: each run's first page and its bytes. A page's own bits
+    /// are its mapping's ([`gex_abi::perm::of_prot`]) where one covers all
+    /// of it, else 0, and 0 below everything a guest maps; its byte is those
+    /// with what it and the next page both allow above (so the page before
+    /// a change is written too).
+    fn writes(&mut self, vmas: &[Vma], generation: u64) -> Vec<(u64, Vec<u8>)> {
+        use gex_abi::{perm, PERM_PAGE, PERM_PAGE_SHIFT};
+        if self.at == Some(generation) {
+            return Vec::new();
+        }
+        let known = self.at.replace(generation).is_some();
+        let mut now: Vec<(u64, u64, u8)> = Vec::with_capacity(vmas.len());
+        for v in vmas {
+            let bits = perm::of_prot(v.prot);
+            match now.last_mut() {
+                Some(last) if last.1 == v.start && last.2 == bits => last.1 = v.end,
+                _ => now.push((v.start, v.end, bits)),
+            }
+        }
+        let dirty = if known {
+            Self::differ(&self.shown, &now)
+        } else {
+            let mut all: Vec<(u64, u64)> = self.shown.iter().chain(&now).map(|&(s, e, _)| (s, e)).collect();
+            all.sort_unstable();
+            all
+        };
+        self.shown = now;
+        let pages = gex_abi::perm_limit() >> PERM_PAGE_SHIFT;
+        let floor = gex_abi::GUEST_FLOOR >> PERM_PAGE_SHIFT;
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for (s, e) in dirty {
+            let (ps, pe) = ((s >> PERM_PAGE_SHIFT).saturating_sub(1), ((e + PERM_PAGE - 1) >> PERM_PAGE_SHIFT).min(pages));
+            if ps >= pe {
+                continue;
+            }
+            match runs.last_mut() {
+                Some(last) if ps <= last.1 => last.1 = last.1.max(pe),
+                _ => runs.push((ps, pe)),
+            }
+        }
+        runs.into_iter()
+            .map(|(ps, pe)| {
+                // One page more, for the last page's next.
+                let n = (pe - ps) as usize + 1;
+                let mut own = vec![0u8; n];
+                let (lo, hi) = (ps << PERM_PAGE_SHIFT, (pe + 1) << PERM_PAGE_SHIFT);
+                let first = self.shown.partition_point(|r| r.1 <= lo);
+                for &(s, e, bits) in self.shown[first..].iter().take_while(|r| r.0 < hi) {
+                    // The pages the range covers all of.
+                    let a = ((s + PERM_PAGE - 1) >> PERM_PAGE_SHIFT).max(ps).max(floor);
+                    let b = (e >> PERM_PAGE_SHIFT).min(pe + 1).min(pages);
+                    if a < b {
+                        own[(a - ps) as usize..(b - ps) as usize].fill(bits);
+                    }
+                }
+                let bytes = (0..n - 1).map(|i| own[i] | (own[i] & own[i + 1]) << perm::BOTH_SHIFT).collect();
+                (ps, bytes)
+            })
+            .collect()
+    }
+
+    /// Where two lists of ranges and bits differ, in order. (Most of a map
+    /// is the same from one change to the next: what the two lists share at
+    /// either end is set aside first.)
+    fn differ(old: &[(u64, u64, u8)], new: &[(u64, u64, u8)]) -> Vec<(u64, u64)> {
+        let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+        let (old, new) = (&old[pre..], &new[pre..]);
+        let suf = old.iter().rev().zip(new.iter().rev()).take_while(|(a, b)| a == b).count();
+        let (old, new) = (&old[..old.len() - suf], &new[..new.len() - suf]);
+        let at = |r: &[(u64, u64, u8)], a: u64| {
+            let i = r.partition_point(|&(s, _, _)| s <= a);
+            r[..i].last().filter(|&&(_, e, _)| a < e).map_or(0, |&(_, _, bits)| bits)
+        };
+        let mut pts: Vec<u64> = old.iter().chain(new).flat_map(|&(s, e, _)| [s, e]).collect();
+        pts.sort_unstable();
+        pts.dedup();
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        for w in pts.windows(2) {
+            if at(old, w[0]) != at(new, w[0]) {
+                match out.last_mut() {
+                    Some(last) if last.1 == w[0] => last.1 = w[1],
+                    _ => out.push((w[0], w[1])),
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The process's address space.
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
     vmas: Vec<Vma>,
+    /// The protection table's state ([`Perms`]), for a process whose
+    /// accesses are checked; `None` for any other.
+    perms: Option<Perms>,
     /// Where the program's stack began at `execve` (`mm->start_stack`),
     /// which `/proc/<pid>/stat` gives; 0 until a host says.
     start_stack: u64,
@@ -627,9 +744,10 @@ fn arena_full(lo: u64, hi: u64, len: u64) {
 /// Whether `[start, end)` touches guest memory the runtime owns but no VMA
 /// records, so `is_free` would call it free:
 ///
-/// - below [`gex_abi::DISPATCH_DIR_END`]: the thread contexts and the dispatch
-///   directory. A guest mapping there wipes directory entries, and a hot block
-///   then misses forever.
+/// - below [`gex_abi::guest_floor`]: the thread contexts and the dispatch
+///   directory, and an M32 process's protection table when it has one. A
+///   guest mapping there wipes directory entries, and a hot block then
+///   misses forever.
 /// - `[STACK_TOP, MMAP_BOTTOM)`, the gap between the guest's stack and the
 ///   arena: in the browser the shim shares the guest's memory and keeps its
 ///   own stack and data there. Natively it is only unused, and refusing it
@@ -637,7 +755,7 @@ fn arena_full(lo: u64, hi: u64, len: u64) {
 /// - in an M64 memory, `[DISPATCH_DIR64, HIGH_TABLES_END)`: its dense
 ///   directory and patched-page bits.
 pub fn hits_runtime(start: u64, end: u64) -> bool {
-    start < gex_abi::DISPATCH_DIR_END
+    start < gex_abi::guest_floor()
         || (start < MMAP_BOTTOM && end > gex_abi::STACK_TOP)
         || (gex_abi::mem64() && start < gex_abi::HIGH_TABLES_END && end > gex_abi::DISPATCH_DIR64)
 }
@@ -645,8 +763,8 @@ pub fn hits_runtime(start: u64, end: u64) -> bool {
 /// Where the runtime's range holding `at` ends ([`hits_runtime`]'s ranges,
 /// less page zero, which nothing holds); `None` for an address in none.
 fn runtime_end(at: u64) -> Option<u64> {
-    if (gex_abi::RESERVED_BASE..gex_abi::DISPATCH_DIR_END).contains(&at) {
-        Some(gex_abi::DISPATCH_DIR_END)
+    if (gex_abi::RESERVED_BASE..gex_abi::guest_floor()).contains(&at) {
+        Some(gex_abi::guest_floor())
     } else if (gex_abi::STACK_TOP..MMAP_BOTTOM).contains(&at) {
         Some(MMAP_BOTTOM)
     } else if gex_abi::mem64() && (gex_abi::DISPATCH_DIR64..gex_abi::HIGH_TABLES_END).contains(&at) {
@@ -668,6 +786,7 @@ impl MemoryMap {
     pub fn new(brk_start: u64) -> MemoryMap {
         MemoryMap {
             vmas: Vec::new(),
+            perms: gex_abi::access_checks().then(Perms::default),
             start_stack: 0,
             view: ViewCell(std::sync::Arc::new(MapView::new(&[]))),
             generation: 0,
@@ -709,8 +828,29 @@ impl MemoryMap {
         // The log goes on (the host has still to retire the old code), but
         // not the old image's shared mappings: exec wrote them back already.
         fresh.log.shared_maps.clear();
+        // The protection table goes on too: it holds the old program's
+        // mappings, to be cleared.
+        fresh.perms = self.perms.take();
+        if let Some(p) = &mut fresh.perms {
+            p.at = None;
+        }
         *self = fresh;
         self.publish();
+    }
+
+    /// What the protection table (`gex_abi::perm_table`) is to be written
+    /// with since it last was: each run's first page and its bytes. Nothing
+    /// for a map that keeps none, or that has not changed.
+    pub fn take_perm_writes(&mut self) -> Vec<(u64, Vec<u8>)> {
+        match &mut self.perms {
+            Some(p) => p.writes(&self.vmas, self.generation),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether this map keeps a protection table.
+    pub fn keeps_perms(&self) -> bool {
+        self.perms.is_some()
     }
 
     /// Say which file the mappings in `[start, end)` are of, and that
@@ -2256,6 +2396,47 @@ impl MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The protection table's bytes follow the map: a mapping's pages get
+    /// its bits, with what each and the next both allow above; a change
+    /// writes the pages it touches and the one before; an unchanged map
+    /// writes nothing; and a new program's map or a copy writes all it has.
+    #[test]
+    fn the_protection_table_follows_the_map() {
+        let at = MMAP_BOTTOM;
+        let page = at >> 12;
+        let mut m = MemoryMap::new(0x100_0000);
+        m.perms = Some(Perms::default());
+        m.insert(at, at + 0x3000, prot::READ | prot::EXEC, "text");
+        m.insert(at + 0x3000, at + 0x4000, prot::READ | prot::WRITE, "data");
+        // 0xd: mapped, read, execute. 0xb: mapped, read, write.
+        assert_eq!(m.take_perm_writes(), vec![(page - 1, vec![0x00, 0xdd, 0xdd, 0x9d, 0x0b])]);
+        assert_eq!(m.take_perm_writes(), vec![]);
+        // No access to the second page: mapped still, and nothing else.
+        m.protect(at + 0x1000, 0x1000, prot::NONE).unwrap();
+        assert_eq!(m.take_perm_writes(), vec![(page, vec![0x8d, 0x88])]);
+        // Write-only is readable; the page before it shares only that.
+        m.protect(at + 0x1000, 0x1000, prot::WRITE).unwrap();
+        assert_eq!(m.take_perm_writes(), vec![(page, vec![0x9d, 0x9b])]);
+        // A copy's table holds nothing yet.
+        let mut child = m.clone();
+        assert_eq!(child.take_perm_writes(), vec![(page - 1, vec![0x00, 0x9d, 0x9b, 0x9d, 0x0b])]);
+        // Unmapped, the pages are cleared.
+        m.unmap(at + 0x2000, 0x2000).unwrap();
+        assert_eq!(m.take_perm_writes(), vec![(page + 1, vec![0x0b, 0x00, 0x00])]);
+        // A new program's map: what the old one had is cleared, whatever
+        // the table holds, and what the new one has is written.
+        m.renew(0x100_0000);
+        m.insert(at + 0x8000, at + 0x9000, prot::READ, "ro");
+        assert_eq!(m.take_perm_writes(), vec![(page - 1, vec![0x00, 0x00, 0x00]), (page + 7, vec![0x00, 0x09])]);
+        // Nothing below what a guest maps is ever allowed, whatever is there.
+        m.insert(0x2000, 0x3000, prot::READ | prot::WRITE, "low");
+        assert_eq!(m.take_perm_writes(), vec![(1, vec![0x00, 0x00])]);
+        // A map that keeps no table writes none.
+        let mut plain = MemoryMap::new(0x100_0000);
+        plain.insert(at, at + 0x1000, prot::READ, "ro");
+        assert_eq!(plain.take_perm_writes(), vec![]);
+    }
 
     /// `PR_SET_VMA_ANON_NAME` names the anonymous mappings of a range,
     /// splitting at its ends, and `/proc/self/maps` shows the name; a file's

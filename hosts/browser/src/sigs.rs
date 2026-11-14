@@ -470,6 +470,12 @@ pub(crate) fn deliver(gm: &mut GuestMem<'_>, ctx_addr: u64) -> Delivery {
 /// `ctx_addr`, entered at `pc`, or the process ends when there is none, it
 /// is ignored, or the signal is blocked. No kernel lock.
 pub(crate) fn fault(gm: &mut GuestMem<'_>, ctx_addr: u64, signo: u32, pc: u64, addr: u64) -> Delivery {
+    fault_as(gm, ctx_addr, signo, None, pc, addr)
+}
+
+/// [`fault`] with more of the fault given (`signal::Fault`), or `None` for
+/// what its signal usually reports.
+pub(crate) fn fault_as(gm: &mut GuestMem<'_>, ctx_addr: u64, signo: u32, fault: Option<signal::Fault>, pc: u64, addr: u64) -> Delivery {
     let end = Delivery::Terminate { signal: signo, core: true };
     let Some(home) = home() else { return end };
     let Some(view) = view(home) else { return end };
@@ -483,7 +489,11 @@ pub(crate) fn fault(gm: &mut GuestMem<'_>, ctx_addr: u64, signo: u32, pc: u64, a
     }
     view.forget_source(signo);
     let compat = crate::CLOCK_ABI.load(Ordering::Acquire) == 1;
-    match signal::setup_frame(&view, gm, ctx_addr, signo, addr, compat) {
+    let frame = match fault {
+        Some(fault) => signal::setup_frame_fault(&view, gm, ctx_addr, signo, fault, addr, compat),
+        None => signal::setup_frame(&view, gm, ctx_addr, signo, addr, compat),
+    };
+    match frame {
         Ok(target) => {
             home.sig.note_fault_handled(signo);
             fault_note(home.pid, signo, pc, addr);

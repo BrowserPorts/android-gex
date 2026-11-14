@@ -140,6 +140,10 @@ mod imp {
         use gex_ir::{Builder, Term};
         use gex_lift::{FlagSource, Flow, Lifter};
         let mut b = Builder::new(start);
+        // The code is held to its pages' protections.
+        if gex_abi::access_checks() {
+            b.check_accesses();
+        }
         let mut pcs: Vec<u64> = Vec::new();
         let mut insts: Vec<u64> = Vec::new();
         let mut pc = start;
@@ -159,6 +163,7 @@ mod imp {
             let raw = u32::from_le_bytes(buf[..4].try_into().unwrap());
             let inst = gex_isa::decode(raw, pc);
             let mark = b.mark();
+            b.set_insn(pc);
             let mut l = Lifter::new(&mut b).with_raw(raw).with_flags(flags);
             let flow = l.lift(&inst, pc);
             flags = l.flags();

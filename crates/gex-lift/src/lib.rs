@@ -987,6 +987,13 @@ impl<'a> Lifter<'a> {
                     SysMaintOp::DcClean => gex_abi::cache_op::DC_CLEAN,
                     SysMaintOp::Other => gex_abi::cache_op::OTHER,
                 };
+                // The host zeroes the block the address is in: a store to
+                // all of it.
+                if op == SysMaintOp::DcZva {
+                    let block = self.b.const_i64(!(gex_abi::DCZID_BLOCK_BYTES - 1));
+                    let first = self.b.bin(BinOp::And, Ty::I64, addr, block);
+                    self.b.check_access(first, 0, gex_abi::DCZID_BLOCK_BYTES as u32, gex_abi::perm::WRITE);
+                }
                 let pcv = self.b.const_i64(pc);
                 let codev = self.b.const_i32(code as u32);
                 self.b.stmt(Stmt::HostCall {
@@ -4824,6 +4831,11 @@ impl<'a> Lifter<'a> {
         let size_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_size, want_size);
         let armed = self.b.bin(BinOp::And, Ty::I32, addr_ok, size_ok);
 
+        // The store is to the guest's address or to the runtime's scratch
+        // word, so the check is of the guest's, whichever is chosen: a
+        // store-exclusive whose monitor does not match may fault as one
+        // that stores does (the architecture leaves it to the processor).
+        self.b.check_access(addr, 0, sz.bytes(), gex_abi::perm::READ | gex_abi::perm::WRITE);
         let scratch = self.b.const_i64(gex_abi::EXCLUSIVE_SCRATCH);
         let eff_addr = self.b.select(armed, addr, scratch, Ty::I64);
 
@@ -4832,7 +4844,7 @@ impl<'a> Lifter<'a> {
             Ty::I32 => self.b.wrap(mon_value),
             _ => mon_value,
         };
-        let old = self.b.def(Expr::CmpXchg {
+        let old = self.b.def_unchecked(Expr::CmpXchg {
             addr: eff_addr,
             expected,
             replacement: value,
@@ -4884,11 +4896,13 @@ impl<'a> Lifter<'a> {
         let spill = self.b.bin(BinOp::Add, Ty::I64, sp, below);
         for (i, r) in [vd, vn, vm].into_iter().enumerate() {
             let v = self.b.read(GuestReg::V128(r));
-            self.b.stmt(Stmt::VStore { addr: spill, offset: 16 * i as i64, val: v, bytes: 16 });
+            // The runtime's own use of the stack, not an access of the
+            // instruction's: it names no memory, and cannot fault.
+            self.b.stmt_unchecked(Stmt::VStore { addr: spill, offset: 16 * i as i64, val: v, bytes: 16 });
         }
         let opv = self.konst(Ty::I64, code);
         self.b.stmt(Stmt::HostCall { func: HostFunc::Crypto, args: vec![opv, spill] });
-        let r = self.b.def(Expr::VLoad { addr: spill, offset: 0, bytes: 16 });
+        let r = self.b.def_unchecked(Expr::VLoad { addr: spill, offset: 0, bytes: 16 });
         self.b.write(GuestReg::V128(vd), r);
     }
 
@@ -4928,8 +4942,12 @@ impl<'a> Lifter<'a> {
         let zero = self.b.const_i64(0);
         let misaligned = self.b.cmp(CmpOp::Ne, Ty::I64, low, zero);
         self.b.stmt(Stmt::Trap { cond: misaligned, pc, code: gex_abi::imports::BRK_ALIGNMENT });
+        // What the host does there: a load of both doublewords, and for a
+        // store or a compare-and-swap a store of them.
+        let need = gex_abi::perm::READ | if op == gex_abi::pair_op::LOAD { 0 } else { gex_abi::perm::WRITE };
+        self.b.check_access(addr, 0, 16, need);
         for offset in [0, 8] {
-            self.b.def(Expr::Load { addr, offset, sz: gex_ir::MemSz::B8, signed: false, ty: Ty::I64, order: Order::Relaxed });
+            self.b.def_unchecked(Expr::Load { addr, offset, sz: gex_ir::MemSz::B8, signed: false, ty: Ty::I64, order: Order::Relaxed });
         }
         let pcv = self.b.const_i64(pc);
         let [a, b, c] = regs.map(RegSel::number);
@@ -4967,10 +4985,12 @@ impl<'a> Lifter<'a> {
         let addr_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_addr, addr);
         let size_ok = self.b.cmp(CmpOp::Eq, Ty::I64, mon_size, want_size);
         let armed = self.b.bin(BinOp::And, Ty::I32, addr_ok, size_ok);
+        // (the guest's address is checked, as `store_exclusive`'s is)
+        self.b.check_access(addr, 0, 8, gex_abi::perm::READ | gex_abi::perm::WRITE);
         let scratch = self.b.const_i64(gex_abi::EXCLUSIVE_SCRATCH);
         let eff_addr = self.b.select(armed, addr, scratch, Ty::I64);
         let expected = self.b.read(GuestReg::MonValue);
-        let old = self.b.def(Expr::CmpXchg { addr: eff_addr, expected, replacement: value, sz: gex_ir::MemSz::B8, ty: Ty::I64 });
+        let old = self.b.def_unchecked(Expr::CmpXchg { addr: eff_addr, expected, replacement: value, sz: gex_ir::MemSz::B8, ty: Ty::I64 });
         let swapped = self.b.cmp(CmpOp::Eq, Ty::I64, old, expected);
         let success = self.b.bin(BinOp::And, Ty::I32, armed, swapped);
         let one = self.b.const_i32(1);

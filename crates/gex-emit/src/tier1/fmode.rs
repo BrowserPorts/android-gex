@@ -107,6 +107,7 @@ impl<'a> FnBody<'a> {
         e.value_local = vec![None; n];
         e.value_const = vec![None; n];
         e.value_ctx = vec![false; n];
+        e.checked.clear();
         e.value_ty = vec![Ty::I64; n];
         e.value_fp = vec![None; n];
         FnBody { e, last: vec![usize::MAX; n], borrowed: Vec::new(), pcs: Vec::new() }
@@ -237,6 +238,7 @@ impl<'a> FnBody<'a> {
         for c in self.e.value_ctx.iter_mut() {
             *c = false;
         }
+        self.e.checked.clear();
         // Values are numbered per block: forget the last block's (a value
         // nobody read keeps its local, which is only a local lost).
         for v in self.e.value_local.iter_mut() {

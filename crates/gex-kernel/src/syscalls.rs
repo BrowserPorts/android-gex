@@ -249,6 +249,22 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 
+/// Counts of the protection table's upkeep, for GEX_PERM_STATS: writes of
+/// it, their bytes, the nanoseconds working them out, and failed checks
+/// the host was asked about.
+pub static PERM_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// What a failed access check comes to ([`Kernel::access_fault`]).
+#[derive(Debug)]
+pub enum AccessFault {
+    /// The map allows the access and the protection table now says so: the
+    /// instruction runs again.
+    Retry,
+    /// The fault was raised: its handler's frame is built, or the process
+    /// ends.
+    Raised(Delivery),
+}
+
 /// What the host should do after a syscall returns.
 #[derive(Debug, Clone)]
 pub enum SyscallOutcome {
@@ -11072,6 +11088,8 @@ impl Kernel {
             self.block_restart = op.restart();
             self.block_pc = pc;
         }
+        // A change the call made to the map is in force when it returns.
+        self.flush_perms(m);
         out
     }
 
@@ -11727,6 +11745,7 @@ impl Kernel {
         m.set_tags(thread_tags(a64_thread(self.compat, self.wasm32), self.signals.thread()));
         let out = self.finish_blocking_tagged(m, r);
         m.set_tags(crate::Tags::None);
+        self.flush_perms(m);
         out
     }
 
@@ -12139,6 +12158,94 @@ impl Kernel {
         pc: u64,
         fault_address: u64,
     ) -> Delivery {
+        self.raise_fault_as(m, signo, None, pc, fault_address)
+    }
+
+    /// Write what has changed of the map to the process's protection table
+    /// (`gex_abi::perm_table`), for a process whose accesses are checked:
+    /// before a thread returns to its program from a call that may have
+    /// changed the map, and before a new program or a fork's child first
+    /// runs. Under the map's lock, so that two threads' writes land in the
+    /// order of the changes they describe.
+    pub fn flush_perms(&mut self, m: &mut GuestMem<'_>) {
+        let mut mm = self.mem.lock();
+        if !mm.keeps_perms() {
+            return;
+        }
+        let table = gex_abi::perm_table();
+        let t0 = std::time::Instant::now();
+        let writes = mm.take_perm_writes();
+        if !writes.is_empty() {
+            use std::sync::atomic::Ordering::Relaxed;
+            PERM_STATS[0].fetch_add(1, Relaxed);
+            PERM_STATS[1].fetch_add(writes.iter().map(|(_, b)| b.len() as u64).sum(), Relaxed);
+            PERM_STATS[2].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        }
+        for (page, bytes) in writes {
+            if m.write(table + page, &bytes).is_err() {
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[gex:{}] the protection table's bytes for page {page:#x} are past the end of the guest's memory: accesses there fault", self.pid);
+                }
+            }
+        }
+    }
+
+    /// An access check failed (`gex_abi::cache_op::PERM_READ`,
+    /// `PERM_WRITE`): the instruction at `pc` would load (`write`: store)
+    /// `size` bytes at `addr`, and the protection table refused it. The map
+    /// decides. An access it allows is one the table was behind on: the
+    /// table is written and the instruction runs again (`None`). Any other
+    /// is the fault Linux raises, SIGSEGV at the access's first byte in a
+    /// page that does not allow it, as the [`signal::Fault`] returned
+    /// beside that address says: `SEGV_MAPERR` where nothing is mapped,
+    /// `SEGV_ACCERR` where the protection refuses it (`do_page_fault`'s
+    /// `bad_area`).
+    pub fn access_verdict(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, size: u32, write: bool) -> Option<(u64, signal::Fault)> {
+        PERM_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.flush_perms(m);
+        let need = if write { gex_abi::perm::WRITE } else { gex_abi::perm::READ };
+        // The access's first byte, and the first of its last byte's page.
+        let last = addr.wrapping_add(size as u64 - 1) & !(gex_abi::PERM_PAGE - 1);
+        for at in [addr, last] {
+            let bits = if at >= gex_abi::GUEST_FLOOR { self.mem.lock().vma_at(at).map(|v| gex_abi::perm::of_prot(v.prot)) } else { None };
+            match bits {
+                Some(b) if b & need != 0 => {
+                    // The map allows it. The table does too now, unless it
+                    // cannot say so (a page past its end).
+                    let page = at >> gex_abi::PERM_PAGE_SHIFT;
+                    let seen = if at < gex_abi::perm_limit() { m.read(gex_abi::perm_table() + page, 1).ok().map(|b| b[0]) } else { None };
+                    if !seen.is_some_and(|s| s & need != 0) {
+                        eprintln!("[gex:{}] the protection table has {seen:x?} for the page of {at:#x}, which the map allows a {} of (pc {pc:#x}): the access cannot be let through", self.pid, if write { "store" } else { "load" });
+                        return Some((at, signal::Fault::data_abort(signal::SEGV_ACCERR, write, true)));
+                    }
+                }
+                Some(b) => return Some((at, signal::Fault::data_abort(signal::SEGV_ACCERR, write, b & gex_abi::perm::READ != 0))),
+                None => return Some((at, signal::Fault::data_abort(signal::SEGV_MAPERR, write, false))),
+            }
+        }
+        None
+    }
+
+    /// [`Self::access_verdict`], and the fault raised against the running
+    /// instruction when it is one. `addr` is without its top byte.
+    pub fn access_fault(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, size: u32, write: bool) -> AccessFault {
+        match self.access_verdict(m, pc, addr, size, write) {
+            None => AccessFault::Retry,
+            Some((at, fault)) => AccessFault::Raised(self.raise_fault_as(m, signal::sig::SIGSEGV, Some(fault), pc, at)),
+        }
+    }
+
+    /// [`Self::raise_fault`] with more of the fault given
+    /// ([`signal::Fault`]), or `None` for what its signal usually reports.
+    pub fn raise_fault_as(
+        &mut self,
+        m: &mut GuestMem<'_>,
+        signo: u32,
+        fault: Option<signal::Fault>,
+        pc: u64,
+        fault_address: u64,
+    ) -> Delivery {
         let action = self.signals.action(signo);
         let blocked = self.signals.blocked() & (1u64 << (signo - 1)) != 0;
         // A synchronous fault that is blocked or ignored is fatal, because
@@ -12156,14 +12263,11 @@ impl Kernel {
             };
         }
         self.signals.forget_source(signo);
-        match signal::setup_frame(
-            &mut self.signals,
-            m,
-            self.ctx_addr,
-            signo,
-            fault_address,
-            self.compat,
-        ) {
+        let frame = match fault {
+            Some(fault) => signal::setup_frame_fault(&self.signals, m, self.ctx_addr, signo, fault, fault_address, self.compat),
+            None => signal::setup_frame(&self.signals, m, self.ctx_addr, signo, fault_address, self.compat),
+        };
+        match frame {
             Ok(resume) => {
                 self.signals.process().note_fault_handled(signo);
                 self.fault_note(signo, pc, fault_address);

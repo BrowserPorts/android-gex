@@ -1173,16 +1173,65 @@ pub fn setup_frame(
     fault_address: u64,
     compat: bool,
 ) -> Result<u64, Errno> {
-    build_frame(signals, m, ctx_addr, signal, fault_address, compat, Taken::Fault)
+    build_frame(signals, m, ctx_addr, signal, fault_address, compat, Taken::Fault(None))
 }
+
+/// What a synchronous fault's frame says of it beyond its signal and
+/// address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fault {
+    /// `si_code`, where it is not the one the signal usually has
+    /// ([`fault_code`]): a protection fault's `SEGV_ACCERR`.
+    pub code: u32,
+    /// AArch64: the exception syndrome (`ESR_EL1`), which the frame carries
+    /// as an `esr_context` record for a fault that has one.
+    pub esr: Option<u64>,
+}
+
+impl Fault {
+    /// A data abort from the program, as an AArch64 processor reports it: a
+    /// load's or a store's (`write`), with Linux's `si_code` for it. The
+    /// syndrome is a data abort from a lower exception level's (class 0x24,
+    /// a 32-bit instruction), write-not-read as it was, at the last level
+    /// of the page tables (where Linux's 4 KiB pages are): a permission
+    /// fault when the page is `there`, mapped for the processor with some
+    /// access that is not this one, else a translation fault -- nothing
+    /// mapped, or a page that allows nothing, which has no valid entry.
+    /// (A page is taken to have been touched: one never touched has no
+    /// entry yet either, and its first refused store is a translation
+    /// fault on hardware.)
+    pub fn data_abort(code: u32, write: bool, there: bool) -> Fault {
+        let status = if there { 0x0f } else { 0x07 };
+        Fault { code, esr: Some(0x24 << 26 | 1 << 25 | (write as u64) << 6 | status) }
+    }
+}
+
+/// [`setup_frame`] with more of the fault given ([`Fault`]).
+pub fn setup_frame_fault(
+    signals: &Signals,
+    m: &mut GuestMem<'_>,
+    ctx_addr: u64,
+    signal: u32,
+    fault: Fault,
+    fault_address: u64,
+    compat: bool,
+) -> Result<u64, Errno> {
+    build_frame(signals, m, ctx_addr, signal, fault_address, compat, Taken::Fault(Some(fault)))
+}
+
+/// `si_code` for a fault at an address nothing is mapped at.
+pub const SEGV_MAPERR: u32 = 1;
+/// `si_code` for a fault at a page whose protection refuses the access.
+pub const SEGV_ACCERR: u32 = 2;
 
 /// Whose a signal a frame is built for is, and who sent it.
 #[derive(Clone, Copy, Debug)]
 enum Taken {
     /// A synchronous fault, raised by the running instruction: its siginfo
-    /// reports the fault, and whatever is pending of it is cleared once the
-    /// frame is built.
-    Fault,
+    /// reports the fault (as this says, or with the signal's usual
+    /// `si_code`), and whatever is pending of it is cleared once the frame
+    /// is built.
+    Fault(Option<Fault>),
     /// A pending signal [`Signals::claim`] already took off the pending
     /// sets, with its sender.
     Claimed(Option<Source>),
@@ -1256,15 +1305,21 @@ fn build_frame(
     m.write_u64(mc + frame::MC_PSTATE as u64, read_pstate(m, ctx_addr)?)?;
 
     // The records: the FP and vector state the handler may use and
-    // `sigreturn` restores. The frame was zeroed, which is the record that
-    // ends them.
-    let rec = mc + frame::MC_RESERVED as u64;
+    // `sigreturn` restores, then the fault's syndrome. The frame was zeroed,
+    // which is the record that ends them.
+    let mut rec = mc + frame::MC_RESERVED as u64;
     m.write_u32(rec, frame::FPSIMD_MAGIC)?;
     m.write_u32(rec + 4, frame::FPSIMD_SIZE)?;
     m.write_u32(rec + 8, m.read_u32(ctx_addr + ctx::FPSR as u64)?)?;
     m.write_u32(rec + 12, m.read_u32(ctx_addr + ctx::FPCR as u64)?)?;
     let vregs = m.read(ctx_addr + ctx::V as u64, 32 * 16)?.to_vec();
     m.write(rec + 16, &vregs)?;
+    rec += frame::FPSIMD_SIZE as u64;
+    if let Taken::Fault(Some(Fault { esr: Some(esr), .. })) = taken {
+        m.write_u32(rec, frame::ESR_MAGIC)?;
+        m.write_u32(rec + 4, frame::ESR_SIZE)?;
+        m.write_u64(rec + 8, esr)?;
+    }
 
     // Block this signal for the duration of the handler unless asked not to,
     // plus whatever the action's mask names.
@@ -1272,7 +1327,7 @@ fn build_frame(
     if action.flags & sa::NODEFER == 0 {
         own.blocked |= bit(signal);
     }
-    if let Taken::Fault = taken {
+    if let Taken::Fault(_) = taken {
         signals.clear_pending(signal);
     }
     own.in_handler = true;
@@ -1384,7 +1439,7 @@ fn setup_frame_x86(
     if action.flags & sa::NODEFER == 0 {
         own.blocked |= bit(signal);
     }
-    if let Taken::Fault = taken {
+    if let Taken::Fault(_) = taken {
         signals.clear_pending(signal);
     }
     own.in_handler = true;
@@ -1613,7 +1668,7 @@ fn setup_frame_i386(
     if action.flags & sa::NODEFER == 0 {
         own.blocked |= bit(signal);
     }
-    if let Taken::Fault = taken {
+    if let Taken::Fault(_) = taken {
         signals.clear_pending(signal);
     }
     own.in_handler = true;
@@ -1911,7 +1966,7 @@ fn write_siginfo(
     let fields = info + if wide { 16 } else { 12 };
     m.write_u32(info, signal)?;
     let source = match taken {
-        Taken::Fault => signals.take_source(signal),
+        Taken::Fault(_) => signals.take_source(signal),
         Taken::Claimed(source) => source,
     };
     if let Some(src) = source {
@@ -1926,7 +1981,11 @@ fn write_siginfo(
         }
         return Ok(());
     }
-    m.write_u32(info + 8, fault_code(signal))?;
+    let code = match taken {
+        Taken::Fault(Some(fault)) => fault.code,
+        _ => fault_code(signal),
+    };
+    m.write_u32(info + 8, code)?;
     if matches!(signal, sig::SIGSEGV | sig::SIGBUS | sig::SIGILL | sig::SIGFPE) {
         if wide {
             m.write_u64(fields, fault_address)?;
@@ -2136,6 +2195,58 @@ mod tests {
         assert_eq!(m.read_u64(CTX + ctx::x(5) as u64).unwrap(), 0x1005);
         assert_eq!(s.blocked(), 0);
         assert!(!s.in_handler());
+    }
+
+    /// The frame's records: the vector registers where the structure has
+    /// them, restored from there (so what a handler writes there is what
+    /// the program resumes with, and what it does to the registers is
+    /// undone); a fault's syndrome after them; and a frame whose records
+    /// are not what the kernel wrote is refused.
+    #[test]
+    fn a_frame_carries_the_vector_state_and_a_faults_syndrome() {
+        let (mut buf, mut s) = setup();
+        let mut m = GuestMem::new(&mut buf);
+        for n in 0..32u8 {
+            m.write(CTX + ctx::v(n) as u64, &[n + 1; 16]).unwrap();
+        }
+        let handler = SigAction { handler: 0x400500, ..Default::default() };
+        s.set_action(sig::SIGSEGV, handler).unwrap();
+        let fault = Fault::data_abort(SEGV_ACCERR, true, true);
+        assert_eq!(fault.esr, Some(0x9200_004f));
+        assert_eq!(Fault::data_abort(SEGV_MAPERR, false, false).esr, Some(0x9200_0007));
+        setup_frame_fault(&s, &mut m, CTX, sig::SIGSEGV, fault, 0x7000, false).unwrap();
+        let frame_at = m.read_u64(CTX + ctx::SP as u64).unwrap();
+        // siginfo: the code and the address.
+        assert_eq!(m.read_u32(frame_at + 8).unwrap(), SEGV_ACCERR);
+        assert_eq!(m.read_u64(frame_at + 16).unwrap(), 0x7000);
+        // `__reserved` is 288 bytes into the context, on a sixteen-byte
+        // boundary: `struct fpsimd_context`, then `struct esr_context`.
+        let reserved = frame_at + frame::UCONTEXT as u64 + frame::UC_MCONTEXT as u64 + 288;
+        assert_eq!(reserved % 16, 0);
+        assert_eq!((m.read_u32(reserved).unwrap(), m.read_u32(reserved + 4).unwrap()), (0x4650_8001, 528));
+        assert_eq!(m.read(reserved + 16 + 31 * 16, 16).unwrap(), [32u8; 16]);
+        assert_eq!((m.read_u32(reserved + 528).unwrap(), m.read_u32(reserved + 532).unwrap()), (0x4553_5201, 16));
+        assert_eq!(m.read_u64(reserved + 536).unwrap(), 0x9200_004f);
+        assert_eq!(m.read_u64(reserved + 544).unwrap(), 0, "the end");
+        // The handler uses the registers, and leaves V1 changed in the frame.
+        for n in 0..32u8 {
+            m.write(CTX + ctx::v(n) as u64, &[0xff; 16]).unwrap();
+        }
+        m.write(reserved + 16 + 16, &[0x55; 16]).unwrap();
+        let saved = m.read(frame_at, frame::FRAME_SIZE).unwrap().to_vec();
+        sigreturn(&s, &mut m, CTX, false, false).unwrap();
+        for n in 0..32u8 {
+            let want = if n == 1 { 0x55 } else { n + 1 };
+            assert_eq!(m.read(CTX + ctx::v(n) as u64, 16).unwrap(), [want; 16], "v{n}");
+        }
+        // Not frames: no vector state, a magic no one knows, a size past
+        // the end.
+        for (at, word) in [(reserved, 0u32), (reserved + 528, 0x1234_5678), (reserved + 4, 8192)] {
+            m.write(frame_at, &saved).unwrap();
+            m.write_u64(CTX + ctx::SP as u64, frame_at).unwrap();
+            m.write_u32(at, word).unwrap();
+            assert_eq!(sigreturn(&s, &mut m, CTX, false, false), Err(Errno::EINVAL), "{word:#x} at {:#x}", at - reserved);
+        }
     }
 
     #[test]
