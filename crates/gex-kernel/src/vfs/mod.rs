@@ -23,6 +23,7 @@ pub mod procfs;
 /// The filesystem when it is not in this process's memory.
 pub mod remote;
 pub mod blocks;
+pub mod selinuxfs;
 pub mod subtree;
 pub mod tmpfs;
 
@@ -32,6 +33,7 @@ pub use devfs::DevFs;
 pub use hostfs::HostFs;
 pub use procfs::{ProcFs, ProcSource, SysCpuFs};
 pub use remote::RemoteFs;
+pub use selinuxfs::SelinuxFs;
 pub use tmpfs::TmpFs;
 
 /// What kind of thing a directory entry names.

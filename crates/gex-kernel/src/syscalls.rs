@@ -4425,6 +4425,15 @@ impl PathIo<'_> {
                 self.view.mount(&target, Arc::new(crate::vfs::DevFs::new()));
                 Ok(0)
             }
+            // selinuxfs: every mount is the one filesystem, over the
+            // kernel's security server. It knows no option.
+            "selinuxfs" => {
+                if a[4] != 0 && !m.read_cstr(a[4], 4096)?.is_empty() {
+                    return Err(Errno::EINVAL);
+                }
+                self.view.mount(&target, Arc::new(crate::vfs::SelinuxFs::of_kernel()));
+                Ok(0)
+            }
             // binderfs: every mount has binder devices of its own.
             "binder" => {
                 let data = if a[4] == 0 { Vec::new() } else { m.read_cstr(a[4], 4096)? };

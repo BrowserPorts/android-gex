@@ -17,10 +17,22 @@
 //! `member`, `relabel` or `validatetrans`. Their answers are checked
 //! against a Linux kernel's.
 //!
-//! Still to come, and nothing here pretends otherwise: the selinuxfs
-//! filesystem that serves those files, `/proc/<pid>/attr`, the labels of
-//! files, and the hooks that ask. Until then no file of selinuxfs exists,
-//! and a program that looks for SELinux finds it absent.
+//! [`crate::vfs::SelinuxFs`] is the filesystem that serves them, which a
+//! program mounts by its type.
+//!
+//! Still to come, and nothing here pretends otherwise: `/proc/<pid>/attr`,
+//! the labels of files, and the hooks that ask. No host mounts selinuxfs
+//! of itself, so a program that looks for SELinux and has not mounted it
+//! finds it absent.
 
 pub mod policy;
 pub mod server;
+
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// The kernel's security server: the one every mount of selinuxfs is
+/// over, as Linux has one for the machine.
+pub fn kernel_server() -> Arc<Mutex<server::Server>> {
+    static SERVER: OnceLock<Arc<Mutex<server::Server>>> = OnceLock::new();
+    Arc::clone(SERVER.get_or_init(Default::default))
+}
