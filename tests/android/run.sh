@@ -31,6 +31,9 @@ check() {
     last=$(printf '%s\n' "$out" | tail -1)
     if [ "$status" -eq "$3" ] && [ "$last" = "$2" ]; then
         echo "PASS $1"
+    elif [ "$status" -eq 77 ]; then
+        # What it needs is not there (a device the host does not have).
+        echo "SKIP $1: $last"
     else
         echo "FAIL $1: exit $status, last line '$last' (wanted exit $3, '$2'); stderr in $ERR/$1.err"
         fail=1
@@ -63,6 +66,8 @@ run() {
     execfault) check "$1" "execfault ok" 0 ;;
     efault) check "$1" "efault ok" 0 ;;
     pdeath) check "$1" "pdeath ok" 0 ;;
+    binder) check "$1" "binder ok" 0 ;;
+    binderwork) check "$1" "binderwork ok" 0 ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -75,7 +80,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath binder binderwork"
     for p in $all; do
         run "$p"
     done
