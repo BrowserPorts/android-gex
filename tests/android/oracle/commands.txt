@@ -56,3 +56,4 @@ ls /system/framework/*.jar | wc -l
 /apex/com.android.art/bin/dexdump -f /system/framework/ext.jar 2>&1 | head -3 | sed -E "s/^[-0-9]+ [0-9:.]+ +[0-9]+ +[0-9]+ //"
 cat /proc/self/maps | grep toybox | awk "{print \$2, \$3, \$6}"
 cat /proc/self/maps | grep linker64 | awk "{print \$2, \$6}" | sort -u
+cat /proc/sys/fs/pipe-max-size
