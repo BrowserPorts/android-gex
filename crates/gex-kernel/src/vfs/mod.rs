@@ -8,6 +8,7 @@ use crate::errno::{Errno, SysResult};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub mod binderfs;
 pub mod devfs;
 pub mod evdev;
 pub mod hostcall;
@@ -24,6 +25,7 @@ pub mod blocks;
 pub mod subtree;
 pub mod tmpfs;
 
+pub use binderfs::BinderFs;
 pub use devfs::DevFs;
 #[cfg(unix)]
 pub use hostfs::HostFs;

@@ -3654,7 +3654,11 @@ fn mount_filesystems(
     // Audio : OSS's /dev/dsp and /dev/mixer, a null output, for
     // native Wine's wineoss.drv (and any OSS program).
     devfs.add_oss();
-    devfs.add_binder();
+    // As Android's init leaves them: binderfs at /dev/binderfs, and the
+    // three devices linked into /dev.
+    for name in ["binder", "hwbinder", "vndbinder"] {
+        devfs.add_link(name, &format!("/dev/binderfs/{name}"));
+    }
     // Pseudoterminals (`/dev/ptmx`, `/dev/pts`): a terminal emulator's
     // shell. The pairs live in this host process (`pty.rs`).
     devfs.add_pts(Arc::new(crate::pty::in_use));
@@ -3663,6 +3667,10 @@ fn mount_filesystems(
     // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
     // in memory (Chromium's, in a CEF game, refuses to start without it).
     kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::new()));
+    match gex_kernel::vfs::BinderFs::new(gex_kernel::vfs::BinderFs::options("").expect("no options")) {
+        Ok(binderfs) => kernel.vfs.mount("/dev/binderfs", Arc::new(binderfs)),
+        Err(e) => eprintln!("[gex] no binderfs: {e:?}"),
+    }
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));
     kernel.vfs.mount(

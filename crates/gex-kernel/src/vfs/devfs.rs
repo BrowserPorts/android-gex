@@ -99,11 +99,13 @@ pub struct DevFs {
     /// lists them and `stat` answers for each (and for `/dev/ptmx`). Opening
     /// one is the kernel's (`open_pty`), not this filesystem's.
     pts: Option<Arc<dyn Fn() -> Vec<u32> + Send + Sync>>,
+    /// Links the host added: name and target.
+    links: Vec<(String, String)>,
 }
 
 impl DevFs {
     pub fn new() -> DevFs {
-        DevFs { extra: Vec::new(), per_open: Vec::new(), pts: None }
+        DevFs { extra: Vec::new(), per_open: Vec::new(), pts: None, links: Vec::new() }
     }
 
     /// `/dev/ptmx` and `/dev/pts`, with `list` saying which pts numbers exist.
@@ -154,14 +156,11 @@ impl DevFs {
         self.add_per_open("mixer", Arc::new(|| Arc::new(OssHandle::new(OssNode::Mixer)) as Arc<dyn FileHandle>));
     }
 
-    /// The binder devices, `binder`, `hwbinder` and `vndbinder`
-    /// ([`crate::binder`]): each open is a process's own, on the one
-    /// context of its name.
-    pub fn add_binder(&mut self) {
-        for name in ["binder", "hwbinder", "vndbinder"] {
-            let ctx = crate::binder::context(name);
-            self.add_per_open(name, Arc::new(move || Arc::new(crate::binder::BinderFile::open(Arc::clone(&ctx))) as Arc<dyn FileHandle>));
-        }
+    /// A symbolic link `name` to `target`, as an init leaves in `/dev`
+    /// (Android's `/dev/binder`, to the device in its binderfs).
+    pub fn add_link(&mut self, name: &str, target: &str) {
+        self.links.retain(|(n, _)| n != name);
+        self.links.push((name.to_string(), target.to_string()));
     }
 
     fn device_of(path: &str) -> Option<Device> {
@@ -204,6 +203,7 @@ impl FileSystem for DevFs {
             return Ok(Arc::new(DevDir {
                 extra: self.extra.iter().map(|(n, _)| n.clone()).chain(self.per_open.iter().map(|(n, _)| n.clone())).collect(),
                 pts: self.pts.is_some(),
+                links: self.links.iter().map(|(n, _)| n.clone()).collect(),
             }));
         }
         if let (Some(list), "pts") = (self.pts.as_ref(), path) {
@@ -259,7 +259,7 @@ impl FileSystem for DevFs {
         if let Some(md) = self.pts_node(path) {
             return Ok(md);
         }
-        if matches!(path, "stdin" | "stdout" | "stderr" | "fd") {
+        if matches!(path, "stdin" | "stdout" | "stderr" | "fd") || self.links.iter().any(|(n, _)| n == path) {
             return Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: 0,
@@ -290,6 +290,9 @@ impl FileSystem for DevFs {
             "stderr" => "/proc/self/fd/2".to_string(),
             "fd" => "/proc/self/fd".to_string(),
             _ => {
+                if let Some((_, target)) = self.links.iter().find(|(n, _)| n == path) {
+                    return Ok(target.clone());
+                }
                 self.metadata(path)?;
                 return Err(Errno::EINVAL);
             }
@@ -303,6 +306,8 @@ struct DevDir {
     extra: Vec<String>,
     /// Whether `ptmx` and `pts` exist.
     pts: bool,
+    /// The links the host added.
+    links: Vec<String>,
 }
 
 /// `/dev/input`: the connected game controllers (`evdev`).
@@ -393,7 +398,7 @@ impl FileHandle for DevDir {
             out.push(DirEntry { name: "ptmx".into(), file_type: FileType::CharDevice, ino: crate::pty::PTMX_INO });
             out.push(DirEntry { name: "pts".into(), file_type: FileType::Directory, ino: 1 });
         }
-        for name in ["stdin", "stdout", "stderr", "fd"] {
+        for name in ["stdin", "stdout", "stderr", "fd"].into_iter().chain(self.links.iter().map(String::as_str)) {
             out.push(DirEntry {
                 name: name.into(),
                 file_type: FileType::Symlink,

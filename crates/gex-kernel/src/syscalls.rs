@@ -4379,6 +4379,13 @@ impl PathIo<'_> {
                 self.view.mount(&target, Arc::new(crate::vfs::DevFs::new()));
                 Ok(0)
             }
+            // binderfs: every mount has binder devices of its own.
+            "binder" => {
+                let data = if a[4] == 0 { Vec::new() } else { m.read_cstr(a[4], 4096)? };
+                let max = crate::vfs::BinderFs::options(&String::from_utf8_lossy(&data))?;
+                self.view.mount(&target, Arc::new(crate::vfs::BinderFs::new(max)?));
+                Ok(0)
+            }
             // `/proc` needs a source of process state that only the host can
             // build, so it cannot be created on demand -- but the host has
             // already mounted one, and a second request for it is satisfied.
@@ -11890,7 +11897,15 @@ impl Kernel {
                 Some(crate::binder::Outcome::Done(done)) => done,
                 None => Err(Errno::EBADF),
             },
-            _ => r,
+            // The wait ended some other way (a signal): the driver is told
+            // its call will not be made again.
+            Some((fd, ..)) => {
+                if let Some(binder) = self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_binder()) {
+                    binder.interrupted(self.tid);
+                }
+                r
+            }
+            None => r,
         };
         // An `accept` that waited does its real work here, now that the
         // kernel is locked again and there is a descriptor table to put the
@@ -13450,6 +13465,9 @@ impl Kernel {
             euid: self.creds.uid(),
             fds: &self.fds,
             nonblock: file.flags() & crate::fs::oflags::O_NONBLOCK != 0,
+            clock: self.clock,
+            // No security module names a process's context yet.
+            secctx: None,
         };
         // Whatever it queued may be what another thread waits for.
         self.fd_activity = true;
