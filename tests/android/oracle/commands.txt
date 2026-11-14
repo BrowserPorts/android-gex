@@ -54,3 +54,5 @@ unzip -l /system/framework/framework-res.apk | tail -1
 ls /system/framework/*.jar | wc -l
 /apex/com.android.art/bin/dex2oat64 --version 2>&1 | head -1
 /apex/com.android.art/bin/dexdump -f /system/framework/ext.jar 2>&1 | head -3
+cat /proc/self/maps | grep toybox | awk "{print \$2, \$3, \$6}"
+cat /proc/self/maps | grep linker64 | awk "{print \$2, \$6}" | sort -u
