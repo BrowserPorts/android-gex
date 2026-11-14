@@ -15597,7 +15597,7 @@ fn write_u64(data: &mut GuestMem<'_>, off: usize, v: u64) {
 /// at `spill` in guest memory, the result written over the first.
 #[no_mangle]
 pub extern "C" fn gex_crypto(_ctx: i32, op: i64, spill: i64) {
-    let mut gm = GuestMem::new(guest_bytes());
+    let mut gm = guest();
     let at = spill as u64;
     let mut v = [[0u8; 16]; 3];
     for (i, r) in v.iter_mut().enumerate() {
