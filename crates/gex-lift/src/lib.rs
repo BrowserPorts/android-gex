@@ -1472,6 +1472,12 @@ impl<'a> Lifter<'a> {
                 vm,
                 index,
             } => {
+                // The scalar forms: one lane, and the accumulating ones
+                // fused, as `fmadd` is ([`Self::fp_by_element`]).
+                if arr.scalar {
+                    self.fp_by_element(op, arr, vd, vn, vm, index);
+                    return Flow::Next;
+                }
                 // Broadcast the chosen lane, then this is an ordinary
                 // three-same operation.
                 let src = self.b.read(GuestReg::V128(vm.0));
@@ -4280,6 +4286,39 @@ impl<'a> Lifter<'a> {
 
     fn fp_bin(&mut self, op: FpBinOp, double: bool, a: Value, b: Value) -> Value {
         self.b.def(Expr::FpBin { op, double, a, b })
+    }
+
+    /// The scalar multiplies by one lane of a vector: `fmul` and `fmulx`
+    /// (which differs from it only for zero times infinity, not modelled
+    /// here either), and `fmla` and `fmls`, which add the product to the
+    /// destination, or take it away, with one rounding. Wasm has no fused
+    /// multiply-add, so those two ask the host as `fmadd` does. The result
+    /// is a scalar: everything above it in the register is zero.
+    fn fp_by_element(&mut self, op: VOp3, arr: VArr, vd: gex_isa::VReg, vn: gex_isa::VReg, vm: gex_isa::VReg, index: u32) {
+        let double = arr.lane_bytes == 8;
+        let sz = if double { FpSz::D } else { FpSz::S };
+        let ty = if double { Ty::I64 } else { Ty::I32 };
+        let a = self.rd_fp(vn, sz);
+        let src = self.b.read(GuestReg::V128(vm.0));
+        let b = self.b.def(Expr::VExtract { a: src, lane: index, lane_bytes: arr.lane_bytes, signed: false, ty });
+        let v = match op {
+            VOp3::FMla | VOp3::FMls => {
+                let acc = self.rd_fp(vd, sz);
+                // Negating a factor is exact, so `fmls` is `fmla` of it.
+                let a = if op == VOp3::FMls { self.b.def(Expr::FpUn { op: FpUnOp::Neg, double, a }) } else { a };
+                let wide = |l: &mut Self, v: Value| if double { v } else { l.b.def(Expr::Extend { a: v, signed: false }) };
+                let (a, b, acc) = (wide(self, a), wide(self, b), wide(self, acc));
+                let is_double = self.konst(Ty::I32, double as u64);
+                let r = self.b.def(Expr::HostCall { func: HostFunc::Fma, args: vec![a, b, acc, is_double], ty: Ty::I64 });
+                if double {
+                    r
+                } else {
+                    self.b.def(Expr::Wrap(r))
+                }
+            }
+            _ => self.fp_bin(FpBinOp::Mul, double, a, b),
+        };
+        self.wr_fp(vd, sz, v);
     }
 
     /// Read a scalar float out of a `v` register as its bit pattern.

@@ -1359,6 +1359,17 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
             vn,
             vm,
             index,
+        } if arr.scalar => {
+            let r = arr.letter();
+            format!("{} {r}{}, {r}{}, v{}.{r}[{index}]", vop3_name(op), vd.0, vn.0, vm.0)
+        }
+        Inst::VByElement {
+            op,
+            arr,
+            vd,
+            vn,
+            vm,
+            index,
         } => format!(
             "{} v{}.{}, v{}.{}, v{}.{}[{index}]",
             vop3_name(op),

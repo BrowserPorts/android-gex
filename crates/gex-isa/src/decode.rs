@@ -1620,6 +1620,35 @@ fn decode_simd_scalar(raw: u32, u: u32) -> Option<Inst> {
         }
     };
 
+    // Scalar x indexed element: 01 U 11111 size L M Rm opcode H 0 Rn Rd.
+    // The floating-point multiplies by one lane of a vector (`fmla d0, d1,
+    // v2.d[1]`): the vector group's encodings with one result lane. The
+    // saturating doubling multiplies beside them are not decoded.
+    if bits(raw, 28, 24) == 0b11111 && bit(raw, 10) == 0 {
+        let op = match (u, bits(raw, 15, 12)) {
+            (0, 0b0001) => VOp3::FMla,
+            (0, 0b0101) => VOp3::FMls,
+            (0, 0b1001) => VOp3::FMul,
+            (1, 0b1001) => VOp3::FMulx,
+            _ => return None,
+        };
+        let (m, h, l) = (bit(raw, 20), bit(raw, 11), bit(raw, 21));
+        // Half precision has no wasm lane type; a doubleword's L is zero.
+        let (lane_bytes, index) = match (bits(raw, 23, 22), l) {
+            (0b10, _) => (4, h << 1 | l),
+            (0b11, 0) => (8, h),
+            _ => return None,
+        };
+        return Some(Inst::VByElement {
+            op,
+            arr: VArr { lane_bytes, q: false, float: true, scalar: true },
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+            vm: VReg((m << 4 | bits(raw, 19, 16)) as u8),
+            index,
+        });
+    }
+
     // Shift by immediate: 01 U 111110 immh immb opcode 1 Rn Rd
     if bits(raw, 28, 23) == 0b111110 && bit(raw, 10) == 1 {
         let immh = bits(raw, 22, 19);
@@ -2963,6 +2992,25 @@ fn expand_simd_immediate(imm8: u32, cmode: u32, op: bool, q: bool) -> Option<u12
 
 #[cfg(test)]
 mod tests {
+
+    /// The scalar multiplies by a vector's element, as llvm-objdump prints
+    /// them; half precision and a doubleword with L set are no instruction
+    /// here.
+    #[test]
+    fn scalar_multiplies_by_element_decode() {
+        for (raw, want) in [
+            (0x5fc4_1844u32, "fmla d4, d2, v4.d[1]"),
+            (0x5fa3_1020, "fmla s0, s1, v3.s[1]"),
+            (0x5fa3_5820, "fmls s0, s1, v3.s[3]"),
+            (0x5fc3_9020, "fmul d0, d1, v3.d[0]"),
+            (0x7fd3_9820, "fmulx d0, d1, v19.d[1]"),
+        ] {
+            assert_eq!(crate::fmt::disasm(&decode(raw, 0), 0), want, "{raw:#x}");
+        }
+        for raw in [0x5f03_1020u32, 0x5fe3_1020] {
+            assert!(!matches!(decode(raw, 0), Inst::VByElement { .. }), "{raw:#x}");
+        }
+    }
 
     /// The widening sums across lanes, as llvm-objdump prints them.
     #[test]
