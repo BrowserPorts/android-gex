@@ -4363,9 +4363,12 @@ fn place_image(
         for (image, path) in files {
             let (Some(image), Some(path)) = (image, path) else { continue };
             let Ok((_, ranges)) = gex_ld::elf::plan(&|at, out| k.read_file_at(&path, at, out), gex_abi::PIE_BASE) else { continue };
+            // The file's own name, as Linux lists a mapping: not a link
+            // the program was run through (`cat`, which is toybox).
+            let named = k.vfs.canonical(&path);
             let mut mm = k.mem.lock();
             for (seg, &(off, _)) in image.segments.iter().zip(&ranges) {
-                mm.show_file(seg.vaddr, seg.vaddr + seg.mem_size, &path, off);
+                mm.show_file(seg.vaddr, seg.vaddr + seg.mem_size, &named, off);
             }
         }
     });
