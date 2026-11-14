@@ -4902,8 +4902,17 @@ impl MapIo<'_> {
         // have been written).
         let _ = self.mem.lock().take_fresh();
         let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.pc);
-        let start = if from_loader || (cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0) {
-            self.mem.lock().mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "")?
+        let low32 = cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0;
+        let start = if from_loader || low32 {
+            let mut mm = self.mem.lock();
+            match mm.mmap_low(addr, len, prot_bits, flags & !mflags::MAP_32BIT, "") {
+                // Not everything a loader reserves is for an object: bionic's
+                // maps a 2 GiB shadow for its control-flow checks, which no
+                // low arena has room for and which holds no code. What does
+                // not fit below goes where data goes.
+                Err(Errno::ENOMEM) if from_loader && !low32 && gex_abi::mem64() => mm.mmap(addr, len, prot_bits, flags, "")?,
+                r => r?,
+            }
         } else {
             self.mem.lock().mmap(addr, len, prot_bits, flags, "")?
         };
