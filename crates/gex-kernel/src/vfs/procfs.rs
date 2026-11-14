@@ -475,7 +475,7 @@ impl ProcFs {
             "cpuinfo" => crate::cpus::proc_cpuinfo(concat!(
                 "processor\t: 0\n",
                 "BogoMIPS\t: 100.00\n",
-                "Features\t: fp asimd crc32 atomics cpuid\n",
+                "Features\t: fp asimd aes pmull sha1 sha2 crc32 atomics cpuid\n",
                 "CPU implementer\t: 0x41\n",
                 "CPU architecture: 8\n",
                 "CPU variant\t: 0x0\n",

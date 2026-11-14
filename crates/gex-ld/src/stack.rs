@@ -57,7 +57,9 @@ pub const HWCAP: u64 = if gex_abi::X86 {
     const HWCAP_CPUID: u64 = 1 << 11;
     const HWCAP_ATOMICS: u64 = 1 << 8;
     const HWCAP_CRC32: u64 = 1 << 7;
-    HWCAP_FP | HWCAP_ASIMD | HWCAP_CPUID | HWCAP_ATOMICS | HWCAP_CRC32
+    // The cryptographic extension: AES, PMULL, SHA-1 and SHA-2.
+    const HWCAP_CRYPTO: u64 = 1 << 3 | 1 << 4 | 1 << 5 | 1 << 6;
+    HWCAP_FP | HWCAP_ASIMD | HWCAP_CPUID | HWCAP_ATOMICS | HWCAP_CRC32 | HWCAP_CRYPTO
 };
 
 /// Process attributes the auxiliary vector reports.

@@ -4998,9 +4998,10 @@ impl<'a> Lifter<'a> {
             SysReg::Ctr => self.b.const_i64(gex_abi::CTR_EL0),
             SysReg::Cntfrq => self.b.const_i64(gex_abi::CNTFRQ),
             // `ID_AA64ISAR0_EL1`, of which a process sees the fields for
-            // what it may use: the LSE atomics (2) and CRC32 (1), which the
-            // auxiliary vector's `AT_HWCAP` reports too.
-            SysReg::Other(ID_AA64ISAR0_EL1) => self.b.const_i64(2 << 20 | 1 << 16),
+            // what it may use: the LSE atomics (2), CRC32 (1), SHA-2 (1),
+            // SHA-1 (1) and AES with PMULL (2), which the auxiliary
+            // vector's `AT_HWCAP` reports too.
+            SysReg::Other(ID_AA64ISAR0_EL1) => self.b.const_i64(2 << 20 | 1 << 16 | 1 << 12 | 1 << 8 | 2 << 4),
             SysReg::Dczid => {
                 // log2 of the block size in words. The "zeroing prohibited"
                 // bit stays clear because DC ZVA is implemented.
