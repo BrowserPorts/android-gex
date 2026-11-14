@@ -11,6 +11,7 @@ kernel's answer after " => ":
     create <scon> <tcon> <class> [<name>]  the context a new object gets
     member <scon> <tcon> <class>           the context of a polyinstantiated member
     relabel <scon> <tcon> <class>          the context a relabel gives
+    validatetrans <old> <new> <class> <task>  ok, if the relabel is one the class's rules let that task make
     read <file>                            a file of selinuxfs, or of /proc/self/attr
     bool <name> <0|1>                      set a boolean, and commit it
 
@@ -60,6 +61,13 @@ def answer(line):
         if len(args) > 3:
             text += " " + args[3]
         return transact(kind, text)
+    if kind == "validatetrans":
+        fd = os.open(f"{FS}/validatetrans", os.O_WRONLY)
+        try:
+            os.write(fd, f"{args[0]} {args[1]} {class_number(args[2])} {args[3]}".encode())
+        finally:
+            os.close(fd)
+        return "ok"
     if kind == "bool":
         with open(f"{FS}/booleans/{args[0]}", "w") as f:
             f.write(args[1])
