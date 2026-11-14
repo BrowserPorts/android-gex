@@ -5009,6 +5009,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let pc = (pc as u64 & !(gex_cgen::RESUMABLE_PC | gex_abi::ILLEGAL_RETURNS_PC)) as i64;
             let pc = pc as u64;
             let raw = raw as u32;
+            // `GEX_TRACE_GUEST_FAULT`: which instruction it was, said before
+            // a handler of the guest's takes it and says less.
+            if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
+                eprintln!("gex: illegal instruction {raw:#010x} at {pc:#x}");
+            }
             if deliver_guest_fault(&mut caller, fault_code::ILLEGAL_INSTRUCTION, pc, pc)? {
                 return Err(StopExecution.into());
             }
