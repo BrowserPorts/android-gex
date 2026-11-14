@@ -161,6 +161,10 @@ pub mod nr {
     pub const GETTID: u64 = 178;
     pub const SYSINFO: u64 = 179;
     pub const PRCTL: u64 = 167;
+    /// `getrlimit` and `setrlimit`, which AArch64 has beside `prlimit64`
+    /// and bionic calls: made as it ([`super::a64_translate`]).
+    pub const GETRLIMIT: u64 = 163;
+    pub const SETRLIMIT: u64 = 164;
     pub const SOCKET: u64 = 198;
     pub const SOCKETPAIR: u64 = 199;
     pub const BIND: u64 = 200;
@@ -7417,6 +7421,28 @@ pub fn untag_mapping_args(n: u64, a: &mut [u64; 6]) {
     }
 }
 
+/// An AArch64 call that is another's special case, as that other: the
+/// canonical number, the arguments rewritten. `getrlimit(resource, old)`
+/// and `setrlimit(resource, new)` are `prlimit64` of the caller
+/// (kernel/sys.c: both are `do_prlimit` on `current`, and a 64-bit
+/// `struct rlimit` is `struct rlimit64`). `prlimit64` takes a null pointer
+/// to mean no limit asked or given; these two fault on one, so theirs
+/// becomes an address nothing is at.
+pub fn a64_translate(raw: u64, a: &mut [u64; 6]) -> u64 {
+    let must = |p: u64| if p == 0 { u64::MAX } else { p };
+    match raw {
+        nr::GETRLIMIT => {
+            *a = [0, a[0], 0, must(a[1]), 0, 0];
+            nr::PRLIMIT64
+        }
+        nr::SETRLIMIT => {
+            *a = [0, a[0], must(a[1]), 0, 0, 0];
+            nr::PRLIMIT64
+        }
+        n => n,
+    }
+}
+
 /// A futex's addresses without their tags, for a thread with the tagged
 /// address ABI on: the word is found, and waiters matched to wakers, by
 /// where it is. (Linux keys a private futex by the pointer as passed, tag
@@ -7973,6 +7999,8 @@ pub fn free_class_of(m: &GuestMem<'_>, regs: CallRegs, compat: bool) -> Option<F
     } else {
         raw
     };
+    // AArch64's calls that are forms of another, as the full call makes them.
+    let inner = if compat || gex_abi::X86 { inner } else { a64_translate(inner, &mut a) };
     let Some(n) = free_number(inner, compat) else { return nosys_call(raw, compat) };
     // A `clone` that makes a process (no `CLONE_THREAD`) is the host's, and
     // so are `fork` and `vfork`, which are `clone` canonically: only the
@@ -10957,7 +10985,7 @@ impl Kernel {
                 self.signals.blocked(),
             )
         } else {
-            raw
+            a64_translate(raw, &mut a)
         };
 
         self.fd_activity |= wakes_fd_waiters(n) && self.io_may_wake(n, &a);
@@ -13765,6 +13793,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::WAIT4 => "wait4",
         nr::WAITID => "waitid",
         nr::PRLIMIT64 => "prlimit64",
+        nr::GETRLIMIT => "getrlimit",
+        nr::SETRLIMIT => "setrlimit",
         nr::PIDFD_OPEN => "pidfd_open",
         nr::PIDFD_SEND_SIGNAL => "pidfd_send_signal",
         nr::GETRANDOM => "getrandom",
@@ -16397,6 +16427,27 @@ mod tests {
             assert_eq!(ret(&m, at), -(Errno::EINVAL.0 as i64));
             k.creds.set_uid(0);
             k.rlimits.set(default_rlimits());
+            // AArch64's getrlimit and setrlimit, which bionic calls: the
+            // caller's limit, through a pointer that must be one.
+            if !gex_abi::X86 {
+                m.write_u64(0x22000, 11).unwrap();
+                m.write_u64(0x22008, 22).unwrap();
+                set_args(&mut m, at, nr::SETRLIMIT, &[RLIMIT_CORE as u64, 0x22000]);
+                let _ = k.syscall(&mut m, 0);
+                assert_eq!(ret(&m, at), 0);
+                set_args(&mut m, at, nr::GETRLIMIT, &[RLIMIT_CORE as u64, 0x22200]);
+                let _ = k.syscall(&mut m, 0);
+                assert_eq!((ret(&m, at), m.read_u64(0x22200).unwrap(), m.read_u64(0x22208).unwrap()), (0, 11, 22));
+                for n in [nr::GETRLIMIT, nr::SETRLIMIT] {
+                    set_args(&mut m, at, n, &[RLIMIT_CORE as u64, 0]);
+                    let _ = k.syscall(&mut m, 0);
+                    assert_eq!(ret(&m, at), -(Errno::EFAULT.0 as i64));
+                    set_args(&mut m, at, n, &[99, 0x22000]);
+                    let _ = k.syscall(&mut m, 0);
+                    assert_eq!(ret(&m, at), -(Errno::EINVAL.0 as i64));
+                }
+                k.rlimits.set(default_rlimits());
+            }
         }
     }
 
