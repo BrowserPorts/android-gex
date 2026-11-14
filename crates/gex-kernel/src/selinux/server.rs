@@ -13,7 +13,7 @@
 //! policy has the names for but does not allow, is the reference's as
 //! read, not yet as seen.
 
-use crate::selinux::policy::{Context, Decision, OContext, Policy, POLICY_CAPABILITIES, VERSION_MAX};
+use crate::selinux::policy::{av, Context, Decision, OContext, Policy, POLICY_CAPABILITIES, VERSION_MAX};
 use std::collections::HashMap;
 
 /// `SECINITSID_NUM`: the last of the kernel's own SIDs.
@@ -39,6 +39,8 @@ pub enum Error {
     Invalid,
     /// `EACCES`: a context the policy does not allow, and it is enforced.
     Denied,
+    /// `EPERM`: a change of label the policy's validatetrans rules refuse.
+    NotPermitted,
 }
 
 /// What a SID stands for.
@@ -244,6 +246,75 @@ impl Server {
         Ok(l.sid_of(new))
     }
 
+    /// `security_validate_transition_user`: whether something of a class
+    /// may go from one label to another at a task's hand. Anything may,
+    /// before a policy; a refusal is one whether or not it is enforced.
+    pub fn validate_transition(&self, old: u32, new: u32, task: u32, class: u32) -> Result<(), Error> {
+        let Some(l) = &self.loaded else { return Ok(()) };
+        let (Some(o), Some(n), Some(t)) = (l.context(old), l.context(new), l.context(task)) else { return Err(Error::Invalid) };
+        match l.policy.validate_transition(o, n, t, class) {
+            Some(true) => Ok(()),
+            Some(false) => Err(Error::NotPermitted),
+            None => Err(Error::Invalid),
+        }
+    }
+
+    /// A question written to one of selinuxfs's files that answer in the
+    /// file it was written to (`context`, `access`, `create`, `member`,
+    /// `relabel`), or to `validatetrans`, which answers by the write's
+    /// success alone. Contexts are text, a class is its number in the
+    /// policy, and a context in the answer ends in a NUL. `None` for any
+    /// other file.
+    pub fn transact(&mut self, file: &str, question: &str) -> Option<Result<Vec<u8>, Error>> {
+        if !matches!(file, "context" | "access" | "create" | "member" | "relabel" | "validatetrans") {
+            return None;
+        }
+        Some(self.answer(file, question))
+    }
+
+    fn answer(&mut self, file: &str, question: &str) -> Result<Vec<u8>, Error> {
+        let context = |s: &Server, sid: u32| s.sid_to_context(sid, false).map(|text| [text.as_bytes(), b"\0"].concat());
+        if file == "context" {
+            // The context as the policy writes it.
+            let sid = self.context_to_sid(question.trim_end_matches('\0'))?;
+            return context(self, sid);
+        }
+        let words: Vec<&str> = question.trim_end_matches('\0').split_ascii_whitespace().collect();
+        let class = |word: &str| word.parse::<u16>().map(u32::from).map_err(|_| Error::Invalid);
+        match (file, words.as_slice()) {
+            // What follows the class is not read.
+            ("access", [scon, tcon, tclass, ..]) => {
+                let (ssid, tsid) = (self.context_to_sid(scon)?, self.context_to_sid(tcon)?);
+                let d = self.compute_av(ssid, tsid, class(tclass)?);
+                Ok(format!("{:x} {:x} {:x} {:x} {} {:x}", d.allowed, !0u32, d.auditallow, d.auditdeny, self.seqno, d.flags).into_bytes())
+            }
+            // A new object's name may follow, with `+` for a space and
+            // `%xx` for any byte. One that is not text is no name a policy
+            // here has, which is as if none were given.
+            ("create", [scon, tcon, tclass, ..]) => {
+                let name = match words.get(3) {
+                    Some(coded) => String::from_utf8(percent_decoded(coded).ok_or(Error::Invalid)?).ok(),
+                    None => None,
+                };
+                let (ssid, tsid) = (self.context_to_sid(scon)?, self.context_to_sid(tcon)?);
+                let sid = self.compute_sid(ssid, tsid, class(tclass)?, av::TRANSITION, name.as_deref())?;
+                context(self, sid)
+            }
+            ("member" | "relabel", [scon, tcon, tclass, ..]) => {
+                let specified = if file == "member" { av::MEMBER } else { av::CHANGE };
+                let (ssid, tsid) = (self.context_to_sid(scon)?, self.context_to_sid(tcon)?);
+                let sid = self.compute_sid(ssid, tsid, class(tclass)?, specified, None)?;
+                context(self, sid)
+            }
+            ("validatetrans", [oldcon, newcon, tclass, taskcon, ..]) => {
+                let class = class(tclass)?;
+                let (old, new, task) = (self.context_to_sid(oldcon)?, self.context_to_sid(newcon)?, self.context_to_sid(taskcon)?);
+                self.validate_transition(old, new, task, class).map(|()| Vec::new())
+            }
+            _ => Err(Error::Invalid),
+        }
+    }
+
     pub fn enforcing(&self) -> bool {
         self.enforcing
     }
@@ -362,10 +433,31 @@ impl Server {
     }
 }
 
+/// A name as `create` takes it: `+` a space, `%xx` a byte, and the name
+/// ends at a byte of 0. `None` for a `%` without its two digits.
+fn percent_decoded(coded: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut bytes = coded.bytes();
+    while let Some(b) = bytes.next() {
+        let b = match b {
+            b'+' => b' ',
+            b'%' => {
+                let (hi, lo) = ((bytes.next()? as char).to_digit(16)?, (bytes.next()? as char).to_digit(16)?);
+                (hi << 4 | lo) as u8
+            }
+            other => other,
+        };
+        if b == 0 {
+            break;
+        }
+        out.push(b);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::selinux::policy::av;
 
     const V33: &[u8] = include_bytes!("testdata/test.33");
 
@@ -504,6 +596,63 @@ mod tests {
         assert_eq!((perms[0].as_str(), perms[6].as_str()), ("read", "open"), "by number, as class/file/perms/* read");
         assert!(s.dir("class").unwrap().contains(&"binder".to_string()));
         assert_eq!((s.dir("class/nothing"), s.file("class/file/perms/nothing").map(|f| f.0)), (None, None));
+    }
+
+    /// Every question a kernel was asked through selinuxfs with test.33
+    /// loaded (testdata/answers.txt), written here to the same files as
+    /// tests/android/oracle/selinux-ask.py wrote them there, and its
+    /// answers.
+    #[test]
+    fn its_question_files_answer_as_a_kernels() {
+        let mut s = Server::default();
+        s.load(V33).unwrap();
+        let class = |s: &Server, name: &str| String::from_utf8(s.file(&format!("class/{name}/index")).unwrap().1.unwrap()).unwrap();
+        let mut asked = 0;
+        for line in include_str!("testdata/answers.txt").lines() {
+            let Some((question, want)) = line.split_once(" => ") else { continue };
+            let words: Vec<&str> = question.split_whitespace().collect();
+            let (file, text) = match words.as_slice() {
+                ["bool", name, value] => {
+                    s.set_bool(name, *value == "1").unwrap();
+                    continue;
+                }
+                ["context", c] => ("context", c.to_string()),
+                ["access", sc, tc, cl] => ("access", format!("{sc} {tc} {} ffffffff", class(&s, cl))),
+                [kind @ ("create" | "member" | "relabel"), sc, tc, cl, name @ ..] => (*kind, format!("{sc} {tc} {} {}", class(&s, cl), name.join(" ")).trim_end().to_string()),
+                ["validatetrans", old, new, cl, task] => ("validatetrans", format!("{old} {new} {} {task}", class(&s, cl))),
+                ["read", ..] => continue,
+                _ => panic!("{question}"),
+            };
+            let got = match s.transact(file, &text).unwrap() {
+                Ok(bytes) if file == "validatetrans" => {
+                    assert!(bytes.is_empty());
+                    "ok".to_string()
+                }
+                Ok(bytes) if file == "access" => {
+                    // The count of loads is in it, which the answers were
+                    // kept without.
+                    let text = String::from_utf8(bytes).unwrap();
+                    let w: Vec<&str> = text.split(' ').collect();
+                    assert_eq!(w[4], s.seqno.to_string());
+                    format!("{} {} {} {} {}", w[0], w[1], w[2], w[3], w[5])
+                }
+                Ok(bytes) => {
+                    assert_eq!(bytes.last(), Some(&0), "{question}");
+                    String::from_utf8(bytes[..bytes.len() - 1].to_vec()).unwrap()
+                }
+                Err(Error::Invalid) => "errno EINVAL".to_string(),
+                Err(Error::NotPermitted) => "errno EPERM".to_string(),
+                Err(Error::Denied) => "errno EACCES".to_string(),
+            };
+            assert_eq!(got, want, "{question}");
+            asked += 1;
+        }
+        assert!(asked > 900, "{asked} questions");
+        // Not a question, and not a file that takes one.
+        assert_eq!(s.transact("access", "system_u:system_r:init_t:s0"), Some(Err(Error::Invalid)));
+        assert_eq!(s.transact("create", "a b 1 %4"), Some(Err(Error::Invalid)));
+        assert_eq!(s.transact("enforce", "1"), None);
+        assert_eq!(percent_decoded("a+b%2fc%00d").as_deref(), Some(&b"a b/c"[..]));
     }
 
     /// When another policy takes a policy's place, a SID keeps its number
