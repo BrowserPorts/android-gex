@@ -4,6 +4,11 @@
 // length is asked for, and copies no more than that length. A forked child
 // has its parent's, and a program it then runs has its own. /proc/self/auxv
 // is the same vector, through its AT_NULL pair.
+//
+// The ids in it are the process's real and effective ones, and AT_SECURE is
+// whether an effective one is not its real one. As root, a child makes all
+// four differ and runs the program again to see them.
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -52,14 +57,39 @@ int main(int argc, char **argv) {
     errno = 0;
     if (prctl(PR_GET_AUXV, v, sizeof v, 0, 1) != -1 || errno != EINVAL) status |= 16;
 
-    unsigned char file[1024];
-    int fd = open("/proc/self/auxv", O_RDONLY);
-    long got = read(fd, file, sizeof file);
-    if (got != (pairs + 1) * 16 || memcmp(file, v, got)) status |= 64;
-    close(fd);
+    // (Not as the program run with an effective id of its own: Linux gives
+    // that one's /proc files to root, and it cannot open them.)
+    if (argc < 2 || strcmp(argv[1], "ids")) {
+        unsigned char file[1024];
+        int fd = open("/proc/self/auxv", O_RDONLY);
+        long got = read(fd, file, sizeof file);
+        if (got != (pairs + 1) * 16 || memcmp(file, v, got)) status |= 64;
+        close(fd);
+    }
 
-    // Run again by the child below: the checks above were the new program's.
-    if (argc > 1) return status ? 1 : 0;
+    int secure = getuid() != geteuid() || getgid() != getegid();
+    if (getauxval(AT_UID) != getuid() || getauxval(AT_EUID) != geteuid()) status |= 128;
+    if (getauxval(AT_GID) != getgid() || getauxval(AT_EGID) != getegid()) status |= 128;
+    if (getauxval(AT_SECURE) != (unsigned long)secure) status |= 128;
+
+    // Run again by a child below: the checks above were the new program's.
+    if (argc > 1) {
+        if (!strcmp(argv[1], "ids") && (getuid() != 2001 || geteuid() != 2002 || getgid() != 3003 || getegid() != 3004)) status |= 256;
+        if (status) fprintf(stderr, "auxv %s %d\n", argv[1], status);
+        return status ? 1 : 0;
+    }
+
+    if (geteuid() == 0) {
+        pid_t ids = fork();
+        if (ids == 0) {
+            if (setresgid(3003, 3004, 3004) || setresuid(2001, 2002, 2002)) _exit(3);
+            char *again[] = {argv[0], "ids", 0};
+            execv(argv[0], again);
+            _exit(2);
+        }
+        int st = -1;
+        if (waitpid(ids, &st, 0) != ids || !WIFEXITED(st) || WEXITSTATUS(st)) status |= 256;
+    }
 
     pid_t child = fork();
     if (child == 0) {
