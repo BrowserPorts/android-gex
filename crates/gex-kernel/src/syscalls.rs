@@ -4520,12 +4520,43 @@ impl MapIo<'_> {
             }
             // MS_INVALIDATE (2): and what other processes wrote back since
             // read in ([`sync_shared_file`]).
-            nr::MSYNC => self.flush_shared(m, a[0], a[1]).and_then(|_| if a[2] & 2 != 0 { self.refresh_shared(m, a[0], a[1]) } else { Ok(()) }).map(|_| 0),
+            nr::MSYNC => self.msync(m, a[0], a[1], a[2]),
             nr::MREMAP => self.mremap(m, a),
             nr::MPROTECT => self.mprotect(m, a),
             nr::MADVISE => self.madvise(m, a[0], a[1], a[2] as u32),
             _ => return None,
         })
+    }
+
+    /// `msync` (mm/msync.c): the flags and the address checked, the shared
+    /// file mappings in the range written back (and with `MS_INVALIDATE`
+    /// read again), and `ENOMEM` if any of the range is not mapped, once
+    /// what is mapped has been done.
+    fn msync(&self, m: &mut GuestMem<'_>, start: u64, len: u64, flags: u64) -> SysResult {
+        const MS_ASYNC: u64 = 1;
+        const MS_INVALIDATE: u64 = 2;
+        const MS_SYNC: u64 = 4;
+        if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+            || !start.is_multiple_of(crate::mem::PAGE_SIZE)
+            || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC
+        {
+            return Err(Errno::EINVAL);
+        }
+        let len = len.wrapping_add(crate::mem::PAGE_SIZE - 1) & !(crate::mem::PAGE_SIZE - 1);
+        let end = start.checked_add(len).ok_or(Errno::ENOMEM)?;
+        if end == start {
+            return Ok(0);
+        }
+        let whole = self.mem.lock().all_mapped(start, end);
+        self.flush_shared(m, start, len)?;
+        if flags & MS_INVALIDATE != 0 {
+            self.refresh_shared(m, start, len)?;
+        }
+        if whole {
+            Ok(0)
+        } else {
+            Err(Errno::ENOMEM)
+        }
     }
 
     /// `mprotect`.
@@ -4593,13 +4624,72 @@ impl MapIo<'_> {
         r
     }
 
+    /// `mremap` to an address the caller fixed (`MREMAP_FIXED`), or one the
+    /// map picks for a source that stays (`MREMAP_DONTUNMAP` alone): the
+    /// mapping's pages go to the new range, over whatever was mapped there,
+    /// and the old range is unmapped or, kept, reads as zero. bionic's
+    /// loader publishes each page of its control-flow shadow this way.
+    fn mremap_to(&self, m: &mut GuestMem<'_>, addr: u64, old_len: u64, new_len: u64, to: Option<u64>, keep_old: bool) -> SysResult {
+        if !addr.is_multiple_of(crate::mem::PAGE_SIZE) || new_len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        // A shared file mapping is written back from where it was mapped,
+        // which a move would have to carry too.
+        if self.mem.lock().log.shared_maps.iter().any(|s| s.start < addr + old_len && addr < s.start + s.len) {
+            eprintln!("[gex] mremap: moving a shared file mapping to a fixed address is not implemented -> ENOMEM");
+            return Err(Errno::ENOMEM);
+        }
+        let keep = old_len.min(new_len) as usize;
+        let prot = self.mem.lock().vma_at(addr).map(|v| v.prot).ok_or(Errno::EFAULT)?;
+        // Code at either end is no longer what was translated.
+        self.retire_code_why(addr, old_len, "mremap", prot);
+        let mut mm = self.mem.lock();
+        let to = match to {
+            Some(to) => to,
+            None => {
+                let v = mm.vma_at(addr).ok_or(Errno::EFAULT)?;
+                let (vprot, name) = (v.prot, v.name.clone());
+                mm.mmap(0, new_len, vprot, 0, &name)?
+            }
+        };
+        drop(mm);
+        self.retire_code_why(to, new_len, "mremap-fixed", prot);
+        let mut mm = self.mem.lock();
+        // The bytes are read before the map changes and written after: the
+        // new range may not have been memory until it is mapped.
+        let bytes = m.read(addr, keep)?.to_vec();
+        let dst = mm.mremap_to(addr, old_len, new_len, to, keep_old)?;
+        m.write(dst, &bytes)?;
+        if new_len as usize > keep {
+            m.zero_dirty(dst + keep as u64, new_len as usize - keep)?;
+        }
+        if keep_old {
+            m.zero_dirty(addr, old_len as usize)?;
+        }
+        Ok(dst)
+    }
+
     /// `mremap`. The map decides where; this moves the bytes.
     pub fn mremap(&self, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysResult {
         const MREMAP_MAYMOVE: u64 = 1;
+        const MREMAP_FIXED: u64 = 2;
+        const MREMAP_DONTUNMAP: u64 = 4;
         let (addr, old_len, new_len, flags) = (a[0], a[1], a[2], a[3]);
+        // The flags as `mremap` checks them (mm/mremap.c): none it does not
+        // know, a fixed address or a kept source only with leave to move,
+        // and a kept source only at the same length.
+        if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+            || (flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0)
+            || (flags & MREMAP_DONTUNMAP != 0 && (flags & MREMAP_MAYMOVE == 0 || old_len != new_len))
+        {
+            return Err(Errno::EINVAL);
+        }
         // Whole pages, as Linux moves and keeps them: an old length short
         // of a page (sqlite passes its file's size) still has the page.
         let (old_al, new_al) = (crate::mem::page_align_up(old_len), crate::mem::page_align_up(new_len));
+        if flags & (MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 {
+            return self.mremap_to(m, addr, old_al, new_al, (flags & MREMAP_FIXED != 0).then_some(a[4]), flags & MREMAP_DONTUNMAP != 0);
+        }
         if addr.is_multiple_of(crate::mem::PAGE_SIZE) && old_len != 0 && new_len != 0 {
             if let Some(r) = self.mremap_shared(m, addr, old_al, new_al, flags & MREMAP_MAYMOVE != 0) {
                 return r;

@@ -1618,6 +1618,48 @@ impl MemoryMap {
         r
     }
 
+    /// `mremap` with `MREMAP_FIXED` (`mremap_to`, mm/mremap.c): the mapping
+    /// at `[addr, addr + old_len)` becomes the one at `new_addr`, `new_len`
+    /// long, over whatever was mapped there. The two ranges may not
+    /// overlap. The old range is unmapped, unless `keep_old`
+    /// (`MREMAP_DONTUNMAP`) leaves it mapped and empty. The caller moves
+    /// the bytes, before this.
+    pub fn mremap_to(&mut self, addr: u64, old_len: u64, new_len: u64, new_addr: u64, keep_old: bool) -> Result<u64, Errno> {
+        let r = self.mremap_to_unpublished(addr, old_len, new_len, new_addr, keep_old);
+        self.publish();
+        r
+    }
+
+    fn mremap_to_unpublished(&mut self, addr: u64, old_len: u64, new_len: u64, new_addr: u64, keep_old: bool) -> Result<u64, Errno> {
+        self.generation += 1;
+        if !addr.is_multiple_of(PAGE_SIZE) || !new_addr.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::EINVAL);
+        }
+        let (old_len, new_len) = (page_align_up(old_len), page_align_up(new_len));
+        let limit = self.limit();
+        if new_len == 0 || new_len > limit || new_addr > limit - new_len {
+            return Err(Errno::EINVAL);
+        }
+        if addr + old_len > new_addr && new_addr + new_len > addr {
+            return Err(Errno::EINVAL);
+        }
+        // The whole range has to be one mapping, as Linux requires.
+        let Some(v) = self.vmas.iter().find(|v| v.start <= addr && v.end >= addr + old_len).cloned() else {
+            return Err(Errno::EFAULT);
+        };
+        let moved = v.slice(addr, addr + old_len.min(new_len), v.prot);
+        self.mmap(new_addr, new_len, v.prot, flags::FIXED | flags::PRIVATE | flags::ANONYMOUS, &v.name)?;
+        for n in self.vmas.iter_mut().filter(|n| n.start >= new_addr && n.end <= new_addr + new_len) {
+            n.anon_name = moved.anon_name.clone();
+            n.file_off = moved.file_off.map(|o| o + (n.start - new_addr));
+        }
+        if keep_old {
+            return Ok(new_addr);
+        }
+        self.unmap(addr, old_len)?;
+        Ok(new_addr)
+    }
+
     /// [`Self::mremap`] before it is published.
     fn mremap_unpublished(
         &mut self,
@@ -1990,6 +2032,18 @@ impl MemoryMap {
         }
     }
 
+    /// Whether every page of `[start, end)` is mapped.
+    pub fn all_mapped(&self, start: u64, end: u64) -> bool {
+        let mut at = start;
+        for v in self.vmas.iter().filter(|v| v.end > start && v.start < end) {
+            if v.start > at {
+                return false;
+            }
+            at = v.end;
+        }
+        at >= end
+    }
+
     /// The first mapping in `[addr, addr + len)` that `mprotect` to `new`
     /// may not be given under `PR_SET_MDWE` (`map_deny_write_exec`): any,
     /// when `new` is writable and executable; one that is not executable
@@ -2166,6 +2220,29 @@ mod tests {
         // An anonymous mapping has none.
         m.mmap(at + 0x10000, 0x1000, prot::READ, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED, "").unwrap();
         assert!(m.proc_maps().lines().any(|l| l.starts_with(&format!("{:08x}-", at + 0x10000)) && l.contains(" 00000000 ")));
+    }
+
+    /// `mremap` with `MREMAP_FIXED`: the mapping moves over what was at the
+    /// new address, keeping its protection and name; overlap is refused.
+    #[test]
+    fn a_mapping_moves_to_a_fixed_address() {
+        let mut m = MemoryMap::new(0x100_0000);
+        let anon = flags::PRIVATE | flags::ANONYMOUS | flags::FIXED;
+        let at = MMAP_BOTTOM;
+        m.mmap(at, 0x2000, prot::READ, anon, "").unwrap();
+        m.set_anon_name(at, 0x2000, Some("tmp")).unwrap();
+        m.mmap(at + 0x10000, 0x4000, prot::NONE, anon, "").unwrap();
+        assert_eq!(m.mremap_to(at, 0x2000, 0x2000, at + 0x11000, false), Ok(at + 0x11000));
+        assert!(m.vma_at(at).is_none(), "the old range is gone");
+        let layout: Vec<_> = m.vmas().iter().filter(|v| v.start >= at + 0x10000 && v.end <= at + 0x14000).map(|v| (v.start - at, v.end - at, v.prot, v.anon_name.as_deref().map(str::to_string))).collect();
+        assert_eq!(layout, vec![(0x10000, 0x11000, prot::NONE, None), (0x11000, 0x13000, prot::READ, Some("tmp".into())), (0x13000, 0x14000, prot::NONE, None)]);
+        // Overlapping ranges, a new address off a page, and no mapping to move.
+        assert_eq!(m.mremap_to(at + 0x11000, 0x2000, 0x2000, at + 0x12000, false), Err(Errno::EINVAL));
+        assert_eq!(m.mremap_to(at + 0x11000, 0x2000, 0x2000, at + 0x20800, false), Err(Errno::EINVAL));
+        assert_eq!(m.mremap_to(at + 0x40000, 0x1000, 0x1000, at + 0x50000, false), Err(Errno::EFAULT));
+        // MREMAP_DONTUNMAP leaves the old range mapped.
+        assert_eq!(m.mremap_to(at + 0x11000, 0x2000, 0x2000, at + 0x30000, true), Ok(at + 0x30000));
+        assert!(m.vma_at(at + 0x11000).is_some() && m.vma_at(at + 0x30000).is_some());
     }
 
     /// `PR_SET_MDWE`: which `mprotect` gains execute where it may not.
