@@ -62,9 +62,11 @@ struct Loaded {
 #[derive(Default)]
 pub struct Server {
     loaded: Option<Loaded>,
-    pub enforcing: bool,
+    enforcing: bool,
     /// How many policies have been loaded (`latest_granting`).
     pub seqno: u32,
+    /// How many times the status page has been written anew.
+    changes: u32,
 }
 
 impl Loaded {
@@ -167,6 +169,7 @@ impl Server {
         }
         self.loaded = Some(Loaded { policy, bools, initial, others, by_context });
         self.seqno += 1;
+        self.changes += 1;
         Ok(())
     }
 
@@ -234,6 +237,29 @@ impl Server {
             return Ok(tsid);
         }
         Ok(l.sid_of(new))
+    }
+
+    pub fn enforcing(&self) -> bool {
+        self.enforcing
+    }
+
+    /// `enforce` written: a change of it is a change of the status page,
+    /// the same value again is nothing.
+    pub fn set_enforcing(&mut self, on: bool) {
+        if on != self.enforcing {
+            self.enforcing = on;
+            self.changes += 1;
+        }
+    }
+
+    /// The words of the status page a program maps to see a change
+    /// without a system call (`struct selinux_kernel_status`): its
+    /// version, a sequence that is odd while the page is being written
+    /// and so goes up by two a change, enforcing, the count of loads, and
+    /// whether an unknown permission is denied.
+    pub fn status(&self) -> [u32; 5] {
+        let deny_unknown = !self.policy().is_some_and(|p| p.allow_unknown);
+        [1, self.changes * 2, self.enforcing as u32, self.seqno, deny_unknown as u32]
     }
 
     /// What a file of selinuxfs that only reads its state reads, and its
@@ -310,6 +336,7 @@ impl Server {
         let at = l.policy.bools.iter().position(|b| b.name == name).ok_or(Error::Invalid)?;
         l.bools[at] = value;
         self.seqno += 1;
+        self.changes += 1;
         Ok(())
     }
 }
@@ -340,8 +367,10 @@ mod tests {
     #[test]
     fn with_a_policy_sids_are_contexts() {
         let mut s = Server::default();
+        assert_eq!(s.status(), [1, 0, 0, 0, 1], "the status page before a policy, as Linux 7.0's read");
         s.load(V33).unwrap();
         assert_eq!(s.seqno, 1);
+        assert_eq!(s.status(), [1, 2, 0, 1, 1], "and after");
         // initial_contexts, as it read: kernel, security, unlabeled, file
         // and devnull.
         assert_eq!(s.sid_to_context(SID_KERNEL, false).as_deref(), Ok("system_u:system_r:kernel_t:s0"));
@@ -424,6 +453,18 @@ mod tests {
             }
         }
         assert!(read >= 15, "{read} files");
+        // A commit of booleans is a change and counts as a load: the
+        // kernel's page read 1 24 0 12 1 after two loads with commits
+        // between them, the sequence twice the count.
+        let before = s.status();
+        s.set_bool("allow_stuff", true).unwrap();
+        assert_eq!(s.status(), [1, before[1] + 2, 0, before[3] + 1, 1]);
+        // From the reference, not yet seen: enforcing set is a change,
+        // and set to what it is already is none.
+        s.set_enforcing(true);
+        s.set_enforcing(true);
+        assert_eq!(s.status(), [1, before[1] + 4, 1, before[3] + 1, 1]);
+        assert_eq!(s.file("enforce"), Some((0o644, Ok(b"1".to_vec()))));
         // In the policy's order of them, which is not the alphabet's.
         assert_eq!(s.dir("booleans"), Some(vec!["other_thing".to_string(), "allow_stuff".to_string()]));
         assert_eq!(s.dir("class/file"), Some(vec!["index".to_string(), "perms".to_string()]));
@@ -446,6 +487,7 @@ mod tests {
         let app = s.context_to_sid("system_u:system_r:app_t:s0").unwrap();
         s.load(include_bytes!("testdata/other.33")).unwrap();
         assert_eq!(s.seqno, 2);
+        assert_eq!(s.status(), [1, 4, 0, 2, 1], "as its status page read");
         assert_eq!(s.sid_to_context(init, false).as_deref(), Ok("system_u:object_r:file_t:s0"), "no init_t now: unlabeled");
         assert_eq!(s.sid_to_context(init, true).as_deref(), Ok("system_u:system_r:init_t:s0"), "as it was written, for whoever may see that");
         // A context the new policy has every name for is itself, under
