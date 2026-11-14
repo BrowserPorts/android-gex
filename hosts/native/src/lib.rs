@@ -1195,7 +1195,8 @@ fn run_program_with(
         gex_kernel::syscalls::Creds::new(uid, gid)
     };
     // The ids the auxiliary vector gives the program (AT_UID, AT_EUID).
-    let (kernel_uid, kernel_gid) = (creds.uid(), creds.gid());
+    let (kernel_uid, kernel_gid) = (creds.ruid(), creds.rgid());
+    let (kernel_euid, kernel_egid) = (creds.uid(), creds.gid());
     let mut kernel = Kernel {
         trace: opts.trace,
         creds,
@@ -1432,6 +1433,8 @@ fn run_program_with(
         Identity {
             uid: kernel_uid,
             gid: kernel_gid,
+            euid: kernel_euid,
+            egid: kernel_egid,
             interp_base: program.interp_base(),
             entry_hook: 0,
         },

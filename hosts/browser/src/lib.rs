@@ -6345,6 +6345,8 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         gex_ld::Identity {
             uid: unsafe { IDENTITY.0 },
             gid: unsafe { IDENTITY.1 },
+            euid: unsafe { IDENTITY.0 },
+            egid: unsafe { IDENTITY.1 },
             // Where the interpreter ended up, which is how it finds itself.
             interp_base: program.interp_base(),
             entry_hook: hook,
@@ -12292,8 +12294,10 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         *b"gexdeterministic",
         // The process's, which a `setuid` before the exec changed.
         gex_ld::Identity {
-            uid: h.kernel.creds.uid(),
-            gid: h.kernel.creds.gid(),
+            uid: h.kernel.creds.ruid(),
+            gid: h.kernel.creds.rgid(),
+            euid: h.kernel.creds.uid(),
+            egid: h.kernel.creds.gid(),
             interp_base,
             entry_hook: hook,
         },

@@ -70,8 +70,13 @@ pub const HWCAP: u64 = if gex_abi::X86 {
 /// disagreed.
 #[derive(Clone, Copy, Debug)]
 pub struct Identity {
+    /// The real ids (`AT_UID`, `AT_GID`), what `getuid` and `getgid` say.
     pub uid: u32,
     pub gid: u32,
+    /// The effective ids (`AT_EUID`, `AT_EGID`). Either differing from its
+    /// real one is what makes the program `AT_SECURE`.
+    pub euid: u32,
+    pub egid: u32,
     /// Load bias of the dynamic linker, or zero for a static program.
     ///
     /// The interpreter reads `AT_BASE` to locate its own relocations; a
@@ -90,6 +95,8 @@ impl Default for Identity {
         Identity {
             uid: 1000,
             gid: 1000,
+            euid: 1000,
+            egid: 1000,
             interp_base: 0,
             entry_hook: 0,
         }
@@ -193,13 +200,16 @@ pub fn build_initial_stack(
             if id.entry_hook != 0 { id.entry_hook } else { image.entry },
         ),
         (auxv::AT_UID, id.uid as u64),
-        (auxv::AT_EUID, id.uid as u64),
+        (auxv::AT_EUID, id.euid as u64),
         (auxv::AT_GID, id.gid as u64),
-        (auxv::AT_EGID, id.gid as u64),
+        (auxv::AT_EGID, id.egid as u64),
         (auxv::AT_HWCAP, HWCAP),
         (auxv::AT_HWCAP2, 0),
         (auxv::AT_CLKTCK, 100),
-        (auxv::AT_SECURE, 0),
+        // `bprm->secureexec` as `cap_bprm_creds_from_file` sets it for a
+        // program that is neither set-id nor has file capabilities: an
+        // effective id that is not the real one.
+        (auxv::AT_SECURE, (id.euid != id.uid || id.egid != id.gid) as u64),
         (auxv::AT_RANDOM, blob_addr + random_off as u64),
         (auxv::AT_PLATFORM, blob_addr + platform_off as u64),
         (auxv::AT_EXECFN, blob_addr + execfn_off as u64),
