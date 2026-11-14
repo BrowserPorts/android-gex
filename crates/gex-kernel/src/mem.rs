@@ -1477,7 +1477,20 @@ impl MemoryMap {
 
     /// As [`Self::mmap`], recording the file and offset the bytes came from.
     pub fn mmap_from(&mut self, addr: u64, len: u64, prot: u32, flags: u64, name: &str, origin: Option<(String, u64)>) -> SysResult {
-        let r = self.mmap_from_unpublished(addr, len, prot, flags, name, origin);
+        let mut r = self.mmap_from_unpublished(addr, len, prot, flags, name, origin.clone());
+        // A file's mapping is kept low because it is usually an object's,
+        // and an object's text is mapped inside it. One with no room below
+        // that is not executable is data all the same (a font, a table: ICU's
+        // is 30 MiB), and goes where data goes in a 64-bit memory.
+        if r == Err(Errno::ENOMEM) && origin.is_some() && prot & prot::EXEC == 0 && flags & (flags::FIXED | flags::FIXED_NOREPLACE) == 0 && len != 0 {
+            let len = page_align_up(len);
+            if let Some(start) = self.find_high(len) {
+                if self.back.is_none_or(|back| back(start, start + len).is_some()) {
+                    self.insert_mapped(start, start + len, prot, name, origin);
+                    r = Ok(start);
+                }
+            }
+        }
         if r == Err(Errno::ENOMEM) && len >= SHORT_REPORT_MIN {
             self.report_short(addr, len);
         }
@@ -2259,6 +2272,22 @@ mod tests {
         // MREMAP_DONTUNMAP leaves the old range mapped.
         assert_eq!(m.mremap_to(at + 0x11000, 0x2000, 0x2000, at + 0x30000, true), Ok(at + 0x30000));
         assert!(m.vma_at(at + 0x11000).is_some() && m.vma_at(at + 0x30000).is_some());
+    }
+
+    /// A file's mapping that has no room below goes to the high arena of a
+    /// 64-bit memory when it is not executable; an executable one does not.
+    #[test]
+    fn a_data_file_with_no_room_below_is_mapped_high() {
+        let mut m = MemoryMap::new(0x100_0000);
+        m.set_high_arena(gex_abi::IMAGE_ZONE64, gex_abi::LIMIT64);
+        // The low arena, all of it, reserved.
+        let anon = flags::PRIVATE | flags::ANONYMOUS | flags::FIXED;
+        m.mmap(MMAP_BOTTOM, MMAP_TOP - MMAP_BOTTOM, prot::NONE, anon, "").unwrap();
+        let file = Some(("/data/x.dat".to_string(), 0));
+        let at = m.mmap_from(0, 0x4000, prot::READ, flags::PRIVATE, "/data/x.dat", file.clone()).unwrap();
+        assert!(at >= gex_abi::IMAGE_ZONE64, "{at:#x}");
+        assert_eq!(m.vma_at(at).unwrap().file_off, Some(0));
+        assert_eq!(m.mmap_from(0, 0x4000, prot::READ | prot::EXEC, flags::PRIVATE, "/lib/x.so", Some(("/lib/x.so".into(), 0))), Err(Errno::ENOMEM));
     }
 
     /// `PR_SET_MDWE`: which `mprotect` gains execute where it may not.
