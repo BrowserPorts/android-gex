@@ -102,7 +102,15 @@ int main(int argc, char **argv) {
     CHECK(fails(EINVAL, 1000, 0, 0, 0, 0));
     CHECK(fails(EINVAL, PR_GET_FPEMU, (unsigned long)&word, 0, 0, 0));
     CHECK(fails(EINVAL, PR_GET_ENDIAN, (unsigned long)&word, 0, 0, 0));
-    CHECK(fails(EINVAL, PR_GET_TSC, (unsigned long)&word, 0, 0, 0));
+    // Whether a read of the counter faults: an option arm64 has had since
+    // Linux 6.12, and did not have before.
+    if (pr(PR_GET_TSC, (unsigned long)&word, 0, 0, 0) == 0) {
+        CHECK(word == PR_TSC_ENABLE);
+        CHECK(pr(PR_SET_TSC, PR_TSC_ENABLE, 0, 0, 0) == 0);
+        CHECK(fails(EINVAL, PR_SET_TSC, 3, 0, 0, 0));
+    } else {
+        CHECK(errno == EINVAL);
+    }
     CHECK(fails(EINVAL, PR_GET_UNALIGN, (unsigned long)&word, 0, 0, 0));
 
     CHECK(pr(PR_GET_PDEATHSIG, (unsigned long)&word, 0, 0, 0) == 0 && word == 0);
