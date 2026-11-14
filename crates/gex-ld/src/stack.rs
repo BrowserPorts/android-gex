@@ -56,7 +56,8 @@ pub const HWCAP: u64 = if gex_abi::X86 {
     const HWCAP_ASIMD: u64 = 1 << 1;
     const HWCAP_CPUID: u64 = 1 << 11;
     const HWCAP_ATOMICS: u64 = 1 << 8;
-    HWCAP_FP | HWCAP_ASIMD | HWCAP_CPUID | HWCAP_ATOMICS
+    const HWCAP_CRC32: u64 = 1 << 7;
+    HWCAP_FP | HWCAP_ASIMD | HWCAP_CPUID | HWCAP_ATOMICS | HWCAP_CRC32
 };
 
 /// Process attributes the auxiliary vector reports.

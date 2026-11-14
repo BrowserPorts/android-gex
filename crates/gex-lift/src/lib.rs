@@ -4586,11 +4586,77 @@ impl<'a> Lifter<'a> {
             Dp2Op::Lsrv => self.b.bin(BinOp::ShrU, ty, a, b),
             Dp2Op::Asrv => self.b.bin(BinOp::ShrS, ty, a, b),
             Dp2Op::Rorv => self.b.bin(BinOp::Rotr, ty, a, b),
-            // CRC32 needs a table or a carry-less multiply; not worth an
-            // inline expansion until something in the corpus uses it.
-            _ => return Flow::End(Term::Illegal { raw: self.raw, pc }),
+            Dp2Op::Crc32b | Dp2Op::Crc32h | Dp2Op::Crc32w | Dp2Op::Crc32x => return self.crc32(op, rd, rn, rm, CRC32_POLY, pc),
+            Dp2Op::Crc32cb | Dp2Op::Crc32ch | Dp2Op::Crc32cw | Dp2Op::Crc32cx => return self.crc32(op, rd, rn, rm, CRC32C_POLY, pc),
         };
         self.wr_gp(rd, sz, v);
+        Flow::Next
+    }
+
+    /// `crc32{b,h,w,x}` and `crc32c{b,h,w,x}`: the checksum in `Wn` taken
+    /// over the low 8, 16, 32 or 64 bits of `Rm`, with no table and no
+    /// carry-less multiply, neither of which wasm has.
+    ///
+    /// A CRC is linear over GF(2): the register after `n` steps is the XOR
+    /// of what each of its bits would have become alone. So the instruction
+    /// is `acc ^ data`, each of whose bits selects a constant
+    /// ([`crc_alone`], worked out here), all XORed together as a tree; the
+    /// bits of `acc` the data did not reach only shift down. A 64-bit
+    /// operand's high half meets the register after 32 steps, so its bits
+    /// have 32 steps to go where the low half's have 64.
+    fn crc32(&mut self, op: Dp2Op, rd: RegSel, rn: RegSel, rm: RegSel, poly: u32, pc: u64) -> Flow {
+        let bits = match op {
+            Dp2Op::Crc32b | Dp2Op::Crc32cb => 8,
+            Dp2Op::Crc32h | Dp2Op::Crc32ch => 16,
+            Dp2Op::Crc32w | Dp2Op::Crc32cw => 32,
+            Dp2Op::Crc32x | Dp2Op::Crc32cx => 64,
+            _ => return Flow::End(Term::Illegal { raw: self.raw, pc }),
+        };
+        let acc = self.rd_gp(rn, Sz::W);
+        let (low, high) = if bits == 64 {
+            let d = self.rd_gp(rm, Sz::X);
+            let thirty_two = self.b.const_i64(32);
+            let top = self.b.bin(BinOp::ShrU, Ty::I64, d, thirty_two);
+            (self.b.wrap(d), Some(self.b.wrap(top)))
+        } else {
+            let d = self.rd_gp(rm, Sz::W);
+            let d = if bits < 32 {
+                let mask = self.b.const_i32((1u32 << bits) - 1);
+                self.b.bin(BinOp::And, Ty::I32, d, mask)
+            } else {
+                d
+            };
+            (d, None)
+        };
+        let x = self.b.bin(BinOp::Xor, Ty::I32, acc, low);
+        let mut terms = Vec::with_capacity(65);
+        if bits < 32 {
+            let by = self.b.const_i32(bits);
+            terms.push(self.b.bin(BinOp::ShrU, Ty::I32, x, by));
+        }
+        let thirty_one = self.b.const_i32(31);
+        for (word, steps) in [(Some(x), bits), (high, 32)] {
+            let Some(word) = word else { continue };
+            for i in 0..bits.min(32) {
+                // All ones when bit `i` is set.
+                let up = self.b.const_i32(31 - i);
+                let top = self.b.bin(BinOp::Shl, Ty::I32, word, up);
+                let mask = self.b.bin(BinOp::ShrS, Ty::I32, top, thirty_one);
+                let k = self.b.const_i32(crc_alone(i, steps, poly));
+                terms.push(self.b.bin(BinOp::And, Ty::I32, mask, k));
+            }
+        }
+        while terms.len() > 1 {
+            let mut next = Vec::with_capacity(terms.len().div_ceil(2));
+            for pair in terms.chunks(2) {
+                next.push(match *pair {
+                    [a, b] => self.b.bin(BinOp::Xor, Ty::I32, a, b),
+                    _ => pair[0],
+                });
+            }
+            terms = next;
+        }
+        self.wr_gp(rd, Sz::W, terms[0]);
         Flow::Next
     }
 
@@ -4886,6 +4952,10 @@ impl<'a> Lifter<'a> {
             SysReg::TpidrroEl0 => self.b.read(GuestReg::TpidrRo),
             SysReg::Ctr => self.b.const_i64(gex_abi::CTR_EL0),
             SysReg::Cntfrq => self.b.const_i64(gex_abi::CNTFRQ),
+            // `ID_AA64ISAR0_EL1`, of which a process sees the fields for
+            // what it may use: the LSE atomics (2) and CRC32 (1), which the
+            // auxiliary vector's `AT_HWCAP` reports too.
+            SysReg::Other(ID_AA64ISAR0_EL1) => self.b.const_i64(2 << 20 | 1 << 16),
             SysReg::Dczid => {
                 // log2 of the block size in words. The "zeroing prohibited"
                 // bit stays clear because DC ZVA is implemented.
@@ -5020,6 +5090,27 @@ fn pairwise_patterns(arr: VArr) -> ([u8; 16], [u8; 16]) {
     (evens, odds)
 }
 
+/// `ID_AA64ISAR0_EL1` as [`SysReg::Other`] packs it: op0 3, op1 0, CRn 0,
+/// CRm 6, op2 0.
+const ID_AA64ISAR0_EL1: u16 = 3 << 14 | 6 << 3;
+
+/// The CRC-32 and CRC-32C (Castagnoli) polynomials, bit-reversed, as the
+/// instructions use them.
+const CRC32_POLY: u32 = 0xedb8_8320;
+const CRC32C_POLY: u32 = 0x82f6_3b78;
+
+/// What a CRC register holding only bit `bit` becomes after `steps` steps
+/// of zero data.
+const fn crc_alone(bit: u32, steps: u32, poly: u32) -> u32 {
+    let mut state = 1u32 << bit;
+    let mut i = 0;
+    while i < steps {
+        state = (state >> 1) ^ (poly & 0u32.wrapping_sub(state & 1));
+        i += 1;
+    }
+    state
+}
+
 /// Encode a system register identifier for the host interface. Modelled
 /// registers get small negative codes; everything else passes through its
 /// `op0:op1:CRn:CRm:op2` packing.
@@ -5050,4 +5141,59 @@ fn exp2_exact(n: i32) -> f64 {
     // Bias 1023; the significand stays zero, which is what makes it exact.
     let biased = (n + 1023) as u64;
     f64::from_bits(biased << 52)
+}
+
+#[cfg(test)]
+mod crc_tests {
+    use super::{crc_alone, CRC32C_POLY, CRC32_POLY};
+
+    /// One bit at a time, as the architecture defines the instructions.
+    fn by_bit(mut acc: u32, data: u64, bits: u32, poly: u32) -> u32 {
+        for i in 0..bits {
+            acc ^= (data >> i & 1) as u32;
+            acc = (acc >> 1) ^ (poly & 0u32.wrapping_sub(acc & 1));
+        }
+        acc
+    }
+
+    /// As [`super::Lifter::crc32`] builds it.
+    fn folded(acc: u32, data: u64, bits: u32, poly: u32) -> u32 {
+        let low = if bits >= 32 { data as u32 } else { data as u32 & ((1 << bits) - 1) };
+        let x = acc ^ low;
+        let mut out = if bits < 32 { x >> bits } else { 0 };
+        let words: [(Option<u32>, u32); 2] = [(Some(x), bits), ((bits == 64).then_some((data >> 32) as u32), 32)];
+        for (word, steps) in words {
+            let Some(word) = word else { continue };
+            for i in 0..bits.min(32) {
+                let mask = ((word << (31 - i)) as i32 >> 31) as u32;
+                out ^= mask & crc_alone(i, steps, poly);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_folded_form_is_the_checksum() {
+        // The check values of both checksums over "123456789", a byte and
+        // then eight bytes at a time.
+        for (poly, want) in [(CRC32_POLY, 0xcbf4_3926u32), (CRC32C_POLY, 0xe306_9283)] {
+            let mut crc = !0u32;
+            for &b in b"123456789" {
+                crc = folded(crc, b as u64, 8, poly);
+            }
+            assert_eq!(!crc, want);
+            let wide = folded(folded(!0, u64::from_le_bytes(*b"12345678"), 64, poly), b'9' as u64, 8, poly);
+            assert_eq!(!wide, want);
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..4000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let (acc, data) = ((seed >> 32) as u32, seed.rotate_left(17) ^ seed >> 7);
+            for poly in [CRC32_POLY, CRC32C_POLY] {
+                for bits in [8, 16, 32, 64] {
+                    assert_eq!(folded(acc, data, bits, poly), by_bit(acc, data, bits, poly), "{bits} bits of {data:#x} into {acc:#x}");
+                }
+            }
+        }
+    }
 }
