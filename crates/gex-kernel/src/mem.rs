@@ -635,6 +635,20 @@ pub fn hits_runtime(start: u64, end: u64) -> bool {
         || (gex_abi::mem64() && start < gex_abi::HIGH_TABLES_END && end > gex_abi::DISPATCH_DIR64)
 }
 
+/// Where the runtime's range holding `at` ends ([`hits_runtime`]'s ranges,
+/// less page zero, which nothing holds); `None` for an address in none.
+fn runtime_end(at: u64) -> Option<u64> {
+    if (gex_abi::RESERVED_BASE..gex_abi::DISPATCH_DIR_END).contains(&at) {
+        Some(gex_abi::DISPATCH_DIR_END)
+    } else if (gex_abi::STACK_TOP..MMAP_BOTTOM).contains(&at) {
+        Some(MMAP_BOTTOM)
+    } else if gex_abi::mem64() && (gex_abi::DISPATCH_DIR64..gex_abi::HIGH_TABLES_END).contains(&at) {
+        Some(gex_abi::HIGH_TABLES_END)
+    } else {
+        None
+    }
+}
+
 pub fn page_align_up(v: u64) -> u64 {
     (v + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
@@ -2061,16 +2075,26 @@ impl MemoryMap {
         }
     }
 
-    /// Whether every page of `[start, end)` is mapped.
+    /// Whether every page of `[start, end)` is mapped: the guest's own
+    /// mappings, and the ranges the runtime holds ([`hits_runtime`]), which
+    /// no mapping records but which are not free either. A program that
+    /// looks for free address space by asking what is mapped (ART probes a
+    /// page at a time with `msync`, then maps there by hint) must not be
+    /// told a range is free that no `mmap` of its own will be given.
     pub fn all_mapped(&self, start: u64, end: u64) -> bool {
         let mut at = start;
-        for v in self.vmas.iter().filter(|v| v.end > start && v.start < end) {
-            if v.start > at {
-                return false;
+        while at < end {
+            if let Some(past) = runtime_end(at) {
+                at = past;
+                continue;
             }
-            at = v.end;
+            let i = self.vmas.partition_point(|v| v.end <= at);
+            match self.vmas.get(i) {
+                Some(v) if v.start <= at => at = v.end,
+                _ => return false,
+            }
         }
-        at >= end
+        true
     }
 
     /// The first mapping in `[addr, addr + len)` that `mprotect` to `new`
@@ -2288,6 +2312,26 @@ mod tests {
         assert!(at >= gex_abi::IMAGE_ZONE64, "{at:#x}");
         assert_eq!(m.vma_at(at).unwrap().file_off, Some(0));
         assert_eq!(m.mmap_from(0, 0x4000, prot::READ | prot::EXEC, flags::PRIVATE, "/lib/x.so", Some(("/lib/x.so".into(), 0))), Err(Errno::ENOMEM));
+    }
+
+    /// What a probe for free address space is told: the runtime's ranges
+    /// are taken, page zero and a gap between mappings are not.
+    #[test]
+    fn the_runtimes_ranges_are_not_free_to_a_probe() {
+        let mut m = MemoryMap::new(0x100_0000);
+        let anon = flags::PRIVATE | flags::ANONYMOUS | flags::FIXED;
+        m.mmap(MMAP_BOTTOM, 0x1000, prot::READ, anon, "").unwrap();
+        m.mmap(MMAP_BOTTOM + 0x2000, 0x1000, prot::READ, anon, "").unwrap();
+        assert!(!m.all_mapped(0, 0x1000), "page zero");
+        assert!(m.all_mapped(gex_abi::RESERVED_BASE, gex_abi::DISPATCH_DIR_END));
+        assert!(!m.all_mapped(gex_abi::DISPATCH_DIR_END, gex_abi::DISPATCH_DIR_END + 0x1000));
+        assert!(m.all_mapped(gex_abi::STACK_TOP, MMAP_BOTTOM + 0x1000), "the gap, then a mapping");
+        assert!(!m.all_mapped(gex_abi::STACK_TOP, MMAP_BOTTOM + 0x2000));
+        assert!(!m.all_mapped(MMAP_BOTTOM + 0x1000, MMAP_BOTTOM + 0x2000));
+        assert!(m.all_mapped(MMAP_BOTTOM + 0x2000, MMAP_BOTTOM + 0x3000));
+        // Whatever is not free to a probe, a hint there is not given either.
+        let got = m.mmap(gex_abi::STACK_TOP, 0x1000, prot::READ, flags::PRIVATE | flags::ANONYMOUS, "").unwrap();
+        assert_ne!(got, gex_abi::STACK_TOP);
     }
 
     /// `PR_SET_MDWE`: which `mprotect` gains execute where it may not.
