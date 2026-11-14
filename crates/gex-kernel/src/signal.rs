@@ -1085,9 +1085,19 @@ pub mod frame {
     pub const MC_SP: usize = 8 + 31 * 8;
     pub const MC_PC: usize = MC_SP + 8;
     pub const MC_PSTATE: usize = MC_PC + 8;
-    /// `__reserved[4096]`, where the FP state record lives.
-    pub const MC_RESERVED: usize = MC_PSTATE + 8;
-    pub const SIGCONTEXT_SIZE: usize = MC_RESERVED + 4096;
+    /// `__reserved[4096]`: records, each a magic and its size, to one whose
+    /// magic is zero. `fpsimd_context` first (FPSR, FPCR and V0-V31 after
+    /// its head), then `esr_context` (the syndrome) for a fault that has
+    /// one (arch/arm64/include/uapi/asm/sigcontext.h).
+    /// (Aligned to sixteen bytes in the structure, which puts eight unused
+    /// ones after `pstate`.)
+    pub const MC_RESERVED: usize = (MC_PSTATE + 8 + 15) & !15;
+    pub const RESERVED_SIZE: usize = 4096;
+    pub const FPSIMD_MAGIC: u32 = 0x4650_8001;
+    pub const FPSIMD_SIZE: u32 = 16 + 32 * 16;
+    pub const ESR_MAGIC: u32 = 0x4553_5201;
+    pub const ESR_SIZE: u32 = 16;
+    pub const SIGCONTEXT_SIZE: usize = MC_RESERVED + RESERVED_SIZE;
     pub const UCONTEXT_SIZE: usize = UC_MCONTEXT + SIGCONTEXT_SIZE;
     pub const FRAME_SIZE: usize = UCONTEXT + UCONTEXT_SIZE;
 }
@@ -1244,6 +1254,17 @@ fn build_frame(
     let pc = m.read_u64(ctx_addr + ctx::PC as u64)?;
     m.write_u64(mc + frame::MC_PC as u64, pc)?;
     m.write_u64(mc + frame::MC_PSTATE as u64, read_pstate(m, ctx_addr)?)?;
+
+    // The records: the FP and vector state the handler may use and
+    // `sigreturn` restores. The frame was zeroed, which is the record that
+    // ends them.
+    let rec = mc + frame::MC_RESERVED as u64;
+    m.write_u32(rec, frame::FPSIMD_MAGIC)?;
+    m.write_u32(rec + 4, frame::FPSIMD_SIZE)?;
+    m.write_u32(rec + 8, m.read_u32(ctx_addr + ctx::FPSR as u64)?)?;
+    m.write_u32(rec + 12, m.read_u32(ctx_addr + ctx::FPCR as u64)?)?;
+    let vregs = m.read(ctx_addr + ctx::V as u64, 32 * 16)?.to_vec();
+    m.write(rec + 16, &vregs)?;
 
     // Block this signal for the duration of the handler unless asked not to,
     // plus whatever the action's mask names.
@@ -1763,6 +1784,47 @@ pub fn sigreturn(
     m.write_u64(ctx_addr + ctx::SP as u64, sp)?;
     m.write_u64(ctx_addr + ctx::PC as u64, pc)?;
     write_pstate(m, ctx_addr, pstate)?;
+
+    // The records, as `parse_user_sigframe` reads them: each on a sixteen
+    // byte boundary and within `__reserved`, to the one with no magic; the
+    // FP and vector state once and whole; the syndrome passed over; any
+    // other magic, or no FP state, a frame that is not one (SIGSEGV).
+    let reserved = mc + frame::MC_RESERVED as u64;
+    let (mut at, mut fpsimd) = (0u64, false);
+    loop {
+        if at + 8 > frame::RESERVED_SIZE as u64 {
+            return Err(Errno::EINVAL);
+        }
+        let (magic, size) = (m.read_u32(reserved + at)?, m.read_u32(reserved + at + 4)? as u64);
+        if magic == 0 {
+            if size != 0 {
+                return Err(Errno::EINVAL);
+            }
+            break;
+        }
+        if size < 8 || size % 16 != 0 || size > frame::RESERVED_SIZE as u64 - at {
+            return Err(Errno::EINVAL);
+        }
+        match magic {
+            frame::FPSIMD_MAGIC => {
+                if fpsimd || size != frame::FPSIMD_SIZE as u64 {
+                    return Err(Errno::EINVAL);
+                }
+                fpsimd = true;
+                let rec = reserved + at;
+                m.write_u32(ctx_addr + ctx::FPSR as u64, m.read_u32(rec + 8)?)?;
+                m.write_u32(ctx_addr + ctx::FPCR as u64, m.read_u32(rec + 12)?)?;
+                let vregs = m.read(rec + 16, 32 * 16)?.to_vec();
+                m.write(ctx_addr + ctx::V as u64, &vregs)?;
+            }
+            frame::ESR_MAGIC => {}
+            _ => return Err(Errno::EINVAL),
+        }
+        at += size;
+    }
+    if !fpsimd {
+        return Err(Errno::EINVAL);
+    }
 
     let mut own = signals.own();
     own.blocked = m.read_u64(uc + frame::UC_SIGMASK as u64)?;
