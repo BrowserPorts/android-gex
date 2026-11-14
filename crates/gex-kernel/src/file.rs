@@ -261,7 +261,7 @@ impl OpenFile {
             self.offset.load(Ordering::Relaxed)
         };
         let n = self.handle.write_at(off, buf)?;
-        if !self.handle.is_stream() {
+        if !self.handle.is_stream() && !self.handle.write_keeps_position() {
             self.offset.store(off + n, Ordering::Relaxed);
         }
         Ok(n)

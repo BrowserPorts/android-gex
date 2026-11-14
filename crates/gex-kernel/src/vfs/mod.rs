@@ -254,6 +254,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         let _ = (offset, buf);
         Err(Errno::EBADF)
     }
+    /// True when a write leaves the file's position where it was: a file
+    /// whose write is a command to the kernel and no contents (selinuxfs's),
+    /// which is written again from the start.
+    fn write_keeps_position(&self) -> bool {
+        false
+    }
     fn metadata(&self) -> Result<Metadata, Errno>;
     /// How many times the file's contents have changed, as the filesystem
     /// holding them counts, or 0 where it keeps no count. Two equal nonzero

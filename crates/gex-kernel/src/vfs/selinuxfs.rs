@@ -11,11 +11,19 @@
 //! Every mount is the one filesystem, as on Linux, where it has a single
 //! superblock: [`SelinuxFs::of_kernel`] is over the kernel's own server.
 //!
+//! A write here is a command, taken whole: the policy in one write to
+//! `load`, a number to `enforce` or a boolean, a question to `access` and
+//! its kind, whose answer the same open file then reads. None moves the
+//! file's position.
+//!
 //! Not here yet, and opening them says so: `policy` (the loaded policy
 //! written out again), and the kernel's own statistics under `avc` and
 //! `ss`, which count a cache and a hash table this kernel does not have.
-//! Nor is a file's mode held against who opens it: no file of this kernel
-//! has an owner yet.
+//! Nor is a file's mode held against who opens it (no file of this kernel
+//! has an owner yet), nor a write against what the policy lets its writer
+//! do to the `security` class: the hooks are still to come, and until
+//! they are, `enforce` set to 1 enforces nothing on what a program does,
+//! which is said when it is set.
 
 use super::devices::makedev;
 use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata};
@@ -79,6 +87,11 @@ const POLICYCAP_OFFSET: u64 = 0x0800_0000;
 const CLASS_STRIDE: u64 = 33;
 /// `sizeof(struct selinux_kernel_status)`: what `status` reads.
 const STATUS_LEN: usize = 20;
+/// The page a write is copied into: one that would fill it is `ENOMEM`.
+const PAGE: usize = 4096;
+/// `SIMPLE_TRANSACTION_LIMIT`: the longest answer a question file gives;
+/// a question is at most one byte shorter.
+const TRANSACTION_LIMIT: usize = PAGE - 8;
 
 /// What a name is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,7 +306,7 @@ impl FileSystem for SelinuxFs {
                     None => None,
                 };
                 let boolean = path.strip_prefix("booleans/").and_then(|name| s.dir("booleans")?.iter().position(|b| b == name));
-                Ok(Arc::new(File { server: Arc::clone(&self.server), path: path.to_string(), metadata, fixed, boolean }))
+                Ok(Arc::new(File { server: Arc::clone(&self.server), path: path.to_string(), metadata, fixed, boolean, answer: Mutex::new(None) }))
             }
         }
     }
@@ -351,6 +364,33 @@ struct File {
     fixed: Option<Vec<u8>>,
     /// For a boolean, its place among the booleans when it was opened.
     boolean: Option<usize>,
+    /// For a file that takes a question: the answer to the one this open
+    /// file was asked, empty if it was refused. An open file is asked once.
+    answer: Mutex<Option<Vec<u8>>>,
+}
+
+/// The files that take a question and are then read for its answer.
+fn takes_question(path: &str) -> bool {
+    matches!(path, "context" | "access" | "create" | "relabel" | "member" | "user")
+}
+
+/// `sscanf(text, "%d", ...)`: the number `text` starts with, after any
+/// white space, kept to an `int`. `None` where there is no digit.
+fn scanned_int(text: &[u8]) -> Option<i32> {
+    let mut rest = text;
+    while let [b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r', tail @ ..] = rest {
+        rest = tail;
+    }
+    let negative = rest.first() == Some(&b'-');
+    if negative {
+        rest = &rest[1..];
+    }
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let n = rest[..digits].iter().fold(0u64, |n, d| n.wrapping_mul(10).wrapping_add((d - b'0') as u64));
+    Some(if negative { n.wrapping_neg() } else { n } as i32)
 }
 
 impl std::fmt::Debug for File {
@@ -369,22 +409,59 @@ impl File {
         if let Some(fixed) = &self.fixed {
             return Ok(fixed.clone());
         }
-        let s = self.lock();
-        if let Some(at) = self.boolean {
-            // Another policy's boolean at its place is not it.
-            let name = self.path.strip_prefix("booleans/").unwrap_or("");
-            if s.dir("booleans").and_then(|b| b.get(at).cloned()).as_deref() != Some(name) {
-                return Err(Errno::EINVAL);
-            }
+        if takes_question(&self.path) {
+            // The answer to its question, or nothing before one.
+            return Ok(self.answer.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default());
         }
+        let s = self.lock();
+        self.still_its_boolean(&s)?;
         match self.path.as_str() {
             "status" => Ok(s.status().iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<u8>>()[..STATUS_LEN].to_vec()),
             // Written to, not read: a file with no way to be read.
             "load" | "commit_pending_bools" | "disable" | "validatetrans" => Err(Errno::EINVAL),
-            // The answer to a question, and none has been written.
-            "context" | "access" | "create" | "relabel" | "member" | "user" => Ok(Vec::new()),
             path => s.file(path).ok_or(Errno::EINVAL)?.1.map_err(errno),
         }
+    }
+
+    /// For a boolean: `EINVAL` once another policy has another boolean,
+    /// or none, at its place.
+    fn still_its_boolean(&self, s: &Server) -> Result<(), Errno> {
+        let Some(at) = self.boolean else { return Ok(()) };
+        let name = self.path.strip_prefix("booleans/").unwrap_or("");
+        if s.dir("booleans").and_then(|b| b.get(at).cloned()).as_deref() != Some(name) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    /// A number written to a file that takes one: the write whole and
+    /// from the file's start, and short of a page.
+    fn number(offset: u64, buf: &[u8]) -> Result<i32, Errno> {
+        if buf.len() >= PAGE {
+            return Err(Errno::ENOMEM);
+        }
+        if offset != 0 {
+            return Err(Errno::EINVAL);
+        }
+        scanned_int(buf).ok_or(Errno::EINVAL)
+    }
+}
+
+/// Said once: a program set `enforce`, and nothing is enforced yet.
+fn warn_nothing_enforced() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[gex] selinux: enforce was set to 1; nothing is enforced on what programs do yet (the hooks are not implemented)");
+    }
+}
+
+/// Said once for each: a write the kernel takes and no longer acts on.
+fn warn_no_longer_supported(file: &str) {
+    static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if !said.iter().any(|f| f == file) {
+        said.push(file.to_string());
+        eprintln!("[gex] selinuxfs: a write to {file}, which Linux no longer acts on either");
     }
 }
 
@@ -392,9 +469,85 @@ impl FileHandle for File {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         read_from(&self.contents()?, offset, buf)
     }
-    fn write_at(&self, _offset: u64, _buf: &[u8]) -> SysResult {
-        eprintln!("[gex] selinuxfs: writing {} is not implemented", self.path);
-        Err(Errno::EOPNOTSUPP)
+    fn write_at(&self, offset: u64, buf: &[u8]) -> SysResult {
+        let count = buf.len() as u64;
+        // The kernel reads what was written as a string: to its first NUL.
+        let text = String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(buf.len())]).into_owned();
+        if takes_question(&self.path) {
+            if buf.len() > TRANSACTION_LIMIT - 1 {
+                return Err(Errno::EFBIG);
+            }
+            let mut answer = self.answer.lock().unwrap_or_else(|e| e.into_inner());
+            if answer.is_some() {
+                return Err(Errno::EBUSY);
+            }
+            // Asked, whatever comes of it: a refused question leaves the
+            // file with nothing to read and no second asking.
+            *answer = Some(Vec::new());
+            let bytes = if self.path == "user" {
+                // The contexts a user may reach: no longer computed.
+                warn_no_longer_supported("user");
+                b"0\0".to_vec()
+            } else {
+                self.lock().transact(&self.path, &text).ok_or(Errno::EINVAL)?.map_err(errno)?
+            };
+            if bytes.len() > TRANSACTION_LIMIT {
+                return Err(Errno::ERANGE);
+            }
+            *answer = Some(bytes);
+            return Ok(count);
+        }
+        let mut s = self.lock();
+        match self.path.as_str() {
+            "load" => {
+                // The policy whole, in one write.
+                if offset != 0 || buf.is_empty() {
+                    return Err(Errno::EINVAL);
+                }
+                s.load(buf).map_err(errno)?;
+            }
+            "enforce" => {
+                let on = File::number(offset, buf)? != 0;
+                if on && !s.enforcing() {
+                    warn_nothing_enforced();
+                }
+                s.set_enforcing(on);
+            }
+            "commit_pending_bools" => {
+                if File::number(offset, buf)? != 0 {
+                    s.commit_bools();
+                }
+            }
+            "validatetrans" => {
+                if buf.len() >= PAGE {
+                    return Err(Errno::ENOMEM);
+                }
+                if offset != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                s.transact("validatetrans", &text).ok_or(Errno::EINVAL)?.map_err(errno)?;
+            }
+            "disable" | "checkreqprot" => warn_no_longer_supported(&self.path),
+            path => match path.strip_prefix("booleans/") {
+                Some(name) => {
+                    if buf.len() >= PAGE {
+                        return Err(Errno::ENOMEM);
+                    }
+                    if offset != 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    self.still_its_boolean(&s)?;
+                    let value = scanned_int(buf).ok_or(Errno::EINVAL)? != 0;
+                    s.set_pending_bool(name, value).map_err(errno)?;
+                }
+                // A file with no way to be written.
+                None => return Err(Errno::EINVAL),
+            },
+        }
+        Ok(count)
+    }
+    fn write_keeps_position(&self) -> bool {
+        true
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(self.metadata.clone())
@@ -518,6 +671,97 @@ mod tests {
         assert_eq!(buf[..n], was[..]);
         assert_eq!(boolean.read_at(0, &mut buf), Err(Errno::EINVAL));
         assert_eq!(fs.metadata("class/binder").err(), Some(Errno::ENOENT));
+    }
+
+    /// What a program writes: the policy in one write, numbers to
+    /// `enforce` and the booleans, a question and its answer in one open
+    /// file. The limits and refusals are the reference's.
+    #[test]
+    fn its_files_take_what_a_program_writes() {
+        let (fs, server) = fs();
+        let rw = crate::fs::oflags::O_RDWR;
+        let open = |path: &str| fs.open(path, rw, 0).unwrap();
+        let read_all = |h: &Arc<dyn FileHandle>| {
+            let mut buf = [0u8; 256];
+            let n = h.read_at(0, &mut buf).unwrap() as usize;
+            buf[..n].to_vec()
+        };
+        // Before a policy the question files answer already.
+        let access = open("access");
+        assert_eq!(read_all(&access), b"");
+        assert_eq!(access.write_at(0, b"kernel file 6"), Ok(13));
+        assert_eq!(read_all(&access), b"ffffffff ffffffff 0 ffffffff 0 0");
+        assert_eq!(access.write_at(0, b"kernel file 6"), Err(Errno::EBUSY), "an open file is asked once");
+        // The policy: whole, from the start, and not nothing.
+        let load = open("load");
+        assert_eq!(load.write_at(0, b""), Err(Errno::EINVAL));
+        assert_eq!(load.write_at(1, V33), Err(Errno::EINVAL));
+        assert_eq!(load.write_at(0, &V33[..V33.len() / 2]), Err(Errno::EINVAL));
+        assert_eq!(server.lock().unwrap().seqno, 0);
+        assert_eq!(load.write_at(0, V33), Ok(V33.len() as u64));
+        let mut buf = [0u8; 8];
+        assert_eq!(load.read_at(0, &mut buf), Err(Errno::EINVAL), "it has no way to be read");
+        assert_eq!(read(&fs, "status").unwrap(), [1u32, 2, 0, 1, 1].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());
+        // Questions, as the kernel that loaded this policy answered them.
+        let ask = |file: &str, text: &str| {
+            let h = open(file);
+            h.write_at(0, text.as_bytes()).map(|n| {
+                assert_eq!(n, text.len() as u64);
+                String::from_utf8(read_all(&h)).unwrap()
+            })
+        };
+        assert_eq!(ask("context", "system_u:object_r:old_file_t:s0").as_deref(), Ok("system_u:object_r:file_t:s0\0"));
+        assert_eq!(ask("context", "system_u:object_r:old_file_t:s0\0and more").as_deref(), Ok("system_u:object_r:file_t:s0\0"), "a string ends at its NUL");
+        assert_eq!(ask("access", "system_u:system_r:kernel_t:s0 system_u:object_r:file_t:s0 2").as_deref(), Ok("5 ffffffff 0 ffffffff 1 0"));
+        assert_eq!(ask("create", "system_u:system_r:init_t:s0 system_u:object_r:exec_t:s0 1").as_deref(), Ok("system_u:app_r:app_t:s1:c0,c1\0"));
+        assert_eq!(ask("user", "anything"), Ok("0\0".to_string()));
+        // A refused question leaves nothing to read, and no second one.
+        let context = open("context");
+        assert_eq!(context.write_at(0, b"nobody:system_r:init_t:s0"), Err(Errno::EINVAL));
+        assert_eq!(read_all(&context), b"");
+        assert_eq!(context.write_at(0, b"system_u:system_r:init_t:s0"), Err(Errno::EBUSY));
+        assert_eq!(open("access").write_at(0, &[b'a'; TRANSACTION_LIMIT]), Err(Errno::EFBIG));
+        assert_eq!(open("access").write_at(0, &[b'a'; TRANSACTION_LIMIT - 1]), Err(Errno::EINVAL));
+        // validatetrans answers by the write.
+        let (file, exec, kernel) = ("system_u:object_r:file_t:s0", "system_u:object_r:exec_t:s0", "system_u:system_r:kernel_t:s0");
+        let trans = open("validatetrans");
+        let ok = format!("{file} {file} 2 {kernel}");
+        assert_eq!(trans.write_at(0, ok.as_bytes()), Ok(ok.len() as u64));
+        assert_eq!(trans.write_at(0, ok.as_bytes()), Ok(ok.len() as u64), "and may be asked again");
+        assert_eq!(trans.write_at(3, ok.as_bytes()), Err(Errno::EINVAL));
+        assert_eq!(trans.write_at(0, format!("{file} {exec} 2").as_bytes()), Err(Errno::EINVAL));
+        assert_eq!(trans.read_at(0, &mut buf), Err(Errno::EINVAL));
+        // A boolean: its value waits for the commit.
+        let boolean = open("booleans/other_thing");
+        let before = read_all(&boolean);
+        let flipped = if before == b"0 0" { (&b"1"[..], &b"0 1"[..], &b"1 1"[..]) } else { (&b"0"[..], &b"1 0"[..], &b"0 0"[..]) };
+        assert_eq!(boolean.write_at(0, flipped.0), Ok(1));
+        assert_eq!(read_all(&boolean), flipped.1);
+        let commit = open("commit_pending_bools");
+        assert_eq!(commit.write_at(0, b"0"), Ok(1));
+        assert_eq!(read_all(&boolean), flipped.1, "0 commits nothing");
+        assert_eq!(commit.write_at(0, b" 1\n"), Ok(3));
+        assert_eq!(read_all(&boolean), flipped.2);
+        assert_eq!(read(&fs, "status").unwrap()[4..8], 4u32.to_le_bytes(), "a commit is a change");
+        assert_eq!((boolean.write_at(0, b"x"), boolean.write_at(1, b"1"), boolean.write_at(0, &[b'1'; PAGE])), (Err(Errno::EINVAL), Err(Errno::EINVAL), Err(Errno::ENOMEM)));
+        // enforce: any number but 0 is on.
+        let enforce = open("enforce");
+        assert_eq!((enforce.write_at(0, b"-7"), read_all(&enforce)), (Ok(2), b"1".to_vec()));
+        assert_eq!((enforce.write_at(0, b"0 and the rest"), read_all(&enforce)), (Ok(14), b"0".to_vec()));
+        assert_eq!((enforce.write_at(0, b"on"), enforce.write_at(1, b"1"), enforce.write_at(0, &[b'1'; PAGE])), (Err(Errno::EINVAL), Err(Errno::EINVAL), Err(Errno::ENOMEM)));
+        assert_eq!(scanned_int(b"4294967296"), Some(0), "kept to an int");
+        // Taken and not acted on, as on Linux now; and files with no
+        // write at all.
+        assert_eq!((open("checkreqprot").write_at(0, b"1"), read(&fs, "checkreqprot").unwrap()), (Ok(1), b"0".to_vec()));
+        assert_eq!(open("disable").write_at(0, b"1"), Ok(1));
+        assert_eq!((open("mls").write_at(0, b"1"), open("class/file/index").write_at(0, b"1"), open("status").write_at(0, b"1")), (Err(Errno::EINVAL), Err(Errno::EINVAL), Err(Errno::EINVAL)));
+        // A write does not move an open file's position: enforce is
+        // written again from the start, and read from there after.
+        let of = crate::file::OpenFile::new(open("enforce"), "/sys/fs/selinux/enforce".into(), rw, true, true);
+        assert_eq!((of.write(b"1"), of.write(b"0"), of.write(b"1")), (Ok(1), Ok(1), Ok(1)));
+        let mut one = [0u8; 4];
+        assert_eq!((of.read(&mut one), one[0], of.read(&mut one)), (Ok(1), b'1', Ok(0)));
+        assert_eq!(of.write(b"0"), Err(Errno::EINVAL), "but a read does, and a write is from the start");
     }
 
     /// Nothing is made, removed or moved here, and what is not here yet
