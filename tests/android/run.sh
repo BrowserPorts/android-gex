@@ -53,6 +53,7 @@ run() {
     sigqueue) check sigqueue "sigqueue ok" 0 ;;
     futex) check futex "futex ok" 0 ;;
     pipesz) check pipesz "pipesz ok" 0 ;;
+    auxv) check auxv "auxv ok" 0 ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -65,7 +66,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz; do
+    for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv; do
         run "$p"
     done
 fi
