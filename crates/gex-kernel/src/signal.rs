@@ -394,7 +394,7 @@ impl ProcSig {
         let mut sources = [None; NSIG];
         for (signo, pid) in procs.take_kill_senders(pid, inbox) {
             if let Some(slot) = sources.get_mut(signo as usize) {
-                *slot = Some(Source { code: SI_USER, pid, uid });
+                *slot = Some(Source { code: SI_USER, pid, uid, value: 0 });
             }
         }
         for signo in 1..=64u32 {
@@ -1008,10 +1008,13 @@ const STATE_BYTES: usize = (NSIG * 4 + 10) * 8;
 /// A process that sent a signal, for its siginfo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Source {
-    /// `si_code`: [`SI_USER`] or [`SI_TKILL`].
+    /// `si_code`: [`SI_USER`], [`SI_TKILL`], or what `rt_sigqueueinfo`'s
+    /// caller put there (`sigqueue`'s `SI_QUEUE`).
     pub code: i32,
     pub pid: i32,
     pub uid: u32,
+    /// `si_value`, which `sigqueue` sends with the signal; zero otherwise.
+    pub value: u64,
 }
 
 /// `si_code` for a signal sent by `kill`.
@@ -1823,6 +1826,12 @@ fn write_siginfo(
         m.write_u32(info + 8, src.code as u32)?;
         m.write_u32(fields, src.pid as u32)?;
         m.write_u32(fields + 4, src.uid)?;
+        // `si_value` follows the sender: a pointer's width.
+        if wide {
+            m.write_u64(fields + 8, src.value)?;
+        } else {
+            m.write_u32(fields + 8, src.value as u32)?;
+        }
         return Ok(());
     }
     m.write_u32(info + 8, fault_code(signal))?;
@@ -1962,9 +1971,9 @@ mod tests {
         let (mut buf, mut s) = setup();
         let mut m = GuestMem::new(&mut buf);
         assert_eq!(s.process().fatal(), None);
-        s.raise_from(sig::SIGSEGV, Source { code: SI_TKILL, pid: 92, uid: 0 });
+        s.raise_from(sig::SIGSEGV, Source { code: SI_TKILL, pid: 92, uid: 0, value: 0 });
         assert!(matches!(dispatch(&mut s, &mut m, CTX, false).unwrap(), Delivery::Terminate { signal: sig::SIGSEGV, .. }));
-        assert_eq!(s.process().fatal(), Some((sig::SIGSEGV, Some(Source { code: SI_TKILL, pid: 92, uid: 0 }), true)));
+        assert_eq!(s.process().fatal(), Some((sig::SIGSEGV, Some(Source { code: SI_TKILL, pid: 92, uid: 0, value: 0 }), true)));
     }
 
     #[test]

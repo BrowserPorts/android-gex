@@ -316,6 +316,8 @@ pub mod raw {
     pub const EPOLL_WAIT: u64 = 232;
     pub const EPOLL_CTL: u64 = 233;
     pub const TGKILL: u64 = 234;
+    pub const RT_SIGQUEUEINFO: u64 = 129;
+    pub const RT_TGSIGQUEUEINFO: u64 = 297;
     pub const OPENAT: u64 = 257;
     pub const MKDIRAT: u64 = 258;
     pub const FCHOWNAT: u64 = 260;
@@ -654,6 +656,8 @@ pub fn translate(
         }
         x::EPOLL_CTL => nr::EPOLL_CTL,
         x::TGKILL => nr::TGKILL,
+        x::RT_SIGQUEUEINFO => nr::RT_SIGQUEUEINFO,
+        x::RT_TGSIGQUEUEINFO => nr::RT_TGSIGQUEUEINFO,
         x::OPENAT => nr::OPENAT,
         x::MKDIRAT => nr::MKDIRAT,
         x::FCHOWNAT => nr::FCHOWNAT,

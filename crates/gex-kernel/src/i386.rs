@@ -210,6 +210,8 @@ pub mod raw {
     pub const STATFS64: u64 = 268;
     pub const FSTATFS64: u64 = 269;
     pub const TGKILL: u64 = 270;
+    pub const RT_SIGQUEUEINFO: u64 = 178;
+    pub const RT_TGSIGQUEUEINFO: u64 = 335;
     pub const OPENAT: u64 = 295;
     pub const MKDIRAT: u64 = 296;
     pub const FCHOWNAT: u64 = 298;
@@ -660,6 +662,15 @@ pub fn translate(
             a[0] = sext(a[0]);
             a[1] = sext(a[1]);
             nr::TGKILL
+        }
+        x::RT_SIGQUEUEINFO => {
+            a[0] = sext(a[0]);
+            nr::RT_SIGQUEUEINFO
+        }
+        x::RT_TGSIGQUEUEINFO => {
+            a[0] = sext(a[0]);
+            a[1] = sext(a[1]);
+            nr::RT_TGSIGQUEUEINFO
         }
         x::RENAME => {
             *a = [AT_FDCWD, a[0], AT_FDCWD, a[1], 0, 0];

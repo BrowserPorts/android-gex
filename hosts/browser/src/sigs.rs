@@ -437,7 +437,7 @@ fn gather(home: &Home) {
         MINE.with(|m| {
             if let Some((tid, t)) = m.borrow().as_ref() {
                 for (_, signo, from) in home.procs.take_thread_signals(home.pid, *tid) {
-                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.creds.ruid() });
+                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.creds.ruid(), value: 0 });
                 }
             }
         });
@@ -556,7 +556,7 @@ pub(crate) fn finish(gm: &mut GuestMem<'_>, ctx_addr: u64, suspended: Option<u64
         // Linux sends it as the writer itself sending it (SI_USER).
         view.raise_from(
             signal::sig::SIGPIPE,
-            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.creds.ruid() },
+            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.creds.ruid(), value: 0 },
         );
     }
     if suspended.is_some() {

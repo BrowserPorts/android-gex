@@ -121,6 +121,8 @@ pub mod nr {
     pub const KILL: u64 = 129;
     pub const TKILL: u64 = 130;
     pub const TGKILL: u64 = 131;
+    pub const RT_SIGQUEUEINFO: u64 = 138;
+    pub const RT_TGSIGQUEUEINFO: u64 = 240;
     pub const RT_SIGSUSPEND: u64 = 133;
     pub const RT_SIGACTION: u64 = 134;
     pub const RT_SIGPROCMASK: u64 = 135;
@@ -7268,7 +7270,10 @@ fn cred_change(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>,
 /// process's threads' signal states ([`ThreadSigs`](crate::signal::ThreadSigs),
 /// behind their own lock), and the caller's. Canonical.
 pub fn is_signal_call(n: u64) -> bool {
-    matches!(n, nr::KILL | nr::TKILL | nr::TGKILL | nr::RT_SIGTIMEDWAIT | nr::RT_SIGSUSPEND | nr::RT_SIGRETURN | nr::PIDFD_OPEN | nr::PIDFD_SEND_SIGNAL)
+    matches!(
+        n,
+        nr::KILL | nr::TKILL | nr::TGKILL | nr::RT_SIGQUEUEINFO | nr::RT_TGSIGQUEUEINFO | nr::RT_SIGTIMEDWAIT | nr::RT_SIGSUSPEND | nr::RT_SIGRETURN | nr::PIDFD_OPEN | nr::PIDFD_SEND_SIGNAL
+    )
 }
 
 /// `pidfd_open` and `pidfd_send_signal` (`crate::pidfd`), for the kernel's
@@ -7395,6 +7400,64 @@ pub struct KillTo<'a> {
     pub creds: &'a Creds,
 }
 
+/// `rt_sigqueueinfo(pid, sig, info)` and `rt_tgsigqueueinfo(tgid, tid, sig,
+/// info)` (kernel/signal.c): `kill` and `tgkill` with the caller's own
+/// `siginfo_t`, which is how `sigqueue` sends a value and how bionic's
+/// `abort` raises SIGABRT. Only another process may not be told a signal is
+/// the kernel's or a `kill`'s: a code that is not negative, or `SI_TKILL`,
+/// is `EPERM` unless the caller sends to itself. `wide` is the 64-bit
+/// `siginfo_t`.
+///
+/// The code, sender and value given reach a handler in this process. For
+/// another process the signal is sent as `kill` or `tgkill` sends it: the
+/// process table carries a signal's sender, not a `siginfo_t`.
+pub fn sigqueue_call(to: &KillTo<'_>, m: &GuestMem<'_>, n: u64, a: [u64; 6], wide: bool) -> SysResult {
+    let thread = n == nr::RT_TGSIGQUEUEINFO;
+    let (tgid, tid, signo, info) = if thread { (a[0] as i32, a[1] as i32, a[2] as u32, a[3]) } else { (a[0] as i32, 0, a[1] as u32, a[2]) };
+    let fields = info + if wide { 16 } else { 12 };
+    let code = m.read_u32(info + 8).map_err(|_| Errno::EFAULT)? as i32;
+    let source = crate::signal::Source {
+        code,
+        pid: m.read_u32(fields).map_err(|_| Errno::EFAULT)? as i32,
+        uid: m.read_u32(fields + 4).map_err(|_| Errno::EFAULT)?,
+        value: if wide { m.read_u64(fields + 8) } else { m.read_u32(fields + 8).map(u64::from) }.map_err(|_| Errno::EFAULT)?,
+    };
+    if thread && (tid <= 0 || tgid <= 0) {
+        return Err(Errno::EINVAL);
+    }
+    let own = if thread { tid == to.tid } else { tgid == to.pid };
+    if (code >= 0 || code == crate::signal::SI_TKILL) && !own {
+        return Err(Errno::EPERM);
+    }
+    if signo > crate::signal::sig::MAX {
+        return Err(Errno::EINVAL);
+    }
+    // To this process, or a thread of it: with the caller's siginfo.
+    let target = if !thread {
+        (tgid == to.pid).then_some(None)
+    } else if tid == to.tid && tgid == to.pid {
+        Some(None)
+    } else if tgid == to.pid {
+        to.threads.get(tid).map(Some)
+    } else {
+        None
+    };
+    match target {
+        Some(t) => {
+            to.signals.process().note_send(to.tid, tgid, tid, signo);
+            if signo > 0 {
+                match t {
+                    Some(t) => t.raise_from(signo, source),
+                    None => to.signals.raise_from(signo, source),
+                }
+            }
+            Ok(0)
+        }
+        None if thread => kill_call(to, nr::TGKILL, [a[0], a[1], a[2], 0, 0, 0]),
+        None => kill_call(to, nr::KILL, [a[0], a[1], 0, 0, 0, 0]),
+    }
+}
+
 /// A send [`is_signal_call`] admits (`kill`, `tkill`, `tgkill`), made, for
 /// the kernel's arms and [`free_call`] alike. A host that has threads
 /// waiting elsewhere wakes them after (a signal for one is raised on its
@@ -7453,7 +7516,7 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
         return Err(Errno::ESRCH);
     }
     if signo > 0 {
-        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: to.pid, uid: to.creds.ruid() };
+        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: to.pid, uid: to.creds.ruid(), value: 0 };
         match target {
             Some(t) => t.raise_from(signo, source),
             None => to.signals.raise_from(signo, source),
@@ -8402,6 +8465,10 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
                 let to = KillTo { signals: f.signals, threads: f.threads, procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds };
                 pidfd_call(f.io.fds, f.procs, &to, n, a)
             }
+            nr::RT_SIGQUEUEINFO | nr::RT_TGSIGQUEUEINFO => {
+                let to = KillTo { signals: f.signals, threads: f.threads, procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds };
+                sigqueue_call(&to, m, n, a, !compat)
+            }
             _ => {
                 let to = KillTo { signals: f.signals, threads: f.threads, procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds };
                 kill_call(&to, n, a)
@@ -8498,7 +8565,7 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
     };
     if r == Err(Errno::EPIPE) && raises_sigpipe(n, &a) {
         // Linux sends it as the writer itself sending it (SI_USER).
-        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.creds.ruid() });
+        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.creds.ruid(), value: 0 });
     }
     // `_llseek` answers through memory (`i386::Post`).
     let ret = match r {
@@ -11373,7 +11440,7 @@ impl Kernel {
                 self.signals.raise_from(
                     crate::signal::sig::SIGPIPE,
                     // Linux sends it as the writer itself sending it (SI_USER).
-                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid() },
+                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid(), value: 0 },
                 );
             }
         }
@@ -11710,7 +11777,7 @@ impl Kernel {
             self.signals.raise_from(
                 crate::signal::sig::SIGPIPE,
                 // Linux sends it as the writer itself sending it (SI_USER).
-                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid() },
+                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid(), value: 0 },
             );
         }
         let ret = encode(r);
@@ -11900,6 +11967,10 @@ impl Kernel {
                 let to = KillTo { signals: &self.signals, threads: &self.thread_signals, procs: &self.procs, pid: self.pid, tid: self.tid, creds: &self.creds };
                 kill_call(&to, n, a)
             }
+            nr::RT_SIGQUEUEINFO | nr::RT_TGSIGQUEUEINFO => {
+                let to = KillTo { signals: &self.signals, threads: &self.thread_signals, procs: &self.procs, pid: self.pid, tid: self.tid, creds: &self.creds };
+                sigqueue_call(&to, m, n, a, !self.compat)
+            }
             nr::PIDFD_OPEN | nr::PIDFD_SEND_SIGNAL => {
                 let to = KillTo { signals: &self.signals, threads: &self.thread_signals, procs: &self.procs, pid: self.pid, tid: self.tid, creds: &self.creds };
                 pidfd_call(&self.fds, &self.procs, &to, n, a)
@@ -11996,7 +12067,7 @@ impl Kernel {
         if self.procs.has_signals(self.pid) {
             let mut other = false;
             for (tid, signo, from) in self.procs.take_thread_signals(self.pid, 0) {
-                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.ruid() };
+                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.ruid(), value: 0 };
                 if tid == self.sig_tid || (self.sig_tid == 0 && tid == self.tid) {
                     self.signals.raise_from(signo, source);
                 } else if let Some(t) = self.thread_signals.get(tid) {
@@ -13685,6 +13756,8 @@ pub fn wakes_fd_waiters(n: u64) -> bool {
             | nr::KILL
             | nr::TKILL
             | nr::TGKILL
+            | nr::RT_SIGQUEUEINFO
+            | nr::RT_TGSIGQUEUEINFO
             | nr::TIMERFD_SETTIME
             // A lock released: a blocked `F_SETLKW` or `flock` looks again.
             | nr::FCNTL
@@ -13800,6 +13873,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::KILL => "kill",
         nr::TKILL => "tkill",
         nr::TGKILL => "tgkill",
+        nr::RT_SIGQUEUEINFO => "rt_sigqueueinfo",
+        nr::RT_TGSIGQUEUEINFO => "rt_tgsigqueueinfo",
         nr::RT_SIGACTION => "rt_sigaction",
         nr::RT_SIGPROCMASK => "rt_sigprocmask",
         nr::RT_SIGPENDING => "rt_sigpending",
@@ -16591,7 +16666,7 @@ mod tests {
 
         // A blocked signal raised is pending, read lock-free.
         k.signals.set_blocked(1 << (SIGUSR1 - 1));
-        k.signals.raise_from(SIGUSR1 as u32, signal::Source { code: signal::SI_USER, pid: k.pid, uid: k.creds.uid() });
+        k.signals.raise_from(SIGUSR1 as u32, signal::Source { code: signal::SI_USER, pid: k.pid, uid: k.creds.uid(), value: 0 });
         set_args(&mut m, at, nr::RT_SIGPENDING, &[0x22000, 8]);
         assert!(done(free(&k, &mut m, at)));
         assert_eq!(m.read_bits64(0x22000).unwrap() & (1 << (SIGUSR1 - 1)), 1 << (SIGUSR1 - 1));
