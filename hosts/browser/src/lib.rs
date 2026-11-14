@@ -18610,7 +18610,14 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
 fn branch_fault(pc: u64) {
     let c = my_ctx();
     let mut gm = guest();
-    match sigs::fault(&mut gm, c, 11, pc, pc) {
+    // An AArch64 program's fault there: nothing mapped, a page that may
+    // not be run, an address off its four bytes (`MemoryMap::exec_fault`).
+    let verdict = if gex_abi::X86 { None } else { sigs::home().and_then(|h| h.mm().lock().exec_fault(pc)) };
+    let (signo, delivery) = match verdict {
+        Some((signo, fault)) => (signo, sigs::fault_as(&mut gm, c, signo, Some(fault), pc, pc)),
+        None => (11, sigs::fault(&mut gm, c, 11, pc, pc)),
+    };
+    match delivery {
         gex_kernel::signal::Delivery::Resume(target) => {
             if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
                 run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;
@@ -18619,7 +18626,7 @@ fn branch_fault(pc: u64) {
             set_resume_ctx(c);
         }
         _ => {
-            exit_here(-11, Some(pc));
+            exit_here(-(signo as i32), Some(pc));
         }
     }
 }

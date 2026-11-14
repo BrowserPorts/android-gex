@@ -1031,6 +1031,25 @@ impl MemoryMap {
         &self.vmas
     }
 
+    /// What a branch of an AArch64 program to `pc` comes to when `pc` cannot
+    /// be run, as the signal and what its frame says: SIGBUS for an address
+    /// that is no multiple of four (a PC alignment fault, taken before
+    /// the address is looked at); SIGSEGV with `SEGV_MAPERR` where nothing
+    /// is mapped, and with `SEGV_ACCERR` where the page may not be run
+    /// (`do_page_fault`, for an instruction abort). `None` for an address
+    /// in a mapping that may be run.
+    pub fn exec_fault(&self, pc: u64) -> Option<(u32, crate::signal::Fault)> {
+        use crate::signal::{sig, Fault, SEGV_ACCERR, SEGV_MAPERR};
+        if pc % 4 != 0 {
+            return Some((sig::SIGBUS, Fault::pc_alignment()));
+        }
+        match self.vma_at(pc).filter(|_| pc >= gex_abi::GUEST_FLOOR) {
+            None => Some((sig::SIGSEGV, Fault::instruction_abort(SEGV_MAPERR, false))),
+            Some(v) if v.prot & prot::EXEC == 0 => Some((sig::SIGSEGV, Fault::instruction_abort(SEGV_ACCERR, v.prot & 7 != 0))),
+            Some(_) => None,
+        }
+    }
+
     /// Where code can change with nothing to say so, so that x86-64 blocks
     /// translated there carry a guard of their bytes (`Block::guard`):
     /// executable mappings that are writable (a JIT's), and the executable

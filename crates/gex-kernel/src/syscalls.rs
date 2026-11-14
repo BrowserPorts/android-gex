@@ -12236,6 +12236,18 @@ impl Kernel {
         }
     }
 
+    /// A branch to `pc`, which cannot be run: the fault an AArch64 program
+    /// takes there ([`MemoryMap::exec_fault`]), raised, and its signal. Not
+    /// for x86 code, nor for an address in a mapping that may be run
+    /// (`None`: what stopped it is not the map).
+    pub fn exec_fault(&mut self, m: &mut GuestMem<'_>, pc: u64) -> Option<(Delivery, u32)> {
+        if gex_abi::X86 {
+            return None;
+        }
+        let (signo, fault) = self.mem.lock().exec_fault(pc)?;
+        Some((self.raise_fault_as(m, signo, Some(fault), pc, pc), signo))
+    }
+
     /// [`Self::raise_fault`] with more of the fault given
     /// ([`signal::Fault`]), or `None` for what its signal usually reports.
     pub fn raise_fault_as(

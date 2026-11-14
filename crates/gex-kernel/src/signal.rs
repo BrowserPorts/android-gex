@@ -1186,6 +1186,9 @@ pub struct Fault {
     /// AArch64: the exception syndrome (`ESR_EL1`), which the frame carries
     /// as an `esr_context` record for a fault that has one.
     pub esr: Option<u64>,
+    /// What the context's `fault_address` holds, where it is not the
+    /// address the siginfo reports.
+    pub context_address: Option<u64>,
 }
 
 impl Fault {
@@ -1202,7 +1205,23 @@ impl Fault {
     /// fault on hardware.)
     pub fn data_abort(code: u32, write: bool, there: bool) -> Fault {
         let status = if there { 0x0f } else { 0x07 };
-        Fault { code, esr: Some(0x24 << 26 | 1 << 25 | (write as u64) << 6 | status) }
+        Fault { code, esr: Some(0x24 << 26 | 1 << 25 | (write as u64) << 6 | status), context_address: None }
+    }
+
+    /// An instruction abort from the program: a branch to an address
+    /// nothing is mapped at, or whose page may not be run. Class 0x20, and
+    /// the status as a data abort's ([`Fault::data_abort`]).
+    pub fn instruction_abort(code: u32, there: bool) -> Fault {
+        let status = if there { 0x0f } else { 0x07 };
+        Fault { code, esr: Some(0x20 << 26 | 1 << 25 | status), context_address: None }
+    }
+
+    /// A branch to an address that is no multiple of four: SIGBUS with
+    /// `BUS_ADRALN`, a PC alignment fault (class 0x22). The siginfo has the
+    /// address; the context's `fault_address` is 0, as `arm64_notify_die`
+    /// leaves it.
+    pub fn pc_alignment() -> Fault {
+        Fault { code: BUS_ADRALN, esr: Some(0x22 << 26 | 1 << 25), context_address: Some(0) }
     }
 }
 
@@ -1219,6 +1238,8 @@ pub fn setup_frame_fault(
     build_frame(signals, m, ctx_addr, signal, fault_address, compat, Taken::Fault(Some(fault)))
 }
 
+/// `si_code` for an address that is not aligned as its use needs.
+pub const BUS_ADRALN: u32 = 1;
 /// `si_code` for a fault at an address nothing is mapped at.
 pub const SEGV_MAPERR: u32 = 1;
 /// `si_code` for a fault at a page whose protection refuses the access.
@@ -1294,7 +1315,11 @@ fn build_frame(
     // The machine context: every general register, sp, pc and pstate, taken
     // from the thread context, which a host call has already made complete.
     let mc = uc + frame::UC_MCONTEXT as u64;
-    m.write_u64(mc + frame::MC_FAULT_ADDRESS as u64, fault_address)?;
+    let context_address = match taken {
+        Taken::Fault(Some(Fault { context_address: Some(a), .. })) => a,
+        _ => fault_address,
+    };
+    m.write_u64(mc + frame::MC_FAULT_ADDRESS as u64, context_address)?;
     for i in 0..31u8 {
         let v = m.read_u64(ctx_addr + ctx::x(i) as u64)?;
         m.write_u64(mc + frame::MC_REGS as u64 + i as u64 * 8, v)?;

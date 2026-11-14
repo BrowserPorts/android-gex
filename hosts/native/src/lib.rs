@@ -5080,6 +5080,12 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
                 eprintln!("gex: illegal instruction {raw:#010x} at {pc:#x}");
             }
+            // Code that ran on into a page that may not be run, or into
+            // nothing: no instruction was fetched there, and the fault is
+            // the branch's (`branch_not_executable`), not SIGILL.
+            if !gex_abi::X86 && caller.data_mut().with_kernel(|k| k.mem.lock().exec_fault(pc)).is_some() {
+                return branch_not_executable(&mut caller, pc).map(|_| ());
+            }
             if deliver_guest_fault(&mut caller, fault_code::ILLEGAL_INSTRUCTION, pc, pc)? {
                 return Err(StopExecution.into());
             }
@@ -7051,12 +7057,22 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
         });
         return Err(StopExecution.into());
     }
-    // The program's own SIGSEGV handler, at the branch's target.
+    // The program's own handler, at the branch's target: for the fault an
+    // AArch64 program takes there (nothing mapped, a page that may not be
+    // run, an address off its four bytes), else SIGSEGV.
+    let mut signo = signal::SIGSEGV;
     if let Some(memory) = caller.data().memory.clone() {
         let mut gm = GuestMem::new(memory.bytes());
         let state = caller.data_mut();
-        if let gex_kernel::signal::Delivery::Resume(target) = state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, pc)) {
-            state.resume_cause = Some("SIGSEGV".into());
+        let delivery = state.with_kernel(|k| match k.exec_fault(&mut gm, pc) {
+            Some((delivery, s)) => {
+                signo = s as i32;
+                delivery
+            }
+            None => k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, pc),
+        });
+        if let gex_kernel::signal::Delivery::Resume(target) = delivery {
+            state.resume_cause = Some("a branch that cannot be run".into());
             state.resume_at = Some(target);
             return Err(StopExecution.into());
         }
@@ -7092,7 +7108,7 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
         }
     };
     caller.data_mut().exit = Some(Exit::Signal {
-        signal: signal::SIGSEGV,
+        signal: signo,
         pc,
         detail,
         internal: false,
