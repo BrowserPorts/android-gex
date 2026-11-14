@@ -53,6 +53,9 @@ enum Entry {
 struct Loaded {
     policy: Policy,
     bools: Vec<bool>,
+    /// What each boolean becomes at the next commit: what it is, until
+    /// `booleans/<name>` is written.
+    pending: Vec<bool>,
     initial: Vec<Option<Entry>>,
     /// SID 28 and on, in the order given out.
     others: Vec<Entry>,
@@ -167,7 +170,9 @@ impl Server {
                 by_context.entry(c.clone()).or_insert(INITIAL_SIDS + 1 + i as u32);
             }
         }
-        self.loaded = Some(Loaded { policy, bools, initial, others, by_context });
+        // Nothing waits for a commit across a load.
+        let pending = bools.clone();
+        self.loaded = Some(Loaded { policy, bools, pending, initial, others, by_context });
         self.seqno += 1;
         self.changes += 1;
         Ok(())
@@ -290,12 +295,11 @@ impl Server {
                 let perms = policy.perms_of(policy.class_named(class)?);
                 number(0o444, perms.iter().find(|(_, name)| name == perm)?.0)
             }
-            // Its value, and the one that waits for a commit: one is not
-            // kept waiting here ([`Server::set_bool`] is the commit).
+            // Its value, and the one that waits for a commit.
             ["booleans", name] => {
                 let l = self.loaded.as_ref()?;
-                let state = l.bools[l.policy.bools.iter().position(|b| b.name == *name)?] as u8;
-                Some((0o644, Ok(format!("{state} {state}").into_bytes())))
+                let at = l.policy.bools.iter().position(|b| b.name == *name)?;
+                Some((0o644, Ok(format!("{} {}", l.bools[at] as u8, l.pending[at] as u8).into_bytes())))
             }
             ["initial_contexts", name] => {
                 let sid = INITIAL_SID_NAMES.iter().position(|n| n.as_deref() == Some(*name))? as u32;
@@ -330,13 +334,30 @@ impl Server {
         }
     }
 
-    /// Set a boolean, by name (`booleans/<name>` and `commit_pending_bools`).
-    pub fn set_bool(&mut self, name: &str, value: bool) -> Result<(), Error> {
+    /// `booleans/<name>` written: the value it takes at the next commit.
+    pub fn set_pending_bool(&mut self, name: &str, value: bool) -> Result<(), Error> {
         let l = self.loaded.as_mut().ok_or(Error::Invalid)?;
         let at = l.policy.bools.iter().position(|b| b.name == name).ok_or(Error::Invalid)?;
-        l.bools[at] = value;
+        l.pending[at] = value;
+        Ok(())
+    }
+
+    /// `commit_pending_bools` written with other than 0
+    /// (`security_set_bools`): every boolean takes the value that waits
+    /// for it. It counts as a load and a change of the status page
+    /// whether or not a value changed; before a policy there is nothing
+    /// to commit and nothing is counted.
+    pub fn commit_bools(&mut self) {
+        let Some(l) = self.loaded.as_mut() else { return };
+        l.bools = l.pending.clone();
         self.seqno += 1;
         self.changes += 1;
+    }
+
+    /// Set a boolean, by name: its file written and a commit.
+    pub fn set_bool(&mut self, name: &str, value: bool) -> Result<(), Error> {
+        self.set_pending_bool(name, value)?;
+        self.commit_bools();
         Ok(())
     }
 }
@@ -457,13 +478,24 @@ mod tests {
         // kernel's page read 1 24 0 12 1 after two loads with commits
         // between them, the sequence twice the count.
         let before = s.status();
-        s.set_bool("allow_stuff", true).unwrap();
+        s.set_bool("other_thing", false).unwrap();
         assert_eq!(s.status(), [1, before[1] + 2, 0, before[3] + 1, 1]);
-        // From the reference, not yet seen: enforcing set is a change,
-        // and set to what it is already is none.
+        // From the reference, not yet seen: a value written and not
+        // committed reads beside the one in force and changes nothing,
+        // and a commit puts it in force, counted even with nothing new.
+        s.set_pending_bool("other_thing", true).unwrap();
+        assert_eq!(s.file("booleans/other_thing"), Some((0o644, Ok(b"0 1".to_vec()))));
+        assert_eq!(s.status(), [1, before[1] + 2, 0, before[3] + 1, 1]);
+        assert_eq!(s.set_pending_bool("nothing", true), Err(Error::Invalid));
+        s.commit_bools();
+        assert_eq!(s.file("booleans/other_thing"), Some((0o644, Ok(b"1 1".to_vec()))));
+        s.commit_bools();
+        assert_eq!(s.status(), [1, before[1] + 6, 0, before[3] + 3, 1]);
+        // Nor seen: enforcing set is a change, and set to what it is
+        // already is none.
         s.set_enforcing(true);
         s.set_enforcing(true);
-        assert_eq!(s.status(), [1, before[1] + 4, 1, before[3] + 1, 1]);
+        assert_eq!(s.status(), [1, before[1] + 8, 1, before[3] + 3, 1]);
         assert_eq!(s.file("enforce"), Some((0o644, Ok(b"1".to_vec()))));
         // In the policy's order of them, which is not the alphabet's.
         assert_eq!(s.dir("booleans"), Some(vec!["other_thing".to_string(), "allow_stuff".to_string()]));
