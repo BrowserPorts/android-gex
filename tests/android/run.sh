@@ -48,6 +48,7 @@ run() {
     block) check block "block ok" 0 ;;
     procfd) check procfd "procfd ok" 0 ;;
     mremap) check mremap "mremap ok" 0 ;;
+    mainstack) check mainstack "mainstack ok" 0 ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -60,7 +61,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello tagged thread simd exclusive casp prctl crc crypto block procfd mremap; do
+    for p in hello tagged thread simd exclusive casp prctl crc crypto block procfd mremap mainstack; do
         run "$p"
     done
 fi
