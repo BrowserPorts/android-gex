@@ -43,6 +43,7 @@ run() {
     exclusive) check exclusive "exclusive ok" 0 ;;
     casp) check casp "casp ok" 0 ;;
     prctl) check prctl "prctl ok" 0 ;;
+    crc) check crc "crc ok" 0 ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -55,7 +56,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello tagged thread simd exclusive casp prctl; do
+    for p in hello tagged thread simd exclusive casp prctl crc; do
         run "$p"
     done
 fi
