@@ -5,6 +5,9 @@
 # linker's default base, as Android's static executables are); without,
 # all of them at both bases.
 #
+# AOSP's own tests of the binder driver run too, where aosp/build.sh has
+# built them: aosp/<name> names one.
+#
 # GEXC=native runs them as they are, which an arm64 Linux host can: the
 # reference they are written against. What they write to stderr goes to
 # bin/, or to the temporary directory when bin/ cannot be written.
@@ -41,6 +44,34 @@ check() {
 }
 
 # run <program>, or low/<program> for the one linked at the default base
+# gtest <name>: one of AOSP's tests (aosp/build.sh), with binderhost as
+# the context manager a device would have. It passes when it exits 0 and
+# says its tests passed; the ones it skips for what a driver lacks are its
+# own to skip.
+gtest() {
+    if [ ! -x "$HERE/bin/aosp/$1" ]; then
+        echo "SKIP aosp/$1: not built (aosp/build.sh)"
+        return
+    fi
+    mkdir -p "$ERR/aosp"
+    if [ "$GEXC" = native ]; then
+        out=$("$HERE/bin/binderhost" "$HERE/bin/aosp/$1" 2>"$ERR/aosp/$1.err")
+    else
+        out=$("$GEXC" run "$HERE/bin/binderhost" "$HERE/bin/aosp/$1" 2>"$ERR/aosp/$1.err")
+    fi
+    status=$?
+    passed=$(printf '%s\n' "$out" | grep '^\[  PASSED  \]')
+    if [ "$status" -eq 0 ] && [ -n "$passed" ]; then
+        echo "PASS aosp/$1: ${passed#\[  PASSED  \] }"
+    elif [ "$status" -eq 77 ]; then
+        echo "SKIP aosp/$1: $(printf '%s\n' "$out" | tail -1)"
+    else
+        echo "FAIL aosp/$1: exit $status; output in $ERR/aosp/$1.out, stderr in $ERR/aosp/$1.err"
+        printf '%s\n' "$out" >"$ERR/aosp/$1.out"
+        fail=1
+    fi
+}
+
 run() {
     case ${1#low/} in
     hello) check "$1" "hello ok" 0 ;;
@@ -68,6 +99,11 @@ run() {
     pdeath) check "$1" "pdeath ok" 0 ;;
     binder) check "$1" "binder ok" 0 ;;
     binderwork) check "$1" "binderwork ok" 0 ;;
+    binderfreeze) check "$1" "binderfreeze ok" 0 ;;
+    binderfs) check "$1" "binderfs ok" 0 ;;
+    bindersg) check "$1" "bindersg ok" 0 ;;
+    binderctx) check "$1" "binderctx ok" 0 ;;
+    aosp/*) gtest "${1#aosp/}" ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -80,12 +116,13 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath binder binderwork"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath binder binderwork binderfreeze binderfs bindersg binderctx"
     for p in $all; do
         run "$p"
     done
     for p in $all; do
         run "low/$p"
     done
+    run aosp/binderDriverInterfaceTest
 fi
 exit $fail
