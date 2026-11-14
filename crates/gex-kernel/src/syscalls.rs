@@ -311,6 +311,47 @@ pub enum SyscallOutcome {
     Blocking(BlockOp),
 }
 
+impl BlockOp {
+    /// This wait with the tag taken off every guest address it holds: what
+    /// a thread with AArch64's tagged address ABI on has asked for. The
+    /// host that runs the wait reads and writes at those addresses long
+    /// after the call that made it, with nothing of the thread's to tell
+    /// it they are tagged.
+    pub fn untagged(mut self) -> BlockOp {
+        let u = crate::untagged_addr;
+        match &mut self {
+            BlockOp::FutexWait { uaddr, .. } | BlockOp::FutexLockPi { uaddr, .. } => *uaddr = u(*uaddr),
+            BlockOp::ReadStream { buf, vectors, .. } => {
+                *buf = u(*buf);
+                if let Some(v) = vectors {
+                    *v = v.iter().map(|&(at, len)| (u(at), len)).collect();
+                }
+            }
+            BlockOp::WriteStream { buf, .. } => *buf = u(*buf),
+            BlockOp::WaitChild { wstatus, waitid, .. } => {
+                *wstatus = u(*wstatus);
+                if let Some(w) = waitid {
+                    w.info = u(w.info);
+                }
+            }
+            BlockOp::Poll { fds, report, .. } => {
+                for f in fds.iter_mut() {
+                    f.addr = u(f.addr);
+                }
+                match report {
+                    PollReport::Epoll { out, .. } => *out = u(*out),
+                    PollReport::Select { readfds, writefds, exceptfds, .. } => {
+                        (*readfds, *writefds, *exceptfds) = (u(*readfds), u(*writefds), u(*exceptfds));
+                    }
+                    PollReport::Poll => {}
+                }
+            }
+            BlockOp::Sleep(_) | BlockOp::SigSuspend { .. } | BlockOp::SigWait { .. } | BlockOp::Connect { .. } | BlockOp::AcceptWait { .. } | BlockOp::FileLock { .. } => {}
+        }
+        self
+    }
+}
+
 /// A syscall's blocking half, to be run without the kernel lock.
 #[derive(Debug, Clone)]
 pub enum BlockOp {
@@ -7376,6 +7417,19 @@ pub fn untag_mapping_args(n: u64, a: &mut [u64; 6]) {
     }
 }
 
+/// A futex's addresses without their tags, for a thread with the tagged
+/// address ABI on: the word is found, and waiters matched to wakers, by
+/// where it is. (Linux keys a private futex by the pointer as passed, tag
+/// and all, so there two differently tagged pointers to one word do not
+/// meet; here they do, a wake more than Linux gives, which a futex's
+/// users must allow for in any case.)
+pub fn untag_futex_args(n: u64, a: &mut [u64; 6]) {
+    if n == nr::FUTEX {
+        a[0] = crate::untagged_addr(a[0]);
+        a[4] = crate::untagged_addr(a[4]);
+    }
+}
+
 /// `prctl(PR_SET_TAGGED_ADDR_CTRL)` and `prctl(PR_GET_TAGGED_ADDR_CTRL)`,
 /// AArch64's tagged address ABI; `None` for any other option.
 ///
@@ -7998,14 +8052,21 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
     // As [`Kernel::syscall`]: a thread with AArch64's tagged address ABI
     // on may pass tagged pointers.
     let a64 = a64_thread(f.io.compat, f.io.wasm32);
-    m.set_tags(thread_tags(a64, f.signals.thread()));
+    let tags = thread_tags(a64, f.signals.thread());
+    m.set_tags(tags);
     let mut call = call;
     if a64 {
         untag_mapping_args(call.n, &mut call.a);
     }
+    if tags == crate::Tags::All {
+        untag_futex_args(call.n, &mut call.a);
+    }
     let out = free_call_untagged(f, m, ctx_addr, call);
     m.set_tags(crate::Tags::None);
-    out
+    match out {
+        FreeOutcome::Blocking(op, mask) if tags == crate::Tags::All => FreeOutcome::Blocking(op.untagged(), mask),
+        out => out,
+    }
 }
 
 fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
@@ -10796,9 +10857,15 @@ impl Kernel {
         self.mem.shared_maps().catch_up(m);
         // A thread with AArch64's tagged address ABI on may pass tagged
         // pointers for the kernel to access (`access_ok`).
-        m.set_tags(thread_tags(a64_thread(self.compat, self.wasm32), self.signals.thread()));
+        let tags = thread_tags(a64_thread(self.compat, self.wasm32), self.signals.thread());
+        m.set_tags(tags);
         let out = self.syscall_cwd(m, pc);
         m.set_tags(crate::Tags::None);
+        // A wait is run by the host, later and with no thread's ABI.
+        let out = match out {
+            SyscallOutcome::Blocking(op) if tags == crate::Tags::All => SyscallOutcome::Blocking(op.untagged()),
+            out => out,
+        };
         // What a signal that ends the wait makes of it ([`Self::finish_blocking`]).
         if let SyscallOutcome::Blocking(op) = &out {
             self.block_restart = op.restart();
@@ -10857,6 +10924,9 @@ impl Kernel {
         };
         if a64_thread(self.compat, self.wasm32) {
             untag_mapping_args(raw, &mut a);
+            if self.signals.thread().tagged_addr() {
+                untag_futex_args(raw, &mut a);
+            }
         }
         // The number's register doubles as the result register on x86-64, so
         // keep the raw number where a host can read it after the fact.
@@ -11451,6 +11521,15 @@ impl Kernel {
     }
 
     pub fn finish_blocking(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
+        // The rest of the thread's call, under the thread's ABI as its
+        // start was ([`Self::syscall`]).
+        m.set_tags(thread_tags(a64_thread(self.compat, self.wasm32), self.signals.thread()));
+        let out = self.finish_blocking_tagged(m, r);
+        m.set_tags(crate::Tags::None);
+        out
+    }
+
+    fn finish_blocking_tagged(&mut self, m: &mut GuestMem<'_>, r: SysResult) -> SyscallOutcome {
         // What other processes wrote back while the call waited: the wait's
         // end can be what orders this process after their writes (a pipe
         // read of a byte written after a commit), with no system call of
