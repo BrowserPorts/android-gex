@@ -97,6 +97,7 @@ run() {
     execfault) check "$1" "execfault ok" 0 ;;
     efault) check "$1" "efault ok" 0 ;;
     pdeath) check "$1" "pdeath ok" 0 ;;
+    signalfd) check "$1" "signalfd ok" 0 ;;
     binder) check "$1" "binder ok" 0 ;;
     binderwork) check "$1" "binderwork ok" 0 ;;
     binderfreeze) check "$1" "binderfreeze ok" 0 ;;
@@ -116,7 +117,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath binder binderwork binderfreeze binderfs bindersg binderctx"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd binder binderwork binderfreeze binderfs bindersg binderctx"
     for p in $all; do
         run "$p"
     done
