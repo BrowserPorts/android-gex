@@ -93,6 +93,9 @@ impl FileSystem for Subtree {
     fn mksocket(&self, path: &str) -> Result<(), Errno> {
         self.inner.mksocket(&self.at(path))
     }
+    fn mknod(&self, path: &str, mode: u32, rdev: u64) -> Result<(), Errno> {
+        self.inner.mknod(&self.at(path), mode, rdev)
+    }
     fn watch_key(&self, path: &str) -> Result<(Option<crate::inotify::Key>, bool), Errno> {
         self.inner.watch_key(&self.at(path))
     }

@@ -32,6 +32,7 @@ pub mod nr {
     pub const DUP3: u64 = 24;
     pub const FCNTL: u64 = 25;
     pub const IOCTL: u64 = 29;
+    pub const MKNODAT: u64 = 33;
     pub const MKDIRAT: u64 = 34;
     pub const UNLINKAT: u64 = 35;
     pub const SYMLINKAT: u64 = 36;
@@ -3492,6 +3493,7 @@ impl PathIo<'_> {
             nr::READLINKAT => self.readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.getcwd(m, a[0], a[1]),
             nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
+            nr::MKNODAT => self.sys_mknodat(m, a[0] as i32, a[1], a[2] as u32, a[3]),
             nr::CHDIR => self.sys_chdir(m, a[0]),
             nr::FCHDIR => self.sys_fchdir(a[0] as i32),
             // There is one process's view of the world and nothing consults
@@ -4101,6 +4103,49 @@ impl PathIo<'_> {
             return Err(if self.ns.metadata(&p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
         }
         self.ns.mkdir(&p, mode & !self.fs.umask()).map(|_| 0)
+    }
+
+    /// `mknodat(dirfd, path, mode, dev)`: a regular file, or a node for
+    /// character device `dev` ([`crate::vfs::devices`]), which takes
+    /// `CAP_MKNOD`. The mode's permission bits are held to the umask.
+    ///
+    /// Not made yet, and said so: a FIFO, a block device, and a socket
+    /// that nothing is bound to.
+    pub fn sys_mknodat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32, dev: u64) -> SysResult {
+        const CAP_MKNOD: u64 = 27;
+        let p = self.at_path(m, dirfd, path)?;
+        if self.ns.metadata_nofollow(&p).is_ok() {
+            return Err(Errno::EEXIST);
+        }
+        let perm = mode & 0o7777 & !self.fs.umask();
+        match mode & 0o170000 {
+            // S_IFREG, or no type at all: an empty file.
+            0 | 0o100000 => self.ns.open_mode(&p, oflags::O_CREAT | oflags::O_EXCL | oflags::O_WRONLY, perm).map(|_| 0),
+            // S_IFCHR
+            0o020000 => {
+                if !self.creds.capable(CAP_MKNOD) {
+                    return Err(Errno::EPERM);
+                }
+                self.ns.mknod(&p, perm, dev & 0xffff_ffff).map(|_| 0)
+            }
+            // S_IFDIR: mkdir's to make.
+            0o040000 => Err(Errno::EPERM),
+            // S_IFIFO, S_IFBLK, S_IFSOCK
+            kind @ (0o010000 | 0o060000 | 0o140000) => {
+                static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let bit = 1 << (kind >> 13);
+                if SAID.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+                    let what = match kind {
+                        0o010000 => "a FIFO",
+                        0o060000 => "a block device",
+                        _ => "a socket",
+                    };
+                    eprintln!("[gex] mknod: {what} is not implemented -> EPERM ({p})");
+                }
+                Err(Errno::EPERM)
+            }
+            _ => Err(Errno::EINVAL),
+        }
     }
 
     pub fn sys_unlinkat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, flags: u64) -> SysResult {
@@ -6181,6 +6226,7 @@ fn is_path(n: u64) -> bool {
             | nr::READLINKAT
             | nr::GETCWD
             | nr::MKDIRAT
+            | nr::MKNODAT
             | nr::UNLINKAT
             | nr::RENAMEAT
             | nr::RENAMEAT2
@@ -7971,6 +8017,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::GETCWD => nr::GETCWD,
             x::GETDENTS64 => nr::GETDENTS64,
             x::MKDIR | x::MKDIRAT => nr::MKDIRAT,
+            x::MKNOD | x::MKNODAT => nr::MKNODAT,
             x::UNLINK | x::RMDIR | x::UNLINKAT => nr::UNLINKAT,
             x::RENAME | x::RENAMEAT => nr::RENAMEAT,
             x::RENAMEAT2 => nr::RENAMEAT2,
@@ -8076,6 +8123,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::GETCWD => nr::GETCWD,
             x::GETDENTS64 => nr::GETDENTS64,
             x::MKDIR | x::MKDIRAT => nr::MKDIRAT,
+            x::MKNOD | x::MKNODAT => nr::MKNODAT,
             x::UNLINK | x::RMDIR | x::UNLINKAT => nr::UNLINKAT,
             x::RENAME | x::RENAMEAT => nr::RENAMEAT,
             x::RENAMEAT2 => nr::RENAMEAT2,
@@ -9653,6 +9701,7 @@ fn traced_path(m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> String {
         | nr::FACCESSAT2
         | nr::UNLINKAT
         | nr::MKDIRAT
+        | nr::MKNODAT
         | nr::READLINKAT
         | nr::UTIMENSAT
         | nr::FCHOWNAT
@@ -14135,6 +14184,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::FCNTL => "fcntl",
         nr::IOCTL => "ioctl",
         nr::MKDIRAT => "mkdirat",
+        nr::MKNODAT => "mknodat",
         nr::UNLINKAT => "unlinkat",
         nr::LINKAT => "linkat",
         nr::SYMLINKAT => "symlinkat",

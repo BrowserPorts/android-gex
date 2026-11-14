@@ -647,6 +647,9 @@ enum Node {
     /// through the socket, not the path -- but it has to be visible to
     /// `stat` and removable by `unlink`.
     Socket,
+    /// A character device, by its number (`mknod`): it opens as whatever
+    /// device has that number ([`super::devices`]).
+    Device { rdev: u64 },
 }
 
 #[derive(Debug, Default)]
@@ -1433,6 +1436,16 @@ impl TmpFs {
                 rdev: 0,
                 times: Default::default(),
             }),
+            Node::Device { rdev } => Ok(Metadata {
+                file_type: FileType::CharDevice,
+                size: 0,
+                mode: inner.modes.get(path).copied().unwrap_or(0o644),
+                ino,
+                mtime: mtime(),
+                nlink: inner.nlink(ino),
+                rdev: *rdev,
+                times: Default::default(),
+            }),
         }
     }
 
@@ -1746,6 +1759,7 @@ impl FileHandle for TmpHandle {
                     Node::Dir => FileType::Directory,
                     Node::Symlink(_) => FileType::Symlink,
                     Node::Socket => FileType::Socket,
+                    Node::Device { .. } => FileType::CharDevice,
                 },
                 ino,
             });
@@ -1885,6 +1899,23 @@ impl TmpFs {
                 Some(node) => {
                     if flags & oflags::O_EXCL != 0 && flags & oflags::O_CREAT != 0 {
                         return Err(Errno::EEXIST);
+                    }
+                    // A device node opens as the device its number names,
+                    // which answers `fstat` with what the node says for as
+                    // long as the node is there.
+                    if let Node::Device { rdev } = node {
+                        let (rdev, ino) = (*rdev, TmpFs::ino_of(&inner, &path));
+                        let at_open = TmpFs::meta_at(&inner, &path)?;
+                        drop(inner);
+                        let fs = Arc::clone(&self.inner);
+                        let node: super::devices::NodeMeta = Arc::new(move || {
+                            let inner = fs.lock().unwrap();
+                            match inner.nodes.get(&path) {
+                                Some(Node::Device { .. }) if TmpFs::ino_of(&inner, &path) == ino => TmpFs::meta_at(&inner, &path).unwrap_or_else(|_| at_open.clone()),
+                                _ => at_open.clone(),
+                            }
+                        });
+                        return super::devices::open_char(rdev, node);
                     }
                     // A directory opens for reading only.
                     let acc = flags & oflags::ACCMODE;
@@ -2186,6 +2217,7 @@ impl FileSystem for TmpFs {
             Some(Node::Dir) => return Err(Errno::EPERM),
             // A socket has one name, the one it was bound to.
             Some(Node::Socket) => return Err(Errno::EPERM),
+            Some(Node::Device { rdev }) => Node::Device { rdev: *rdev },
             None => return Err(Errno::ENOENT),
         };
         if inner.nodes.contains_key(to) {
@@ -2207,6 +2239,22 @@ impl FileSystem for TmpFs {
             crate::inotify::event(crate::inotify::Key { fs, ino }, crate::inotify::mask::ATTRIB, 0, None, false);
             note(&inner, fs, to, None, crate::inotify::mask::CREATE, 0);
         }
+        Ok(())
+    }
+
+    fn mknod(&self, path: &str, mode: u32, rdev: u64) -> Result<(), Errno> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.nodes.contains_key(path) {
+            return Err(Errno::EEXIST);
+        }
+        inner.parent_ok(path)?;
+        let ino = inner.next_ino;
+        inner.next_ino += 1;
+        inner.set_ino(path.to_string(), ino);
+        inner.nodes.insert(path.to_string(), Node::Device { rdev });
+        inner.chmod(path, mode)?;
+        inner.entries_changed(path, now());
+        note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
 

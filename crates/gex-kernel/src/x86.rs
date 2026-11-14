@@ -242,6 +242,7 @@ pub mod raw {
     pub const FCHDIR: u64 = 81;
     pub const RENAME: u64 = 82;
     pub const MKDIR: u64 = 83;
+    pub const MKNOD: u64 = 133;
     pub const RMDIR: u64 = 84;
     pub const CREAT: u64 = 85;
     pub const LINK: u64 = 86;
@@ -320,6 +321,7 @@ pub mod raw {
     pub const RT_TGSIGQUEUEINFO: u64 = 297;
     pub const OPENAT: u64 = 257;
     pub const MKDIRAT: u64 = 258;
+    pub const MKNODAT: u64 = 259;
     pub const FCHOWNAT: u64 = 260;
     pub const NEWFSTATAT: u64 = 262;
     pub const UNLINKAT: u64 = 263;
@@ -662,6 +664,11 @@ pub fn translate(
         x::RT_TGSIGQUEUEINFO => nr::RT_TGSIGQUEUEINFO,
         x::OPENAT => nr::OPENAT,
         x::MKDIRAT => nr::MKDIRAT,
+        x::MKNOD => {
+            *a = [AT_FDCWD, a[0], a[1], a[2], 0, 0];
+            nr::MKNODAT
+        }
+        x::MKNODAT => nr::MKNODAT,
         x::FCHOWNAT => nr::FCHOWNAT,
         x::NEWFSTATAT => nr::NEWFSTATAT,
         x::UNLINKAT => nr::UNLINKAT,

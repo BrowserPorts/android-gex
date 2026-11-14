@@ -440,7 +440,7 @@ fn seed_of(fs: &TmpFs) -> HashMap<String, u64> {
             Node::Dir => sig_dir(mode_of(&inner, p, n), &xattrs_of(&inner, ino)),
             Node::Symlink(t) => sig_link(t),
             Node::File(f) => sig_file_seed(mode_of(&inner, p, n), &xattrs_of(&inner, f.ino)),
-            Node::Socket => continue,
+            Node::Socket | Node::Device { .. } => continue,
         };
         out.insert(p.clone(), s);
     }
@@ -479,6 +479,10 @@ impl State {
                     out.push((p.clone(), Pre::Link { target: t.clone() }));
                 }
                 Node::Socket => {}
+                // A device node is not kept either, yet: the records have
+                // no form for one, and the nodes there are so far are an
+                // init's, made again at every boot in a tmpfs of its own.
+                Node::Device { .. } => {}
                 Node::File(f) => {
                     let xattrs = xattrs_of(&inner, f.ino);
                     if f.written.load(Ordering::Relaxed) {

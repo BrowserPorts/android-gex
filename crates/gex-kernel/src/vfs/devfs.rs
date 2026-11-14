@@ -36,9 +36,31 @@ fn rdev_of(device: Device) -> u64 {
     }
 }
 
-#[derive(Debug)]
 struct DevHandle {
     device: Device,
+    /// The node it was opened through, when that is one a program made
+    /// ([`super::devices`]): `fstat` says what the node says.
+    node: Option<super::devices::NodeMeta>,
+}
+
+impl std::fmt::Debug for DevHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.device)
+    }
+}
+
+/// The device a node numbered `dev` opens as, of those this module has:
+/// the memory devices and the terminals, by Linux's numbers.
+pub(super) fn open_numbered(dev: u64, node: super::devices::NodeMeta) -> Option<Arc<dyn FileHandle>> {
+    let device = match (super::devices::major(dev), super::devices::minor(dev)) {
+        (1, 3) => Device::Null,
+        (1, 5) => Device::Zero,
+        (1, 7) => Device::Full,
+        (1, 8 | 9) => Device::Random,
+        (5, 0 | 1) => Device::Tty,
+        _ => return None,
+    };
+    Some(Arc::new(DevHandle { device, node: Some(node) }))
 }
 
 impl FileHandle for DevHandle {
@@ -67,6 +89,9 @@ impl FileHandle for DevHandle {
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
+        if let Some(node) = &self.node {
+            return Ok(node());
+        }
         Ok(Metadata {
             file_type: FileType::CharDevice,
             size: 0,
@@ -191,7 +216,7 @@ impl FileSystem for DevFs {
             return Err(Errno::EISDIR);
         }
         if let Some(device) = Self::device_of(path) {
-            return Ok(Arc::new(DevHandle { device }));
+            return Ok(Arc::new(DevHandle { device, node: None }));
         }
         if let Some((_, handle)) = self.extra.iter().find(|(n, _)| n == path) {
             return Ok(Arc::clone(handle));

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 pub mod binderfs;
 pub mod devfs;
+pub mod devices;
 pub mod evdev;
 pub mod hostcall;
 // Passthrough to the host's own filesystem; the browser gets `opfs`/`httpfs`
@@ -960,6 +961,15 @@ pub trait FileSystem: Send + Sync {
         Err(Errno::EROFS)
     }
 
+    /// `mknod` of a character device: a node at `path`, with `mode`'s
+    /// permission bits, that opens as device number `rdev`
+    /// ([`devices`]). A filesystem that keeps no device nodes says
+    /// `EPERM`, as Linux's that cannot (vfat) do.
+    fn mknod(&self, path: &str, mode: u32, rdev: u64) -> Result<(), Errno> {
+        let _ = (path, mode, rdev);
+        Err(Errno::EPERM)
+    }
+
     /// What an `inotify` watch on `path` watches: the inode's key and
     /// whether it is a directory. `None` for the key where this filesystem
     /// says no changes (the default: `/proc`, `/dev`); `ENOENT` for nothing
@@ -1732,6 +1742,12 @@ impl Namespace {
     pub fn mksocket(&self, path: &str) -> Result<(), Errno> {
         let (fs, rel) = self.resolve(path)?;
         fs.mksocket(&rel)
+    }
+
+    /// Create a character device node ([`FileSystem::mknod`]).
+    pub fn mknod(&self, path: &str, mode: u32, rdev: u64) -> Result<(), Errno> {
+        let (fs, rel) = self.resolve(path)?;
+        fs.mknod(&rel, mode, rdev)
     }
 
     pub fn symlink(&self, target: &str, path: &str) -> Result<(), Errno> {
