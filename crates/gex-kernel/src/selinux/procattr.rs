@@ -168,25 +168,26 @@ mod tests {
         // setcon leaves prev as it was.
         assert_eq!(write(&mut s, &mut ids, CURRENT, INIT), (Ok(27), init.clone()));
         assert_eq!(show(&s, ids[PREV]), "system_u:system_r:kernel_t:s0\0");
-        // From the reference, not seen: current cannot be taken back.
+        // current cannot be taken back (as on Linux 7.0:
+        // tests/android/src/procattr.c).
         assert_eq!(write(&mut s, &mut ids, CURRENT, b"").0, Err(Errno::EINVAL));
         assert_eq!(write(&mut s, &mut ids, CURRENT, b"\n").0, Err(Errno::EINVAL));
     }
 
-    /// An `execve`: as seen, a process that had asked for nothing is what
-    /// it was, with that as `prev` and `exec` empty. From the reference:
-    /// one that had asked becomes what it asked, and every request is
-    /// forgotten.
+    /// An `execve`, as Linux 7.0 has it (tests/android/src/procattr.c): a
+    /// process that had asked for nothing is what it was, with that as
+    /// `prev`; one that had asked becomes what it asked; and every
+    /// request is forgotten.
     #[test]
     fn an_exec_takes_the_request_and_forgets_the_rest() {
         assert_eq!(exec([30, 1, 0, 0, 0, 0]), [30, 30, 0, 0, 0, 0]);
         assert_eq!(exec([30, 1, 31, 32, 33, 34]), [31, 30, 0, 0, 0, 0]);
     }
 
-    /// From the reference, not seen: a context the policy has no words
-    /// for may be asked for a privileged process's files, and is kept as
-    /// written, reading as unlabeled; for anything else, or by anyone
-    /// else, it is no context.
+    /// A context the policy has no words for may be asked for a
+    /// privileged process's files, and is kept as written, reading as
+    /// unlabeled (as root's did on Linux 7.0: procattr.c); for anything
+    /// else it is no context, and by the reference for anyone else.
     #[test]
     fn a_privileged_process_may_ask_for_a_context_the_policy_lacks() {
         let mut s = Server::default();
@@ -202,7 +203,7 @@ mod tests {
     }
 
     /// Before a policy every process is "kernel", and whatever it writes
-    /// is the kernel's SID.
+    /// is the kernel's SID (as on Linux 7.0: procattr.c).
     #[test]
     fn before_a_policy_a_process_is_the_kernel() {
         let mut s = Server::default();

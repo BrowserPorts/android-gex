@@ -37,7 +37,7 @@ CC=$ndk/toolchains/llvm/prebuilt/$host/bin/clang
 # The policy selinuxfs.c carries, to load into the kernel it runs on.
 POLICY=$HERE/../../crates/gex-kernel/src/selinux/testdata/test.33
 
-for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx binderhost selinuxfs; do
+for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx binderhost selinuxfs procattr; do
     "$CC" --target="$TARGET" -O2 -Wall -Werror -static -DTEST_POLICY="\"$POLICY\"" -Wl,--image-base=0x400000 -o "$OUT/$p" "$HERE/src/$p.c"
     "$CC" --target="$TARGET" -O2 -Wall -Werror -static -DTEST_POLICY="\"$POLICY\"" -o "$OUT/low/$p" "$HERE/src/$p.c"
 done
