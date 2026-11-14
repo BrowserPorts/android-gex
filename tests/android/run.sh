@@ -38,6 +38,7 @@ run() {
     case $1 in
     hello) check hello "hello ok" 0 ;;
     tagged) check tagged "tagged ok" 0 ;;
+    tbi) check tbi "tbi ok" 0 ;;
     thread) check thread "thread ok" 0 ;;
     simd) check simd "simd ok" 0 ;;
     exclusive) check exclusive "exclusive ok" 0 ;;
@@ -61,7 +62,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello tagged thread simd exclusive casp prctl crc crypto block procfd mremap mainstack; do
+    for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack; do
         run "$p"
     done
 fi
