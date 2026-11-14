@@ -8903,8 +8903,24 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
             }
         }
         // Requeue is an optimisation for condition variables; waking
-        // everyone is correct, if less efficient.
-        futex::op::REQUEUE | futex::op::CMP_REQUEUE => Ok(cx.table.wake(uaddr, u32::MAX)),
+        // everyone is correct, if less efficient. The answer is a count, as
+        // Linux gives it (`futex_requeue`'s `task_count`, for both
+        // operations): the waiters woken and moved, at most `val` and the
+        // count in the timeout argument together. (It was the count asked
+        // for, which for "everyone" is -1 to a caller that reads it as an
+        // int: ART took that for a failure and aborted.)
+        futex::op::REQUEUE | futex::op::CMP_REQUEUE => {
+            // `FUTEX_CMP_REQUEUE` does nothing unless the word still holds
+            // what the caller saw (`val3`).
+            if operation == futex::op::CMP_REQUEUE {
+                let now = gex_atomic::load_u32(m.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0).ok_or(Errno::EFAULT)?;
+                if now != a[5] as u32 {
+                    return Err(Errno::EAGAIN);
+                }
+            }
+            let all = cx.table.wake(uaddr, u32::MAX);
+            Ok(all.min(val as u64 + (a[3] as u32) as u64))
+        }
         // `FUTEX_WAKE_OP`: atomically apply an op to a second word, wake
         // `val` waiters on `uaddr`, then -- if the old second word compares
         // true -- wake `a[3]` waiters on `uaddr2` (`a[4]`). glibc's condvar

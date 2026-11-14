@@ -245,10 +245,13 @@ impl FutexTable {
         }
     }
 
-    /// Wake up to `count` waiters on `addr`, returning how many were woken.
-    ///
-    /// Approximate in the same way Linux's is: it reports how many could be
-    /// woken, and a woken thread re-checks its own condition regardless.
+    /// Wake up to `count` waiters on `addr`, returning how many were woken:
+    /// never more than wait there (a waiter holds its queue, with the table
+    /// and this call), so a wake of everyone is not answered with the
+    /// count it asked for. More than one and fewer than all wakes all, and
+    /// reports the count asked: a woken thread re-checks its own condition
+    /// regardless. Waiters in another table (the browser's other Workers)
+    /// are not counted.
     pub fn wake(&self, addr: u64, count: u32) -> u64 {
         // Record for the cross-thread relay BEFORE the local-queue lookup: a
         // waiter in another Worker leaves this table with no queue for `addr`,
@@ -269,15 +272,16 @@ impl FutexTable {
         };
         let mut gen = queue.generation.lock().unwrap();
         *gen = gen.wrapping_add(1);
+        let waiting = (Arc::strong_count(&queue) as u64).saturating_sub(2);
         match count {
             0 => 0,
             1 => {
                 queue.ready.notify_one();
-                1
+                waiting.min(1)
             }
             n => {
                 queue.ready.notify_all();
-                n as u64
+                waiting.min(n as u64)
             }
         }
     }
