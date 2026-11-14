@@ -213,6 +213,22 @@ impl Server {
         Ok(l.sid_of(c))
     }
 
+    /// `security_context_to_sid_force`: as [`Server::context_to_sid`],
+    /// but text the policy has no words for gets a SID all the same, kept
+    /// as written and treated as unlabeled until a policy has the words.
+    pub fn context_to_sid_force(&mut self, text: &str) -> Result<u32, Error> {
+        match self.context_to_sid(text) {
+            Err(Error::Invalid) if !text.is_empty() => {}
+            other => return other,
+        }
+        let Some(l) = &mut self.loaded else { return Err(Error::Invalid) };
+        if let Some(at) = l.others.iter().position(|e| matches!(e, Entry::Unmapped(t) if t == text)) {
+            return Ok(INITIAL_SIDS + 1 + at as u32);
+        }
+        l.others.push(Entry::Unmapped(text.to_string()));
+        Ok(INITIAL_SIDS + l.others.len() as u32)
+    }
+
     /// `security_compute_av_user`. Everything, before a policy.
     pub fn compute_av(&self, ssid: u32, tsid: u32, class: u32) -> Decision {
         let all = Decision { allowed: !0, auditallow: 0, auditdeny: !0, flags: 0 };

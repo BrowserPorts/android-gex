@@ -26,6 +26,7 @@
 //! finds it absent.
 
 pub mod policy;
+pub mod procattr;
 pub mod server;
 
 use std::sync::{Arc, Mutex, OnceLock};
