@@ -49,6 +49,26 @@ const ALLOW_UNKNOWN: u32 = 4;
 const ANDROID_NETLINK_GETNEIGH: u32 = 1 << 30;
 const ANDROID_NETLINK_ROUTE: u32 = 1 << 31;
 
+/// The policy capabilities by number (include/policycap_names.h): a
+/// policy's [`Policy::policycaps`] has a bit for each it turns on, and
+/// selinuxfs a file of each name.
+pub const POLICY_CAPABILITIES: [&str; 14] = [
+    "network_peer_controls",
+    "open_perms",
+    "extended_socket_class",
+    "always_check_network",
+    "cgroup_seclabel",
+    "nnp_nosuid_transition",
+    "genfs_seclabel_symlinks",
+    "ioctl_skip_cloexec",
+    "userspace_initial_context",
+    "netlink_xperm",
+    "netif_wildcard",
+    "genfs_seclabel_wildcard",
+    "functionfs_seclabel",
+    "memfd_class",
+];
+
 /// What an access vector table entry says (`AVTAB_*`).
 pub mod av {
     pub const ALLOWED: u16 = 0x0001;
@@ -892,6 +912,17 @@ impl Policy {
         let c = self.classes.get(class.checked_sub(1)? as usize)?;
         let value = c.perms.get(name).or_else(|| self.commons.get(c.common? as usize - 1)?.perms.get(name))?;
         Some(1 << (value - 1))
+    }
+
+    /// A class's permissions with their numbers, its common's first: what
+    /// selinuxfs lists under `class/<name>/perms`, each file reading its
+    /// number. Permission `n` is bit `n - 1` of an access vector.
+    pub fn perms_of(&self, class: u32) -> Vec<(u32, &str)> {
+        let Some(c) = class.checked_sub(1).and_then(|i| self.classes.get(i as usize)) else { return Vec::new() };
+        let common = c.common.and_then(|n| self.commons.get(n as usize - 1));
+        let mut all: Vec<(u32, &str)> = common.into_iter().flat_map(|c| c.perms.iter()).chain(c.perms.iter()).map(|(name, &n)| (n, name.as_str())).collect();
+        all.sort();
+        all
     }
 
     fn level_ok(&self, l: &Level) -> bool {
@@ -1868,8 +1899,32 @@ mod tests {
                     Some(false) => "errno EPERM".to_string(),
                     None => "errno EINVAL".to_string(),
                 },
-                // What selinuxfs's own files read: not this module's yet.
-                ["read", ..] => continue,
+                // What selinuxfs's files read, of those the policy alone
+                // decides; the rest are the kernel's own or the SID
+                // table's (`server`).
+                ["read", file] => match file.split('/').collect::<Vec<_>>().as_slice() {
+                    ["mls"] => (p.mls as u8).to_string(),
+                    ["deny_unknown"] => (!p.allow_unknown as u8).to_string(),
+                    ["reject_unknown"] => (p.reject_unknown as u8).to_string(),
+                    ["class", class, "index"] => p.class_named(class).unwrap().to_string(),
+                    ["class", class, "perms", perm] => {
+                        let perms = p.perms_of(p.class_named(class).unwrap());
+                        let (number, _) = perms.iter().find(|(_, name)| name == perm).unwrap();
+                        // Its number is its bit's place.
+                        assert_eq!(p.perm_named(p.class_named(class).unwrap(), perm), Some(1 << (number - 1)));
+                        number.to_string()
+                    }
+                    // Its value, and the one waiting to be committed.
+                    ["booleans", name] => {
+                        let state = bools[p.bools.iter().position(|b| b.name == *name).unwrap()] as u8;
+                        format!("{state} {state}")
+                    }
+                    ["policy_capabilities", name] => {
+                        let bit = POLICY_CAPABILITIES.iter().position(|c| c == name).unwrap();
+                        (p.policycaps.get(bit as u32) as u8).to_string()
+                    }
+                    _ => continue,
+                },
                 _ => panic!("{question}"),
             };
             assert_eq!(got, want, "{question}");
@@ -1894,7 +1949,8 @@ mod tests {
     /// (vendor/etc/selinux/precompiled_sepolicy) has been through this
     /// against Linux 7.0, which loads it where 6.8's tools cannot read
     /// it: 6,643 questions of fifteen domains, twenty-three types and the
-    /// classes between them, and no answer different.
+    /// classes between them, and nine of its selinuxfs files, and no
+    /// answer different.
     #[test]
     #[ignore = "needs GEX_SELINUX_POLICY and GEX_SELINUX_ANSWERS"]
     fn its_answers_about_a_policy_given_are_a_kernels() {
