@@ -598,17 +598,14 @@ mod tests {
         assert_eq!((s.dir("class/nothing"), s.file("class/file/perms/nothing").map(|f| f.0)), (None, None));
     }
 
-    /// Every question a kernel was asked through selinuxfs with test.33
-    /// loaded (testdata/answers.txt), written here to the same files as
-    /// tests/android/oracle/selinux-ask.py wrote them there, and its
-    /// answers.
-    #[test]
-    fn its_question_files_answer_as_a_kernels() {
-        let mut s = Server::default();
-        s.load(V33).unwrap();
+    /// Write each question of `answers` (lines of
+    /// tests/android/oracle/selinux-ask.py's) to the file that script
+    /// wrote it to, and hold the answer to the kernel's. How many were
+    /// asked.
+    fn replay(s: &mut Server, answers: &str) -> usize {
         let class = |s: &Server, name: &str| String::from_utf8(s.file(&format!("class/{name}/index")).unwrap().1.unwrap()).unwrap();
         let mut asked = 0;
-        for line in include_str!("testdata/answers.txt").lines() {
+        for line in answers.lines() {
             let Some((question, want)) = line.split_once(" => ") else { continue };
             let words: Vec<&str> = question.split_whitespace().collect();
             let (file, text) = match words.as_slice() {
@@ -647,12 +644,37 @@ mod tests {
             assert_eq!(got, want, "{question}");
             asked += 1;
         }
+        asked
+    }
+
+    /// Every question a kernel was asked through selinuxfs with test.33
+    /// loaded (testdata/answers.txt), and its answers.
+    #[test]
+    fn its_question_files_answer_as_a_kernels() {
+        let mut s = Server::default();
+        s.load(V33).unwrap();
+        let asked = replay(&mut s, include_str!("testdata/answers.txt"));
         assert!(asked > 900, "{asked} questions");
         // Not a question, and not a file that takes one.
         assert_eq!(s.transact("access", "system_u:system_r:init_t:s0"), Some(Err(Error::Invalid)));
         assert_eq!(s.transact("create", "a b 1 %4"), Some(Err(Error::Invalid)));
         assert_eq!(s.transact("enforce", "1"), None);
         assert_eq!(percent_decoded("a+b%2fc%00d").as_deref(), Some(&b"a b/c"[..]));
+    }
+
+    /// The same for any policy there is a kernel's answers about, as
+    /// `policy`'s test of the name has it: `GEX_SELINUX_POLICY` and
+    /// `GEX_SELINUX_ANSWERS`.
+    #[test]
+    #[ignore = "needs GEX_SELINUX_POLICY and GEX_SELINUX_ANSWERS"]
+    fn its_question_files_answer_about_a_policy_given_as_a_kernels() {
+        let policy = std::fs::read(std::env::var("GEX_SELINUX_POLICY").expect("GEX_SELINUX_POLICY")).unwrap();
+        let answers = std::fs::read_to_string(std::env::var("GEX_SELINUX_ANSWERS").expect("GEX_SELINUX_ANSWERS")).unwrap();
+        let mut s = Server::default();
+        s.load(&policy).unwrap();
+        let asked = replay(&mut s, &answers);
+        assert!(asked > 0);
+        println!("{asked} questions, each answered as the kernel answered it");
     }
 
     /// When another policy takes a policy's place, a SID keeps its number
