@@ -132,6 +132,10 @@ pub struct Vma {
     /// The name `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)` gave an anonymous
     /// mapping, which `/proc/<pid>/maps` shows as `[anon:name]`.
     pub anon_name: Option<std::sync::Arc<str>>,
+    /// For a mapping of a file (`mmap` of a descriptor): the offset in the
+    /// file its start is at, which `/proc/<pid>/maps` shows and an unwinder
+    /// finds an object's headers by. Kept whatever is written there since.
+    pub file_off: Option<u64>,
 }
 
 impl Vma {
@@ -147,6 +151,11 @@ impl Vma {
         self.prot == next.prot
             && self.name == next.name
             && self.anon_name == next.anon_name
+            && match (self.file_off, next.file_off) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a + (self.end - self.start) == b,
+                _ => false,
+            }
             && self.patched == next.patched
             && continues(&self.origin, &next.origin)
             && continues(&self.code, &next.code)
@@ -170,6 +179,7 @@ impl Vma {
             namings: self.namings,
             patched: self.patched,
             anon_name: self.anon_name.clone(),
+            file_off: self.file_off.map(|o| o + (start - self.start)),
         }
     }
 }
@@ -1260,6 +1270,7 @@ impl MemoryMap {
             namings: 0,
             patched: false,
             anon_name: None,
+            file_off: None,
         });
         self.vmas.sort_by_key(|v| v.start);
     }
@@ -1280,6 +1291,17 @@ impl MemoryMap {
         self.insert_from(start, end, prot, name, code);
         if let Some(v) = self.vmas.iter_mut().find(|v| v.start == page_align_down(start)) {
             v.origin = None;
+        }
+    }
+
+    /// [`Self::insert_from`] for `mmap`: a mapping of a file also keeps the
+    /// file offset of its start, for `/proc/<pid>/maps`.
+    fn insert_mapped(&mut self, start: u64, end: u64, prot: u32, name: &str, origin: Option<(String, u64)>) {
+        let off = origin.as_ref().map(|&(_, off)| off);
+        self.insert_from(start, end, prot, name, origin);
+        let aligned = page_align_down(start);
+        if let (Some(off), Some(v)) = (off, self.vmas.iter_mut().find(|v| v.start == aligned)) {
+            v.file_off = Some(off.saturating_sub(start - aligned));
         }
     }
 
@@ -1323,6 +1345,7 @@ impl MemoryMap {
             namings: 0,
             patched: false,
             anon_name: None,
+            file_off: None,
         });
         // Sorted already but for the one just pushed: move it into place.
         let at = self.vmas[..self.vmas.len() - 1].partition_point(|v| v.start < aligned);
@@ -1487,7 +1510,7 @@ impl MemoryMap {
             // MAP_FIXED replaces whatever was there.
             self.claim(addr, end)?;
             self.unmap(addr, len)?;
-            self.insert_from(addr, end, prot, name, origin);
+            self.insert_mapped(addr, end, prot, name, origin);
             return Ok(addr);
         }
 
@@ -1500,7 +1523,7 @@ impl MemoryMap {
                 && !hits_runtime(addr, end)
                 && self.claim(addr, end).is_ok()
             {
-                self.insert_from(addr, end, prot, name, origin);
+                self.insert_mapped(addr, end, prot, name, origin);
                 return Ok(addr);
             }
         }
@@ -1514,7 +1537,7 @@ impl MemoryMap {
                 if let Some(back) = self.back {
                     back(start, start + len).ok_or(Errno::ENOMEM)?;
                 }
-                self.insert_from(start, start + len, prot, name, origin);
+                self.insert_mapped(start, start + len, prot, name, origin);
                 return Ok(start);
             }
         }
@@ -1525,11 +1548,11 @@ impl MemoryMap {
         if self.take.is_some() {
             let found = self.arena.iter().find_map(|&(lo, hi)| self.first_fit(lo, hi, len));
             if let Some(candidate) = found {
-                self.insert_from(candidate, candidate + len, prot, name, origin);
+                self.insert_mapped(candidate, candidate + len, prot, name, origin);
                 return Ok(candidate);
             }
             let start = self.extend_arena(len)?;
-            self.insert_from(start, start + len, prot, name, origin);
+            self.insert_mapped(start, start + len, prot, name, origin);
             return Ok(start);
         }
 
@@ -1540,7 +1563,7 @@ impl MemoryMap {
                 }
                 return Err(Errno::ENOMEM);
             };
-            self.insert_from(start, start + len, prot, name, origin);
+            self.insert_mapped(start, start + len, prot, name, origin);
             return Ok(start);
         }
 
@@ -1569,7 +1592,7 @@ impl MemoryMap {
             }
             if self.is_free(start, start + len) {
                 self.mmap_next = start;
-                self.insert_from(start, start + len, prot, name, origin);
+                self.insert_mapped(start, start + len, prot, name, origin);
                 return Ok(start);
             }
             // Skip below the mapping that got in the way.
@@ -2074,12 +2097,13 @@ impl MemoryMap {
         let mut s = String::new();
         for v in &self.vmas {
             s.push_str(&format!(
-                "{:08x}-{:08x} {}{}{}p 00000000 00:00 0 {}{}\n",
+                "{:08x}-{:08x} {}{}{}p {:08x} 00:00 0 {}{}\n",
                 v.start,
                 v.end,
                 if v.prot & prot::READ != 0 { 'r' } else { '-' },
                 if v.prot & prot::WRITE != 0 { 'w' } else { '-' },
                 if v.prot & prot::EXEC != 0 { 'x' } else { '-' },
+                v.file_off.unwrap_or(0),
                 if v.name.is_empty() && v.anon_name.is_none() {
                     ""
                 } else {
@@ -2127,6 +2151,21 @@ mod tests {
         assert_eq!(m.set_anon_name(at + 0x3000, 0x2000, Some("both")), Err(Errno::EBADF));
         assert_eq!(m.vma_at(at + 0x3000).unwrap().anon_name.as_deref(), Some("both"), "named up to the file's");
         assert_eq!(m.vma_at(at + 0x4000).unwrap().anon_name, None);
+    }
+
+    /// A mapping of a file shows the file offset of its start, and a piece
+    /// of it the offset of the piece's.
+    #[test]
+    fn a_file_mapping_shows_its_offset() {
+        let mut m = MemoryMap::new(0x100_0000);
+        let at = MMAP_BOTTOM;
+        m.mmap_from(at, 0x3000, prot::READ | prot::WRITE, flags::PRIVATE | flags::FIXED, "/lib/x.so", Some(("/lib/x.so".into(), 0x5000))).unwrap();
+        m.protect(at + 0x1000, 0x1000, prot::READ).unwrap();
+        let shown: Vec<_> = m.proc_maps().lines().filter(|l| l.ends_with("/lib/x.so")).map(|l| l.split(' ').nth(2).unwrap().to_string()).collect();
+        assert_eq!(shown, ["00005000", "00006000", "00007000"]);
+        // An anonymous mapping has none.
+        m.mmap(at + 0x10000, 0x1000, prot::READ, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED, "").unwrap();
+        assert!(m.proc_maps().lines().any(|l| l.starts_with(&format!("{:08x}-", at + 0x10000)) && l.contains(" 00000000 ")));
     }
 
     /// `PR_SET_MDWE`: which `mprotect` gains execute where it may not.

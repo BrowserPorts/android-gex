@@ -38,6 +38,11 @@ struct Live {
     envp: Vec<String>,
     /// Its ids and capabilities, read when `status` is.
     creds: Arc<crate::syscalls::Creds>,
+    /// Its threads' own state, and the publishing thread's (a thread no
+    /// one has asked about yet is not among them): `status`'s
+    /// `NoNewPrivs:` line.
+    threads: Arc<crate::signal::ThreadSigs>,
+    thread: Arc<crate::signal::ThreadSig>,
     /// The host's clock (`Kernel::clock`): uptime, and `btime`.
     clock: crate::syscalls::ClockFn,
 }
@@ -215,10 +220,13 @@ impl ProcSource for KernelProcSource {
         let (size, rss, anon) = l.mm.lock().vm_counters();
         let (size, rss, anon) = (size >> 10, rss >> 10, anon >> 10);
         let (uid, gid, caps) = crate::vfs::procfs::status_ids(&l.creds.save());
+        // The task's own flag; no seccomp filter can be installed.
+        let nnp = l.threads.get(tid).unwrap_or_else(|| Arc::clone(&l.thread)).prctl().no_new_privs as u8;
         format!(
             "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{uid}{gid}\
              VmPeak:\t{size:8} kB\nVmSize:\t{size:8} kB\nVmHWM:\t{rss:8} kB\nVmRSS:\t{rss:8} kB\n\
-             RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\n{caps}",
+             RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\n{caps}\
+             NoNewPrivs:\t{nnp}\nSeccomp:\t0\nSeccomp_filters:\t0\n",
             task.and_then(|t| t.own_name()).unwrap_or_else(|| l.exe.rsplit('/').next().unwrap_or("gex").to_string()),
             l.pid,
             tid,
@@ -280,6 +288,8 @@ impl Kernel {
                 && o.argv == self.argv
                 && o.envp == self.envp
                 && Arc::ptr_eq(&o.creds, &self.creds)
+                && Arc::ptr_eq(&o.threads, &self.thread_signals)
+                && Arc::ptr_eq(&o.thread, self.signals.thread())
         });
         // The ids as they are now, for the other processes' `status` (an
         // exec's capabilities, a fork child's own).
@@ -299,6 +309,8 @@ impl Kernel {
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             creds: Arc::clone(&self.creds),
+            threads: Arc::clone(&self.thread_signals),
+            thread: Arc::clone(self.signals.thread()),
             clock: self.clock,
         };
         // A program's publication (an exec arms its own, as it chooses the
