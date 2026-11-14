@@ -213,7 +213,8 @@ impl ProcSource for KernelProcSource {
             }
             None => comm(&l.exe),
         };
-        crate::vfs::procfs::stat_line(tid, &name, 'R', ppid, pgid, sid, tty, threads, &u)
+        let start_stack = l.mm.lock().start_stack();
+        crate::vfs::procfs::stat_line_at(tid, &name, 'R', ppid, pgid, sid, tty, threads, &u, start_stack)
     }
     fn usage(&self) -> crate::proc::Usage {
         self.0.get().map(|l| usage(&l)).unwrap_or_default()

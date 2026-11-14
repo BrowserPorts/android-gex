@@ -6347,6 +6347,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
         gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE,
         "[stack]",
     );
+    kernel.mem.lock().set_start_stack(layout.sp);
 
     let c = gex_abi::ctx_addr(0) as usize;
     // Registers first, then the stack pointer: on x86-64 `SP` is one of them.
@@ -12303,6 +12304,7 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
         gex_kernel::mem::prot::READ | gex_kernel::mem::prot::WRITE,
         "[stack]",
     );
+    h.kernel.mem.lock().set_start_stack(layout.sp);
 
     // The new program has nothing translated, and the old directory points at
     // other code at the same addresses. Clearing it sends every branch back

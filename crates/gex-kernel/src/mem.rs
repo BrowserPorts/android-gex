@@ -374,6 +374,9 @@ pub const BACKED_ISLAND: u64 = u64::MAX;
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
     vmas: Vec<Vma>,
+    /// Where the program's stack began at `execve` (`mm->start_stack`),
+    /// which `/proc/<pid>/stat` gives; 0 until a host says.
+    start_stack: u64,
     /// What readers that do not own the map see of it ([`MapView`]).
     view: ViewCell,
     brk_start: u64,
@@ -644,6 +647,7 @@ impl MemoryMap {
     pub fn new(brk_start: u64) -> MemoryMap {
         MemoryMap {
             vmas: Vec::new(),
+            start_stack: 0,
             view: ViewCell(std::sync::Arc::new(MapView::new(&[]))),
             generation: 0,
             brk_start: page_align_up(brk_start),
@@ -686,6 +690,18 @@ impl MemoryMap {
         fresh.log.shared_maps.clear();
         *self = fresh;
         self.publish();
+    }
+
+    /// The stack pointer the program started with ([`Self::start_stack`]).
+    pub fn set_start_stack(&mut self, sp: u64) {
+        self.start_stack = sp;
+    }
+
+    /// Where the program's stack began, as `/proc/<pid>/stat`'s
+    /// `startstack` has it. bionic finds the main thread's stack by this
+    /// address, looked up in `/proc/self/maps`.
+    pub fn start_stack(&self) -> u64 {
+        self.start_stack
     }
 
     /// Record that `[start, end)` holds only zeros (the caller just zeroed it,

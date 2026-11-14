@@ -197,6 +197,13 @@ pub fn mounts(table: &[(String, &'static str)]) -> String {
 /// time counts as user time, a thread's as its process's.
 #[allow(clippy::too_many_arguments)]
 pub fn stat_line(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>, threads: usize, u: &Usage) -> String {
+    stat_line_at(id, comm, state, ppid, pgid, sid, tty, threads, u, 0)
+}
+
+/// [`stat_line`] with `startstack`, where the process's stack began, which
+/// a process knows of itself (0: not known, another process's).
+#[allow(clippy::too_many_arguments)]
+pub fn stat_line_at(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>, threads: usize, u: &Usage, start_stack: u64) -> String {
     let (tty_nr, tpgid) = tty.map_or((0, -1), |(n, fg)| (crate::pty::tty_nr(n), if fg > 0 { fg } else { -1 }));
     // pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
     // majflt cmajflt utime stime cutime cstime priority nice num_threads
@@ -209,7 +216,7 @@ pub fn stat_line(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i3
     let (vsize, rss) = (u.vsize, u.rss / 4096);
     format!(
         "{id} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} 4194560 0 0 0 0 {utime} 0 {cutime} 0 20 0 {threads} 0 {start} {vsize} {rss} \
-         18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+         18446744073709551615 0 0 {start_stack} 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
 }
 
@@ -798,6 +805,8 @@ mod tests {
         // Its own pid is `self`, served from its own state, not the table's.
         assert_eq!(read(&fs(), "42/cmdline"), "/bin/prog\0arg\0");
         assert_eq!(stat_line(1, "x", 'R', 0, 1, 1, None, 1, &Usage::default()).split_whitespace().count(), 52);
+        // startstack is the 28th field.
+        assert_eq!(stat_line_at(1, "x", 'R', 0, 1, 1, None, 1, &Usage::default(), 0x57f_f000).split_whitespace().nth(27), Some("92270592"));
         let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, Some((3, 7)), 1, &Usage::default()).split_whitespace().map(String::from).collect();
         assert_eq!((f[6].as_str(), f[7].as_str()), ("34819", "7"), "tty_nr is 136:3, tpgid the foreground group");
     }

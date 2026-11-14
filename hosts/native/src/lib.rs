@@ -4374,12 +4374,14 @@ fn place_image(
 
     let stack_low = gex_abi::STACK_TOP - gex_abi::STACK_SIZE;
     store.data_mut().with_kernel(|k| {
-        k.mem.lock().insert(
+        let mut mm = k.mem.lock();
+        mm.insert(
             stack_low,
             gex_abi::STACK_TOP,
             prot::READ | prot::WRITE,
             "[stack]",
-        )
+        );
+        mm.set_start_stack(layout.sp);
     });
 
     // Finally the initial register state: sp, and x0 cleared the way Linux
