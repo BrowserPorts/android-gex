@@ -43,6 +43,8 @@ struct Live {
     /// `NoNewPrivs:` line.
     threads: Arc<crate::signal::ThreadSigs>,
     thread: Arc<crate::signal::ThreadSig>,
+    /// What the process holds as one: its saved auxiliary vector (`auxv`).
+    process: Arc<crate::signal::ProcSig>,
     /// The host's clock (`Kernel::clock`): uptime, and `btime`.
     clock: crate::syscalls::ClockFn,
 }
@@ -117,6 +119,14 @@ impl ProcSource for KernelProcSource {
     }
     fn environ(&self) -> Vec<u8> {
         self.0.get().map(|l| nul_joined(&l.envp)).unwrap_or_default()
+    }
+    fn auxv(&self) -> Vec<u8> {
+        // `auxv_read`: the saved vector by pairs of the kernel's words, up
+        // to and with the first whose type is zero.
+        let Some(l) = self.0.get() else { return Vec::new() };
+        let saved = l.process.saved_auxv();
+        let end = saved.chunks(16).position(|pair| pair[..8] == [0; 8]).map_or(saved.len(), |i| (i + 1) * 16);
+        saved[..end].to_vec()
     }
     fn exe(&self) -> String {
         self.0.get().map(|l| l.exe.clone()).unwrap_or_default()
@@ -327,6 +337,7 @@ impl Kernel {
                 && Arc::ptr_eq(&o.creds, &self.creds)
                 && Arc::ptr_eq(&o.threads, &self.thread_signals)
                 && Arc::ptr_eq(&o.thread, self.signals.thread())
+                && Arc::ptr_eq(&o.process, self.signals.process())
         });
         // The ids as they are now, for the other processes' `status` (an
         // exec's capabilities, a fork child's own).
@@ -348,6 +359,7 @@ impl Kernel {
             creds: Arc::clone(&self.creds),
             threads: Arc::clone(&self.thread_signals),
             thread: Arc::clone(self.signals.thread()),
+            process: Arc::clone(self.signals.process()),
             clock: self.clock,
         };
         // A program's publication (an exec arms its own, as it chooses the

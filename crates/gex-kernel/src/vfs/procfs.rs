@@ -20,6 +20,8 @@ pub trait ProcSource: Send + Sync {
     fn maps(&self) -> String;
     fn cmdline(&self) -> Vec<u8>;
     fn environ(&self) -> Vec<u8>;
+    /// `/proc/self/auxv`: the saved auxiliary vector through its end.
+    fn auxv(&self) -> Vec<u8>;
     fn exe(&self) -> String;
     fn cwd(&self) -> String;
     /// Names of the currently open descriptors, as `(fd, target)`.
@@ -432,6 +434,7 @@ impl ProcFs {
             "self/maps" => s.maps().into_bytes(),
             "self/cmdline" => s.cmdline(),
             "self/environ" => s.environ(),
+            "self/auxv" => s.auxv(),
             "self/stat" => s.stat(id, self.tasks_of("self").len(), task().as_ref()).into_bytes(),
             "self/status" => s.status(id, self.tasks_of("self").len(), task().as_ref()).into_bytes(),
             "self/statm" => statm_text(&s.usage()).into_bytes(),
@@ -590,7 +593,7 @@ impl FileSystem for ProcFs {
                 return Ok(Arc::new(GenDir { entries: out }));
             }
             "self" => vec![
-                "maps", "cmdline", "environ", "stat", "status", "statm", "comm", "exe", "cwd", "fd",
+                "maps", "cmdline", "environ", "auxv", "stat", "status", "statm", "comm", "exe", "cwd", "fd",
                 "fdinfo", "task", "mountinfo", "mounts",
             ],
             "self/fd" => {
@@ -730,6 +733,9 @@ mod tests {
         }
         fn environ(&self) -> Vec<u8> {
             b"PATH=/bin\0".to_vec()
+        }
+        fn auxv(&self) -> Vec<u8> {
+            vec![0; 16]
         }
         fn exe(&self) -> String {
             "/bin/prog".into()
