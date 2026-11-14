@@ -507,6 +507,8 @@ impl ProcFs {
             "sys/kernel/pid_max" => b"32768\n".to_vec(),
             // glibc and musl both consult this before using large mappings.
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
+            // The limit `F_SETPIPE_SZ` holds an unprivileged caller to.
+            "sys/fs/pipe-max-size" => format!("{}\n", crate::pipe::PIPE_MAX_SIZE).into_bytes(),
             _ => return None,
         })
     }
@@ -609,16 +611,19 @@ impl FileSystem for ProcFs {
                 }
                 return Ok(Arc::new(GenDir { entries: out }));
             }
-            "sys" => vec!["kernel", "vm"],
+            "sys" => vec!["fs", "kernel", "vm"],
+            "sys/fs" => vec!["pipe-max-size"],
             "sys/kernel" => vec!["osrelease", "pid_max"],
             "sys/vm" => vec!["overcommit_memory"],
             _ => return Err(Errno::ENOENT),
         };
+        // `sys` holds directories, the directories under it files.
+        let file_type = if path == "sys" { FileType::Directory } else { FileType::Regular };
         let mut out = base_entries();
         for name in entries {
             out.push(DirEntry {
                 name: name.to_string(),
-                file_type: FileType::Regular,
+                file_type,
                 ino: 1,
             });
         }
@@ -656,7 +661,7 @@ impl FileSystem for ProcFs {
             };
         }
         match path.as_str() {
-            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
+            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/fs" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
             "self/exe" | "self/cwd" => Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: 0,
