@@ -6,9 +6,11 @@
 #
 # ROOT is root.sh's. Hello.java beside this script is compiled with javac
 # and turned into a dex jar with d8 (D8_JAR: the d8.jar of an Android SDK's
-# build-tools). ART runs it with its interpreter, on the core libraries
-# alone and no boot image: its JIT maps a 64 MiB file below 4 GiB by trial,
-# which costs gexc a copy of the file each try.
+# build-tools). ART runs it on the core libraries alone and no boot image,
+# and without its JIT, which maps a 64 MiB file below 4 GiB by trial and
+# costs gexc a copy of the file each try. Twice: with the portable
+# interpreter (-Xint), and with the one written in assembly, which takes a
+# null reference from the fault its load raises, as compiled code does.
 #
 # Needs an arm64 Linux host, root through sudo, a JDK, and a gexc built
 # with the big64 feature (GEXC).
@@ -29,22 +31,27 @@ A=/apex/com.android.art/javalib
 BCP=$A/core-oj.jar:$A/core-libart.jar:$A/okhttp.jar:$A/bouncycastle.jar:$A/apache-xml.jar:/apex/com.android.i18n/javalib/core-icu4j.jar:/apex/com.android.conscrypt/javalib/conscrypt.jar
 ENVS="PATH=/system/bin:/apex/com.android.art/bin ANDROID_ROOT=/system ANDROID_DATA=/data ANDROID_ART_ROOT=/apex/com.android.art ANDROID_I18N_ROOT=/apex/com.android.i18n ANDROID_TZDATA_ROOT=/apex/com.android.tzdata"
 VM=/apex/com.android.art/bin/dalvikvm64
-set -- "-Xbootclasspath:$BCP" -Xusejit:false -Xint -cp /data/local/tmp/hello.jar Hello
-
 mountpoint -q "$ROOT/proc" || sudo mount -t proc proc "$ROOT/proc"
 mountpoint -q "$ROOT/dev" || sudo mount --bind /dev "$ROOT/dev"
-native=$(sudo timeout 120 env -i $ENVS /usr/sbin/chroot "$ROOT" $VM "$@" 2>/dev/null) || true
 args=""
 for e in $ENVS; do args="$args --env $e"; done
-gex=$(cd "$ROOT" && timeout 900 "$GEXC" run --argv0 $VM --uid 0 --mem64 $args --sysroot "$ROOT" "$ROOT$VM" "$@" 2>/dev/null) || true
-if [ -n "$native" ] && [ "$native" = "$gex" ]; then
-    printf '%s\n' "$gex"
-    echo "PASS art"
-else
-    echo "FAIL art"
-    echo "native:"
-    printf '%s\n' "$native"
-    echo "gex:"
-    printf '%s\n' "$gex"
-    exit 1
-fi
+
+status=0
+for interp in -Xint ""; do
+    name="art${interp:+ $interp}"
+    set -- "-Xbootclasspath:$BCP" -Xusejit:false $interp -cp /data/local/tmp/hello.jar Hello
+    native=$(sudo timeout 120 env -i $ENVS /usr/sbin/chroot "$ROOT" $VM "$@" 2>/dev/null) || true
+    gex=$(cd "$ROOT" && timeout 1800 "$GEXC" run --argv0 $VM --uid 0 --mem64 $args --sysroot "$ROOT" "$ROOT$VM" "$@" 2>/dev/null) || true
+    if [ -n "$native" ] && [ "$native" = "$gex" ]; then
+        printf '%s\n' "$gex"
+        echo "PASS $name"
+    else
+        echo "FAIL $name"
+        echo "native:"
+        printf '%s\n' "$native"
+        echo "gex:"
+        printf '%s\n' "$gex"
+        status=1
+    fi
+done
+exit $status
