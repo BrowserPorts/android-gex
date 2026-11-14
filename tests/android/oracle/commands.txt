@@ -1,0 +1,56 @@
+echo hello
+echo $((6*7))
+for i in 1 2 3; do echo $i; done
+x=$(echo hi); echo $x
+echo abc | tr a-c A-C
+seq 1 5 | sort -r | head -2
+echo one two three | while read a b c; do echo $c $b $a; done
+printf "%s-%d\n" a 5
+true && echo yes || echo no
+false; echo $?
+sleep 0.1; echo slept
+sleep 1 & wait; echo waited
+kill -0 $$ && echo alive
+trap "echo trapped" USR1; kill -USR1 $$; echo after
+timeout 1 sleep 5; echo $?
+nice -n 5 true; echo $?
+cat /system/etc/hosts
+sed -n 1p /system/etc/hosts
+grep -c localhost /system/etc/hosts
+sha256sum /system/bin/toybox
+sha512sum /system/etc/hosts
+md5sum /system/bin/sh
+wc -c /system/bin/sh
+od -An -tx1 -N4 /system/bin/toybox
+xxd -l 4 -p /system/bin/sh
+base64 /system/etc/hosts | head -c 20
+gzip -c /system/etc/hosts | gunzip -c | wc -c
+tar -cf - /system/etc/hosts 2>/dev/null | tar -tf -
+dd if=/dev/zero bs=1024 count=3 2>/dev/null | wc -c
+awk "BEGIN{print 2^10}"
+bc <<< "2^64"
+expr 3 + 4
+basename /a/b/c
+date -u -d @0 +%Y-%m-%d
+uname -m
+getconf PAGE_SIZE
+ulimit -n
+id
+whoami
+env | sort
+ls /system/bin | wc -l
+ls /system/lib64 | grep -c so
+ls /apex/com.android.runtime/lib64/bionic
+ls -la /system/etc/hosts | cut -c1-10
+stat -c "%s %a" /system/bin/toybox
+readlink /system/bin/linker64
+find /system/etc/init -name "*.rc" | wc -l
+cat /system/build.prop | grep -c ro.
+cd /system/bin && pwd && ls linker64
+mkdir -p /data/local/tmp/t && echo x > /data/local/tmp/t/f && cat /data/local/tmp/t/f && rm -r /data/local/tmp/t && echo gone
+cat /proc/self/status | grep -E "^(Uid|Gid|CapEff|CapBnd|NoNewPrivs|Seccomp)"
+cat /proc/self/maps | grep "libc.so" | awk "{print \$2, \$3}"
+unzip -l /system/framework/framework-res.apk | tail -1
+ls /system/framework/*.jar | wc -l
+/apex/com.android.art/bin/dex2oat64 --version 2>&1 | head -1
+/apex/com.android.art/bin/dexdump -f /system/framework/ext.jar 2>&1 | head -3
