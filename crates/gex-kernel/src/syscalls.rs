@@ -765,6 +765,12 @@ pub struct Kernel {
     /// an empty blocking pipe or socket, re-run once it is readable, as
     /// `retry_recvmsg`.
     pub retry_transfer: Option<(u64, [u64; 6])>,
+    /// A binder device's `BINDER_WRITE_READ` whose read waited (descriptor,
+    /// request, argument): made again once the thread has work.
+    pub retry_ioctl: Option<(i32, u64, u64)>,
+    /// A binder ioctl's answer, worked out where the call was found not to
+    /// wait ([`Kernel::binder_ioctl`]), for the dispatch that follows.
+    pub binder_done: Option<SysResult>,
     /// The blocked mask an `rt_sigsuspend` has to put back when it returns.
     pub restore_sigmask: Option<u64>,
     /// An `rt_sigtimedwait` that waited (`BlockOp::SigWait`): its arguments,
@@ -10405,6 +10411,7 @@ pub struct PendingCall {
     pub write_blocked: bool,
     pub retry_recvmsg: Option<(i32, u64, u64)>,
     pub retry_transfer: Option<(u64, [u64; 6])>,
+    pub retry_ioctl: Option<(i32, u64, u64)>,
     pub restore_sigmask: Option<u64>,
     pub retry_sigwait: Option<[u64; 6]>,
     pub retry_lock: Option<i32>,
@@ -10467,6 +10474,7 @@ impl Kernel {
             write_blocked: std::mem::take(&mut self.write_blocked),
             retry_recvmsg: self.retry_recvmsg.take(),
             retry_transfer: self.retry_transfer.take(),
+            retry_ioctl: self.retry_ioctl.take(),
             restore_sigmask: self.restore_sigmask.take(),
             retry_sigwait: self.retry_sigwait.take(),
             retry_lock: self.retry_lock.take(),
@@ -10481,6 +10489,7 @@ impl Kernel {
         self.write_blocked = call.write_blocked;
         self.retry_recvmsg = call.retry_recvmsg;
         self.retry_transfer = call.retry_transfer;
+        self.retry_ioctl = call.retry_ioctl;
         self.restore_sigmask = call.restore_sigmask;
         self.retry_sigwait = call.retry_sigwait;
         self.retry_lock = call.retry_lock;
@@ -10617,6 +10626,8 @@ impl Kernel {
             write_blocked: false,
             retry_recvmsg: None,
             retry_transfer: None,
+            retry_ioctl: None,
+            binder_done: None,
             restore_sigmask: None,
             retry_sigwait: None,
             retry_lock: None,
@@ -11060,6 +11071,8 @@ impl Kernel {
             write_blocked: false,
             retry_recvmsg: None,
             retry_transfer: None,
+            retry_ioctl: None,
+            binder_done: None,
             restore_sigmask: None,
             retry_sigwait: None,
             retry_lock: None,
@@ -11474,6 +11487,21 @@ impl Kernel {
             self.restore_sigmask = Some(self.signals.blocked());
             self.signals.set_blocked(want & !UNBLOCKABLE);
         }
+        // A binder device's ioctl is made here, where it can wait: what it
+        // writes is done, and a read with nothing to return parks the
+        // thread until it has work, when the call is made again
+        // (`finish_blocking`). One that does not wait has its answer kept
+        // for the dispatch below.
+        if n == nr::IOCTL {
+            match self.binder_ioctl(m, a[0] as i32, a[1], a[2]) {
+                Some(crate::binder::Outcome::Wait(waiter)) => {
+                    self.retry_ioctl = Some((a[0] as i32, a[1], a[2]));
+                    return SyscallOutcome::Blocking(BlockOp::AcceptWait { socket: waiter });
+                }
+                Some(crate::binder::Outcome::Done(r)) => self.binder_done = Some(r),
+                None => {}
+            }
+        }
         // A syscall that sleeps must do so with the kernel unlocked, or the
         // thread that would wake it can never get in.
         if let Some(op) = self.blocking_op(m, n, a) {
@@ -11848,6 +11876,19 @@ impl Kernel {
         // read of a byte written after a commit), with no system call of
         // its own before it reads the mapping ([`SharedMapView::catch_up`]).
         self.mem.shared_maps().catch_up(m);
+        // A binder read that waited is made again: it returns what its
+        // thread now has, or waits again if another thread took it.
+        let r = match self.retry_ioctl.take() {
+            Some((fd, req, arg)) if r.is_ok() => match self.binder_ioctl(m, fd, req, arg) {
+                Some(crate::binder::Outcome::Wait(waiter)) => {
+                    self.retry_ioctl = Some((fd, req, arg));
+                    return SyscallOutcome::Blocking(BlockOp::AcceptWait { socket: waiter });
+                }
+                Some(crate::binder::Outcome::Done(done)) => done,
+                None => Err(Errno::EBADF),
+            },
+            _ => r,
+        };
         // An `accept` that waited does its real work here, now that the
         // kernel is locked again and there is a descriptor table to put the
         // new socket in.
@@ -13394,7 +13435,28 @@ fn signal_foreground(procs: &ProcTable, tty: &crate::tty::TtyRef, pid: i32, sign
 }
 
 impl Kernel {
+    /// An ioctl of a binder device by the calling thread
+    /// ([`crate::binder::BinderFile::ioctl`]); `None` for any other
+    /// descriptor.
+    fn binder_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> Option<crate::binder::Outcome> {
+        let file = self.fds.get(fd).ok()?;
+        let binder = Arc::clone(&file.handle).as_binder()?;
+        let cx = crate::binder::Caller {
+            pid: self.pid,
+            tid: self.tid,
+            euid: self.creds.uid(),
+            fds: &self.fds,
+            nonblock: file.flags() & crate::fs::oflags::O_NONBLOCK != 0,
+        };
+        // Whatever it queued may be what another thread waits for.
+        self.fd_activity = true;
+        Some(binder.ioctl(&cx, m, req, arg))
+    }
+
     fn sys_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> SysResult {
+        if let Some(r) = self.binder_done.take() {
+            return r;
+        }
         if let Some(r) = pty_peer_ioctl(&self.fds, &self.path_io(), fd, req, arg) {
             return r;
         }

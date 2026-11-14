@@ -3654,6 +3654,7 @@ fn mount_filesystems(
     // Audio : OSS's /dev/dsp and /dev/mixer, a null output, for
     // native Wine's wineoss.drv (and any OSS program).
     devfs.add_oss();
+    devfs.add_binder();
     // Pseudoterminals (`/dev/ptmx`, `/dev/pts`): a terminal emulator's
     // shell. The pairs live in this host process (`pty.rs`).
     devfs.add_pts(Arc::new(crate::pty::in_use));
@@ -4753,8 +4754,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 stall::decoded(sys_nr);
             }
             // A blocking syscall is run here, with the kernel unlocked, and
-            // then finished under the lock again.
-            let outcome = if let SyscallOutcome::Blocking(op) = outcome {
+            // then finished under the lock again; and again, for a call
+            // whose finish finds it has to wait once more (a binder read
+            // whose work another thread took).
+            let mut outcome = outcome;
+            while let SyscallOutcome::Blocking(op) = outcome {
                 // `GEX_STALL_BT=1`: where in the guest each blocking call was
                 // made, for a stall dump to say what a stuck thread waits in.
                 if stall_on && stall::want_bt() {
@@ -4808,12 +4812,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     g.enter();
                 }
                 let mut gm = GuestMem::new(memory.bytes());
-                caller
-                    .data_mut()
-                    .with_kernel(|k| k.finish_blocking(&mut gm, r))
-            } else {
-                outcome
-            };
+                outcome = caller.data_mut().with_kernel(|k| k.finish_blocking(&mut gm, r));
+            }
             // Wake threads parked on descriptors if this call may have made
             // one ready (`ready`).
             if caller.data_mut().with_kernel(|k| k.take_fd_activity()) {

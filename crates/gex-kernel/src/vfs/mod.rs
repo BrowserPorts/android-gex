@@ -511,6 +511,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_memfd(self: Arc<Self>) -> Option<Arc<crate::unix::MemFd>> {
         None
     }
+    /// An open of a binder device, whose ioctls need to know their caller
+    /// and may wait ([`crate::binder::BinderFile::ioctl`]).
+    fn as_binder(self: Arc<Self>) -> Option<Arc<crate::binder::BinderFile>> {
+        None
+    }
 
     /// A short description of this handle's state, for a diagnostic: the
     /// buffer behind a descriptor -- empty, full, which way it points -- that

@@ -154,6 +154,16 @@ impl DevFs {
         self.add_per_open("mixer", Arc::new(|| Arc::new(OssHandle::new(OssNode::Mixer)) as Arc<dyn FileHandle>));
     }
 
+    /// The binder devices, `binder`, `hwbinder` and `vndbinder`
+    /// ([`crate::binder`]): each open is a process's own, on the one
+    /// context of its name.
+    pub fn add_binder(&mut self) {
+        for name in ["binder", "hwbinder", "vndbinder"] {
+            let ctx = crate::binder::context(name);
+            self.add_per_open(name, Arc::new(move || Arc::new(crate::binder::BinderFile::open(Arc::clone(&ctx))) as Arc<dyn FileHandle>));
+        }
+    }
+
     fn device_of(path: &str) -> Option<Device> {
         Some(match path {
             "null" => Device::Null,
