@@ -712,6 +712,23 @@ mod tests {
         assert_eq!(percent_decoded("a+b%2fc%00d").as_deref(), Some(&b"a b/c"[..]));
     }
 
+    /// Before a policy the question files answer too, from the reference
+    /// (not put to a kernel): everything is allowed, a name of one of the
+    /// kernel's SIDs is that SID and any other text the kernel's, and
+    /// something new is labelled as its maker if it is a process (class
+    /// 2) and as what it is made in if not.
+    #[test]
+    fn before_a_policy_its_question_files_answer() {
+        let mut s = Server::default();
+        let mut ask = |file: &str, text: &str| String::from_utf8(s.transact(file, text).unwrap().unwrap()).unwrap();
+        assert_eq!(ask("access", "kernel file 6"), "ffffffff ffffffff 0 ffffffff 0 0");
+        assert_eq!(ask("context", "file"), "file\0");
+        assert_eq!(ask("context", "anything at all"), "kernel\0");
+        assert_eq!(ask("create", "kernel file 2"), "kernel\0");
+        assert_eq!(ask("create", "kernel file 6 name"), "file\0");
+        assert_eq!(ask("validatetrans", "file devnull 6 kernel"), "");
+    }
+
     /// The same for any policy there is a kernel's answers about, as
     /// `policy`'s test of the name has it: `GEX_SELINUX_POLICY` and
     /// `GEX_SELINUX_ANSWERS`.
