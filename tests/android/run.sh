@@ -46,6 +46,7 @@ run() {
     crc) check crc "crc ok" 0 ;;
     crypto) check crypto "crypto ok" 0 ;;
     block) check block "block ok" 0 ;;
+    procfd) check procfd "procfd ok" 0 ;;
     *)
         echo "FAIL $1: no such program"
         fail=1
@@ -58,7 +59,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    for p in hello tagged thread simd exclusive casp prctl crc crypto block; do
+    for p in hello tagged thread simd exclusive casp prctl crc crypto block procfd; do
         run "$p"
     done
 fi
