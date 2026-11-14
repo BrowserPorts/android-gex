@@ -975,7 +975,12 @@ impl<'a> Lifter<'a> {
                 if op == SysMaintOp::DcClean {
                     return Flow::Next;
                 }
-                let addr = self.rd_addr(rt);
+                // The host works at the address it is given, and the top
+                // byte of one is ignored here as in a load or a store: a
+                // `memset` of tagged heap memory zeroes with `dc zva`.
+                let tagged = self.rd_addr(rt);
+                let mask = self.b.const_i64(0x00ff_ffff_ffff_ffff);
+                let addr = self.b.bin(BinOp::And, Ty::I64, tagged, mask);
                 let code = match op {
                     SysMaintOp::DcZva => gex_abi::cache_op::DC_ZVA,
                     SysMaintOp::IcInvalidate => gex_abi::cache_op::IC_INVALIDATE,
