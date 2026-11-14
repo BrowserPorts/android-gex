@@ -13,8 +13,12 @@ use crate::errno::{Errno, SysResult};
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 
-/// Linux's pipe capacity.
+/// Linux's pipe capacity, until `F_SETPIPE_SZ` changes it.
 pub const PIPE_BUF: usize = 65536;
+
+/// The largest capacity a caller without `CAP_SYS_RESOURCE` may ask for:
+/// Linux's default `/proc/sys/fs/pipe-max-size`.
+pub const PIPE_MAX_SIZE: usize = 1 << 20;
 
 /// Linux's `PIPE_BUF`: a write of at most this many bytes goes in whole or
 /// not at all, so no other writer's bytes land inside it.
@@ -23,6 +27,8 @@ pub const PIPE_ATOMIC: usize = 4096;
 #[derive(Debug, Default)]
 struct State {
     buf: VecDeque<u8>,
+    /// How many bytes the pipe holds when full.
+    cap: usize,
     readers: usize,
     writers: usize,
     /// Short writes (took less than offered) and refused writes (took
@@ -62,6 +68,7 @@ impl Pipe {
         Pipe {
             state: Mutex::new(State {
                 buf: VecDeque::new(),
+                cap: PIPE_BUF,
                 readers: 1,
                 writers: 1,
                 short: 0,
@@ -194,7 +201,7 @@ impl Pipe {
                     Err(Errno::EPIPE)
                 };
             }
-            let room = PIPE_BUF.saturating_sub(s.buf.len());
+            let room = s.cap.saturating_sub(s.buf.len());
             // A small write waits for room for all of it (`EAGAIN` here; the
             // syscall layer parks a blocking one and tries it whole again).
             if len <= PIPE_ATOMIC && room < len {
@@ -290,7 +297,46 @@ impl Pipe {
 
     /// How many bytes a write can take before the pipe is full.
     pub fn room(&self) -> usize {
-        PIPE_BUF.saturating_sub(self.state.lock().unwrap().buf.len())
+        let s = self.state.lock().unwrap();
+        s.cap.saturating_sub(s.buf.len())
+    }
+
+    /// The pipe's capacity in bytes (`F_GETPIPE_SZ`).
+    pub fn capacity(&self) -> usize {
+        self.state.lock().unwrap().cap
+    }
+
+    /// `F_SETPIPE_SZ` (Linux's `pipe_set_size`): the capacity becomes `arg`
+    /// rounded up to a power of two of pages, and is returned. More than
+    /// 2 GiB is `EINVAL`; growing past [`PIPE_MAX_SIZE`] needs `privileged`
+    /// (`CAP_SYS_RESOURCE`), `EPERM` without; shrinking below what is
+    /// buffered is `EBUSY`.
+    ///
+    /// Linux counts a pipe in page-sized buffers, and refuses a shrink by
+    /// how many of them are in use; this one counts bytes. The two differ
+    /// only for a pipe whose buffers are partly filled. Linux's limit on one
+    /// user's pipe pages in total (`pipe-user-pages-soft`) is not kept.
+    pub fn set_capacity(&self, arg: u32, privileged: bool) -> SysResult {
+        if arg > 1 << 31 {
+            return Err(Errno::EINVAL);
+        }
+        let size = (arg as usize).max(PIPE_ATOMIC).next_power_of_two();
+        let mut s = self.state.lock().unwrap();
+        if size > s.cap && size > PIPE_MAX_SIZE && !privileged {
+            return Err(Errno::EPERM);
+        }
+        if size < s.buf.len() {
+            return Err(Errno::EBUSY);
+        }
+        let grew = size > s.cap;
+        s.cap = size;
+        drop(s);
+        if grew {
+            // A writer waiting for room has it.
+            self.ready.notify_all();
+            self.queue.notify();
+        }
+        Ok(size as u64)
     }
 
     /// How many bytes are waiting to be read.
@@ -317,7 +363,7 @@ impl Pipe {
     /// wake to be refused again.
     pub fn writable(&self) -> bool {
         let s = self.state.lock().unwrap();
-        PIPE_BUF.saturating_sub(s.buf.len()) >= PIPE_ATOMIC || s.readers == 0
+        s.cap.saturating_sub(s.buf.len()) >= PIPE_ATOMIC || s.readers == 0
     }
 }
 
@@ -447,6 +493,27 @@ mod tests {
     }
 
     #[test]
+    fn capacity_is_set_in_whole_pages_within_the_rules() {
+        let p = Pipe::new();
+        assert_eq!(p.capacity(), PIPE_BUF);
+        assert_eq!(p.set_capacity(0, false).unwrap(), 4096);
+        assert_eq!(p.set_capacity(5000, false).unwrap(), 8192);
+        assert_eq!(p.write(&vec![1u8; 10000]).unwrap(), 8192);
+        assert!(!p.writable());
+        assert_eq!(p.set_capacity(4096, false).err(), Some(Errno::EBUSY));
+        assert_eq!(p.set_capacity(16384, false).unwrap(), 16384);
+        assert!(p.writable());
+        assert_eq!(p.room(), 8192);
+        assert_eq!(p.set_capacity((1 << 20) + 1, false).err(), Some(Errno::EPERM));
+        assert_eq!(p.set_capacity(1 << 20, false).unwrap(), 1 << 20);
+        assert_eq!(p.set_capacity((1 << 20) + 1, true).unwrap(), 2 << 20);
+        // Down from above the limit needs no privilege.
+        assert_eq!(p.set_capacity(1 << 20, false).unwrap(), 1 << 20);
+        assert_eq!(p.set_capacity((1 << 31) + 1, true).err(), Some(Errno::EINVAL));
+        assert_eq!(p.capacity(), 1 << 20);
+    }
+
+    #[test]
     fn a_small_write_goes_in_whole_or_not_at_all() {
         // At most PIPE_ATOMIC bytes: never split, so no other writer's
         // bytes can land inside it (Linux's PIPE_BUF rule).
@@ -493,6 +560,10 @@ pub struct Remote {
     pub readable: extern "C" fn(id: i32) -> i32,
     pub writable: extern "C" fn(id: i32) -> i32,
     pub buffered: extern "C" fn(id: i32) -> i32,
+    /// The capacity in bytes; negative when the pipe is gone.
+    pub capacity: extern "C" fn(id: i32) -> i64,
+    /// [`Pipe::set_capacity`]: the new capacity, or a negative errno.
+    pub set_capacity: extern "C" fn(id: i32, arg: u32, privileged: i32) -> i64,
     /// The pipe's wait queue (`crate::wait`).
     pub queue: extern "C" fn(id: i32) -> u32,
 }
@@ -588,6 +659,18 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
         } else {
             (self.remote.buffered)(self.id).max(0) as u64
         })
+    }
+
+    fn pipe_capacity(&self) -> Option<u64> {
+        let n = (self.remote.capacity)(self.id);
+        (n >= 0).then_some(n as u64)
+    }
+
+    fn set_pipe_capacity(&self, arg: u32, privileged: bool) -> SysResult {
+        match (self.remote.set_capacity)(self.id, arg, privileged as i32) {
+            n if n >= 0 => Ok(n as u64),
+            n => Err(Errno(-n as i32)),
+        }
     }
 
     fn write_room(&self) -> Option<u64> {

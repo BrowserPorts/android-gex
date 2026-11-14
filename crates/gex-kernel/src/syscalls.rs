@@ -12423,6 +12423,9 @@ impl FdIo<'_> {
         const F_ADD_SEALS: u64 = 1033;
         const F_GET_SEALS: u64 = 1034;
         const F_DUPFD_CLOEXEC: u64 = 1030;
+        const F_SETPIPE_SZ: u64 = 1031;
+        const F_GETPIPE_SZ: u64 = 1032;
+        const CAP_SYS_RESOURCE: u64 = 24;
         // every command is on an open descriptor
         self.fds.get(fd)?;
         match cmd {
@@ -12482,6 +12485,9 @@ impl FdIo<'_> {
             // carrying on without the guarantee.
             F_ADD_SEALS => self.memfd_of(fd)?.add_seals(arg as u32),
             F_GET_SEALS => Ok(self.memfd_of(fd)?.seals() as u64),
+            // Either end of a pipe; the argument is an `int`.
+            F_SETPIPE_SZ => self.fds.get(fd)?.handle.set_pipe_capacity(arg as u32, self.creds.capable(CAP_SYS_RESOURCE)),
+            F_GETPIPE_SZ => self.fds.get(fd)?.handle.pipe_capacity().ok_or(Errno::EBADF),
             _ => Err(Errno::EINVAL),
         }
     }

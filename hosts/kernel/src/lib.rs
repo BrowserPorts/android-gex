@@ -2310,6 +2310,25 @@ pub extern "C" fn k_pipe_buffered(id: i32) -> i32 {
     pipe_at(id).map_or(0, |p| p.buffered() as i32)
 }
 
+/// A pipe's capacity in bytes (`F_GETPIPE_SZ`); negative when it is gone.
+#[no_mangle]
+pub extern "C" fn k_pipe_capacity(id: i32) -> i64 {
+    pipe_at(id).map_or(-9, |p| p.capacity() as i64)
+}
+
+/// `F_SETPIPE_SZ`: the new capacity, or a negative errno. A writer parked
+/// for room is woken through the pipe's own queue.
+#[no_mangle]
+pub extern "C" fn k_pipe_set_capacity(id: i32, arg: u32, privileged: i32) -> i64 {
+    match pipe_at(id) {
+        Some(p) => match p.set_capacity(arg, privileged != 0) {
+            Ok(n) => n as i64,
+            Err(e) => -e.0 as i64,
+        },
+        None => -9,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unix98 pseudoterminals. The same shape as pipes -- a numbered pair in the
 // global kernel, bytes copied across memories -- with the terminal added: the

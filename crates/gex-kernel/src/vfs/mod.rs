@@ -592,6 +592,19 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         let _ = (start, len);
     }
 
+    /// A pipe's capacity in bytes (`F_GETPIPE_SZ`). `None` for anything that
+    /// is not a pipe.
+    fn pipe_capacity(&self) -> Option<u64> {
+        None
+    }
+
+    /// `F_SETPIPE_SZ` ([`crate::pipe::Pipe::set_capacity`]). `EBADF` for
+    /// anything that is not a pipe, as Linux.
+    fn set_pipe_capacity(&self, arg: u32, privileged: bool) -> SysResult {
+        let _ = (arg, privileged);
+        Err(Errno::EBADF)
+    }
+
     /// How many bytes a write can take now, when bounded. `None` means it is
     /// not (file, terminal, socket). A pipe is bounded, and a blocking write
     /// larger than its free space is carried to completion by the syscall layer.

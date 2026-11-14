@@ -827,6 +827,14 @@ impl FileHandle for PipeEnd {
         self.write.then(|| self.pipe.room() as u64)
     }
 
+    fn pipe_capacity(&self) -> Option<u64> {
+        Some(self.pipe.capacity() as u64)
+    }
+
+    fn set_pipe_capacity(&self, arg: u32, privileged: bool) -> SysResult {
+        self.pipe.set_capacity(arg, privileged)
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if self.write {
             return Err(Errno::EBADF);
