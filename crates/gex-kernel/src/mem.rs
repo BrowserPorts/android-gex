@@ -136,6 +136,11 @@ pub struct Vma {
     /// file its start is at, which `/proc/<pid>/maps` shows and an unwinder
     /// finds an object's headers by. Kept whatever is written there since.
     pub file_off: Option<u64>,
+    /// The file `/proc/<pid>/maps` names for a mapping a loader placed
+    /// (the program's own segments and its interpreter's, whose `name` is
+    /// `[image]`), with `file_off` its offset there
+    /// ([`MemoryMap::show_file`]).
+    pub shown: Option<std::sync::Arc<str>>,
 }
 
 impl Vma {
@@ -151,6 +156,7 @@ impl Vma {
         self.prot == next.prot
             && self.name == next.name
             && self.anon_name == next.anon_name
+            && self.shown == next.shown
             && match (self.file_off, next.file_off) {
                 (None, None) => true,
                 (Some(a), Some(b)) => a + (self.end - self.start) == b,
@@ -180,6 +186,7 @@ impl Vma {
             patched: self.patched,
             anon_name: self.anon_name.clone(),
             file_off: self.file_off.map(|o| o + (start - self.start)),
+            shown: self.shown.clone(),
         }
     }
 }
@@ -703,6 +710,23 @@ impl MemoryMap {
         // not the old image's shared mappings: exec wrote them back already.
         fresh.log.shared_maps.clear();
         *self = fresh;
+        self.publish();
+    }
+
+    /// Say which file the mappings in `[start, end)` are of, and that
+    /// `start` is `off` into it, for `/proc/<pid>/maps`: a segment a loader
+    /// built in place, which no `mmap` of the file made. An unwinder finds
+    /// the program and its interpreter there by name and offset, as it
+    /// finds a library.
+    pub fn show_file(&mut self, start: u64, end: u64, path: &str, off: u64) {
+        let (lo, hi) = (page_align_down(start), page_align_up(end));
+        let base = off.saturating_sub(start - lo);
+        let path: std::sync::Arc<str> = path.into();
+        for v in self.vmas.iter_mut().filter(|v| v.start >= lo && v.end <= hi) {
+            v.shown = Some(path.clone());
+            v.file_off = Some(base + (v.start - lo));
+        }
+        self.generation += 1;
         self.publish();
     }
 
@@ -1301,6 +1325,7 @@ impl MemoryMap {
             patched: false,
             anon_name: None,
             file_off: None,
+            shown: None,
         });
         self.vmas.sort_by_key(|v| v.start);
     }
@@ -1376,6 +1401,7 @@ impl MemoryMap {
             patched: false,
             anon_name: None,
             file_off: None,
+            shown: None,
         });
         // Sorted already but for the one just pushed: move it into place.
         let at = self.vmas[..self.vmas.len() - 1].partition_point(|v| v.start < aligned);
@@ -2216,8 +2242,9 @@ impl MemoryMap {
                 } else {
                     "                    "
                 },
-                match &v.anon_name {
-                    Some(n) if v.name.is_empty() => format!("[anon:{n}]"),
+                match (&v.shown, &v.anon_name) {
+                    (Some(file), _) => file.to_string(),
+                    (None, Some(n)) if v.name.is_empty() => format!("[anon:{n}]"),
                     _ => v.name.clone(),
                 },
             ));
@@ -2258,6 +2285,21 @@ mod tests {
         assert_eq!(m.set_anon_name(at + 0x3000, 0x2000, Some("both")), Err(Errno::EBADF));
         assert_eq!(m.vma_at(at + 0x3000).unwrap().anon_name.as_deref(), Some("both"), "named up to the file's");
         assert_eq!(m.vma_at(at + 0x4000).unwrap().anon_name, None);
+    }
+
+    /// A segment a loader placed is listed by the file it is of.
+    #[test]
+    fn a_placed_segment_is_listed_by_its_file() {
+        let mut m = MemoryMap::new(0x100_0000);
+        m.insert(0x40_0580, 0x40_3000, prot::READ | prot::EXEC, "[image]");
+        m.show_file(0x40_0580, 0x40_3000, "/system/bin/toybox", 0x2580);
+        let line = m.proc_maps().lines().find(|l| l.starts_with("00400000-")).unwrap().to_string();
+        assert_eq!(line.split_whitespace().collect::<Vec<_>>(), ["00400000-00403000", "r-xp", "00002000", "00:00", "0", "/system/bin/toybox"]);
+        // A piece split off keeps the name, at its own offset.
+        m.protect(0x40_1000, 0x1000, prot::READ).unwrap();
+        let offs: Vec<_> = m.proc_maps().lines().filter(|l| l.ends_with("/system/bin/toybox")).map(|l| l.split(' ').nth(2).unwrap().to_string()).collect();
+        assert_eq!(offs, ["00002000", "00003000", "00004000"]);
+        assert_eq!(m.vma_at(0x40_0000).unwrap().name, "[image]", "the name the runtime knows it by stays");
     }
 
     /// A mapping of a file shows the file offset of its start, and a piece

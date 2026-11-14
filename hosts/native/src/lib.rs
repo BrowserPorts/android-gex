@@ -4354,6 +4354,22 @@ fn place_image(
         });
     }
 
+    // Which file each of them is of, and where in it, for /proc/<pid>/maps:
+    // the program's own path, and its interpreter's. (A program run by its
+    // interpreter directly is the interpreter, by that path.)
+    store.data_mut().with_kernel(|k| {
+        let exe_path = program.direct.clone().unwrap_or_else(|| k.exe_path.clone());
+        let files = [(Some(&program.exe), Some(exe_path)), (program.interp.as_ref(), program.exe.interp.clone())];
+        for (image, path) in files {
+            let (Some(image), Some(path)) = (image, path) else { continue };
+            let Ok((_, ranges)) = gex_ld::elf::plan(&|at, out| k.read_file_at(&path, at, out), gex_abi::PIE_BASE) else { continue };
+            let mut mm = k.mem.lock();
+            for (seg, &(off, _)) in image.segments.iter().zip(&ranges) {
+                mm.show_file(seg.vaddr, seg.vaddr + seg.mem_size, &path, off);
+            }
+        }
+    });
+
     // Then the stack. Determinism by default means a fixed
     // AT_RANDOM unless the caller asks otherwise.
     let layout = build_initial_stack(
