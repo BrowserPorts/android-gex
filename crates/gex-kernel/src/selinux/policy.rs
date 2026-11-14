@@ -1775,16 +1775,14 @@ mod tests {
         }
     }
 
-    /// What a Linux kernel answered through selinuxfs with test.33 loaded
-    /// (testdata/answers.txt: each line a question of
-    /// tests/android/oracle/selinux-ask.py and the kernel's answer; how
-    /// they were asked is at its head), and the same asked of this.
-    #[test]
-    fn its_answers_are_a_kernels() {
-        let p = Policy::read(V33).unwrap();
+    /// Ask `p` each question of `answers` (lines of
+    /// tests/android/oracle/selinux-ask.py's: a question, an arrow, what a
+    /// kernel answered) and hold it to the kernel's answer. How many were
+    /// asked.
+    fn replay(p: &Policy, answers: &str) -> usize {
         let mut bools = p.bool_defaults();
         let mut asked = 0;
-        for line in include_str!("testdata/answers.txt").lines() {
+        for line in answers.lines() {
             if line.starts_with('#') {
                 continue;
             }
@@ -1818,7 +1816,34 @@ mod tests {
             assert_eq!(got, want, "{question}");
             asked += 1;
         }
+        asked
+    }
+
+    /// What a Linux kernel answered through selinuxfs with test.33 loaded
+    /// (testdata/answers.txt; how they were asked is at its head), and the
+    /// same asked of this.
+    #[test]
+    fn its_answers_are_a_kernels() {
+        let asked = replay(&Policy::read(V33).unwrap(), include_str!("testdata/answers.txt"));
         assert!(asked > 400, "{asked} questions");
+    }
+
+    /// The same for any policy there is a kernel's answers about:
+    /// `GEX_SELINUX_POLICY` names the policy, `GEX_SELINUX_ANSWERS` what
+    /// a kernel that had loaded it answered. A system image's policy is
+    /// not kept here. The Android 17 image's
+    /// (vendor/etc/selinux/precompiled_sepolicy) has been through this
+    /// against Linux 7.0, which loads it where 6.8's tools cannot read
+    /// it: 6,643 questions of fifteen domains, twenty-three types and the
+    /// classes between them, and no answer different.
+    #[test]
+    #[ignore = "needs GEX_SELINUX_POLICY and GEX_SELINUX_ANSWERS"]
+    fn its_answers_about_a_policy_given_are_a_kernels() {
+        let policy = std::fs::read(std::env::var("GEX_SELINUX_POLICY").expect("GEX_SELINUX_POLICY")).unwrap();
+        let answers = std::fs::read_to_string(std::env::var("GEX_SELINUX_ANSWERS").expect("GEX_SELINUX_ANSWERS")).unwrap();
+        let asked = replay(&Policy::read(&policy).unwrap(), &answers);
+        assert!(asked > 0);
+        println!("{asked} questions, each answered as the kernel answered it");
     }
 
     #[test]
