@@ -814,6 +814,16 @@ pub trait FileSystem: Send + Sync {
     fn fs_type(&self) -> &'static str {
         "tmpfs"
     }
+    /// Its magic number, `statfs`'s `f_type` (include/uapi/linux/magic.h):
+    /// by its type, and tmpfs's for one that names none.
+    fn magic(&self) -> u64 {
+        match self.fs_type() {
+            "proc" => 0x9fa0,
+            "sysfs" => 0x6265_6572,
+            "binder" => 0x6c6f_6f70,
+            _ => 0x0102_1994,
+        }
+    }
     /// Open a path relative to this mount's root (no leading slash).
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno>;
     /// [`FileSystem::open`] for a program's `open` (or the page's, which has
@@ -1330,6 +1340,20 @@ impl Namespace {
         self.mount_at(&normalize(path, &self.cwd)).map_or(1, |(at, _)| mount_id(at))
     }
 
+    /// The magic number of the filesystem `path` is in, for `statfs`; the
+    /// path has to name something.
+    pub fn fs_magic(&self, path: &str) -> Result<u64, Errno> {
+        self.metadata(path)?;
+        self.resolve(path).map(|(fs, _)| fs.magic())
+    }
+
+    /// [`Namespace::fs_magic`] for an open file, by the name it was opened
+    /// under; tmpfs's for one with no name in any filesystem (a pipe, a
+    /// socket).
+    pub fn fs_magic_of_open(&self, path: &str) -> u64 {
+        self.resolve(path).map_or(0x0102_1994, |(fs, _)| fs.magic())
+    }
+
     /// Whether something is mounted at exactly this path.
     pub fn is_mount_point(&self, path: &str) -> bool {
         self.mounts.contains_key(&normalize(path, &self.cwd))
@@ -1366,6 +1390,17 @@ impl Namespace {
     pub fn canonical(&self, abs: &str) -> String {
         match self.walk(abs, true) {
             Ok(Some(w)) if !w.at_mount => w.path,
+            _ => abs.to_string(),
+        }
+    }
+
+    /// Where `mount` and `umount` of absolute `abs` act: the root
+    /// filesystem's links on it followed, up to another mount if it lies in
+    /// one. (A mount made under a name with a link in it would be found
+    /// under no name.)
+    pub fn mount_target(&self, abs: &str) -> String {
+        match self.walk(abs, true) {
+            Ok(Some(w)) => w.path,
             _ => abs.to_string(),
         }
     }

@@ -4350,11 +4350,13 @@ impl PathIo<'_> {
         if n == nr::CHROOT {
             return self.chroot(m, a[0]);
         }
+        // A mount is at the directory its path leads to, links followed:
+        // under any other name nothing would find it.
         if n == nr::UMOUNT2 {
-            let target = self.at_path(m, AT_FDCWD, a[0])?;
+            let target = self.ns.mount_target(&self.at_path(m, AT_FDCWD, a[0])?);
             return if self.view.unmount(&target) { Ok(0) } else { Err(Errno::EINVAL) };
         }
-        let target = self.at_path(m, AT_FDCWD, a[1])?;
+        let target = self.ns.mount_target(&self.at_path(m, AT_FDCWD, a[1])?);
         let fstype = if a[2] == 0 {
             String::new()
         } else {
@@ -8562,7 +8564,8 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
             nr::FTRUNCATE => f.io.ftruncate(m, a[0] as i32, a[1]),
             nr::TRUNCATE => f.path.truncate_target(m, a[0]).and_then(|t| f.io.truncate_file(m, &t, a[1])),
             nr::FADVISE64 => f.io.fadvise(a[0] as i32, a[1], a[2], a[3]),
-            nr::STATFS | nr::FSTATFS => statfs(m, compat, a[1]),
+            nr::STATFS => f.path.at_path(m, AT_FDCWD, a[0]).and_then(|p| f.io.ns.fs_magic(&p)).and_then(|magic| statfs(m, compat, magic, a[1])),
+            nr::FSTATFS => f.io.fds.get(a[0] as i32).and_then(|file| statfs(m, compat, f.io.ns.fs_magic_of_open(&file.path), a[1])),
             // As the kernel's arms: nice 0, and a change taken and ignored.
             nr::GETPRIORITY => Ok(20),
             nr::SETPRIORITY => Ok(0),
@@ -12049,7 +12052,7 @@ impl Kernel {
                 thread_own_call(self.signals.thread(), &self.thread_fs, &fs, self.ctx_addr, self.tid, n, a)
             }
             nr::PPOLL | nr::PSELECT6 => self.fd_io().poll_now(m, n, a),
-            nr::STATFS | nr::FSTATFS => self.sys_statfs(m, a[1]),
+            nr::STATFS | nr::FSTATFS => self.sys_statfs(m, n, a[0], a[1]),
             // There is one process's view of the world and nothing consults
             // a umask, but a program that sets one wants the old value back.
 
@@ -13540,10 +13543,17 @@ impl Kernel {
     }
 
 
-    /// `statfs`. One filesystem, large and mostly empty, which is what a
-    /// program checking for room before it writes wants to hear.
-    fn sys_statfs(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        statfs(m, self.compat, buf)
+    /// `statfs` and `fstatfs`. Every filesystem is large and mostly empty,
+    /// which is what a program checking for room before it writes wants to
+    /// hear; its type is its own.
+    fn sys_statfs(&mut self, m: &mut GuestMem<'_>, n: u64, what: u64, buf: u64) -> SysResult {
+        let magic = if n == nr::STATFS {
+            let path = self.path_io().at_path(m, AT_FDCWD, what)?;
+            self.vfs.fs_magic(&path)?
+        } else {
+            self.vfs.fs_magic_of_open(&self.fds.get(what as i32)?.path)
+        };
+        statfs(m, self.compat, magic, buf)
     }
 
     // -- memory --------------------------------------------------------------
@@ -13875,7 +13885,7 @@ impl Kernel {
 /// magic, a 4 GiB volume half free). `f_flags` has ST_VALID, as Linux's
 /// always does: glibc's `statvfs` otherwise looks the mount flags up in
 /// /proc/mounts.
-pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
+pub fn statfs(m: &mut GuestMem<'_>, compat: bool, magic: u64, buf: u64) -> SysResult {
     if buf == 0 {
         return Err(Errno::EFAULT);
     }
@@ -13883,7 +13893,7 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     let put = |o: &mut [u8; 120], at: usize, v: u64| {
         o[at..at + 8].copy_from_slice(&v.to_le_bytes())
     };
-    put(&mut out, 0, 0x0102_1994); // f_type: TMPFS_MAGIC
+    put(&mut out, 0, magic); // f_type
     put(&mut out, 8, 4096); // f_bsize
     put(&mut out, 16, 1 << 20); // f_blocks
     put(&mut out, 24, 1 << 19); // f_bfree
@@ -13899,7 +13909,7 @@ pub fn statfs(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
         // f_type, f_bsize, f_namelen, f_frsize, 64-bit counts
         let mut c = [0u8; 84];
         let w32 = |o: &mut [u8; 84], at: usize, v: u32| o[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        w32(&mut c, 0, 0x0102_1994);
+        w32(&mut c, 0, magic as u32);
         w32(&mut c, 4, 4096);
         c[8..48].copy_from_slice(&out[16..56]); // blocks, bfree, bavail, files, ffree
         w32(&mut c, 56, 255);
@@ -14345,7 +14355,7 @@ mod tests {
     #[test]
     fn statfs_fields_are_where_linux_puts_them() {
         let mut buf = vec![0u8; 0x1000];
-        statfs(&mut GuestMem::new(&mut buf), false, 0x100).unwrap();
+        statfs(&mut GuestMem::new(&mut buf), false, 0x0102_1994, 0x100).unwrap();
         let q = |at: usize| u64::from_le_bytes(buf[0x100 + at..0x108 + at].try_into().unwrap());
         assert_eq!(q(8), 4096, "f_bsize");
         assert_eq!(q(56), 0, "f_fsid");
@@ -14353,7 +14363,7 @@ mod tests {
         assert_eq!(q(72), 4096, "f_frsize");
         assert_eq!(q(80) & ST_VALID, ST_VALID, "f_flags");
         let mut buf = vec![0u8; 0x1000];
-        statfs(&mut GuestMem::new(&mut buf), true, 0x100).unwrap();
+        statfs(&mut GuestMem::new(&mut buf), true, 0x0102_1994, 0x100).unwrap();
         let d = |at: usize| u32::from_le_bytes(buf[0x100 + at..0x104 + at].try_into().unwrap());
         assert_eq!((d(56), d(60), d(64) & 0x20), (255, 4096, 0x20), "i386 statfs64: f_namelen, f_frsize, f_flags");
     }
