@@ -702,10 +702,6 @@ fn choose_mem(ra: &mut RunArgs, wide: bool) -> Result<()> {
     ra.opts.mem = if m64 { gex_abi::MemFlavor::M64 } else { gex_abi::MemFlavor::M32 };
     // Everything translated in this process targets it.
     gex_abi::set_mem_flavor(ra.opts.mem);
-    // AArch64 code is held to its pages' protections, as on hardware.
-    // GEX_UNSAFE_NO_ACCESS_CHECKS=1 leaves the checks out, to price them:
-    // a bad access then goes through, or is the engine's trap.
-    gex_abi::set_access_checks(!gex_abi::X86 && std::env::var_os("GEX_UNSAFE_NO_ACCESS_CHECKS").is_none());
     // Its first program may be told later that it needs a 64-bit memory
     // (an exec that asks for one): the run then starts again with one
     // (`gex_native::restart_mem64`), unless the flavour was given.
@@ -730,6 +726,26 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         }
     }
     let bytes = std::fs::read(&ra.path).with_context(|| format!("reading {}", ra.path))?;
+    // AArch64 code is held to its pages' protections, as on hardware.
+    // GEX_UNSAFE_NO_ACCESS_CHECKS=1 leaves the checks out, to price them:
+    // a bad access then goes through, or is the engine's trap. Before the
+    // program is loaded: where a 32-bit memory's floor is depends on it.
+    gex_abi::set_access_checks(!gex_abi::X86 && std::env::var_os("GEX_UNSAFE_NO_ACCESS_CHECKS").is_none());
+    // A program linked below a 32-bit memory's floor and above a 64-bit
+    // one's (a static AArch64 executable at lld's default base, 0x200000,
+    // as Android's are) runs with a 64-bit memory, whose tables are above
+    // 4 GiB. Chosen before the loader looks at the program's addresses.
+    {
+        use gex_abi::{guest_floor_of, MemFlavor::{M32, M64}};
+        let low = gex_ld::elf::lowest_fixed_segment(&bytes).is_some_and(|v| (guest_floor_of(M64)..guest_floor_of(M32)).contains(&v));
+        if low && ra.mem64.is_none() {
+            eprintln!("gex: {} runs with a 64-bit memory (it is linked below {:#x}, where a 32-bit memory keeps gex's tables)", ra.path, guest_floor_of(M32));
+            ra.mem64 = Some(true);
+        }
+        if ra.mem64 == Some(true) {
+            gex_abi::set_mem_flavor(M64);
+        }
+    }
     // Resolved through the guest's namespace (the sysroot when given), so a
     // program links against its own root's libraries, not the host's.
     let sysroot = ra.opts.sysroot.clone();

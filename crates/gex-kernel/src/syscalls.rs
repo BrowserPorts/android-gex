@@ -12287,7 +12287,7 @@ impl Kernel {
         // The access's first byte, and the first of its last byte's page.
         let last = addr.wrapping_add(size as u64 - 1) & !(gex_abi::PERM_PAGE - 1);
         for at in [addr, last] {
-            let bits = if at >= gex_abi::GUEST_FLOOR { self.mem.lock().vma_at(at).map(|v| gex_abi::perm::of_prot(v.prot)) } else { None };
+            let bits = if at >= gex_abi::guest_floor() { self.mem.lock().vma_at(at).map(|v| gex_abi::perm::of_prot(v.prot)) } else { None };
             match bits {
                 Some(b) if b & need != 0 => {
                     // The map allows it. The table does too now, unless it

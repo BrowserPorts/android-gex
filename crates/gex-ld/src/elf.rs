@@ -92,7 +92,7 @@ pub enum LoadError {
         second_end: u64,
     },
     /// A segment lies in the runtime's own low region: the thread contexts
-    /// and the dispatch directory, below [`gex_abi::DISPATCH_DIR_END`]. A
+    /// and the dispatch directory, below [`gex_abi::guest_floor`]. A
     /// fixed-address image there would overwrite them.
     InRuntimeRegion {
         vaddr: u64,
@@ -129,9 +129,12 @@ impl fmt::Display for LoadError {
             LoadError::InRuntimeRegion { vaddr, size } => write!(
                 f,
                 "segment at 0x{vaddr:x} (0x{size:x} bytes) lies in gex's reserved low region \
-                 (below 0x{:x}: thread contexts and the dispatch directory); relink the \
-                 program higher, e.g. with -Wl,--image-base=0x{:x}",
-                gex_abi::DISPATCH_DIR_END,
+                 (below 0x{:x}: thread contexts and, in a 32-bit memory, the dispatch \
+                 directory and protection table); run a 64-bit program linked at or above \
+                 0x{:x} with a 64-bit memory, or relink the program higher, e.g. with \
+                 -Wl,--image-base=0x{:x}",
+                gex_abi::guest_floor(),
+                gex_abi::guest_floor_of(gex_abi::MemFlavor::M64),
                 gex_abi::PIE_BASE
             ),
             LoadError::Malformed(m) => write!(f, "malformed ELF: {m}"),
@@ -647,7 +650,7 @@ fn headers(r: &Reader, pie_base: u64) -> Result<Headers, LoadError> {
                 // is being measured or parsed (`closure::resolve` sizes every
                 // library at base 0), and where it really goes is the
                 // loader's or the kernel's placement, which never picks there.
-                if !pie && p_memsz != 0 && vaddr < gex_abi::DISPATCH_DIR_END {
+                if !pie && p_memsz != 0 && vaddr < gex_abi::guest_floor() {
                     return Err(LoadError::InRuntimeRegion {
                         vaddr,
                         size: p_memsz,
@@ -785,6 +788,28 @@ pub fn plan(
         }
     }
     Ok((image, ranges))
+}
+
+/// Where the lowest loaded segment of a 64-bit `ET_EXEC` image is linked,
+/// or `None` for any other file: a relocatable image goes where the loader
+/// puts it, and a fixed one has to have its own addresses free
+/// (`gex_abi::guest_floor_of`), which decides the memory a run of it needs
+/// before it is loaded.
+pub fn lowest_fixed_segment(data: &[u8]) -> Option<u64> {
+    let u16_at = |at: usize| Some(u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?));
+    let u64_at = |at: usize| Some(u64::from_le_bytes(data.get(at..at + 8)?.try_into().ok()?));
+    // \x7fELF, ELFCLASS64, little-endian.
+    if data.get(..6)? != [0x7f, b'E', b'L', b'F', 2, 1] || u16_at(16)? != ET_EXEC {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (u64_at(32)? as usize, u16_at(54)? as usize, u16_at(56)? as usize);
+    (0..phnum)
+        .filter_map(|i| {
+            let at = phoff.checked_add(i.checked_mul(phentsize)?)?;
+            let kind = u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?);
+            (kind == PT_LOAD && u64_at(at + 40)? != 0).then(|| u64_at(at + 16)).flatten()
+        })
+        .min()
 }
 
 /// Parse and place an aarch64 ELF image.
@@ -1489,6 +1514,17 @@ mod tests {
         let so = test_image(ET_DYN, 0);
         assert_eq!(load(&so, 0).unwrap().brk, 0x1000);
         assert_eq!(load(&so, gex_abi::MMAP_BOTTOM).unwrap().bias, gex_abi::MMAP_BOTTOM);
+    }
+
+    /// Where a fixed image's lowest segment is, read before it is loaded;
+    /// nothing for one the loader places.
+    #[test]
+    fn a_fixed_images_lowest_segment_is_read_from_its_headers() {
+        assert_eq!(lowest_fixed_segment(&exec_at(0x20_0000)), Some(0x20_0000));
+        assert_eq!(lowest_fixed_segment(&exec_at(gex_abi::EXEC_BASE)), Some(gex_abi::EXEC_BASE));
+        assert_eq!(lowest_fixed_segment(&test_image(ET_DYN, 0)), None);
+        assert_eq!(lowest_fixed_segment(b"\x7fELF"), None);
+        assert_eq!(lowest_fixed_segment(&[]), None);
     }
 
     /// lld's default base for a static i386 executable is 0x10000, inside

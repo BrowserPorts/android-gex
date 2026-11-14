@@ -430,7 +430,7 @@ impl Perms {
         };
         self.shown = now;
         let pages = gex_abi::perm_limit() >> PERM_PAGE_SHIFT;
-        let floor = gex_abi::GUEST_FLOOR >> PERM_PAGE_SHIFT;
+        let floor = gex_abi::guest_floor() >> PERM_PAGE_SHIFT;
         let mut runs: Vec<(u64, u64)> = Vec::new();
         for (s, e) in dirty {
             let (ps, pe) = ((s >> PERM_PAGE_SHIFT).saturating_sub(1), ((e + PERM_PAGE - 1) >> PERM_PAGE_SHIFT).min(pages));
@@ -1043,7 +1043,7 @@ impl MemoryMap {
         if pc % 4 != 0 {
             return Some((sig::SIGBUS, Fault::pc_alignment()));
         }
-        match self.vma_at(pc).filter(|_| pc >= gex_abi::GUEST_FLOOR) {
+        match self.vma_at(pc).filter(|_| pc >= gex_abi::guest_floor()) {
             None => Some((sig::SIGSEGV, Fault::instruction_abort(SEGV_MAPERR, false))),
             Some(v) if v.prot & prot::EXEC == 0 => Some((sig::SIGSEGV, Fault::instruction_abort(SEGV_ACCERR, v.prot & 7 != 0))),
             Some(_) => None,

@@ -268,11 +268,31 @@ pub fn access_checks() -> bool {
     !X86 && ACCESS_CHECKS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// The lowest address a guest mapping may have: [`GUEST_FLOOR`], or the end
-/// of an M32 process's protection table, which lies just above it.
+/// The lowest address a guest mapping may have in this process's memory
+/// flavour ([`guest_floor_of`]).
 #[inline]
 pub fn guest_floor() -> u64 {
-    if access_checks() && !mem64() { PERM_TABLE + PERM_TABLE_BYTES } else { GUEST_FLOOR }
+    guest_floor_of(mem_flavor())
+}
+
+/// The lowest address a guest mapping may have in a memory of `flavor`.
+///
+/// An M32 memory keeps the dispatch directory below [`GUEST_FLOOR`], and
+/// its protection table just above when it has one. A native M64 memory's
+/// directory and table are its dense ones above 4 GiB, so only the thread
+/// contexts lie low and a mapping may begin at [`RESERVED_END`]: where a
+/// program linked at lld's default base for a static AArch64 executable,
+/// 0x200000, has its image (Android's are). The page's M64 memory keeps
+/// the M32 floor: its shim claims the low directory's range. So does an
+/// x86 guest's: native Windows code's function pointers are numbers below
+/// that floor ([`ftab::NATIVE_FN_TOP`]), which nothing mapped may be.
+#[inline]
+pub fn guest_floor_of(flavor: MemFlavor) -> u64 {
+    match flavor {
+        MemFlavor::M64 if !X86 && !cfg!(target_family = "wasm") => RESERVED_END,
+        MemFlavor::M32 if access_checks() => PERM_TABLE + PERM_TABLE_BYTES,
+        _ => GUEST_FLOOR,
+    }
 }
 
 /// The directory's byte range `[dispatch_dir(), end)`.
@@ -1594,6 +1614,14 @@ mod tests {
         assert!(PERM_TABLE64 + PERM_TABLE64_BYTES <= HIGH_TABLES_END);
         // Byte 0 refuses: page 0 is below everything a guest maps.
         assert!(RESERVED_BASE >= PERM_PAGE && PERM_TABLE + PERM_TABLE_BYTES <= EXEC_BASE);
+        // A native 64-bit memory keeps nothing of gex's between the thread
+        // contexts and 4 GiB, so a mapping may begin where a static
+        // AArch64 executable is linked by default; a 32-bit one may not.
+        if !X86 && !cfg!(target_family = "wasm") {
+            assert_eq!(guest_floor_of(MemFlavor::M64), RESERVED_END);
+            assert!(guest_floor_of(MemFlavor::M64) <= 0x20_0000);
+        }
+        assert!(guest_floor_of(MemFlavor::M32) >= GUEST_FLOOR && GUEST_FLOOR > 0x20_0000);
         assert_eq!(perm::of_prot(0), perm::MAPPED);
         assert_eq!(perm::of_prot(1), perm::MAPPED | perm::READ);
         assert_eq!(perm::of_prot(2), perm::MAPPED | perm::READ | perm::WRITE);
