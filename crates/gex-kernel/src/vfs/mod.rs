@@ -1035,6 +1035,16 @@ pub trait FileSystem: Send + Sync {
         false
     }
 
+    /// Whether the namespace follows this filesystem's links to
+    /// directories when it is mounted somewhere other than `/`: for one
+    /// that keeps symbolic links a program makes or an image holds (tmpfs,
+    /// ext4), whose targets may lead anywhere. One that resolves its own
+    /// names (proc, the host's), or has no links, is not asked, a
+    /// directory at a time, on every lookup under it.
+    fn keeps_links(&self) -> bool {
+        false
+    }
+
     /// An extended-attribute call on `path` (the node it names: a final
     /// symlink is the link's own, the caller follows it first). A
     /// filesystem that keeps none answers `EOPNOTSUPP`, as Linux's do.
@@ -1904,8 +1914,11 @@ impl Namespace {
     /// `abs` with every symlink among its directories followed (not the
     /// final component: each caller decides about that). A filesystem here
     /// is a map of whole paths, so `/bin/sh` under a merged /usr (`/bin ->
-    /// usr/bin`) names nothing until the `/bin` link is followed. Only the
-    /// root filesystem's links: /proc and /dev resolve their own names.
+    /// usr/bin`) names nothing until the `/bin` link is followed. The root
+    /// filesystem's links, and those of a mount that keeps links
+    /// ([`FileSystem::keeps_links`]: a tmpfs that is a process's `/dev`,
+    /// with `fd` leading to `/proc/self/fd`); /proc and the like resolve
+    /// their own names, and the walk ends at one.
     fn through_dir_links(&self, mut abs: String) -> Result<String, Errno> {
         'again: for _ in 0..40 {
             let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
@@ -1914,10 +1927,17 @@ impl Namespace {
                 prefix.push('/');
                 prefix.push_str(c);
                 let (at, fs) = self.mount_at(&prefix)?;
-                if at != "/" {
+                let rel = if at == "/" {
+                    prefix.trim_start_matches('/')
+                } else if !fs.keeps_links() {
                     break;
-                }
-                if let Ok(target) = fs.read_link(prefix.trim_start_matches('/')) {
+                } else if prefix.len() == at.len() {
+                    // The mount point itself: the mounted filesystem's root.
+                    continue;
+                } else {
+                    &prefix[at.len() + 1..]
+                };
+                if let Ok(target) = fs.read_link(rel) {
                     let base = if target.starts_with('/') {
                         normalize(&target, "/")
                     } else {
@@ -2814,6 +2834,44 @@ mod tests {
         assert_eq!(vfs.read_link("/bin/sh").unwrap(), "dash");
         assert!(vfs.metadata("/bin/sh").is_ok());
         assert!(vfs.metadata("/bin/../lib/ld.so").is_ok());
+    }
+
+    /// A mounted tmpfs's links to directories are followed too, wherever
+    /// they lead: within it, by an absolute name, and into another mount.
+    #[test]
+    fn a_mounts_directory_links_are_followed() {
+        let mut vfs = Vfs::new();
+        let root = Arc::new(TmpFs::new());
+        root.add_file("data/file", b"root's".to_vec());
+        vfs.mount("/", root);
+        let dev = Arc::new(TmpFs::new());
+        dev.add_file("real/inside", b"in".to_vec());
+        vfs.mount("/dev", dev);
+        let other = Arc::new(TmpFs::new());
+        other.add_file("sub/there", b"other".to_vec());
+        vfs.mount("/other", other);
+        vfs.symlink("real", "/dev/rel").unwrap();
+        vfs.symlink("/dev/real", "/dev/abs").unwrap();
+        vfs.symlink("/data", "/dev/out").unwrap();
+        vfs.symlink("/other/sub", "/dev/across").unwrap();
+        vfs.symlink("../data", "/dev/up").unwrap();
+        vfs.symlink("rel", "/dev/twice").unwrap();
+        assert_eq!(vfs.resolve("/dev/rel/inside").unwrap().1, "real/inside");
+        assert_eq!(vfs.resolve("/dev/abs/inside").unwrap().1, "real/inside");
+        assert_eq!(vfs.resolve("/dev/twice/inside").unwrap().1, "real/inside");
+        assert_eq!(vfs.resolve("/dev/out/file").unwrap().1, "data/file");
+        assert_eq!(vfs.resolve("/dev/up/file").unwrap().1, "data/file");
+        assert_eq!(vfs.resolve("/dev/across/there").unwrap().1, "sub/there");
+        assert!(vfs.metadata("/dev/twice/inside").is_ok());
+        assert!(vfs.metadata("/dev/across/there").is_ok());
+        assert_eq!(vfs.metadata("/dev/rel/nothing").err(), Some(Errno::ENOENT));
+        // The final name is still the caller's to follow or not.
+        assert_eq!(vfs.resolve("/dev/rel").unwrap().1, "rel");
+        assert_eq!(vfs.read_link("/dev/twice").unwrap(), "rel");
+        // A loop ends.
+        vfs.symlink("b", "/dev/a").unwrap();
+        vfs.symlink("a", "/dev/b").unwrap();
+        assert_eq!(vfs.metadata("/dev/a/x").err(), Some(Errno::ELOOP));
     }
 
     #[test]

@@ -685,6 +685,23 @@ struct Inner {
 }
 
 impl Inner {
+    /// Why `path`, which is not here, is not: `ENOTDIR` when the nearest
+    /// name above it that is here is not a directory (a name under a
+    /// file), else `ENOENT`. Its directory is nearly always there, and
+    /// that is the one more lookup this costs.
+    fn missing(&self, path: &str) -> Errno {
+        let mut at = path;
+        while let Some(i) = at.rfind('/') {
+            at = &at[..i];
+            match self.nodes.get(at) {
+                Some(Node::Dir) => break,
+                Some(_) => return Errno::ENOTDIR,
+                None => {}
+            }
+        }
+        Errno::ENOENT
+    }
+
     /// Whether a name can be made at `path`: the directory it would be in
     /// is there (ENOENT) and is a directory (ENOTDIR), as on Linux. A
     /// `mkdir -p` (Qt's `mkpath`) tries the whole path first and makes the
@@ -1382,10 +1399,10 @@ impl TmpFs {
     }
 
     /// The metadata of the node at `path` (relative), from the tree.
-    /// The node first: a miss (most of a lookup's answers) asks no more.
+    /// The node first; a miss (most of a lookup's answers) asks only why.
     fn meta_at(inner: &Inner, path: &str) -> Result<Metadata, Errno> {
         let Some(node) = inner.nodes.get(path) else {
-            return Err(Errno::ENOENT);
+            return Err(inner.missing(path));
         };
         TmpFs::meta_of(inner, path, node)
     }
@@ -2014,6 +2031,10 @@ impl FileSystem for TmpFs {
         self.open_as(path, flags, None)
     }
 
+    fn keeps_links(&self) -> bool {
+        true
+    }
+
     fn open_mode(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         self.open_as(path, flags, Some(mode))
     }
@@ -2084,18 +2105,7 @@ impl FileSystem for TmpFs {
             // A name that is not there is ENOENT (or ENOTDIR), not EINVAL:
             // `realpath` takes EINVAL for "there, and not a link" and
             // resolves a file that does not exist.
-            None => {
-                let mut at = path;
-                while let Some(i) = at.rfind('/') {
-                    at = &at[..i];
-                    match inner.nodes.get(at) {
-                        Some(Node::Dir) => break,
-                        Some(_) => return Err(Errno::ENOTDIR),
-                        None => {}
-                    }
-                }
-                Err(Errno::ENOENT)
-            }
+            None => Err(inner.missing(path)),
         }
     }
 
@@ -2110,7 +2120,7 @@ impl FileSystem for TmpFs {
             Some(false) if !super::within_any(abs, mounts) => {
                 let rel = abs.trim_start_matches('/');
                 match inner.nodes.get(rel) {
-                    None => return Err(Errno::ENOENT),
+                    None => return Err(inner.missing(rel)),
                     Some(Node::Symlink(_)) => {}
                     Some(node) => return TmpFs::meta_of(&inner, rel, node).map(Some),
                 }
@@ -2773,6 +2783,11 @@ mod tests {
         assert_eq!(fs.read_link("nothing-here"), Err(Errno::ENOENT));
         assert_eq!(fs.read_link("no-dir/x"), Err(Errno::ENOENT));
         assert_eq!(fs.read_link("f/x"), Err(Errno::ENOTDIR));
+        // And so `stat` says of a name under a file.
+        assert_eq!(fs.metadata("f/x").err(), Some(Errno::ENOTDIR));
+        assert_eq!(fs.metadata("f/x/y").err(), Some(Errno::ENOTDIR));
+        assert_eq!(fs.metadata("no-dir/x").err(), Some(Errno::ENOENT));
+        assert_eq!(fs.metadata("nothing-here").err(), Some(Errno::ENOENT));
     }
 
     #[test]
