@@ -558,6 +558,10 @@ impl ProcFs {
             "sys/kernel/random/boot_id" => format!("{}\n", uuid_text(boot_id())).into_bytes(),
             "sys/kernel/random/uuid" => format!("{}\n", uuid_text(random_uuid())).into_bytes(),
             "sys/kernel/random/entropy_avail" | "sys/kernel/random/poolsize" => b"256\n".to_vec(),
+            // What a socket's buffers start as and the most a process may
+            // ask for without privilege (crate::netlink keeps to them).
+            "sys/net/core/rmem_default" | "sys/net/core/wmem_default" => format!("{}\n", crate::netlink::BUF_DEFAULT).into_bytes(),
+            "sys/net/core/rmem_max" | "sys/net/core/wmem_max" => format!("{}\n", crate::netlink::BUF_MAX).into_bytes(),
             // glibc and musl both consult this before using large mappings.
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
             // The limit `F_SETPIPE_SZ` holds an unprivileged caller to.
@@ -682,7 +686,9 @@ impl FileSystem for ProcFs {
                 out.push(DirEntry { name: "mnt".to_string(), file_type: FileType::Symlink, ino: 1 });
                 return Ok(Arc::new(GenDir { entries: out }));
             }
-            "sys" => vec!["fs", "kernel", "vm"],
+            "sys" => vec!["fs", "kernel", "net", "vm"],
+            "sys/net" => vec!["core"],
+            "sys/net/core" => vec!["rmem_default", "rmem_max", "wmem_default", "wmem_max"],
             "sys/fs" => vec!["pipe-max-size"],
             "sys/kernel" => vec!["osrelease", "pid_max", "random"],
             "sys/kernel/random" => vec!["boot_id", "entropy_avail", "poolsize", "uuid"],
@@ -692,7 +698,7 @@ impl FileSystem for ProcFs {
         // `sys` holds directories, the directories under it files (and
         // `sys/kernel` one directory more).
         let file_type = if path == "sys" { FileType::Directory } else { FileType::Regular };
-        let is_dir = |name: &str| (path == "self" && name == "attr") || (path == "sys/kernel" && name == "random");
+        let is_dir = |name: &str| (path == "self" && name == "attr") || (path == "sys/kernel" && name == "random") || (path == "sys/net" && name == "core");
         let mut out = base_entries();
         for name in entries {
             out.push(DirEntry {
@@ -742,7 +748,7 @@ impl FileSystem for ProcFs {
             };
         }
         match path.as_str() {
-            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/fs" | "sys/kernel" | "sys/kernel/random" | "sys/vm" => Ok(Metadata::dir()),
+            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/fs" | "sys/kernel" | "sys/kernel/random" | "sys/net" | "sys/net/core" | "sys/vm" => Ok(Metadata::dir()),
             "self/ns" if self.source.mount_ns_id().is_some() => Ok(Metadata { mode: 0o511, ..Metadata::dir() }),
             "self/exe" | "self/cwd" | "self/ns/mnt" => Ok(Metadata {
                 file_type: FileType::Symlink,

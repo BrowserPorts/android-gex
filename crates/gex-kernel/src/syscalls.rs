@@ -2422,6 +2422,23 @@ impl FdIo<'_> {
             }
             return d.send_to(&data, to.as_deref());
         }
+        if let Ok(sock) = self.netlink_of(fd) {
+            // To `msg_name` when it has a length, else where the socket is
+            // connected. The sender's credentials are the caller's own.
+            let namelen = m.read_u32(msg + if self.compat { 4 } else { 8 })? as u64;
+            let to = if name != 0 && namelen != 0 { Some(FdIo::read_sockaddr_nl(m, name, namelen)?) } else { None };
+            let iov = self.msg_rd(m, msg, 2)?;
+            let iovlen = self.msg_rd(m, msg, 3)?;
+            let mut data = Vec::new();
+            for i in 0..iovlen.min(1024) {
+                let base = self.msg_rd(m, iov, 2 * i)?;
+                let len = self.msg_rd(m, iov, 2 * i + 1)? as usize;
+                if len > 0 {
+                    data.extend_from_slice(m.read(base, len.min(1 << 22))?);
+                }
+            }
+            return sock.send(self.netlink_sender(), to, &data);
+        }
         if name != 0 {
             if let Ok(sock) = self.socket_of(fd) {
                 let bytes = m.read(name, 16)?.to_vec();
@@ -2602,6 +2619,9 @@ impl FdIo<'_> {
         if let Ok(d) = self.dgram_of(fd) {
             return self.recvmsg_dgram(m, &d, msg, iov, iovlen, peek);
         }
+        if let Ok(sock) = self.netlink_of(fd) {
+            return self.recvmsg_netlink(m, &sock, msg, iov, iovlen, control, controllen, flags);
+        }
         let unix_sock = self.unix_of(fd).ok();
         if unix_sock.is_none() {
             if let Ok(sock) = self.remote_unix_of(fd) {
@@ -2691,6 +2711,48 @@ impl FdIo<'_> {
         Ok(total)
     }
 
+    /// `recvmsg` on a netlink socket: one datagram scattered over the
+    /// vector, its sender's port and group in `msg_name`, the sender's
+    /// credentials in the control data when the socket asked for them
+    /// (`SO_PASSCRED`), `MSG_TRUNC` in `msg_flags` when it did not fit (and
+    /// its whole length returned when the call asked with `MSG_TRUNC`).
+    #[allow(clippy::too_many_arguments)]
+    fn recvmsg_netlink(&self, m: &mut GuestMem<'_>, sock: &Arc<crate::netlink::Socket>, msg: u64, iov: u64, iovlen: u64, control: u64, controllen: u64, flags: u64) -> SysResult {
+        const MSG_TRUNC: u64 = 0x20;
+        let mut parts = Vec::new();
+        let mut want = 0usize;
+        for i in 0..iovlen.min(1024) {
+            let base = self.msg_rd(m, iov, 2 * i)?;
+            let len = (self.msg_rd(m, iov, 2 * i + 1)? as usize).min((1 << 22) - want);
+            if len > 0 {
+                parts.push((base, len));
+                want += len;
+            }
+        }
+        let r = sock.recv(want, flags & Kernel::MSG_PEEK != 0)?;
+        let mut at = 0usize;
+        for (base, len) in parts {
+            if at >= r.data.len() {
+                break;
+            }
+            let take = len.min(r.data.len() - at);
+            m.write(base, &r.data[at..at + take])?;
+            at += take;
+        }
+        let name = self.msg_rd(m, msg, 0)?;
+        FdIo::write_sockaddr_nl(m, name, if name != 0 { msg + if self.compat { 4 } else { 8 } } else { 0 }, r.from, r.groups)?;
+        let cred = unix::Cred { pid: r.cred.0, uid: r.cred.1, gid: r.cred.2, sid: 0 };
+        let written = if sock.passcred() { self.write_scm_creds(m, control, controllen, Some(cred))? } else { 0 };
+        self.msg_wr(m, msg, 5, written)?;
+        const MSG_CTRUNC: u32 = 0x8;
+        let mut out = if r.whole > r.data.len() { MSG_TRUNC as u32 } else { 0 };
+        if sock.passcred() && written == 0 {
+            out |= MSG_CTRUNC;
+        }
+        m.write_u32(msg + if self.compat { 24 } else { 48 }, out)?;
+        Ok(if flags & MSG_TRUNC != 0 { r.whole } else { r.data.len() } as u64)
+    }
+
     fn write_sockaddr(
         &self,
         m: &mut GuestMem<'_>,
@@ -2724,6 +2786,56 @@ impl FdIo<'_> {
     /// The internet socket behind a descriptor.
     pub(crate) fn socket_of(&self, fd: i32) -> Result<Arc<net::Socket>, Errno> {
         Arc::clone(&self.fds.get(fd)?.handle).as_inet_socket().ok_or(Errno::ENOTSOCK)
+    }
+
+    /// The netlink socket behind a descriptor.
+    pub(crate) fn netlink_of(&self, fd: i32) -> Result<Arc<crate::netlink::Socket>, Errno> {
+        Arc::clone(&self.fds.get(fd)?.handle).as_netlink().ok_or(Errno::ENOTSOCK)
+    }
+
+    /// This process as the sender of a netlink message: its ids, and
+    /// whether it has `CAP_NET_ADMIN` and `CAP_SYS_ADMIN`.
+    pub(crate) fn netlink_sender(&self) -> crate::netlink::Sender {
+        const CAP_NET_ADMIN: u64 = 12;
+        const CAP_SYS_ADMIN: u64 = 21;
+        crate::netlink::Sender {
+            pid: self.pid,
+            uid: self.creds.uid(),
+            gid: self.creds.gid(),
+            net_admin: self.creds.capable(CAP_NET_ADMIN),
+            sys_admin: self.creds.capable(CAP_SYS_ADMIN),
+        }
+    }
+
+    /// A `sockaddr_nl` at `addr`, `len` bytes: its `nl_pid` and
+    /// `nl_groups`. `EINVAL` for one too short or of another family.
+    pub(crate) fn read_sockaddr_nl(m: &GuestMem<'_>, addr: u64, len: u64) -> Result<(u32, u32), Errno> {
+        if len < 12 {
+            return Err(Errno::EINVAL);
+        }
+        let b = m.read(addr, 12)?;
+        if u16::from_le_bytes([b[0], b[1]]) != 16 {
+            return Err(Errno::EINVAL);
+        }
+        Ok((u32::from_le_bytes(b[4..8].try_into().unwrap()), u32::from_le_bytes(b[8..12].try_into().unwrap())))
+    }
+
+    /// Write a `sockaddr_nl` to `addr`, as much as the `socklen_t` at
+    /// `addrlen` leaves room for, and its whole length there.
+    pub(crate) fn write_sockaddr_nl(m: &mut GuestMem<'_>, addr: u64, addrlen: u64, pid: u32, groups: u32) -> SysResult {
+        if addr == 0 {
+            return Ok(0);
+        }
+        let mut sa = [0u8; 12];
+        sa[0..2].copy_from_slice(&16u16.to_le_bytes());
+        sa[4..8].copy_from_slice(&pid.to_le_bytes());
+        sa[8..12].copy_from_slice(&groups.to_le_bytes());
+        let room = if addrlen != 0 { (m.read_u32(addrlen)? as usize).min(12) } else { 12 };
+        m.write(addr, &sa[..room])?;
+        if addrlen != 0 {
+            m.write_u32(addrlen, 12)?;
+        }
+        Ok(0)
     }
 
     /// The local unix socket behind a descriptor.
@@ -5562,6 +5674,19 @@ impl NetIo<'_> {
             // A unix socket and an internet socket are different concrete
             // types behind the same descriptor, so which `connect` this is
             // depends on what the descriptor turned out to be.
+            nr::CONNECT if io.netlink_of(fd).is_ok() => {
+                let sock = io.netlink_of(fd)?;
+                // To `AF_UNSPEC`: connected to nothing again.
+                if a[2] < 2 {
+                    return Err(Errno::EINVAL);
+                }
+                if m.read(a[1], 2)? == [0, 0] {
+                    sock.disconnect();
+                    return Ok(0);
+                }
+                let (pid, groups) = FdIo::read_sockaddr_nl(m, a[1], a[2])?;
+                sock.connect(io.netlink_sender(), pid, groups).map(|_| 0)
+            }
             nr::CONNECT => match self.unix_connect(io, m, fd, a[1], a[2], cwd) {
                 Err(Errno::ENOTSOCK) => inet_connect(io, m, fd, a[1], a[2]),
                 other => other,
@@ -5591,6 +5716,13 @@ impl NetIo<'_> {
                     Some(p) => Kernel::write_sockaddr_un(m, a[1], a[2], &p).map(|_| 0),
                     None => Kernel::write_sockaddr_unnamed(m, a[1], a[2]),
                 }
+            }
+            // A netlink socket has a name whether bound and connected or
+            // not: its port and groups, and where its sends go.
+            nr::GETPEERNAME | nr::GETSOCKNAME if io.netlink_of(fd).is_ok() => {
+                let sock = io.netlink_of(fd)?;
+                let (pid, groups) = if n == nr::GETPEERNAME { sock.peer() } else { sock.name() };
+                FdIo::write_sockaddr_nl(m, a[1], a[2], pid, groups)
             }
             nr::GETPEERNAME => {
                 let (ip, port) = io.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
@@ -5639,6 +5771,7 @@ impl NetIo<'_> {
             // option worth setting -- no timeouts, no buffer sizes that mean
             // anything -- and refusing makes libraries treat the socket as
             // broken: agreed to without effect, on a descriptor that exists.
+            nr::SETSOCKOPT if io.netlink_of(fd).is_ok() => netlink_setsockopt(io, m, &*io.netlink_of(fd)?, a[1], a[2], a[3], a[4]),
             nr::SETSOCKOPT => {
                 const SOL_SOCKET: u64 = 1;
                 const SO_PASSCRED: u64 = 16;
@@ -5672,6 +5805,10 @@ impl NetIo<'_> {
             // A local address means nothing when there is one interface and
             // it is a proxy, but a resolver binds its socket before it sends
             // and gives up if that fails.
+            nr::BIND if io.netlink_of(fd).is_ok() => {
+                let (pid, groups) = FdIo::read_sockaddr_nl(m, a[1], a[2])?;
+                io.netlink_of(fd)?.bind(io.pid, pid, groups).map(|_| 0)
+            }
             nr::BIND => match self.unix_bind(io, m, fd, a[1], a[2], cwd) {
                 Err(Errno::ENOTSOCK) => match io.socket_of(fd) {
                     // An internet socket remembers where it is (`listen`,
@@ -5763,30 +5900,26 @@ impl NetIo<'_> {
             let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
             return install_unix(io, sock, flags, ty & SOCK_CLOEXEC != 0);
         }
-        // AF_NETLINK, which libudev's device monitor opens (SDL's joystick
-        // and haptic start-up through it; a failure there makes SDL_Init undo
-        // its video subsystem too, and the program sees no display). There
-        // are no devices to announce, so the socket binds, takes its options
-        // and never has a message: an empty eventfd behind the descriptor.
-        // NETLINK_ROUTE answers its interface and address dumps
-        // (crate::netlink): musl's if_nameindex and getifaddrs, and Wine's
-        // nsi through them, and glibc's getaddrinfo (AI_ADDRCONFIG), which
-        // an eventfd here once answered with the 8-byte counter its own send
-        // wrote, and aborted on (apt's http method). No other family.
+        // AF_NETLINK (crate::netlink): NETLINK_ROUTE, which answers its
+        // interface and address dumps (musl's if_nameindex and getifaddrs,
+        // Wine's nsi through them, glibc's getaddrinfo with AI_ADDRCONFIG),
+        // and NETLINK_KOBJECT_UEVENT, the device events Android's ueventd
+        // and libudev's monitor listen to (SDL's joystick and haptic
+        // start-up through it; a failure there makes SDL_Init undo its
+        // video subsystem too). No other protocol.
         const AF_NETLINK: u64 = 16;
-        const NETLINK_ROUTE: u64 = 0;
-        const NETLINK_KOBJECT_UEVENT: u64 = 15;
-        if domain == AF_NETLINK && protocol == NETLINK_ROUTE {
-            let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::netlink::NetlinkRoute::new());
-            let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
-            let file = OpenFile::new(handle, "socket:[netlink]".to_string(), flags, true, true);
-            return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
-        }
-        if domain == AF_NETLINK && protocol != NETLINK_KOBJECT_UEVENT {
-            return Err(Errno::EAFNOSUPPORT);
-        }
         if domain == AF_NETLINK {
-            let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::eventfd::EventFd::new(0, false));
+            const SOCK_DGRAM: u64 = 2;
+            const SOCK_RAW: u64 = 3;
+            let kind = ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if kind != SOCK_RAW && kind != SOCK_DGRAM {
+                return Err(Errno::ESOCKTNOSUPPORT);
+            }
+            let protocol = protocol as u32;
+            if protocol != crate::netlink::NETLINK_ROUTE && protocol != crate::netlink::NETLINK_KOBJECT_UEVENT {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            let handle: Arc<dyn crate::vfs::FileHandle> = crate::netlink::Socket::new(protocol, kind as u32, io.netlink_sender());
             let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
             let file = OpenFile::new(handle, "socket:[netlink]".to_string(), flags, true, true);
             return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
@@ -6070,6 +6203,11 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
         };
         return d.send_to(&data, to.as_deref());
     }
+    if let Ok(sock) = io.netlink_of(fd) {
+        let to = if dest != 0 && dest_len != 0 { Some(FdIo::read_sockaddr_nl(m, dest, dest_len)?) } else { None };
+        let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
+        return sock.send(io.netlink_sender(), to, &data);
+    }
     if dest != 0 {
         if let Ok(sock) = io.socket_of(fd) {
             let bytes = m.read(dest, 16)?.to_vec();
@@ -6100,6 +6238,13 @@ fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, fl
         const MSG_TRUNC: u64 = 0x20;
         return Ok(if flags & MSG_TRUNC != 0 { whole } else { n } as u64);
     }
+    if let Ok(sock) = io.netlink_of(fd) {
+        const MSG_TRUNC: u64 = 0x20;
+        let r = sock.recv(len, flags & Kernel::MSG_PEEK != 0)?;
+        m.write(buf, &r.data)?;
+        FdIo::write_sockaddr_nl(m, addr, addrlen, r.from, r.groups)?;
+        return Ok(if flags & MSG_TRUNC != 0 { r.whole } else { r.data.len() } as u64);
+    }
     // The read and the sender address it set, as one (`recv_turn`).
     let inet = if addr != 0 { io.socket_of(fd).ok() } else { None };
     let _turn = inet.as_ref().map(|s| s.recv_turn());
@@ -6118,6 +6263,87 @@ fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, fl
     Ok(n)
 }
 
+/// `setsockopt` on a netlink socket. Its buffers' sizes are kept as Linux
+/// keeps them (twice what was asked, what was asked no more than the
+/// system's limit unless forced, which takes `CAP_NET_ADMIN`): Android's
+/// `ueventd` asks for a large receive buffer, reads it back, and forces it
+/// when it reads less than twice what it asked. `SO_PASSCRED` has each
+/// datagram carry its sender's credentials. Any other `SOL_SOCKET` option
+/// is agreed to without effect, as for the other sockets here.
+fn netlink_setsockopt(io: &FdIo<'_>, m: &GuestMem<'_>, sock: &crate::netlink::Socket, level: u64, name: u64, val: u64, len: u64) -> SysResult {
+    const SOL_SOCKET: u64 = 1;
+    const SO_SNDBUF: u64 = 7;
+    const SO_RCVBUF: u64 = 8;
+    const SO_PASSCRED: u64 = 16;
+    const SO_SNDBUFFORCE: u64 = 32;
+    const SO_RCVBUFFORCE: u64 = 33;
+    const CAP_NET_ADMIN: u64 = 12;
+    if level == crate::netlink::SOL_NETLINK {
+        let v = if len >= 4 { m.read_u32(val)? } else { 0 };
+        return sock.set_option(name, v).map(|_| 0);
+    }
+    if level != SOL_SOCKET {
+        return Err(Errno::ENOPROTOOPT);
+    }
+    if !matches!(name, SO_SNDBUF | SO_RCVBUF | SO_PASSCRED | SO_SNDBUFFORCE | SO_RCVBUFFORCE) {
+        return Ok(0);
+    }
+    if len < 4 {
+        return Err(Errno::EINVAL);
+    }
+    let v = m.read_u32(val)? as i32;
+    let force = matches!(name, SO_SNDBUFFORCE | SO_RCVBUFFORCE);
+    if force && !io.creds.capable(CAP_NET_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    match name {
+        SO_RCVBUF | SO_RCVBUFFORCE => sock.set_rcvbuf(v, force),
+        SO_SNDBUF | SO_SNDBUFFORCE => sock.set_sndbuf(v, force),
+        _ => sock.set_passcred(v != 0),
+    }
+    Ok(0)
+}
+
+/// `getsockopt` on a netlink socket, for the options it keeps itself:
+/// `None` for one that reads as any socket's does.
+fn netlink_getsockopt(m: &mut GuestMem<'_>, sock: &crate::netlink::Socket, level: u64, name: u64, val: u64, optlen: u64) -> Option<SysResult> {
+    const SOL_SOCKET: u64 = 1;
+    const SO_SNDBUF: u64 = 7;
+    const SO_RCVBUF: u64 = 8;
+    const SO_PASSCRED: u64 = 16;
+    let v = if level == crate::netlink::SOL_NETLINK {
+        // The groups it listens to, a word of 32.
+        let v = if name == crate::netlink::option::LIST_MEMBERSHIPS { Ok(sock.name().1) } else { sock.option(name) };
+        match v {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        }
+    } else if level == SOL_SOCKET {
+        match name {
+            SO_SNDBUF => sock.sndbuf(),
+            SO_RCVBUF => sock.rcvbuf(),
+            SO_PASSCRED => sock.passcred() as u32,
+            _ => return None,
+        }
+    } else {
+        return Some(Err(Errno::ENOPROTOOPT));
+    };
+    let write = |m: &mut GuestMem<'_>| -> SysResult {
+        let room = if optlen != 0 { m.read_u32(optlen)? as usize } else { 4 };
+        if level == crate::netlink::SOL_NETLINK && room < 4 && name != crate::netlink::option::LIST_MEMBERSHIPS {
+            return Err(Errno::EINVAL);
+        }
+        if val != 0 {
+            m.write(val, &v.to_le_bytes()[..room.min(4)])?;
+        }
+        if optlen != 0 {
+            m.write_u32(optlen, if level == crate::netlink::SOL_NETLINK { 4 } else { room.min(4) as u32 })?;
+        }
+        Ok(0)
+    };
+    Some(write(m))
+}
+
 /// The family and type of the socket behind `fd`.
 fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     const AF_INET: u64 = 2;
@@ -6129,6 +6355,9 @@ fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     }
     if io.dgram_of(fd).is_ok() {
         return Ok((AF_UNIX, SOCK_DGRAM));
+    }
+    if let Ok(s) = io.netlink_of(fd) {
+        return Ok((16, s.kind()));
     }
     if io.unix_of(fd).is_ok() || io.remote_unix_of(fd).is_ok() {
         return Ok((AF_UNIX, SOCK_STREAM));
@@ -6154,7 +6383,7 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         let v = match name {
             SO_TYPE => ty as u64,
             SO_DOMAIN => family,
-            _ => 0,
+            _ => io.netlink_of(fd).map_or(0, |s| s.protocol() as u64),
         };
         if val != 0 {
             m.write_u32(val, v as u32)?;
@@ -6222,6 +6451,11 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         return Ok(0);
     }
     socket_family_type(io, fd)?;
+    if let Ok(sock) = io.netlink_of(fd) {
+        if let Some(r) = netlink_getsockopt(m, &sock, level, name, val, optlen) {
+            return r;
+        }
+    }
     // SO_PEERCRED: the far end's `struct ucred` (pid, uid, gid; 12 bytes on
     // every ABI), as it was when the two were joined. Every byte is written:
     // dbus-daemon reads the struct off its stack uninitialised and compares

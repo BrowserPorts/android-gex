@@ -515,6 +515,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// This handle as a netlink socket, when it is one.
+    fn as_netlink(self: Arc<Self>) -> Option<Arc<crate::netlink::Socket>> {
+        None
+    }
+
     /// This handle as an epoll set, when it is one: `epoll_ctl` and
     /// `epoll_pwait` recover the set from the descriptor's handle, with or
     /// without the kernel.
