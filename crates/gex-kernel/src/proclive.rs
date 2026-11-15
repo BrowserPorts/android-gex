@@ -104,6 +104,9 @@ impl ProcSource for KernelProcSource {
     fn pid(&self) -> i32 {
         self.0.get().map_or(0, |l| l.pid)
     }
+    fn mount_ns_id(&self) -> Option<u64> {
+        self.0.get().and_then(|l| l.vfs.upgrade()).map(|view| view.mount_ns().id())
+    }
     fn attr_ids(&self) -> Option<[u32; 6]> {
         self.0.get().map(|l| l.creds.sec())
     }

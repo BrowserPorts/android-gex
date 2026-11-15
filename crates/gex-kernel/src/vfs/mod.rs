@@ -541,6 +541,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_signalfd(self: Arc<Self>) -> Option<Arc<crate::signalfd::SignalFd>> {
         None
     }
+    /// A mount namespace, open as the file `/proc/<pid>/ns/mnt` is:
+    /// what `setns` enters.
+    fn as_mount_ns(self: Arc<Self>) -> Option<Arc<MountNs>> {
+        None
+    }
     /// An open of a binder device, whose ioctls need to know their caller
     /// and may wait ([`crate::binder::BinderFile::ioctl`]).
     fn as_binder(self: Arc<Self>) -> Option<Arc<crate::binder::BinderFile>> {
@@ -1085,25 +1090,73 @@ pub struct Vfs {
 /// process that has changed its root sees the mounts under that root, and
 /// a mount it makes is recorded where it is in the namespace.
 ///
+/// A namespace made as a copy of another is not wholly apart from it. A
+/// mount is private unless it is made shared, and what is mounted or
+/// unmounted under a shared mount happens in every namespace that has
+/// that mount too ([`Propagation`]): Android's init makes `/` shared and
+/// `/apex` private, and then keeps two namespaces that see each other's
+/// mounts everywhere but under `/apex`.
+///
 /// One for a kernel's processes. A host whose processes are each a
 /// kernel of their own (the page's) has one a process, as before: there
 /// nothing a process mounts is seen by another.
 pub struct MountNs {
-    table: std::sync::Mutex<BTreeMap<String, Arc<dyn FileSystem>>>,
+    table: std::sync::Mutex<BTreeMap<String, Mounted>>,
     changes: std::sync::atomic::AtomicU64,
     id: u64,
 }
 
+/// How what is mounted and unmounted under a mount spreads to the other
+/// namespaces that have the mount (`mount(2)`'s `MS_SHARED`, `MS_PRIVATE`,
+/// `MS_SLAVE` and `MS_UNBINDABLE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Propagation {
+    /// To every namespace that has this mount as a peer or a slave of it,
+    /// and from the peers to here.
+    Shared,
+    /// Nowhere, and nothing comes: what a mount is until it is made
+    /// otherwise.
+    Private,
+    /// From the peers it had to here, and nothing from here.
+    Slave,
+    /// As private (and not to be bound elsewhere, which nothing here does
+    /// yet).
+    Unbindable,
+}
+
+/// A mount in a namespace's table.
+#[derive(Clone)]
+struct Mounted {
+    fs: Arc<dyn FileSystem>,
+    /// The peer group it is in, if it is shared: the mounts in the other
+    /// namespaces that are this mount there.
+    group: Option<u64>,
+    /// The peer group it takes from without giving to, if it is a slave.
+    master: Option<u64>,
+}
+
+/// Every mount namespace there is, for a mount that spreads.
+static NAMESPACES: std::sync::Mutex<Vec<std::sync::Weak<MountNs>>> = std::sync::Mutex::new(Vec::new());
+
+fn next_group() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl MountNs {
-    fn new(table: BTreeMap<String, Arc<dyn FileSystem>>) -> Arc<MountNs> {
+    fn new(table: BTreeMap<String, Mounted>) -> Arc<MountNs> {
         // Numbered as Linux numbers a namespace's inode, from the first
         // number it gives out after the ones it keeps for its own.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xf000_0000);
-        Arc::new(MountNs {
+        let ns = Arc::new(MountNs {
             table: std::sync::Mutex::new(table),
             changes: std::sync::atomic::AtomicU64::new(0),
             id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        })
+        });
+        let mut all = NAMESPACES.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|ns| ns.strong_count() > 0);
+        all.push(Arc::downgrade(&ns));
+        ns
     }
 
     /// The number `/proc/<pid>/ns/mnt` shows for it: `mnt:[n]`.
@@ -1111,8 +1164,147 @@ impl MountNs {
         self.id
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<dyn FileSystem>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Mounted>> {
         self.table.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The filesystems, by where they are mounted.
+    fn filesystems(&self) -> BTreeMap<String, Arc<dyn FileSystem>> {
+        self.lock().iter().map(|(at, m)| (at.clone(), Arc::clone(&m.fs))).collect()
+    }
+
+    /// The namespaces there are now.
+    fn all() -> Vec<Arc<MountNs>> {
+        NAMESPACES.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    }
+
+    /// The mount `at` is in, other than one at `at` itself: where it is
+    /// mounted, and it.
+    fn parent<'a>(table: &'a BTreeMap<String, Mounted>, at: &str) -> Option<(&'a String, &'a Mounted)> {
+        table.iter().filter(|(k, _)| k.as_str() != at && (k.as_str() == "/" || within(at, k))).max_by_key(|(k, _)| k.len())
+    }
+
+    fn count(&self) {
+        self.changes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Mount `fs` at `at`, replacing what was mounted there (or, with
+    /// `unless_there`, leaving it: whether it mounted). Under a shared
+    /// mount it is mounted in every namespace that has that mount, as a
+    /// peer or as a slave, and is shared itself there.
+    fn mount(self: &Arc<Self>, at: String, fs: Arc<dyn FileSystem>, unless_there: bool) -> bool {
+        // Where it spreads is this namespace's to say: by the mount it is
+        // made under here.
+        let spread = {
+            let mut table = self.lock();
+            if unless_there && table.contains_key(&at) {
+                return false;
+            }
+            match Self::parent(&table, &at).map(|(k, m)| (k.clone(), m.group)) {
+                Some((parent, Some(group))) => (parent, group),
+                _ => {
+                    table.insert(at, Mounted { fs, group: None, master: None });
+                    self.count();
+                    return true;
+                }
+            }
+        };
+        let (parent, group) = spread;
+        let new = next_group();
+        for ns in Self::all() {
+            let mut table = ns.lock();
+            let mounted = match Self::parent(&table, &at) {
+                Some((k, m)) if *k == parent && m.group == Some(group) => Mounted { fs: Arc::clone(&fs), group: Some(new), master: None },
+                Some((k, m)) if *k == parent && m.master == Some(group) => Mounted { fs: Arc::clone(&fs), group: None, master: Some(new) },
+                _ => continue,
+            };
+            table.insert(at.clone(), mounted);
+            ns.count();
+        }
+        true
+    }
+
+    /// Remove the mount at exactly `at`: whether there was one. Under a
+    /// shared mount it goes from every namespace that has that mount and
+    /// this one under it.
+    fn unmount(self: &Arc<Self>, at: &str) -> bool {
+        let (parent, group, gone) = {
+            let mut table = self.lock();
+            let Some(gone) = table.get(at).cloned() else { return false };
+            match Self::parent(&table, at).map(|(k, m)| (k.clone(), m.group)) {
+                Some((parent, Some(group))) => (parent, group, gone),
+                _ => {
+                    table.remove(at);
+                    self.count();
+                    return true;
+                }
+            }
+        };
+        for ns in Self::all() {
+            let mut table = ns.lock();
+            let under = matches!(Self::parent(&table, at), Some((k, m)) if *k == parent && (m.group == Some(group) || m.master == Some(group)));
+            // The same mount there: the filesystem that spread with it.
+            let same = table.get(at).is_some_and(|m| Arc::ptr_eq(&m.fs, &gone.fs));
+            if same && (under || Arc::ptr_eq(&ns, self)) {
+                table.remove(at);
+                ns.count();
+            }
+        }
+        true
+    }
+
+    /// Change how the mount at exactly `at` spreads, and with `recursive`
+    /// every mount under it: `false` where nothing is mounted at `at`.
+    fn set_propagation(&self, at: &str, kind: Propagation, recursive: bool) -> bool {
+        let mut table = self.lock();
+        if !table.contains_key(at) {
+            return false;
+        }
+        let which: Vec<String> = table.keys().filter(|k| k.as_str() == at || (recursive && (at == "/" || within(k, at)))).cloned().collect();
+        for k in which {
+            let m = table.get_mut(&k).expect("a key of the table");
+            match kind {
+                // A group of its own, which a copy of the namespace then
+                // has too.
+                Propagation::Shared => {
+                    if m.group.is_none() {
+                        m.group = Some(next_group());
+                    }
+                }
+                Propagation::Private | Propagation::Unbindable => (m.group, m.master) = (None, None),
+                // What it shared with, it now only takes from.
+                Propagation::Slave => {
+                    if let Some(group) = m.group.take() {
+                        m.master = Some(group);
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+/// A mount namespace as an open file (`/proc/<pid>/ns/mnt`): nothing to
+/// read, a regular file whose inode is the namespace's number, and the
+/// namespace for as long as it is open, whatever becomes of the processes
+/// that were in it.
+pub struct MountNsFile(pub Arc<MountNs>);
+
+impl std::fmt::Debug for MountNsFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mnt:[{}]", self.0.id())
+    }
+}
+
+impl FileHandle for MountNsFile {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
+        Err(Errno::EINVAL)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o444, ino: self.0.id(), mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+    }
+    fn as_mount_ns(self: Arc<Self>) -> Option<Arc<MountNs>> {
+        Some(Arc::clone(&self.0))
     }
 }
 
@@ -1146,6 +1338,18 @@ pub struct VfsView {
 impl VfsView {
     /// A picture, `ns`, of the namespace `shared` as it was at its
     /// change `seen`.
+    /// Change how the mount at `at` spreads ([`Propagation`]), and with
+    /// `recursive` every mount under it. `false` where nothing is mounted
+    /// there. One of the process's own mounts spreads nowhere, whatever is
+    /// asked.
+    pub fn set_propagation(&self, at: &str, kind: Propagation, recursive: bool) -> bool {
+        self.sync();
+        let cur = self.cur.read(crate::sync::me() as usize, Arc::clone);
+        let outer = cur.outer_path(&normalize(at, &cur.cwd)).into_owned();
+        let own = self.own().contains_key(&outer);
+        self.mount_ns().set_propagation(&outer, kind, recursive) || own
+    }
+
     fn new(ns: &Namespace, shared: Arc<MountNs>, seen: u64, own: BTreeMap<String, Arc<dyn FileSystem>>) -> VfsView {
         VfsView {
             cur: gex_atomic::rcu::Published::new(Arc::new(ns.clone()), crate::file::FD_READER_SLOTS),
@@ -1196,7 +1400,7 @@ impl VfsView {
                 return (None, false);
             }
             let mut ns = Namespace::new();
-            ns.mounts = shared.lock().clone();
+            ns.mounts = shared.filesystems();
             ns.mounts.extend(self.own().iter().map(|(at, fs)| (at.clone(), Arc::clone(fs))));
             ns.list_others();
             // From the process's root, where that is not the namespace's.
@@ -1222,7 +1426,10 @@ impl VfsView {
     pub fn unshare(&self) {
         self.sync();
         let mut shared = self.shared.write().unwrap_or_else(|e| e.into_inner());
-        let copy = MountNs::new(shared.lock().clone());
+        // A copy with every mount as it is there, the shared ones peers of
+        // the ones they are copies of.
+        let table = shared.lock().clone();
+        let copy = MountNs::new(table);
         // The copy is at its first count, and the picture is of it.
         self.seen.store(0, std::sync::atomic::Ordering::Release);
         *shared = copy;
@@ -1235,7 +1442,7 @@ impl VfsView {
         let now = ns.changes.load(std::sync::atomic::Ordering::Acquire);
         self.cur.write(|_| {
             let mut fresh = Namespace::new();
-            fresh.mounts = ns.lock().clone();
+            fresh.mounts = ns.filesystems();
             fresh.mounts.extend(self.own().iter().map(|(at, fs)| (at.clone(), Arc::clone(fs))));
             fresh.list_others();
             self.seen.store(now, std::sync::atomic::Ordering::Release);
@@ -1269,29 +1476,41 @@ impl VfsView {
         self.changed.id()
     }
 
+    /// Where `at` (absolute, or relative to the published directory) is
+    /// in the namespace: this process's root is not always the
+    /// namespace's.
+    fn outer(&self, at: &str) -> String {
+        self.sync();
+        let cur = self.cur.read(crate::sync::me() as usize, Arc::clone);
+        cur.outer_path(&normalize(at, &cur.cwd)).into_owned()
+    }
+
     /// Mount `fs` at `at` (absolute, or relative to the published
     /// directory), replacing what was mounted there: in the namespace,
-    /// for every process in it.
+    /// for every process in it, and wherever it spreads to.
     pub fn mount(&self, at: &str, fs: Arc<dyn FileSystem>) {
-        self.change(|table, cur| {
-            table.insert(cur.outer_path(&normalize(at, &cur.cwd)).into_owned(), fs);
-            true
-        });
+        let at = self.outer(at);
+        self.mount_ns().mount(at, fs, false);
+        self.sync();
     }
 
     /// Remove the mount at exactly `path` (absolute). The root mount
     /// stays: a guest that unmounts `/` has nothing left to run from.
     pub fn unmount(&self, path: &str) -> bool {
-        self.change(|table, cur| {
-            let at = normalize(path, &cur.cwd);
-            if at == "/" {
-                return false;
-            }
-            // One of the process's own goes for the process alone; what
-            // the namespace has under it shows again.
-            let outer = cur.outer_path(&at);
-            self.own().remove(outer.as_ref()).is_some() | table.remove(outer.as_ref()).is_some()
-        })
+        if normalize(path, "/") == "/" {
+            return false;
+        }
+        let at = self.outer(path);
+        // One of the process's own goes for the process alone; what the
+        // namespace has under it shows again.
+        let gone = if self.own().remove(&at).is_some() {
+            self.seen.store(u64::MAX, std::sync::atomic::Ordering::Release);
+            true
+        } else {
+            self.mount_ns().unmount(&at)
+        };
+        self.sync();
+        gone
     }
 
     /// [`Namespace::chroot`] of the namespace as published: this
@@ -1318,38 +1537,13 @@ impl VfsView {
     /// Mount `fs` at `at` unless something is mounted there already:
     /// whether it did.
     pub fn mount_unless_there(&self, at: &str, fs: impl FnOnce() -> Arc<dyn FileSystem>) -> bool {
-        self.change(|table, cur| {
-            let at = cur.outer_path(&normalize(at, &cur.cwd)).into_owned();
-            if table.contains_key(&at) {
-                return false;
-            }
-            table.insert(at, fs());
-            true
-        })
-    }
-
-    /// A change `f` makes to the namespace's mount table, given this
-    /// process's picture for where its paths are: counted if it says it
-    /// made one, and this picture brought up to date (every other
-    /// process's follows at its next look).
-    fn change(&self, f: impl FnOnce(&mut BTreeMap<String, Arc<dyn FileSystem>>, &Namespace) -> bool) -> bool {
-        self.sync();
-        let shared = self.mount_ns();
-        let cur = self.cur.read(crate::sync::me() as usize, Arc::clone);
-        let changed = {
-            let mut table = shared.lock();
-            let changed = f(&mut table, &cur);
-            // Counted with the table held: a picture made at a count has
-            // every change up to it.
-            if changed {
-                shared.changes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            }
-            changed
-        };
-        if changed {
-            self.sync();
+        let at = self.outer(at);
+        if self.own().contains_key(&at) || self.mount_ns().lock().contains_key(&at) {
+            return false;
         }
-        changed
+        let mounted = self.mount_ns().mount(at, fs(), true);
+        self.sync();
+        mounted
     }
 }
 
@@ -2340,6 +2534,76 @@ mod tests {
         jailed.join_mounts(apart.view().mount_ns());
         assert!(jailed.is_mount_point("/d") && jailed.is_mount_point("/jail/in") && !jailed.is_mount_point("/a"));
         assert_eq!((jailed.root(), jailed.cwd.as_str()), ("/", "/"));
+    }
+
+    /// What is mounted under a shared mount is mounted in every namespace
+    /// that has that mount, and unmounted from them all; under a private
+    /// one it is the namespace's own; a slave takes and does not give
+    /// (the reference's rules: Documentation/filesystems/sharedsubtree.rst).
+    #[test]
+    fn a_mount_under_a_shared_mount_spreads() {
+        let fs = || Arc::new(TmpFs::new()) as Arc<dyn FileSystem>;
+        let mut one = Vfs::new();
+        one.mount("/", fs());
+        one.mount("/s", fs());
+        one.mount("/p", fs());
+        assert!(one.view().set_propagation("/s", Propagation::Shared, false));
+        assert!(!one.view().set_propagation("/nothing", Propagation::Shared, false));
+        let mut two = one.clone();
+        two.unshare_mounts();
+        let look = |a: &mut Vfs, b: &mut Vfs| {
+            a.refresh();
+            b.refresh();
+        };
+        // Under the shared mount: both; under the private ones: its own.
+        two.mount("/s/x", fs());
+        two.mount("/p/x", fs());
+        two.mount("/y", fs());
+        look(&mut one, &mut two);
+        assert!(one.is_mount_point("/s/x") && !one.is_mount_point("/p/x") && !one.is_mount_point("/y"));
+        one.mount("/s/z", fs());
+        look(&mut one, &mut two);
+        assert!(two.is_mount_point("/s/z"));
+        // What spread is shared in its turn, and an unmount spreads as the
+        // mount did.
+        one.mount("/s/x/deep", fs());
+        look(&mut one, &mut two);
+        assert!(two.is_mount_point("/s/x/deep"));
+        assert!(two.unmount("/s/z"));
+        look(&mut one, &mut two);
+        assert!(!one.is_mount_point("/s/z") && one.is_mount_point("/s/x"));
+        // A third namespace, a copy of the second, is a peer too.
+        let mut three = two.clone();
+        three.unshare_mounts();
+        three.mount("/s/w", fs());
+        look(&mut one, &mut two);
+        assert!(one.is_mount_point("/s/w") && two.is_mount_point("/s/w"));
+        // A slave takes what its peers mount and gives nothing.
+        assert!(two.view().set_propagation("/s", Propagation::Slave, false));
+        one.mount("/s/from-one", fs());
+        two.mount("/s/from-two", fs());
+        look(&mut one, &mut two);
+        three.refresh();
+        assert!(two.is_mount_point("/s/from-one") && !one.is_mount_point("/s/from-two") && !three.is_mount_point("/s/from-two"));
+        // Private again: nothing comes or goes.
+        assert!(two.view().set_propagation("/s", Propagation::Private, false));
+        one.mount("/s/later", fs());
+        look(&mut one, &mut two);
+        assert!(!two.is_mount_point("/s/later"));
+        // Everything shared, as Android's init makes it, but one mount
+        // made private after: the namespaces meet everywhere but there.
+        let mut init = Vfs::new();
+        init.mount("/", fs());
+        init.mount("/apex", fs());
+        assert!(init.view().set_propagation("/", Propagation::Shared, true));
+        assert!(init.view().set_propagation("/apex", Propagation::Private, false));
+        let mut other = init.clone();
+        other.unshare_mounts();
+        other.mount("/data", fs());
+        other.mount("/apex/com.android.art", fs());
+        init.mount("/apex/com.android.runtime", fs());
+        look(&mut init, &mut other);
+        assert!(init.is_mount_point("/data") && !init.is_mount_point("/apex/com.android.art") && !other.is_mount_point("/apex/com.android.runtime"));
     }
 
     /// `chroot`: the root a directory of the old one's filesystem, its

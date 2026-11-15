@@ -48,6 +48,7 @@ pub mod nr {
     pub const CHDIR: u64 = 49;
     pub const FCHDIR: u64 = 50;
     pub const UNSHARE: u64 = 97;
+    pub const SETNS: u64 = 268;
     pub const FCHMOD: u64 = 52;
     pub const FCHMODAT: u64 = 53;
     pub const SETXATTR: u64 = 5;
@@ -3637,6 +3638,17 @@ impl PathIo<'_> {
             if let Some(n) = self.magic_fd(&p) {
                 return self.reopen_fd(n, flags, mode);
             }
+            // The process's mount namespace, as the file its link in
+            // /proc opens (the link reads `mnt:[n]`, which names nothing
+            // to follow): for `setns`.
+            if p == "/proc/self/ns/mnt" || p == "/proc/thread-self/ns/mnt" || p == format!("/proc/{}/ns/mnt", self.pid) {
+                if crate::vfs::writes(flags) {
+                    return Err(Errno::EPERM);
+                }
+                let handle = Arc::new(crate::vfs::MountNsFile(self.view.mount_ns()));
+                let cloexec = flags & oflags::O_CLOEXEC != 0;
+                return self.map.fds.insert(OpenFile::new(handle, p, flags, true, false), cloexec);
+            }
         }
         // `O_TMPFILE` names a directory and asks for an unnamed file inside
         // it: made, opened, and unlinked at once, so the handle is the only
@@ -4573,6 +4585,25 @@ impl PathIo<'_> {
         if n == nr::CHROOT {
             return self.chroot(m, a[0]);
         }
+        // `setns(fd, type)`: into the mount namespace `fd` is, which is
+        // the only kind there is here; its root is then the process's
+        // root and directory. It takes `CAP_SYS_ADMIN` and
+        // `CAP_SYS_CHROOT`. The process's, where Linux moves the calling
+        // thread alone.
+        if n == nr::SETNS {
+            const CAP_SYS_CHROOT: u64 = 18;
+            const CAP_SYS_ADMIN: u64 = 21;
+            let ns = Arc::clone(&self.map.fds.get(a[0] as i32)?.handle).as_mount_ns().ok_or(Errno::EINVAL)?;
+            if a[1] != 0 && a[1] != clone_flags::NEWNS {
+                return Err(Errno::EINVAL);
+            }
+            if !self.creds.capable(CAP_SYS_ADMIN) || !self.creds.capable(CAP_SYS_CHROOT) {
+                return Err(Errno::EPERM);
+            }
+            self.view.join(ns);
+            self.fs.set("/".to_string(), None);
+            return Ok(0);
+        }
         // A mount is at the directory its path leads to, links followed:
         // under any other name nothing would find it.
         if n == nr::UMOUNT2 {
@@ -4585,18 +4616,25 @@ impl PathIo<'_> {
         } else {
             String::from_utf8_lossy(&m.read_cstr(a[2], 64)?).into_owned()
         };
-        // A change of how a mount's own changes spread to other mount
-        // namespaces (`MS_SHARED` and its kin, with no type and no
-        // source): of what is mounted at the target, or `EINVAL`. There is
-        // nothing for it to change here, where no mount spreads anywhere
-        // (a process's mount table is its own, which is the opposite fault:
-        // Linux's is shared until it is unshared).
+        // A change of how a mount's own mounts spread to the other mount
+        // namespaces that have it (`MS_SHARED` and its kin, with no type
+        // and no source; with `MS_REC`, of every mount under it too): one
+        // of the four, of what is mounted at the target, or `EINVAL`.
+        const MS_REC: u64 = 1 << 14;
         const MS_UNBINDABLE: u64 = 1 << 17;
         const MS_PRIVATE: u64 = 1 << 18;
         const MS_SLAVE: u64 = 1 << 19;
         const MS_SHARED: u64 = 1 << 20;
         if a[3] & (MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED) != 0 {
-            return if self.ns.is_mount_point(&target) { Ok(0) } else { Err(Errno::EINVAL) };
+            use crate::vfs::Propagation;
+            let kind = match a[3] & (MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED) {
+                MS_SHARED => Propagation::Shared,
+                MS_PRIVATE => Propagation::Private,
+                MS_SLAVE => Propagation::Slave,
+                MS_UNBINDABLE => Propagation::Unbindable,
+                _ => return Err(Errno::EINVAL),
+            };
+            return if self.view.set_propagation(&target, kind, a[3] & MS_REC != 0) { Ok(0) } else { Err(Errno::EINVAL) };
         }
         // A remount or a bind of something already there changes nothing gex
         // models, and reporting failure would stop an init script that is in
@@ -7133,7 +7171,7 @@ fn cap_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, se
 /// `mount` and `umount2`: the namespace's mount table, which its
 /// published view ([`crate::vfs::VfsView`]) writes. Canonical.
 pub fn is_mount(n: u64) -> bool {
-    matches!(n, nr::MOUNT | nr::UMOUNT2 | nr::CHROOT)
+    matches!(n, nr::MOUNT | nr::UMOUNT2 | nr::CHROOT | nr::SETNS)
 }
 
 /// The calls on the calling thread's own state alone:
@@ -14568,6 +14606,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::CHDIR => "chdir",
         nr::FCHDIR => "fchdir",
         nr::UNSHARE => "unshare",
+        nr::SETNS => "setns",
         nr::FCHMOD => "fchmod",
         nr::FCHMODAT => "fchmodat",
         nr::SETXATTR => "setxattr",

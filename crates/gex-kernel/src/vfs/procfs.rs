@@ -30,6 +30,11 @@ pub trait ProcSource: Send + Sync {
     fn attr_writer(&self) -> Result<bool, Errno> {
         Err(Errno::EPERM)
     }
+    /// The number of the mount namespace the process is in, for the link
+    /// `ns/mnt` (`mnt:[n]`). `None`: a source that knows of none.
+    fn mount_ns_id(&self) -> Option<u64> {
+        None
+    }
     /// Set one of the process's SELinux ids.
     fn set_attr_id(&self, which: usize, sid: u32) {
         let _ = (which, sid);
@@ -672,6 +677,11 @@ impl FileSystem for ProcFs {
                 }
                 return Ok(Arc::new(GenDir { entries: out }));
             }
+            "self/ns" if self.source.mount_ns_id().is_some() => {
+                let mut out = base_entries();
+                out.push(DirEntry { name: "mnt".to_string(), file_type: FileType::Symlink, ino: 1 });
+                return Ok(Arc::new(GenDir { entries: out }));
+            }
             "sys" => vec!["fs", "kernel", "vm"],
             "sys/fs" => vec!["pipe-max-size"],
             "sys/kernel" => vec!["osrelease", "pid_max", "random"],
@@ -733,7 +743,8 @@ impl FileSystem for ProcFs {
         }
         match path.as_str() {
             "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/fs" | "sys/kernel" | "sys/kernel/random" | "sys/vm" => Ok(Metadata::dir()),
-            "self/exe" | "self/cwd" => Ok(Metadata {
+            "self/ns" if self.source.mount_ns_id().is_some() => Ok(Metadata { mode: 0o511, ..Metadata::dir() }),
+            "self/exe" | "self/cwd" | "self/ns/mnt" => Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: 0,
                 mode: 0o777,
@@ -756,6 +767,7 @@ impl FileSystem for ProcFs {
         let (path, _) = self.canonical(path)?;
         match path.as_str() {
             "self/exe" => Ok(self.source.exe()),
+            "self/ns/mnt" => self.source.mount_ns_id().map(|n| format!("mnt:[{n}]")).ok_or(Errno::ENOENT),
             "self/cwd" => Ok(self.source.cwd()),
             other => {
                 if let Some(n) = other.strip_prefix("self/fd/") {
