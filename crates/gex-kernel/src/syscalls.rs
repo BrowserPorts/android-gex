@@ -4636,13 +4636,27 @@ impl PathIo<'_> {
             };
             return if self.view.set_propagation(&target, kind, a[3] & MS_REC != 0) { Ok(0) } else { Err(Errno::EINVAL) };
         }
-        // A remount or a bind of something already there changes nothing gex
-        // models, and reporting failure would stop an init script that is in
-        // fact fine.
+        // A remount changes a mount's options, none of which gex models,
+        // and reporting failure would stop an init script that is in fact
+        // fine.
         const MS_REMOUNT: u64 = 32;
         const MS_BIND: u64 = 4096;
-        if a[3] & (MS_REMOUNT | MS_BIND) != 0 {
+        if a[3] & MS_REMOUNT != 0 {
             return Ok(0);
+        }
+        // A bind: what is at the source, a directory or a file, is at the
+        // target too, and with `MS_REC` so is everything mounted under
+        // it. Both have to be there.
+        if a[3] & MS_BIND != 0 {
+            if a[0] == 0 {
+                return Err(Errno::EINVAL);
+            }
+            let source = self.ns.mount_target(&self.at_path(m, AT_FDCWD, a[0])?);
+            let (from, to) = (self.ns.metadata(&source)?, self.ns.metadata(&target)?);
+            if (from.file_type == FileType::Directory) != (to.file_type == FileType::Directory) {
+                return Err(Errno::ENOTDIR);
+            }
+            return self.view.bind(&source, &target, a[3] & MS_REC != 0).map(|()| 0);
         }
         match fstype.as_str() {
             "tmpfs" | "ramfs" => {

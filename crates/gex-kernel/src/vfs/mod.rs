@@ -1534,6 +1534,32 @@ impl VfsView {
         err
     }
 
+    /// A bind mount: what is at `source` (absolute) is at `target` too,
+    /// and with `recursive` so is each thing mounted under it, where it
+    /// is from the source. The same files, not copies. (It spreads as any
+    /// mount made at the target does: Linux has it join the source's
+    /// peers when the source is shared, which is not kept.)
+    pub fn bind(&self, source: &str, target: &str, recursive: bool) -> Result<(), Errno> {
+        let cur = self.get();
+        let source = normalize(source, &cur.cwd);
+        let (fs, rel) = cur.mount_of(source.clone())?;
+        let root: Arc<dyn FileSystem> = if rel.is_empty() { Arc::clone(fs) } else { Arc::new(subtree::Subtree::new(Arc::clone(fs), &rel)) };
+        // What is mounted under the source now: looked up before anything
+        // is mounted, since the target may be under the source itself.
+        let under: Vec<(String, Arc<dyn FileSystem>)> = if recursive {
+            let inside = |at: &str| at != source && (source == "/" || within(at, &source));
+            cur.mounts.iter().filter(|(at, _)| inside(at)).map(|(at, fs)| (if source == "/" { at.clone() } else { at[source.len()..].to_string() }, Arc::clone(fs))).collect()
+        } else {
+            Vec::new()
+        };
+        let target = normalize(target, &cur.cwd);
+        self.mount(&target, root);
+        for (rest, fs) in under {
+            self.mount(&format!("{}{rest}", target.trim_end_matches('/')), fs);
+        }
+        Ok(())
+    }
+
     /// Mount `fs` at `at` unless something is mounted there already:
     /// whether it did.
     pub fn mount_unless_there(&self, at: &str, fs: impl FnOnce() -> Arc<dyn FileSystem>) -> bool {
@@ -2534,6 +2560,47 @@ mod tests {
         jailed.join_mounts(apart.view().mount_ns());
         assert!(jailed.is_mount_point("/d") && jailed.is_mount_point("/jail/in") && !jailed.is_mount_point("/a"));
         assert_eq!((jailed.root(), jailed.cwd.as_str()), ("/", "/"));
+    }
+
+    /// A bind mount shows what is at one place at another: the same
+    /// files, with what is mounted under it only when that is asked for.
+    #[test]
+    fn a_bind_shows_a_directory_in_another_place() {
+        let root = Arc::new(TmpFs::new());
+        for dir in ["src", "src/sub", "dst", "all"] {
+            root.add_dir(dir);
+        }
+        root.add_file("src/file", b"here".to_vec());
+        let sub = Arc::new(TmpFs::new());
+        sub.add_file("inner", b"deep".to_vec());
+        let mut v = Vfs::new();
+        v.mount("/", root);
+        v.mount("/src/sub", sub);
+        let read = |v: &Vfs, p: &str| {
+            let h = v.open(p, 0, 0).map_err(|e| e.0)?;
+            let mut b = [0u8; 16];
+            let n = h.read_at(0, &mut b).map_err(|e| e.0)?;
+            Ok::<_, i32>(String::from_utf8_lossy(&b[..n as usize]).into_owned())
+        };
+        v.view().bind("/src", "/dst", false).unwrap();
+        v.refresh();
+        assert!(v.is_mount_point("/dst"));
+        assert_eq!(read(&v, "/dst/file").unwrap(), "here");
+        assert!(read(&v, "/dst/sub/inner").is_err(), "what is mounted under it does not come unasked");
+        // The same files: what is made through one is in the other.
+        v.open("/dst/new", crate::fs::oflags::O_CREAT | crate::fs::oflags::O_WRONLY, 0o644).unwrap().write_at(0, b"made").unwrap();
+        assert_eq!(read(&v, "/src/new").unwrap(), "made");
+        v.view().bind("/src", "/all", true).unwrap();
+        v.refresh();
+        assert_eq!((read(&v, "/all/file").unwrap(), read(&v, "/all/sub/inner").unwrap()), ("here".to_string(), "deep".to_string()));
+        assert!(v.is_mount_point("/all/sub"));
+        // A whole filesystem bound is that filesystem; and nothing bound
+        // from nothing.
+        v.view().bind("/src/sub", "/dst", false).unwrap();
+        v.refresh();
+        assert_eq!(read(&v, "/dst/inner").unwrap(), "deep");
+        assert!(v.unmount("/dst") && v.unmount("/all/sub") && v.unmount("/all"));
+        assert_eq!(read(&v, "/src/file").unwrap(), "here");
     }
 
     /// What is mounted under a shared mount is mounted in every namespace

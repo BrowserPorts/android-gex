@@ -8,6 +8,8 @@
 //   after that nobody else sees.
 // - Under a mount that has been made shared, what it mounts is mounted in
 //   the namespace it left as well; made private again, it is not.
+// - A bind mount shows a directory at another place too: the same files,
+//   and what is mounted under it only with MS_REC.
 // - A namespace is a file, /proc/self/ns/mnt, a link that reads mnt:[n]:
 //   another namespace has another number, and setns on the file opened
 //   puts a process back in the namespace it is.
@@ -178,6 +180,25 @@ int main(void) {
     wait_ok(pid, "the child that mounts under a private mount");
     if (there("q/made")) die("a mount under a private mount, seen from another namespace", 0, 0);
     close(ns);
+
+    // A bind mount: a directory at another place too, the same files,
+    // with what is mounted under it only when that is asked for.
+    if (mkdir(in("src"), 0755) || mkdir(in("src/sub"), 0755) || mkdir(in("dst"), 0755) || mkdir(in("all"), 0755)) die("mkdir", 0, 0);
+    touch("src/file");
+    if (mount("tmpfs", in("src/sub"), "tmpfs", 0, NULL)) die("mount", 0, 0);
+    touch("src/sub/inner");
+    if (mount(NULL, in("dst"), NULL, MS_PRIVATE, NULL) != -1 || errno != EINVAL) die("propagation of a directory not yet bound", errno, EINVAL);
+    if (mount(in("src"), in("dst"), NULL, MS_BIND, NULL)) die("bind", 0, 0);
+    if (!there("dst/file") || !there("dst/sub") || there("dst/sub/inner")) die("what a bind shows", there("dst/file"), there("dst/sub/inner"));
+    touch("dst/new");
+    if (!there("src/new")) die("a file made through the bind", 0, 0);
+    if (mount(NULL, in("dst"), NULL, MS_PRIVATE, NULL)) die("propagation of a bind", 0, 0);
+    if (mount(in("src"), in("all"), NULL, MS_BIND | MS_REC, NULL)) die("bind with what is under it", 0, 0);
+    if (!there("all/file") || !there("all/sub/inner")) die("what a recursive bind shows", there("all/file"), there("all/sub/inner"));
+    if (mount(in("nothing"), in("dst"), NULL, MS_BIND, NULL) != -1 || errno != ENOENT) die("a bind of nothing", errno, ENOENT);
+    if (mount(in("src/file"), in("dst"), NULL, MS_BIND, NULL) != -1 || errno != ENOTDIR) die("a file bound on a directory", errno, ENOTDIR);
+    if (umount(in("all/sub")) || umount(in("all")) || umount(in("dst")) || umount(in("src/sub"))) die("umount of the binds", 0, 0);
+    if (!there("src/file") || there("dst/file")) die("the source after its binds are gone", 0, 0);
 
     if (umount(in("s")) || umount(in("a")) || umount(in("b")) || umount(dir)) die("umount", 0, 0);
     rmdir(dir);
