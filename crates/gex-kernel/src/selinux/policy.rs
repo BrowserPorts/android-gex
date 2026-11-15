@@ -69,6 +69,63 @@ pub const POLICY_CAPABILITIES: [&str; 14] = [
     "memfd_class",
 ];
 
+/// How a filesystem labels its files (`SECURITY_FS_USE_*`).
+pub mod fs_use {
+    /// By each file's `security.selinux` attribute.
+    pub const XATTR: u32 = 1;
+    /// As a transition from its maker's context and the filesystem's
+    /// (devpts, tmpfs).
+    pub const TRANS: u32 = 2;
+    /// As its maker (pipes, sockets).
+    pub const TASK: u32 = 3;
+    /// By `genfscon`, from its path.
+    pub const GENFS: u32 = 4;
+    /// Not at all.
+    pub const NONE: u32 = 5;
+    /// As the mount says (`context=`).
+    pub const MNTPOINT: u32 = 6;
+    /// By the filesystem's own labels (NFS).
+    pub const NATIVE: u32 = 7;
+}
+
+/// The kernel's `match_wildcard` (lib/parser.c): whether all of `text`
+/// matches `pattern`, where `*` is any run of bytes and `?` any one.
+pub fn wildcard_matches(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut s) = (0, 0);
+    // Where to take up again after a `*`: in the pattern, in the text.
+    let mut star: Option<(usize, usize)> = None;
+    while s < text.len() {
+        match pattern.get(p) {
+            Some(b'?') => {
+                s += 1;
+                p += 1;
+            }
+            Some(b'*') => {
+                p += 1;
+                if p == pattern.len() {
+                    return true;
+                }
+                star = Some((p, s));
+            }
+            c => {
+                if c == Some(&text[s]) {
+                    s += 1;
+                    p += 1;
+                } else {
+                    let Some((after, from)) = star else { return false };
+                    star = Some((after, from + 1));
+                    s = from + 1;
+                    p = after;
+                }
+            }
+        }
+    }
+    if pattern.get(p) == Some(&b'*') {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
 /// What an access vector table entry says (`AVTAB_*`).
 pub mod av {
     pub const ALLOWED: u16 = 0x0001;
@@ -923,6 +980,49 @@ impl Policy {
         let mut all: Vec<(u32, &str)> = common.into_iter().flat_map(|c| c.perms.iter()).chain(c.perms.iter()).map(|(name, &n)| (n, name.as_str())).collect();
         all.sort();
         all
+    }
+
+    /// How a filesystem of type `fstype` labels its files
+    /// ([`fs_use`]), and the context the filesystem itself has
+    /// (`security_fs_use`): what an `fs_use_*` rule says; or, with none,
+    /// by `genfscon`, the filesystem's context being what genfscon gives
+    /// its root directory; or, with neither, not at all, when the
+    /// filesystem is unlabeled (`None`).
+    pub fn fs_use(&self, fstype: &str) -> (u32, Option<&Context>) {
+        for c in &self.fs_use {
+            if let OContext::FsUse { behavior, fstype: f, context } = c {
+                if f == fstype {
+                    return (*behavior, Some(context));
+                }
+            }
+        }
+        match self.class_named("dir").and_then(|dir| self.genfs_context(fstype, "/", dir)) {
+            Some(context) => (fs_use::GENFS, Some(context)),
+            None => (fs_use::NONE, None),
+        }
+    }
+
+    /// The context `genfscon` gives the file at `path` (from its
+    /// filesystem's root, with a leading slash) of a filesystem of type
+    /// `fstype`, as a `class` (`__security_genfs_sid`): the first rule of
+    /// the filesystem's, longest path first, that is for the class or
+    /// for any and whose path the file's begins with; with the
+    /// `genfs_seclabel_wildcard` capability, whose pattern (`*`, `?`) the
+    /// whole path matches. `None` where no rule does: the file is
+    /// unlabeled.
+    pub fn genfs_context(&self, fstype: &str, path: &str, class: u32) -> Option<&Context> {
+        /// `POLICYDB_CAP_GENFS_SECLABEL_WILDCARD`.
+        const CAP_GENFS_SECLABEL_WILDCARD: u32 = 11;
+        let mut path = path;
+        while path.starts_with("//") {
+            path = &path[1..];
+        }
+        let (_, rules) = self.genfs.iter().find(|(f, _)| f == fstype)?;
+        let wildcard = self.policycaps.get(CAP_GENFS_SECLABEL_WILDCARD);
+        rules
+            .iter()
+            .find(|r| (r.class == 0 || r.class == class) && if wildcard { wildcard_matches(r.path.as_bytes(), path.as_bytes()) } else { path.starts_with(r.path.as_str()) })
+            .map(|r| &r.context)
     }
 
     fn level_ok(&self, l: &Level) -> bool {
@@ -1959,6 +2059,53 @@ mod tests {
         let asked = replay(&Policy::read(&policy).unwrap(), &answers);
         assert!(asked > 0);
         println!("{asked} questions, each answered as the kernel answered it");
+    }
+
+    /// The labelling rules of test.conf, from the reference's lookups
+    /// (not yet seen on a kernel's files): `fs_use_*` by type, `genfscon`
+    /// by the longest path a file's begins with, for its class.
+    #[test]
+    fn a_filesystem_is_labelled_as_the_policy_says() {
+        let p = Policy::read(V33).unwrap();
+        let text = |c: Option<&Context>| c.map(|c| p.context_string(c));
+        let (file, dir) = (p.class_named("file").unwrap(), p.class_named("dir").unwrap());
+        assert_eq!((p.fs_use("ext4").0, text(p.fs_use("ext4").1).as_deref()), (fs_use::XATTR, Some("system_u:object_r:file_t:s0")));
+        assert_eq!((p.fs_use("pipefs").0, text(p.fs_use("pipefs").1).as_deref()), (fs_use::TASK, Some("system_u:object_r:tmp_t:s0")));
+        assert_eq!((p.fs_use("devpts").0, text(p.fs_use("devpts").1).as_deref()), (fs_use::TRANS, Some("system_u:object_r:tmp_t:s0")));
+        // No fs_use rule: by genfscon, the filesystem being its root.
+        assert_eq!((p.fs_use("proc").0, text(p.fs_use("proc").1).as_deref()), (fs_use::GENFS, Some("system_u:object_r:file_t:s0")));
+        assert_eq!((p.fs_use("selinuxfs").0, text(p.fs_use("selinuxfs").1).as_deref()), (fs_use::GENFS, Some("system_u:object_r:tmp_t:s0")));
+        // Neither: not labelled.
+        assert_eq!(p.fs_use("vfat"), (fs_use::NONE, None));
+        let genfs = |path: &str, class: u32| text(p.genfs_context("proc", path, class));
+        assert_eq!(genfs("/cpuinfo", file).as_deref(), Some("system_u:object_r:file_t:s0"));
+        assert_eq!(genfs("/sys/vm/overcommit_memory", file).as_deref(), Some("system_u:object_r:tmp_t:s0"));
+        // The rule for /sys/kernel is for files alone.
+        assert_eq!(genfs("/sys/kernel/hostname", file).as_deref(), Some("system_u:object_r:exec_t:s0"));
+        assert_eq!(genfs("/sys/kernel", dir).as_deref(), Some("system_u:object_r:tmp_t:s0"));
+        // A path begins with a rule's as text does: /sysvipc with /sys.
+        assert_eq!(genfs("/sysvipc/shm", file).as_deref(), Some("system_u:object_r:tmp_t:s0"));
+        assert_eq!(genfs("//cpuinfo", file).as_deref(), Some("system_u:object_r:file_t:s0"));
+        assert_eq!(p.genfs_context("vfat", "/x", file), None);
+    }
+
+    /// `match_wildcard`, as lib/parser.c has it.
+    #[test]
+    fn a_wildcard_matches_the_whole_text() {
+        for (pattern, text, want) in [
+            ("/sys*", "/sys/kernel", true),
+            ("/sys", "/sys/kernel", false),
+            ("/sys/*/x", "/sys/a/b/x", true),
+            ("/sys/?", "/sys/a", true),
+            ("/sys/?", "/sys/ab", false),
+            ("*", "", true),
+            ("", "", true),
+            ("a*b*c", "aXbYbZc", true),
+            ("a*b*c", "aXbYbZ", false),
+            ("/proc/*/net*", "/proc/1/net/rpc", true),
+        ] {
+            assert_eq!(wildcard_matches(pattern.as_bytes(), text.as_bytes()), want, "{pattern} {text}");
+        }
     }
 
     #[test]
