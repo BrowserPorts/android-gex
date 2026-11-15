@@ -45,6 +45,12 @@ pub fn secid_to_secctx(sid: u32) -> Result<Vec<u8>, crate::errno::Errno> {
     Ok([text.as_bytes(), b"\0"].concat())
 }
 
+/// Whether the kernel's security server has a policy: before one, no
+/// file has a label and nothing is asked of it.
+pub fn loaded() -> bool {
+    kernel_server().lock().unwrap_or_else(|e| e.into_inner()).policy().is_some()
+}
+
 /// The kernel's security server: the one every mount of selinuxfs is
 /// over, as Linux has one for the machine.
 pub fn kernel_server() -> Arc<Mutex<server::Server>> {

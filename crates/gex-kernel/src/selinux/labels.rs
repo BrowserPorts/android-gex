@@ -50,6 +50,19 @@ pub struct File<'a> {
     pub stored: Option<&'a [u8]>,
 }
 
+/// A file's class by what kind of file it is.
+pub fn class_of(kind: crate::vfs::FileType) -> &'static str {
+    use crate::vfs::FileType;
+    match kind {
+        FileType::Regular => "file",
+        FileType::Directory => "dir",
+        FileType::Symlink => "lnk_file",
+        FileType::CharDevice => "chr_file",
+        FileType::Fifo => "fifo_file",
+        FileType::Socket => "sock_file",
+    }
+}
+
 fn errno(e: Error) -> Errno {
     match e {
         Error::Invalid => Errno::EINVAL,

@@ -3418,19 +3418,23 @@ fn exec_program(
     // And the handlers, which are addresses in the image being replaced.
     // Every other thread is gone; their signal state with them.
     let tid = if kernel.sig_tid != 0 { kernel.sig_tid } else { kernel.tid };
-    kernel.exec_signals(tid);
     // `/proc/self/exe` is the file just loaded, by its guest path -- not
     // argv[0], which for a busybox applet run through `$PATH` is a bare `wc`
     // (and glibc's `$ORIGIN` handling asserts on a relative link).
     // (an exec of `/proc/self/exe` runs the program it links to, and that
     // is what the new image's link says too)
-    kernel.exe_path = if req.path == "/proc/self/exe" || req.path == format!("/proc/{}/exe", kernel.pid) {
+    let exe_path = if req.path == "/proc/self/exe" || req.path == format!("/proc/{}/exe", kernel.pid) {
         kernel.exe_path.clone()
     } else if req.path.starts_with('/') {
         req.path.clone()
     } else {
         format!("{}/{}", kernel.caller_cwd().trim_end_matches('/'), req.path)
     };
+    // SELinux's part first: what the process becomes by the program's
+    // label, where it asked for nothing itself.
+    kernel.exec_selinux(&exe_path);
+    kernel.exec_signals(tid);
+    kernel.exe_path = exe_path;
     let opts = RunOptions {
         // (a program its interpreter maps: the interpreter's command line
         // for it, gex_ld::Program::direct)

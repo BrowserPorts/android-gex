@@ -743,7 +743,7 @@ impl Inner {
     /// An extended-attribute call on inode `ino` (`symlink`: the node is a
     /// link, whose `user.` attributes Linux refuses to set).
     fn xattr(&mut self, ino: u64, symlink: bool, op: super::XattrOp<'_>) -> Result<usize, Errno> {
-        if symlink && matches!(op, super::XattrOp::Set { .. }) {
+        if symlink && matches!(op, super::XattrOp::Set { name, .. } if name.starts_with("user.")) {
             return Err(Errno::EPERM);
         }
         let mut none = BTreeMap::new();

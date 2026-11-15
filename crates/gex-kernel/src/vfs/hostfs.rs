@@ -844,20 +844,42 @@ pub mod host_xattr {
         let _ = CALLS.set(calls);
     }
 
+    /// A file's SELinux label, and the host attribute it is kept in: the
+    /// host keeps `security.` for itself, so the guest's label is one of
+    /// the host's `user.` attributes, which the guest does not see under
+    /// that name. (Where the host keeps no `user.` attribute for a kind
+    /// of file, Linux's symbolic links and devices, that file's label is
+    /// not kept, and setting it says so.)
+    const LABEL: &str = "security.selinux";
+    const HOST_LABEL: &str = "user.gex.selinux";
+
+    /// The host's name for the guest's attribute `name`.
+    fn host_name(name: &str) -> Result<&str, Errno> {
+        if name == LABEL {
+            return Ok(HOST_LABEL);
+        }
+        xattr_name(name)?;
+        // The label's own keeping is not the guest's to touch.
+        if name == HOST_LABEL {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        Ok(name)
+    }
+
     pub fn call(on: On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
         let calls = CALLS.get().ok_or(Errno::EOPNOTSUPP)?;
         let not_user = |e: Errno| if e == Errno::EOPNOTSUPP { Errno::ENODATA } else { e };
         match op {
             XattrOp::Get { name, buf } => {
-                xattr_name(name).map_err(not_user)?;
+                let name = host_name(name).map_err(not_user)?;
                 calls(&on, XattrOp::Get { name, buf })
             }
             XattrOp::Set { name, value, flags } => {
-                xattr_name(name)?;
+                let name = host_name(name)?;
                 calls(&on, XattrOp::Set { name, value, flags })
             }
             XattrOp::Remove { name } => {
-                xattr_name(name).map_err(not_user)?;
+                let name = host_name(name).map_err(not_user)?;
                 calls(&on, XattrOp::Remove { name })
             }
             XattrOp::List { buf } => {
@@ -868,7 +890,7 @@ pub mod host_xattr {
                 all.truncate(got);
                 let mut mine = Vec::new();
                 for name in all.split(|&c| c == 0).filter(|n| n.starts_with(b"user.")) {
-                    mine.extend_from_slice(name);
+                    mine.extend_from_slice(if name == HOST_LABEL.as_bytes() { LABEL.as_bytes() } else { name });
                     mine.push(0);
                 }
                 if buf.is_empty() {

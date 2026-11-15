@@ -197,6 +197,20 @@ pub fn xattr_name(name: &str) -> Result<(), Errno> {
     Ok(())
 }
 
+/// [`xattr_name`] for a filesystem that keeps its attributes in memory, as
+/// Linux's tmpfs does: the `security.` namespace is kept as well as
+/// `user.` (a file's SELinux label is `security.selinux`; who may set one
+/// is the system call's to say).
+fn xattr_name_in_memory(name: &str) -> Result<(), Errno> {
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return Err(Errno::ERANGE);
+    }
+    if name.strip_prefix("user.").or(name.strip_prefix("security.")).is_none_or(str::is_empty) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(())
+}
+
 /// One node's attributes, kept by a filesystem: the work every
 /// [`XattrOp`] does on them.
 pub fn xattr_apply(attrs: &mut std::collections::BTreeMap<String, Vec<u8>>, op: XattrOp<'_>) -> Result<usize, Errno> {
@@ -212,12 +226,12 @@ pub fn xattr_apply(attrs: &mut std::collections::BTreeMap<String, Vec<u8>>, op: 
     }
     match op {
         XattrOp::Get { name, buf } => {
-            xattr_name(name).map_err(|e| if e == Errno::EOPNOTSUPP { Errno::ENODATA } else { e })?;
+            xattr_name_in_memory(name).map_err(|e| if e == Errno::EOPNOTSUPP { Errno::ENODATA } else { e })?;
             let v = attrs.get(name).ok_or(Errno::ENODATA)?;
             out(buf, v)
         }
         XattrOp::Set { name, value, flags } => {
-            xattr_name(name)?;
+            xattr_name_in_memory(name)?;
             if value.len() > XATTR_SIZE_MAX {
                 return Err(Errno::E2BIG);
             }
@@ -240,7 +254,7 @@ pub fn xattr_apply(attrs: &mut std::collections::BTreeMap<String, Vec<u8>>, op: 
             out(buf, &all)
         }
         XattrOp::Remove { name } => {
-            xattr_name(name).map_err(|e| if e == Errno::EOPNOTSUPP { Errno::ENODATA } else { e })?;
+            xattr_name_in_memory(name).map_err(|e| if e == Errno::EOPNOTSUPP { Errno::ENODATA } else { e })?;
             attrs.remove(name).map(|_| 0).ok_or(Errno::ENODATA)
         }
     }
@@ -1698,6 +1712,19 @@ impl Namespace {
     pub fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let (fs, rel) = self.resolve(path)?;
         fs.chmod(&rel, mode)
+    }
+
+    /// Where the file `path` names is, for whoever labels it: its
+    /// filesystem's type, its path from that filesystem's root (with a
+    /// leading slash) and what it is; the link itself without `follow`.
+    pub fn located(&self, path: &str, follow: bool) -> Result<(&'static str, String, Metadata), Errno> {
+        let abs = normalize(path, &self.cwd);
+        let (fs, rel) = match self.resolve_walked(&abs, follow)? {
+            Some(found) => found,
+            None => self.resolve(&abs)?,
+        };
+        let md = if follow { fs.metadata(&rel)? } else { fs.metadata_nofollow(&rel)? };
+        Ok((fs.fs_type(), format!("/{}", rel.trim_start_matches('/')), md))
     }
 
     /// An extended-attribute call on `path`, following a final symlink when

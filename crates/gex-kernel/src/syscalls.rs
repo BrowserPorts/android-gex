@@ -686,6 +686,9 @@ pub struct Kernel {
     pub tid: i32,
     /// Guest path of the running program.
     pub exe_path: String,
+    /// [`Kernel::exec_selinux`] has been called for the `execve` under
+    /// way.
+    pub exec_labelled: bool,
     /// The memory flavour the last `execve` asked for:
     /// `Some(true)` a 64-bit memory, `Some(false)` a 32-bit one, `None`
     /// the page's own. From the call's `GEX_MEM64` entry, which the kernel
@@ -3692,7 +3695,13 @@ impl PathIo<'_> {
             // A directory opens for reading only: each filesystem's `open`
             // says `EISDIR`, without a lookup of its own here.
             // O_CREAT's mode, less the umask, as Linux makes the file.
+            // (Whether it makes one is looked at only where a new file
+            // will want a label.)
+            let makes = flags & oflags::O_CREAT != 0 && crate::selinux::loaded() && self.ns.metadata_nofollow(&p).is_err();
             let h = self.ns.open_mode(&p, flags, mode & 0o7777 & !self.fs.umask())?;
+            if makes {
+                self.label_new(&p);
+            }
             // O_DIRECTORY on what is not one: ENOTDIR (mv's and find's test
             // of whether a name is a directory)
             if flags & oflags::O_DIRECTORY != 0 && h.metadata()?.file_type != FileType::Directory {
@@ -4102,7 +4111,9 @@ impl PathIo<'_> {
         if Self::path_tail(m, path)?.1 != 0 {
             return Err(if self.ns.metadata(&p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
         }
-        self.ns.mkdir(&p, mode & !self.fs.umask()).map(|_| 0)
+        self.ns.mkdir(&p, mode & !self.fs.umask())?;
+        self.label_new(&p);
+        Ok(0)
     }
 
     /// `mknodat(dirfd, path, mode, dev)`: a regular file, or a node for
@@ -4120,13 +4131,19 @@ impl PathIo<'_> {
         let perm = mode & 0o7777 & !self.fs.umask();
         match mode & 0o170000 {
             // S_IFREG, or no type at all: an empty file.
-            0 | 0o100000 => self.ns.open_mode(&p, oflags::O_CREAT | oflags::O_EXCL | oflags::O_WRONLY, perm).map(|_| 0),
+            0 | 0o100000 => {
+                self.ns.open_mode(&p, oflags::O_CREAT | oflags::O_EXCL | oflags::O_WRONLY, perm)?;
+                self.label_new(&p);
+                Ok(0)
+            }
             // S_IFCHR
             0o020000 => {
                 if !self.creds.capable(CAP_MKNOD) {
                     return Err(Errno::EPERM);
                 }
-                self.ns.mknod(&p, perm, dev & 0xffff_ffff).map(|_| 0)
+                self.ns.mknod(&p, perm, dev & 0xffff_ffff)?;
+                self.label_new(&p);
+                Ok(0)
             }
             // S_IFDIR: mkdir's to make.
             0o040000 => Err(Errno::EPERM),
@@ -4324,7 +4341,9 @@ impl PathIo<'_> {
         let t = String::from_utf8(m.read_cstr(target, 4096)?).map_err(|_| Errno::EINVAL)?;
         let p = self.at_path(m, newdirfd, path)?;
         self.new_name_check(m, path, &p)?;
-        self.ns.symlink(&t, &p).map(|_| 0)
+        self.ns.symlink(&t, &p)?;
+        self.label_new(&p);
+        Ok(0)
     }
 
     /// `fchmod` and `fchmodat`. The first names an open file, whose path the
@@ -4345,21 +4364,174 @@ impl PathIo<'_> {
             String::from_utf8(raw).map_err(|_| Errno::EINVAL)?
         };
         let x = Xattr { kind, name: &name, flags: a[4] as u32, at: if kind == 2 { a[1] } else { a[2] }, size: if kind == 2 { a[2] } else { a[3] } };
+        // `security.` is the kernel's: to set or remove an attribute there
+        // takes `CAP_SYS_ADMIN`, but for a file's SELinux label, which
+        // SELinux answers for itself.
+        const CAP_SYS_ADMIN: u64 = 21;
+        let label = name == crate::selinux::labels::XATTR;
+        if matches!(kind, 0 | 3) && name.starts_with("security.") && !label && !self.creds.capable(CAP_SYS_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+        // A file's label, or the list it is in, is SELinux's to answer
+        // once a policy is loaded.
+        let selinux = label || kind == 2;
         if form == 2 {
             let f = self.map.fds.get(a[0] as i32)?;
-            if let Some(r) = x.run(m, |op| f.handle.xattr(op)) {
-                return r;
+            // Its own node, where the handle has one; or by the name it
+            // was opened under, as `fchmod` falls back. A pipe or socket
+            // has no name, and no attributes. (A handle answers for its
+            // node or not at all, so which to ask is found once.)
+            let has_node = f.handle.xattr(crate::vfs::XattrOp::List { buf: &mut [] }).is_some();
+            let call = |op: crate::vfs::XattrOp<'_>| {
+                if has_node {
+                    f.handle.xattr(op).unwrap_or(Err(Errno::EOPNOTSUPP))
+                } else if f.path.is_empty() {
+                    Err(Errno::EOPNOTSUPP)
+                } else {
+                    self.ns.xattr(&f.path, true, op)
+                }
+            };
+            if selinux {
+                let at = if f.path.is_empty() { None } else { self.ns.located(&f.path, true).ok() };
+                let unnamed = f.handle.metadata().ok();
+                return x.run(m, |op| Some(self.label_xattr(at, unnamed, op, &call))).unwrap_or(Err(Errno::EOPNOTSUPP));
             }
-            // No node of its own here: by the name it was opened under, as
-            // `fchmod` falls back. A pipe or socket has no name, and no
-            // attributes.
-            if f.path.is_empty() {
-                return Err(Errno::EOPNOTSUPP);
-            }
-            return x.run(m, |op| Some(self.ns.xattr(&f.path, true, op))).unwrap_or(Err(Errno::EOPNOTSUPP));
+            return x.run(m, |op| Some(call(op))).unwrap_or(Err(Errno::EOPNOTSUPP));
         }
         let path = self.at_path(m, AT_FDCWD, a[0])?;
-        x.run(m, |op| Some(self.ns.xattr(&path, form == 0, op))).unwrap_or(Err(Errno::EOPNOTSUPP))
+        let call = |op: crate::vfs::XattrOp<'_>| self.ns.xattr(&path, form == 0, op);
+        if selinux {
+            let at = self.ns.located(&path, form == 0)?;
+            return x.run(m, |op| Some(self.label_xattr(Some(at), None, op, &call))).unwrap_or(Err(Errno::EOPNOTSUPP));
+        }
+        x.run(m, |op| Some(call(op))).unwrap_or(Err(Errno::EOPNOTSUPP))
+    }
+
+    /// The SID of the file at `path` as the policy now loaded labels it
+    /// ([`crate::selinux::labels::file_sid`]), the link itself without
+    /// `follow`. `None` before a policy, and for no file.
+    pub fn file_sid(&self, path: &str, follow: bool) -> Option<u32> {
+        use crate::selinux::labels;
+        let server = crate::selinux::kernel_server();
+        let mut s = server.lock().unwrap_or_else(|e| e.into_inner());
+        s.policy()?;
+        let (fstype, within, md) = self.ns.located(path, follow).ok()?;
+        let mut kept = vec![0u8; 4096];
+        let stored = self.ns.xattr(path, follow, crate::vfs::XattrOp::Get { name: labels::XATTR, buf: &mut kept }).ok().map(|n| kept[..n].to_vec());
+        Some(labels::file_sid(&mut s, &labels::File { fstype, path: &within, class: labels::class_of(md.file_type), stored: stored.as_deref() }))
+    }
+
+    /// Give what was just made at `p` its SELinux label
+    /// ([`crate::selinux::labels::new_file`]): what its maker asked its
+    /// files to be, or what the policy makes of the maker, the directory
+    /// it is in, its class and its name. Stored as its attribute where
+    /// its filesystem stores one; nothing before a policy.
+    fn label_new(&self, p: &str) {
+        use crate::selinux::labels;
+        use crate::vfs::XattrOp;
+        let server = crate::selinux::kernel_server();
+        let mut s = server.lock().unwrap_or_else(|e| e.into_inner());
+        if s.policy().is_none() {
+            return;
+        }
+        let Ok((fstype, _, md)) = self.ns.located(p, false) else { return };
+        let (parent, name) = match p.trim_end_matches('/').rsplit_once('/') {
+            Some(("", name)) => ("/", name),
+            Some((parent, name)) => (parent, name),
+            None => return,
+        };
+        let Ok((dir_fstype, dir_path, _)) = self.ns.located(parent, true) else { return };
+        let mut kept = vec![0u8; 4096];
+        let stored = self.ns.xattr(parent, true, XattrOp::Get { name: labels::XATTR, buf: &mut kept }).ok().map(|n| kept[..n].to_vec());
+        let dir = labels::file_sid(&mut s, &labels::File { fstype: dir_fstype, path: &dir_path, class: "dir", stored: stored.as_deref() });
+        let Some((_, Some(value))) = labels::new_file(&mut s, &self.creds.sec(), fstype, dir, labels::class_of(md.file_type), name) else { return };
+        drop(s);
+        if let Err(e) = self.ns.xattr(p, false, XattrOp::Set { name: labels::XATTR, value: &value, flags: 0 }) {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[gex] selinux: {p} was made and its label could not be stored ({e:?}): it will read as its filesystem's default (said once)");
+            }
+        }
+    }
+
+    /// An attribute call that is SELinux's to answer
+    /// ([`crate::selinux::labels`]): a file's `security.selinux`, read,
+    /// set or removed, or the list of its attributes, which names it.
+    /// `at` is where the file is ([`crate::vfs::Namespace::located`]), or
+    /// `None` with `unnamed` for a pipe or a socket, which is in no
+    /// filesystem a path reaches; `raw` makes a call on what its
+    /// filesystem keeps for it. Before a policy the filesystem's own
+    /// attribute is all there is.
+    fn label_xattr(
+        &self,
+        at: Option<(&'static str, String, crate::vfs::Metadata)>,
+        unnamed: Option<crate::vfs::Metadata>,
+        op: crate::vfs::XattrOp<'_>,
+        raw: &dyn Fn(crate::vfs::XattrOp<'_>) -> Result<usize, Errno>,
+    ) -> Result<usize, Errno> {
+        use crate::selinux::labels;
+        use crate::vfs::{FileType, XattrOp};
+        /// `CAP_MAC_ADMIN`.
+        const CAP_MAC_ADMIN: u64 = 33;
+        fn out(buf: &mut [u8], bytes: &[u8]) -> Result<usize, Errno> {
+            if buf.is_empty() {
+                return Ok(bytes.len());
+            }
+            if buf.len() < bytes.len() {
+                return Err(Errno::ERANGE);
+            }
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        let server = crate::selinux::kernel_server();
+        let mut s = server.lock().unwrap_or_else(|e| e.into_inner());
+        if s.policy().is_none() {
+            drop(s);
+            return raw(op);
+        }
+        // A pipe is pipefs's and a socket sockfs's, each its one file.
+        let (fstype, path, md) = match (at, unnamed) {
+            (Some(at), _) => at,
+            (None, Some(md)) => (if md.file_type == FileType::Socket { "sockfs" } else { "pipefs" }, "/".to_string(), md),
+            (None, None) => return Err(Errno::EOPNOTSUPP),
+        };
+        let class = labels::class_of(md.file_type);
+        // What its filesystem has stored for it, if it stores any.
+        let mut kept = vec![0u8; 4096];
+        let stored = raw(XattrOp::Get { name: labels::XATTR, buf: &mut kept }).ok().map(|n| kept[..n].to_vec());
+        let file = labels::File { fstype, path: &path, class, stored: stored.as_deref() };
+        let mac_admin = self.creds.capable(CAP_MAC_ADMIN);
+        match op {
+            XattrOp::Get { buf, .. } => out(buf, &labels::get(&mut s, &file, mac_admin)?),
+            XattrOp::Set { name, value, flags } => {
+                labels::set(&mut s, &file, self.creds.sec()[crate::selinux::procattr::CURRENT], value, mac_admin)?;
+                drop(s);
+                raw(XattrOp::Set { name, value, flags })
+            }
+            XattrOp::Remove { name } => {
+                labels::remove(&s)?;
+                raw(XattrOp::Remove { name })
+            }
+            XattrOp::List { buf } => {
+                let attribute_labelled = s.policy().is_some_and(|p| p.fs_use(fstype).0 == crate::selinux::policy::fs_use::XATTR);
+                let mut names = vec![0u8; crate::vfs::XATTR_SIZE_MAX];
+                let mut names = match raw(XattrOp::List { buf: &mut names }) {
+                    Ok(n) => names[..n].to_vec(),
+                    // A filesystem that keeps none has none to list.
+                    Err(Errno::EOPNOTSUPP) => Vec::new(),
+                    Err(e) => return Err(e),
+                };
+                // A filesystem that keeps labels as attributes lists the
+                // ones it has; any other asks SELinux, which always has
+                // one.
+                let listed = names.split(|&b| b == 0).any(|n| n == labels::XATTR.as_bytes());
+                if labels::listed(&s) && !listed && !attribute_labelled {
+                    names.extend_from_slice(labels::XATTR.as_bytes());
+                    names.push(0);
+                }
+                out(buf, &names)
+            }
+        }
     }
 
     pub fn sys_chmod(&self, m: &GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
@@ -10694,14 +10866,18 @@ impl Kernel {
             self.vfs.put_cwd(cwd);
         }
         self.signals.exec();
-        // SELinux: the process is what it asked to be, and its requests
-        // are forgotten.
+        // SELinux: the process is what it asked to be, or what the
+        // policy makes of it and the program's label
+        // ([`Kernel::exec_selinux`], the host's to call first: without
+        // it no such transition is made, which is said), and its
+        // requests are forgotten.
         let asked = self.creds.sec()[crate::selinux::procattr::EXEC] != 0;
         self.creds.exec_sec();
         self.procs.set_creds(self.pid, &self.creds.save());
-        if !asked {
+        if !asked && !std::mem::take(&mut self.exec_labelled) {
             crate::selinux::procattr::warn_exec_by_label();
         }
+        self.exec_labelled = false;
         let cur = Arc::clone(self.signals.thread());
         // The other threads are gone, and their ids with them.
         for t in self.thread_signals.tids() {
@@ -10759,6 +10935,7 @@ impl Kernel {
             pid: 1,
             tid: 1,
             exe_path,
+            exec_labelled: false,
             exec_mem64: None,
             exec_image: None,
             argv: Vec::new(),
@@ -11198,6 +11375,7 @@ impl Kernel {
             pid: self.pid,
             tid: self.tid,
             exe_path: self.exe_path.clone(),
+            exec_labelled: false,
             exec_mem64: None,
             exec_image: self.exec_image.clone(),
             argv: self.argv.clone(),
@@ -11856,6 +12034,31 @@ impl Kernel {
     /// The path calls' part of this kernel ([`PathIo`]): the namespace
     /// itself, whose working directory is the calling thread's while its
     /// call runs (`syscall_cwd`).
+    /// SELinux at an `execve` of the program at `path`, before
+    /// [`Kernel::exec_signals`] (`selinux_bprm_creds_for_exec`): a
+    /// process that asked for no context becomes what the policy makes
+    /// of it and the program's label, which is as if it had asked for
+    /// that. Nothing before a policy. Not held yet: that the policy
+    /// allows the change (`transition`, `entrypoint`), and what
+    /// `no_new_privs` and a `nosuid` mount keep it from.
+    pub fn exec_selinux(&mut self, path: &str) {
+        use crate::selinux::procattr;
+        self.exec_labelled = true;
+        let ids = self.creds.sec();
+        if ids[procattr::EXEC] != 0 || !crate::selinux::loaded() {
+            return;
+        }
+        let Some(program) = self.path_io().file_sid(path, true) else { return };
+        let server = crate::selinux::kernel_server();
+        let mut s = server.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(class) = s.policy().and_then(|p| p.class_named("process")) else { return };
+        if let Ok(sid) = s.compute_sid(ids[procattr::CURRENT], program, class, crate::selinux::policy::av::TRANSITION, None) {
+            if sid != ids[procattr::CURRENT] {
+                self.creds.set_sec(procattr::EXEC, sid);
+            }
+        }
+    }
+
     pub fn path_io(&self) -> PathIo<'_> {
         PathIo {
             ns: &self.vfs,
