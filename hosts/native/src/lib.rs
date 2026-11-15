@@ -6163,14 +6163,32 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             static RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
         const MAX_RETRIES: u32 = 16;
-        if retired && RETRIES.with(|r| r.get()) < MAX_RETRIES {
+        // Or the translation has no block that starts there at all. Seen
+        // only with many threads translating at once (Android's apexd,
+        // fifty reading archives; one run in several), which fits another
+        // thread publishing the block between this thread's miss and its
+        // translation's look at what is known, a known address not being
+        // made again; that is not established. Trying again begins by
+        // taking what others have published, and if the address is still
+        // not covered the report says what was made in its place.
+        let made = translated_module.exported_blocks.iter().any(|(a, _)| *a == pc);
+        if (retired || !made) && RETRIES.with(|r| r.get()) < MAX_RETRIES {
             jit_stats::STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             RETRIES.with(|r| r.set(r.get() + 1));
             let again = translate_and_install(caller, pc);
             RETRIES.with(|r| r.set(r.get() - 1));
             return again;
         }
-        bail!("translated blocks but none covered 0x{pc:x}{}", if retired { " (its page kept being retired)" } else { "" });
+        // What was made instead, for whoever reads this: the instruction
+        // there and the blocks nearest it.
+        let word = memory.bytes().get(pc as usize..pc as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        let below = translated_module.exported_blocks.iter().map(|(a, _)| *a).filter(|a| *a < pc).max();
+        let above = translated_module.exported_blocks.iter().map(|(a, _)| *a).filter(|a| *a > pc).min();
+        bail!(
+            "translated blocks but none covered 0x{pc:x}{} (a block made there: {made}; the instruction: {word:x?}; {} blocks made, the nearest at {below:x?} and {above:x?})",
+            if retired { " (its page kept being retired)" } else { "" },
+            translated_module.exported_blocks.len(),
+        );
     }
     Ok(true)
 }
