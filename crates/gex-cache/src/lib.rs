@@ -330,7 +330,17 @@ const FORMAT_VERSION: u32 = 2;
 /// Uses the executable's size and mtime (a rebuild changes both) rather than
 /// hashing tens of megabytes. `None` means the cache must not be used, since
 /// an unidentifiable build cannot be told from a different one.
+///
+/// `GEX_CACHE_BUILD=<name>` says what the build is instead, for someone
+/// rebuilding gex over and over with changes that leave translation alone
+/// (the kernel's), who would otherwise translate every program again after
+/// each: the name must change whenever the translator, the emitter, the
+/// compiler or the host's use of them does, and whoever sets it answers for
+/// that (`tests/android/oracle/cache-id.sh` makes one from the sources).
 pub fn build_fingerprint() -> Option<String> {
+    if let Some(name) = std::env::var("GEX_CACHE_BUILD").ok().filter(|n| !n.is_empty()) {
+        return Some(format!("named:{name}"));
+    }
     let exe = std::env::current_exe().ok()?;
     let meta = std::fs::metadata(&exe).ok()?;
     let mtime = meta
