@@ -9,7 +9,7 @@
 // (apex.txt beside it).
 //
 // - mount -t ext4 of the device, read-only: its files read as they are,
-//   with their sizes, modes, link counts and times; a file with holes
+//   with their sizes, modes, owners, link counts and times; a file with holes
 //   reads zeros in them; two names of one file are one inode.
 // - Symbolic links: a short one, a long one, an absolute one; a path
 //   through a link to a directory beside it.
@@ -170,7 +170,11 @@ int main(void) {
     file_is("etc/empty-file", 0, 0xcbf29ce484222325ull);
     file_is("etc/long/nested/deeper/file", 5, fnv((const unsigned char *)"deep\n", 5));
     if (stat(in(mnt, "bin/tool"), &st) || (st.st_mode & 07777) != 0755 || !S_ISREG(st.st_mode) || st.st_nlink != 2 || st.st_mtime != 1767323045) die("bin/tool", st.st_mode, st.st_mtime);
+    if (st.st_uid != 0 || st.st_gid != 2000) die("bin/tool's owner", st.st_uid, st.st_gid);
     if (stat(in(mnt, "bin/tool2"), &other) || other.st_ino != st.st_ino) die("two names of one file", st.st_ino, other.st_ino);
+    if (stat(in(mnt, "etc/empty-file"), &other) || other.st_uid != 1000 || other.st_gid != 1000) die("etc/empty-file's owner", other.st_uid, other.st_gid);
+    if (stat(in(mnt, "bin"), &other) || other.st_uid != 0 || other.st_gid != 2000) die("bin's owner", other.st_uid, other.st_gid);
+    if (chown(in(mnt, "etc/empty-file"), 1, 1) == 0 || errno != EROFS) die("chown in a read-only filesystem", errno, 0);
     if (stat(in(mnt, "lib64/holes"), &st) || (st.st_mode & 07777) != 04755 || st.st_size != 40000) die("lib64/holes", st.st_mode, st.st_size);
     if (stat(in(mnt, "etc/long"), &st) || !S_ISDIR(st.st_mode) || (st.st_mode & 07777) != 0750) die("etc/long", st.st_mode, 0);
     if (stat(in(mnt, "apex_manifest.pb"), &st) || st.st_mtime != 1000000000) die("a time", st.st_mtime, 0);
