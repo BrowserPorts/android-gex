@@ -1072,33 +1072,182 @@ pub struct Vfs {
     held: Option<String>,
 }
 
+/// A mount namespace: the mount table every process in it sees, and how
+/// many times it has changed.
+///
+/// Processes share one until one of them leaves for a copy of its own
+/// (`unshare(CLONE_NEWNS)`), as on Linux: what a process mounts, its
+/// parent, its children and its siblings all see. Each process's own
+/// picture of it ([`VfsView`]) is made from this table and the process's
+/// root, and made again when the count here has moved on.
+///
+/// The paths are the namespace's own, from the root it began with: a
+/// process that has changed its root sees the mounts under that root, and
+/// a mount it makes is recorded where it is in the namespace.
+///
+/// One for a kernel's processes. A host whose processes are each a
+/// kernel of their own (the page's) has one a process, as before: there
+/// nothing a process mounts is seen by another.
+pub struct MountNs {
+    table: std::sync::Mutex<BTreeMap<String, Arc<dyn FileSystem>>>,
+    changes: std::sync::atomic::AtomicU64,
+    id: u64,
+}
+
+impl MountNs {
+    fn new(table: BTreeMap<String, Arc<dyn FileSystem>>) -> Arc<MountNs> {
+        // Numbered as Linux numbers a namespace's inode, from the first
+        // number it gives out after the ones it keeps for its own.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0xf000_0000);
+        Arc::new(MountNs {
+            table: std::sync::Mutex::new(table),
+            changes: std::sync::atomic::AtomicU64::new(0),
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        })
+    }
+
+    /// The number `/proc/<pid>/ns/mnt` shows for it: `mnt:[n]`.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<dyn FileSystem>>> {
+        self.table.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// A [`Vfs`]'s namespace as other threads read it: replaced whole on every
 /// change, so a reader holds one consistent table and directory for as long
 /// as it likes (an `Arc`), and a lookup through it runs outside every lock.
 ///
-/// It is the mount table's one writer: `mount` and `umount2` change it here,
-/// with or without the kernel lock, and the kernel's own copy follows it
-/// ([`Vfs::refresh`]).
+/// It is the process's picture of its mount namespace ([`MountNs`]), from
+/// the process's own root and with its own directory: `mount` and
+/// `umount2` change the namespace's table through it, with or without the
+/// kernel lock, and it follows the table, as the kernel's own copy
+/// follows it ([`Vfs::refresh`]).
 pub struct VfsView {
     cur: gex_atomic::rcu::Published<Arc<Namespace>>,
-    /// How many times the mount table has changed.
+    /// How many times this picture's mount table has changed.
     mounts: std::sync::atomic::AtomicU64,
     /// Notified at each change: a reader of `/proc/self/mountinfo` waits
     /// on it.
     changed: crate::wait::Queue,
+    /// The mount namespace this is a picture of.
+    shared: std::sync::RwLock<Arc<MountNs>>,
+    /// The namespace's count of changes at which `cur`'s table was made.
+    seen: std::sync::atomic::AtomicU64,
+    /// The mounts that are this process's alone, over the namespace's, by
+    /// their paths in the namespace: its `/proc`, which is one filesystem
+    /// on Linux that answers each reader about itself, and here a
+    /// filesystem a process, made of that process's own state.
+    own: std::sync::Mutex<BTreeMap<String, Arc<dyn FileSystem>>>,
 }
 
 impl VfsView {
-    fn new(ns: &Namespace) -> VfsView {
+    /// A picture, `ns`, of the namespace `shared` as it was at its
+    /// change `seen`.
+    fn new(ns: &Namespace, shared: Arc<MountNs>, seen: u64, own: BTreeMap<String, Arc<dyn FileSystem>>) -> VfsView {
         VfsView {
             cur: gex_atomic::rcu::Published::new(Arc::new(ns.clone()), crate::file::FD_READER_SLOTS),
             mounts: std::sync::atomic::AtomicU64::new(0),
             changed: crate::wait::Queue::new(),
+            shared: std::sync::RwLock::new(shared),
+            seen: std::sync::atomic::AtomicU64::new(seen),
+            own: std::sync::Mutex::new(own),
         }
+    }
+
+    fn own(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<dyn FileSystem>>> {
+        self.own.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Mount `fs` at `at` for this process alone, over whatever the
+    /// namespace has there: its own `/proc`. A fork begins with its
+    /// parent's and is given its own.
+    pub fn mount_own(&self, at: &str, fs: Arc<dyn FileSystem>) {
+        self.sync();
+        let cur = self.cur.read(crate::sync::me() as usize, Arc::clone);
+        self.own().insert(cur.outer_path(&normalize(at, &cur.cwd)).into_owned(), fs);
+        // The picture again, whatever the namespace's count.
+        self.seen.store(u64::MAX, std::sync::atomic::Ordering::Release);
+        self.sync();
+    }
+
+    /// The mount namespace this process is in.
+    pub fn mount_ns(&self) -> Arc<MountNs> {
+        Arc::clone(&self.shared.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Bring the picture up to date with its namespace, if another
+    /// process (or this one) has changed the table since it was made: the
+    /// table again, from this process's root, with its directory as it
+    /// is. One load when nothing has changed.
+    fn sync(&self) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let shared = self.mount_ns();
+        if shared.changes.load(Acquire) == self.seen.load(Acquire) {
+            return;
+        }
+        let changed = self.cur.write(|cur| {
+            // The count, then the table: a table never older than the
+            // count it is kept with.
+            let now = shared.changes.load(Acquire);
+            if now == self.seen.load(Acquire) {
+                return (None, false);
+            }
+            let mut ns = Namespace::new();
+            ns.mounts = shared.lock().clone();
+            ns.mounts.extend(self.own().iter().map(|(at, fs)| (at.clone(), Arc::clone(fs))));
+            ns.list_others();
+            // From the process's root, where that is not the namespace's.
+            if cur.root != "/" && ns.chroot(&cur.root).is_err() {
+                // Its root is no longer there to be found: the picture it
+                // had stands.
+                self.seen.store(now, Release);
+                return (None, false);
+            }
+            ns.cwd.clone_from(&cur.cwd);
+            self.seen.store(now, Release);
+            (Some(Arc::new(ns)), true)
+        });
+        if changed {
+            self.mounts.fetch_add(1, AcqRel);
+            self.changed.notify();
+        }
+    }
+
+    /// Leave the mount namespace for a copy of it that is this process's
+    /// own (`unshare(CLONE_NEWNS)`): what it mounts from now nobody else
+    /// sees, nor it what they do.
+    pub fn unshare(&self) {
+        self.sync();
+        let mut shared = self.shared.write().unwrap_or_else(|e| e.into_inner());
+        let copy = MountNs::new(shared.lock().clone());
+        // The copy is at its first count, and the picture is of it.
+        self.seen.store(0, std::sync::atomic::Ordering::Release);
+        *shared = copy;
+    }
+
+    /// Enter the mount namespace `ns` (`setns`): its table, from its root,
+    /// and in its root directory.
+    pub fn join(&self, ns: Arc<MountNs>) {
+        *self.shared.write().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&ns);
+        let now = ns.changes.load(std::sync::atomic::Ordering::Acquire);
+        self.cur.write(|_| {
+            let mut fresh = Namespace::new();
+            fresh.mounts = ns.lock().clone();
+            fresh.mounts.extend(self.own().iter().map(|(at, fs)| (at.clone(), Arc::clone(fs))));
+            fresh.list_others();
+            self.seen.store(now, std::sync::atomic::Ordering::Release);
+            (Some(Arc::new(fresh)), ())
+        });
+        self.mounts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.changed.notify();
     }
 
     /// The namespace as it stands.
     pub fn get(&self) -> Arc<Namespace> {
+        self.sync();
         self.cur.read(crate::sync::me() as usize, Arc::clone)
     }
 
@@ -1111,6 +1260,7 @@ impl VfsView {
 
     /// How many times the mount table has changed, now.
     pub fn mounts(&self) -> u64 {
+        self.sync();
         self.mounts.load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -1120,73 +1270,107 @@ impl VfsView {
     }
 
     /// Mount `fs` at `at` (absolute, or relative to the published
-    /// directory), replacing what was mounted there.
+    /// directory), replacing what was mounted there: in the namespace,
+    /// for every process in it.
     pub fn mount(&self, at: &str, fs: Arc<dyn FileSystem>) {
-        self.change(|ns| {
-            ns.mount(at, fs);
+        self.change(|table, cur| {
+            table.insert(cur.outer_path(&normalize(at, &cur.cwd)).into_owned(), fs);
             true
         });
     }
 
-    /// Remove the mount at exactly `path` ([`Namespace::unmount`]).
+    /// Remove the mount at exactly `path` (absolute). The root mount
+    /// stays: a guest that unmounts `/` has nothing left to run from.
     pub fn unmount(&self, path: &str) -> bool {
-        self.change(|ns| ns.unmount(path))
+        self.change(|table, cur| {
+            let at = normalize(path, &cur.cwd);
+            if at == "/" {
+                return false;
+            }
+            // One of the process's own goes for the process alone; what
+            // the namespace has under it shows again.
+            let outer = cur.outer_path(&at);
+            self.own().remove(outer.as_ref()).is_some() | table.remove(outer.as_ref()).is_some()
+        })
     }
 
-    /// [`Namespace::chroot`] of the namespace as published.
+    /// [`Namespace::chroot`] of the namespace as published: this
+    /// process's root alone, which its picture of the table is made from
+    /// after this.
     pub fn chroot(&self, dir: &str) -> Result<(), Errno> {
+        self.sync();
         let mut err = Ok(());
-        self.change(|ns| {
+        let changed = self.cur.write(|cur| {
+            let mut ns = Namespace::clone(cur);
             err = ns.chroot(dir);
-            err.is_ok()
+            if err.is_err() {
+                return (None, false);
+            }
+            (Some(Arc::new(ns)), true)
         });
+        if changed {
+            self.mounts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.changed.notify();
+        }
         err
     }
 
     /// Mount `fs` at `at` unless something is mounted there already:
     /// whether it did.
     pub fn mount_unless_there(&self, at: &str, fs: impl FnOnce() -> Arc<dyn FileSystem>) -> bool {
-        self.change(|ns| {
-            if ns.is_mount_point(at) {
+        self.change(|table, cur| {
+            let at = cur.outer_path(&normalize(at, &cur.cwd)).into_owned();
+            if table.contains_key(&at) {
                 return false;
             }
-            ns.mount(at, fs());
+            table.insert(at, fs());
             true
         })
     }
 
-    /// A change `f` makes to the mount table, published if it says it made
-    /// one.
-    fn change(&self, f: impl FnOnce(&mut Namespace) -> bool) -> bool {
-        let changed = self.cur.write(|cur| {
-            let mut ns = Namespace::clone(cur);
-            if !f(&mut ns) {
-                return (None, false);
+    /// A change `f` makes to the namespace's mount table, given this
+    /// process's picture for where its paths are: counted if it says it
+    /// made one, and this picture brought up to date (every other
+    /// process's follows at its next look).
+    fn change(&self, f: impl FnOnce(&mut BTreeMap<String, Arc<dyn FileSystem>>, &Namespace) -> bool) -> bool {
+        self.sync();
+        let shared = self.mount_ns();
+        let cur = self.cur.read(crate::sync::me() as usize, Arc::clone);
+        let changed = {
+            let mut table = shared.lock();
+            let changed = f(&mut table, &cur);
+            // Counted with the table held: a picture made at a count has
+            // every change up to it.
+            if changed {
+                shared.changes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             }
-            (Some(Arc::new(ns)), true)
-        });
-        // Counted once the new table is out: a copy taken after reading
-        // the count is never older than the count says (`Vfs::refresh`).
+            changed
+        };
         if changed {
-            self.mounts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            self.changed.notify();
+            self.sync();
         }
         changed
     }
 }
 
-/// A view a copy of the table does not share: a forked child's mounts and
-/// directory are its own.
+/// A view a copy of the table does not share: a forked child's picture of
+/// the mounts, its root and its directory are its own. The mount
+/// namespace the picture is of is the parent's.
 struct NsCell(Arc<VfsView>);
 
 impl Clone for Vfs {
     fn clone(&self) -> Vfs {
         // A fork's copy: the calling thread's directory is the child's.
         // The mount table as published (another thread may have mounted
-        // since this copy's was taken), the directory as it is here.
-        let mut ns = Namespace::clone(&self.view.0.get());
+        // since this copy's was taken), the directory as it is here. The
+        // namespace's count is read first: the picture is no older than
+        // it, so the child misses no change (at worst it looks again).
+        let seen = self.view.0.seen.load(std::sync::atomic::Ordering::Acquire);
+        let shared = self.view.0.mount_ns();
+        let own = self.view.0.own().clone();
+        let mut ns = Namespace::clone(&self.view.0.cur.read(crate::sync::me() as usize, Arc::clone));
         ns.cwd.clone_from(&self.ns.cwd);
-        Vfs { view: NsCell(Arc::new(VfsView::new(&ns))), ns, mounts: 0, held: None }
+        Vfs { view: NsCell(Arc::new(VfsView::new(&ns, shared, seen, own))), ns, mounts: 0, held: None }
     }
 }
 
@@ -1200,8 +1384,30 @@ impl std::ops::Deref for Vfs {
 impl Vfs {
     pub fn new() -> Vfs {
         let ns = Namespace::new();
-        let view = NsCell(Arc::new(VfsView::new(&ns)));
+        let view = NsCell(Arc::new(VfsView::new(&ns, MountNs::new(BTreeMap::new()), 0, BTreeMap::new())));
         Vfs { ns, view, mounts: 0, held: None }
+    }
+
+    /// Mount `fs` at `at` for this process alone ([`VfsView::mount_own`]).
+    pub fn mount_own(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
+        self.view.0.mount_own(at, fs);
+        self.refresh();
+    }
+
+    /// Leave the mount namespace for a copy of the process's own
+    /// ([`VfsView::unshare`]).
+    pub fn unshare_mounts(&mut self) {
+        self.view.0.unshare();
+        self.refresh();
+    }
+
+    /// Enter another mount namespace ([`VfsView::join`]).
+    pub fn join_mounts(&mut self, ns: Arc<MountNs>) {
+        self.view.0.join(ns);
+        self.mounts = u64::MAX;
+        self.refresh();
+        self.ns.cwd = "/".to_string();
+        self.ns.root = "/".to_string();
     }
 
     /// The published namespace, the same view for this table's whole life.
@@ -1372,12 +1578,6 @@ impl Namespace {
         Ok(())
     }
 
-    fn mount(&mut self, at: &str, fs: Arc<dyn FileSystem>) {
-        let at = normalize(at, "/");
-        self.mounts.insert(at, fs);
-        self.list_others();
-    }
-
     fn list_others(&mut self) {
         let others: Vec<&str> = self.mounts.keys().map(String::as_str).filter(|m| *m != "/").collect();
         self.others = others.join("\0");
@@ -1412,17 +1612,6 @@ impl Namespace {
     /// Whether something is mounted at exactly this path.
     pub fn is_mount_point(&self, path: &str) -> bool {
         self.mounts.contains_key(&normalize(path, &self.cwd))
-    }
-
-    /// Remove the mount at exactly this path. The root mount stays: a guest
-    /// that unmounts `/` has nothing left to run from.
-    fn unmount(&mut self, path: &str) -> bool {
-        let at = normalize(path, &self.cwd);
-        let gone = at != "/" && self.mounts.remove(&at).is_some();
-        if gone {
-            self.list_others();
-        }
-        gone
     }
 
     /// Find the backend responsible for `path`, and the path relative to it.
@@ -2064,6 +2253,93 @@ mod tests {
         for p in ["", "a", "//", "/a/", "/a//b", "/a/./b", "/a/..", "/."] {
             assert!(!is_normal(p), "{p}");
         }
+    }
+
+    /// One mount table for the processes of a mount namespace, as on
+    /// Linux: what a fork's copy mounts its parent sees, and the other way
+    /// about, each at its next look; a process with a root of its own sees
+    /// the mounts under that root, where they are from there, and what it
+    /// mounts is where it is in the namespace; and a process that leaves
+    /// for a namespace of its own neither shows its mounts nor sees any
+    /// made after, until it enters another's.
+    #[test]
+    fn a_mount_is_every_process_of_the_namespaces() {
+        let root = Arc::new(TmpFs::new());
+        for dir in ["a", "b", "jail", "jail/in", "c", "d"] {
+            root.add_dir(dir);
+        }
+        let mut parent = Vfs::new();
+        parent.mount("/", root);
+        let mut child = parent.clone();
+        let fs = || Arc::new(TmpFs::new()) as Arc<dyn FileSystem>;
+        // The child mounts: the parent sees it, by its view at once and
+        // in its own copy at its next call.
+        child.mount("/a", fs());
+        assert!(child.is_mount_point("/a") && parent.view().get().is_mount_point("/a"));
+        assert!(!parent.is_mount_point("/a"), "not until it looks");
+        parent.refresh();
+        assert!(parent.is_mount_point("/a"));
+        // And the parent's the child, a fork made later too.
+        parent.mount("/b", fs());
+        child.refresh();
+        assert!(child.is_mount_point("/b") && parent.clone().is_mount_point("/b"));
+        assert!(child.unmount("/b"));
+        parent.refresh();
+        assert!(!parent.is_mount_point("/b"));
+        assert_eq!(parent.view().mount_ns().id(), child.view().mount_ns().id());
+
+        // A mount of a process's own (its /proc) is that process's alone,
+        // a fork starting with its parent's until it is given its own.
+        let mine = fs();
+        mine.open("parent", crate::fs::oflags::O_CREAT | crate::fs::oflags::O_WRONLY, 0o644).unwrap();
+        parent.mount_own("/d", mine);
+        child.refresh();
+        assert!(parent.is_mount_point("/d") && !child.is_mount_point("/d") && parent.metadata("/d/parent").is_ok());
+        let mut later = parent.clone();
+        assert!(later.metadata("/d/parent").is_ok(), "its parent's, to begin with");
+        later.mount_own("/d", fs());
+        parent.refresh();
+        assert!(later.metadata("/d/parent").is_err() && parent.metadata("/d/parent").is_ok());
+        assert!(parent.unmount("/d") && !parent.is_mount_point("/d") && later.is_mount_point("/d"));
+
+        // A root of its own: the namespace's mounts under it, from it.
+        let mut jailed = parent.clone();
+        jailed.chroot("/jail").unwrap();
+        parent.mount("/jail/in", fs());
+        parent.mount("/c", fs());
+        jailed.refresh();
+        assert!(jailed.is_mount_point("/in") && !jailed.is_mount_point("/c") && jailed.metadata("/c").is_err());
+        assert_eq!(jailed.root(), "/jail");
+        // What it mounts is in the namespace where it is there.
+        jailed.mount("/in", fs());
+        jailed.mount("/new", fs());
+        parent.refresh();
+        assert!(parent.is_mount_point("/jail/new") && !parent.is_mount_point("/new"));
+        assert!(jailed.unmount("/new") && !jailed.unmount("/"));
+        parent.refresh();
+        assert!(!parent.is_mount_point("/jail/new"));
+
+        // A namespace of its own: a copy as it stood, then apart.
+        let mut apart = parent.clone();
+        apart.unshare_mounts();
+        assert!(apart.is_mount_point("/a") && apart.is_mount_point("/c"));
+        assert_ne!(apart.view().mount_ns().id(), parent.view().mount_ns().id());
+        apart.mount("/d", fs());
+        assert!(apart.unmount("/a"));
+        parent.mount("/b", fs());
+        parent.refresh();
+        apart.refresh();
+        assert!(!parent.is_mount_point("/d") && parent.is_mount_point("/a"), "the parent sees nothing of it");
+        assert!(!apart.is_mount_point("/b") && apart.is_mount_point("/d"), "nor it of the parent");
+        // A fork of it is in its namespace.
+        let mut its_child = apart.clone();
+        its_child.mount("/b", fs());
+        apart.refresh();
+        assert!(apart.is_mount_point("/b"));
+        // And another process may enter it: its table, from its root.
+        jailed.join_mounts(apart.view().mount_ns());
+        assert!(jailed.is_mount_point("/d") && jailed.is_mount_point("/jail/in") && !jailed.is_mount_point("/a"));
+        assert_eq!((jailed.root(), jailed.cwd.as_str()), ("/", "/"));
     }
 
     /// `chroot`: the root a directory of the old one's filesystem, its

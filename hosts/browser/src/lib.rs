@@ -2260,7 +2260,7 @@ fn mount_devices(kernel: &mut Kernel) -> Option<crate::wl::WaylandDevice> {
 /// dispatch miss at pc=0 with nothing to blame the filesystem.
 fn mount_procfs(kernel: &mut Kernel) -> Arc<gex_kernel::KernelProcSource> {
     let proc_state: Arc<gex_kernel::KernelProcSource> = Arc::new(gex_kernel::KernelProcSource::new());
-    kernel.vfs.mount(
+    kernel.vfs.mount_own(
         "/proc",
         Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
     );
@@ -6222,7 +6222,7 @@ pub extern "C" fn gex_load(ptr: u32, len: u32, argv: u32, argv_len: u32) -> u64 
     // `FILE*` and faults at pc=0, blaming nothing.
     root.add_dir("/proc");
     let proc_state: Arc<gex_kernel::KernelProcSource> = Arc::new(gex_kernel::KernelProcSource::new());
-    kernel.vfs.mount(
+    kernel.vfs.mount_own(
         "/proc",
         Arc::new(gex_kernel::vfs::ProcFs::new(proc_state.clone())),
     );

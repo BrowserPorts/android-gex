@@ -2885,7 +2885,9 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     // the parent's `/proc` -- so without this the child, and everything it
     // goes on to exec, reads its ancestor's pid, maps and command line from
     // `/proc/self`. Each process gets its own.
-    child_kernel.vfs.mount(
+    // Its own alone: the mount table is the namespace's, which the child
+    // shares with its parent.
+    child_kernel.vfs.mount_own(
         "/proc",
         Arc::new(ProcFs::new(Arc::new(KernelProcSource(Arc::clone(&child_proc))))),
     );
@@ -3700,7 +3702,8 @@ fn mount_filesystems(
     }
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));
-    kernel.vfs.mount(
+    // The process's own: every process has a /proc made of its own state.
+    kernel.vfs.mount_own(
         "/proc",
         Arc::new(ProcFs::new(Arc::new(KernelProcSource(proc_state)))),
     );

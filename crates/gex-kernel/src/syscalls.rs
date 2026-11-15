@@ -644,6 +644,8 @@ pub mod clone_flags {
     pub const PIDFD: u64 = 0x0000_1000;
     pub const VFORK: u64 = 0x0000_4000;
     pub const THREAD: u64 = 0x0001_0000;
+    /// A mount namespace of the caller's own.
+    pub const NEWNS: u64 = 0x0002_0000;
     pub const SETTLS: u64 = 0x0008_0000;
     pub const PARENT_SETTID: u64 = 0x0010_0000;
     pub const CHILD_CLEARTID: u64 = 0x0020_0000;
@@ -7514,6 +7516,7 @@ pub fn thread_own_call(
     thread: &crate::signal::ThreadSig,
     thread_fs: &ThreadFs,
     fs: &Arc<FsCwd>,
+    view: &crate::vfs::VfsView,
     ctx_addr: u64,
     tid: i32,
     n: u64,
@@ -7524,15 +7527,22 @@ pub fn thread_own_call(
             thread.set_clear_child_tid(a[0]);
             Ok(tid as u64)
         }
-        // Only a thread's own working directory (CLONE_FS) is unshared;
-        // a private descriptor table or namespace is not supported.
+        // A thread's own working directory (CLONE_FS), and a mount
+        // namespace of the caller's own (CLONE_NEWNS, which brings
+        // CLONE_FS with it); a private descriptor table or any other
+        // namespace is not supported. The mount namespace is the
+        // process's here, every thread's, where Linux gives it to the
+        // calling thread alone.
         nr::UNSHARE => {
-            if a[0] & !clone_flags::FS != 0 {
+            if a[0] & !(clone_flags::FS | clone_flags::NEWNS) != 0 {
                 return Err(Errno::EINVAL);
             }
-            if a[0] & clone_flags::FS != 0 {
+            if a[0] & (clone_flags::FS | clone_flags::NEWNS) != 0 {
                 // A copy of the directory it had, its own from now.
                 thread_fs.set(ctx_addr, Some(Arc::new(fs.copy())));
+            }
+            if a[0] & clone_flags::NEWNS != 0 {
+                view.unshare();
             }
             Ok(0)
         }
@@ -8856,7 +8866,7 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
             },
         }
     } else if is_thread_own(n) {
-        thread_own_call(f.signals.thread(), f.thread_fs, &f.path.fs, ctx_addr, f.futex.tid as i32, n, a)
+        thread_own_call(f.signals.thread(), f.thread_fs, &f.path.fs, f.path.view, ctx_addr, f.futex.tid as i32, n, a)
     } else if is_signal_call(n) {
         match n {
             // Returning from a handler restores a whole context, so it
@@ -12516,7 +12526,7 @@ impl Kernel {
             // `set_tid_address` and `unshare`.
             n if is_thread_own(n) => {
                 let fs = self.fs_of(self.ctx_addr);
-                thread_own_call(self.signals.thread(), &self.thread_fs, &fs, self.ctx_addr, self.tid, n, a)
+                thread_own_call(self.signals.thread(), &self.thread_fs, &fs, self.vfs.view(), self.ctx_addr, self.tid, n, a)
             }
             nr::PPOLL | nr::PSELECT6 => self.fd_io().poll_now(m, n, a),
             nr::STATFS | nr::FSTATFS => self.sys_statfs(m, n, a[0], a[1]),
