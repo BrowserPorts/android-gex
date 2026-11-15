@@ -42,6 +42,18 @@ pub mod op {
     pub const CLOCK_REALTIME: u32 = 256;
 }
 
+/// The table for futex words in files mapped shared, used without
+/// `FUTEX_PRIVATE_FLAG`: such a word is every process's that maps the
+/// file, so its waiters are found by the file and the word's place in it
+/// (`crate::syscalls::FutexCx::shared_word`), whichever process they are
+/// in. One for this kernel: natively that is every process (they are
+/// threads of one host process); a host whose processes are each a kernel
+/// of their own (the page's) has no such futexes yet.
+pub fn shared() -> &'static Arc<FutexTable> {
+    static TABLE: std::sync::OnceLock<Arc<FutexTable>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| Arc::new(FutexTable::new()))
+}
+
 /// The bits of a priority-inheritance futex word.
 pub mod pi {
     pub const WAITERS: u32 = 0x8000_0000;

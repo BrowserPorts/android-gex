@@ -113,6 +113,7 @@ run() {
     procattr) check "$1" "procattr ok" 0 root ;;
     filelabel) check "$1" "filelabel ok" 0 root ;;
     kmsg) check "$1" "kmsg ok" 0 root ;;
+    sharedfutex) check "$1" "sharedfutex ok" 0 ;;
     aosp/*) gtest "${1#aosp/}" ;;
     *)
         echo "FAIL $1: no such program"
@@ -126,7 +127,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex"
     for p in $all; do
         run "$p"
     done

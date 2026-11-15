@@ -9055,9 +9055,39 @@ pub struct FutexCx<'a> {
     pub mapped_by: Option<&'a dyn Fn(u64, u64) -> bool>,
     pub tid: u32,
     pub clock: ClockFn,
+    /// The process's shared file mappings: a futex word in one, used
+    /// without `FUTEX_PRIVATE_FLAG`, is every mapper's
+    /// ([`FutexCx::shared_word`]). `None` where a host has no such
+    /// futexes: the word is then this process's alone.
+    pub shared: Option<&'a SharedMapView>,
 }
 
 impl FutexCx<'_> {
+    /// For a futex word in a file this process maps shared, in a call
+    /// made without `FUTEX_PRIVATE_FLAG`: what every process that maps
+    /// the file knows the word by (the file and the word's place in it,
+    /// as Linux keys a shared futex by inode and offset), and the
+    /// mapping. `None` for a private call and for any other word, which
+    /// is then the process's own.
+    ///
+    /// A mapping here is a copy the process keeps, so what a futex is
+    /// for (one process changing the word, another waiting on it) needs
+    /// the copies to meet: a wake writes the waker's pages back first
+    /// ([`futex_call`]), and a wait is refused, to be made again, when
+    /// another process has written back since this one last took such
+    /// writes in ([`futex_block`]).
+    fn shared_word(&self, addr: u64, raw_op: u32) -> Option<(u64, SharedMap)> {
+        use std::hash::{Hash, Hasher};
+        if raw_op & futex::op::PRIVATE_FLAG != 0 {
+            return None;
+        }
+        let maps = self.shared?.get();
+        let map = maps.iter().find(|m| addr >= m.start && addr + 4 <= m.start + m.len)?;
+        let mut key = std::collections::hash_map::DefaultHasher::new();
+        (&map.file.path, map.offset + (addr - map.start)).hash(&mut key);
+        Some((key.finish(), map.clone()))
+    }
+
     /// Whether the futex word at `addr` is inside the process's memory map.
     /// Checked against the map, not by reading: a guest address is a
     /// linear-memory offset, so reading address zero succeeds and proves
@@ -9114,7 +9144,22 @@ pub fn futex_block(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Bl
     // (caught just below as EAGAIN) or bumped a generation the park
     // will see. The native host holds the queue lock across its
     // check-and-sleep instead and ignores this.
-    let parked = cx.table.park(a[0]);
+    // A word in a file mapped shared is waited for where every process
+    // that maps the file will look.
+    let (table, key) = match cx.shared_word(a[0], a[1] as u32) {
+        Some((key, _)) => (futex::shared(), key),
+        None => (cx.table, a[0]),
+    };
+    let parked = table.park(key);
+    // This process's copy of such a word is as the file was when it last
+    // took in what others wrote back. If anything has been written back
+    // since, the word may have changed where this process cannot see it
+    // yet, and the wake for it may have been and gone: no wait (`EAGAIN`
+    // from `futex_call`), and the call made again finds the copy brought
+    // up to date at its entry.
+    if !std::ptr::eq(table, cx.table) && cx.shared.is_some_and(|s| !s.caught_up()) {
+        return None;
+    }
     // The word must still hold what the caller expects, or the
     // wake that changed it has already been and gone and the wait
     // would be permanent. A mismatch declines the wait (EAGAIN via
@@ -9150,7 +9195,7 @@ pub fn futex_block(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Bl
         ))
     };
     Some(BlockOp::FutexWait {
-        table: Arc::clone(cx.table),
+        table: Arc::clone(table),
         uaddr: a[0],
         val: a[2] as u32,
         deadline,
@@ -9207,7 +9252,17 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
             // and may not read (`get_user` in `futex_wait_setup`).
             Err(if mapped && m.read_u32(uaddr).is_ok() { Errno::EAGAIN } else { Errno::EFAULT })
         }
-        futex::op::WAKE | futex::op::WAKE_BITSET => Ok(cx.table.wake(uaddr, val)),
+        futex::op::WAKE | futex::op::WAKE_BITSET => {
+            // A word in a file mapped shared: what this process stored
+            // there goes out to the file first, where the waiters, each
+            // with a copy of its own, will read it; then they are woken
+            // wherever they are.
+            if let Some((key, map)) = cx.shared_word(uaddr, raw_op) {
+                sync_shared_file(cx.shared, m, &map.file, MapSync::Release, None);
+                return Ok(futex::shared().wake(key, val));
+            }
+            Ok(cx.table.wake(uaddr, val))
+        }
         // Take the lock if it is free. Held, the waiters bit goes on
         // *before* the caller parks (`EAGAIN`, which `lock_pi_op` turns
         // into the park), as Linux sets it in the kernel: the owner's
@@ -10452,6 +10507,13 @@ impl SharedMapView {
         for map in self.get().iter() {
             let _ = refresh(m, map, false, None, true);
         }
+    }
+
+    /// Whether nothing has been written back to any file since this
+    /// process's mappings last took such writes in
+    /// ([`SharedMapView::catch_up`]).
+    pub fn caught_up(&self) -> bool {
+        !self.any.load(std::sync::atomic::Ordering::Relaxed) || self.seq.load(std::sync::atomic::Ordering::Relaxed) == crate::locks::write_seq()
     }
 
     /// The mappings as they stand.
@@ -12541,7 +12603,7 @@ impl Kernel {
     /// What this process's futex calls need ([`FutexCx`]), for the calling
     /// thread, with the map asked directly (`mapped`): this kernel owns it.
     fn futex_cx<'a>(&'a self, mapped: &'a dyn Fn(u64, u64) -> bool) -> FutexCx<'a> {
-        FutexCx { table: &self.futexes, map: None, mapped_by: Some(mapped), tid: self.tid as u32, clock: self.clock }
+        FutexCx { table: &self.futexes, map: None, mapped_by: Some(mapped), tid: self.tid as u32, clock: self.clock, shared: Some(self.mem.shared_maps()) }
     }
 
     // -- signals -------------------------------------------------------------
@@ -15819,7 +15881,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
@@ -16045,7 +16107,7 @@ mod tests {
         let call = free_class(&m, at, true).expect("in the class");
         assert_eq!(call.number(), nr::SOCKETPAIR);
         assert_eq!(call.args(), [1, 1, 0]);
-        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
         let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
         assert!(matches!(free_call(&f, &mut m, at, call), FreeOutcome::Done(_)));
         assert_eq!(m.read_u64(at + ctx::x(0) as u64).unwrap() as u32, 0);
@@ -16099,7 +16161,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
@@ -16167,7 +16229,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
@@ -16375,7 +16437,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
@@ -16473,7 +16535,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -16552,7 +16614,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -16670,7 +16732,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -16756,7 +16818,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -16854,7 +16916,7 @@ mod tests {
         // Without the lock: a park on its set, with the timeout.
         set_args(&mut m, at, nr::RT_SIGTIMEDWAIT, &[set_at, info_at, ts_at, 8]);
         let call = free_class(&m, at, false).expect("in the class");
-        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
         let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
         match free_call(&f, &mut m, at, call) {
             FreeOutcome::Blocking(BlockOp::SigWait { set, timeout, .. }, None) => {
@@ -16923,7 +16985,7 @@ mod tests {
         k.compat = true;
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -17017,7 +17079,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
@@ -17122,7 +17184,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
@@ -17282,7 +17344,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
@@ -17377,7 +17439,7 @@ mod tests {
         let wfd = m.read_u32(0x20004).unwrap() as u64;
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> Option<FreeOutcome> {
             let call = free_class(m, at, false)?;
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             Some(free_call(&f, m, at, call))
         }
@@ -17557,7 +17619,7 @@ mod tests {
         let req = 0x3000u64;
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("sleeps are in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -17615,7 +17677,7 @@ mod tests {
         let word = 0x30000u64;
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("futex is in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -17733,7 +17795,7 @@ mod tests {
                 std::thread::spawn(move || {
                     crate::sync::set_thread_id(i as u32 + 1);
                     let mapped = |_: u64, _: u64| true;
-                    let cx = FutexCx { table: &table, map: None, mapped_by: Some(&mapped), tid: i as u32 + 1, clock: system_clock };
+                    let cx = FutexCx { table: &table, map: None, mapped_by: Some(&mapped), tid: i as u32 + 1, clock: system_clock, shared: None };
                     // The word lives in an AtomicU32 every thread shares; each
                     // call sees it through a copy of its own (the crate has no
                     // unsafe code to alias it), and a waiter also re-reads it,
@@ -18016,7 +18078,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("socket messages are in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -18090,7 +18152,7 @@ mod tests {
         let mut m = GuestMem::new(&mut buf);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("ioctl is in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -18205,7 +18267,7 @@ mod tests {
         k.compat = true;
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -18284,7 +18346,7 @@ mod tests {
         k.compat = true;
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -18406,7 +18468,7 @@ mod tests {
         let fd = open(&mut m, &mut k);
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, false).expect("in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }
@@ -18505,7 +18567,7 @@ mod tests {
         let close = |m: &mut GuestMem<'_>, k: &Kernel, fd: u64| {
             set_args(m, at, nr::CLOSE, &[fd]);
             let call = free_class(m, at, false).expect("close is in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)));
             ret(m, at)
@@ -18559,7 +18621,7 @@ mod tests {
                 set_args(m, at, n, a);
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
-                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
                     let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
@@ -18631,7 +18693,7 @@ mod tests {
                 set_args(m, at, n, a);
                 match free_class(m, at, false) {
                     Some(call) if lock_free => {
-                        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                        let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
                         let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                         assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                     }
@@ -18688,7 +18750,7 @@ mod tests {
                 set_args(m, at, n, a);
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
-                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
                     let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
@@ -18768,7 +18830,7 @@ mod tests {
                 set_args(m, at, n, a);
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
-                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
                     let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
@@ -18876,7 +18938,7 @@ mod tests {
                 set_args(m, at, n, a);
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
-                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
                     let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
@@ -18949,7 +19011,7 @@ mod tests {
                 }
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
-                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
                     let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
@@ -19153,7 +19215,7 @@ mod tests {
                 set_args(m, at, n, a);
                 if lock_free {
                     let call = free_class(m, at, false).expect("in the class");
-                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
                     let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
@@ -19231,7 +19293,7 @@ mod tests {
                 }
                 if lock_free {
                     let call = free_class(m, at, true).expect("in the class");
-                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+                    let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
                     let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
                     assert!(matches!(free_call(&f, m, at, call), FreeOutcome::Done(_)), "{n} in the class");
                 } else {
@@ -19267,7 +19329,7 @@ mod tests {
         k.compat = true;
         fn free(k: &Kernel, m: &mut GuestMem<'_>, at: u64) -> FreeOutcome {
             let call = free_class(m, at, true).expect("in the class");
-            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock };
+            let futex = FutexCx { table: &k.futexes, map: Some(k.mem.view()), mapped_by: None, tid: k.tid as u32, clock: k.clock, shared: None };
             let f = Free { io: k.fd_io(), map: k.map_io(), path: k.path_io(), signals: &k.signals, procs: &k.procs, live: &k.live_threads, slots: &k.next_ctx_slot, tty: &k.tty, pid: k.pid, creds: &k.creds, threads: &k.thread_signals, wasm32: false, futex, started: k.started, rlimits: &k.rlimits, net: k.net_io(), thread_fs: &k.thread_fs };
             free_call(&f, m, at, call)
         }

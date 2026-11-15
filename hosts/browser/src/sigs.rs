@@ -623,6 +623,9 @@ pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, co
         mapped_by: Some(&by_kernel),
         tid: crate::my_tid() as u32,
         clock: home.clock,
+        // A futex in a file two processes map is not here yet: each
+        // process's kernel is its own, and so is its futex table.
+        shared: None,
     };
     // This thread's fs_struct: its own, or the process's (borrowed: no
     // count taken on what every thread shares).
