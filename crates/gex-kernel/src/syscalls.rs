@@ -12381,7 +12381,7 @@ impl Kernel {
                 return SyscallOutcome::Exit(*exit);
             }
         };
-        if self.trace {
+        if self.trace || strace_only(n) {
             eprintln!(
                 "[gex:{}{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} = {}",
                 self.pid,
@@ -14787,6 +14787,16 @@ pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64, procs: &ProcTable, 
 }
 
 const CAP_SYS_RESOURCE: u64 = 24;
+
+/// `GEX_STRACE_ONLY=mknodat,fchownat`: whether call `n` is one of the calls
+/// named there, which are then printed as `gexc run --strace` prints every
+/// call, without the rest of what tracing a process costs it. For
+/// watching a few calls of a long run (a boot).
+fn strace_only(n: u64) -> bool {
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| std::env::var("GEX_STRACE_ONLY").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default());
+    !only.is_empty() && only.iter().any(|s| s == syscall_name(n))
+}
 
 /// `prlimit64(pid, resource, new, old)`, for the calling process (gex's
 /// processes set only their own). Limits are recorded and reported;
