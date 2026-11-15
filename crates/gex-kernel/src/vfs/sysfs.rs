@@ -414,6 +414,11 @@ impl FileSystem for SysFs {
         "sysfs"
     }
 
+    /// One number, whichever mount is asked: every mount is the one filesystem.
+    fn dev(&self) -> u64 {
+        super::anon_dev(super::DevKey::Kind("sysfs"))
+    }
+
     fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let path = &resolve(path, true)?;
         if let Some(rest) = cpu(path) {

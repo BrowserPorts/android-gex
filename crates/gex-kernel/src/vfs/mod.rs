@@ -89,6 +89,35 @@ pub fn anon_ino(p: *const u8) -> u64 {
     (1 << 62) | (p as usize as u64 >> 3)
 }
 
+/// What a filesystem with no device behind it is numbered by
+/// ([`anon_dev`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DevKey {
+    /// One mounted instance, by where it is in memory.
+    Instance(usize),
+    /// The one filesystem of its kind: proc, sysfs, the pipes'.
+    Kind(&'static str),
+    /// A tree of the host's, by the host's own number for the filesystem
+    /// it is on: two views of one host tree are one filesystem.
+    Host(u64),
+}
+
+/// The device number of a filesystem with no device behind it
+/// (`get_anon_bdev`): major 0 and a minor of its own, from 1, the same
+/// one every time it is asked for. A file's `st_dev` is its filesystem's
+/// number, and programs take two files of one `st_dev` and `st_ino` for
+/// one file: bionic's linker takes a library it is asked for as loaded
+/// already when a loaded one has both, and the libraries of two APEXes,
+/// each an ext4 of its own with inodes counted from 11, would be one
+/// another's if every filesystem said 0.
+pub fn anon_dev(key: DevKey) -> u64 {
+    static TABLE: std::sync::Mutex<Option<std::collections::HashMap<DevKey, u32>>> = std::sync::Mutex::new(None);
+    let mut t = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let t = t.get_or_insert_with(Default::default);
+    let next = t.len() as u32 + 1;
+    devices::makedev(0, *t.entry(key).or_insert(next))
+}
+
 /// Metadata about a path, independent of any open file.
 #[derive(Clone, Debug)]
 pub struct Metadata {
@@ -407,6 +436,15 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Option<Result<(), Errno>> {
         let _ = (uid, gid);
         None
+    }
+
+    /// The device number (`st_dev`) of an object no path leads to, which
+    /// is its kind's filesystem's: the anonymous inodes' for anything
+    /// that does not say (an eventfd, an epoll), the pipes' for a pipe,
+    /// the sockets' for a socket. A file opened by a path has the number
+    /// of the filesystem the path led to, and is not asked.
+    fn fs_dev(&self) -> u64 {
+        anon_dev(DevKey::Kind("anon_inodefs"))
     }
 
     /// An extended-attribute call on the open file itself (`fgetxattr` and
@@ -1021,6 +1059,14 @@ pub trait FileSystem: Send + Sync {
     fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
         let _ = (uid, gid);
         self.metadata_nofollow(path).map(|_| ())
+    }
+
+    /// The number of the device the filesystem is on (`s_dev`: its
+    /// files' `st_dev`, and what `/proc/self/mountinfo` says of it). The
+    /// block device's for one that is on one; for the rest a number of
+    /// its own ([`anon_dev`]), by default this instance's.
+    fn dev(&self) -> u64 {
+        anon_dev(DevKey::Instance(self as *const Self as *const u8 as usize))
     }
 
     /// Set a file's modification time (seconds since the epoch), for
@@ -1897,7 +1943,7 @@ impl Namespace {
             .map(|(at, fs)| {
                 let fs_type = fs.fs_type();
                 let record = fs.mount_record().unwrap_or(mounted::Record { source: fs_type.to_string(), flags: 0 });
-                MountLine { at: at.clone(), fs_type, record, fs_options: fs.show_options() }
+                MountLine { at: at.clone(), fs_type, record, fs_options: fs.show_options(), dev: fs.dev() }
             })
             .collect()
     }
@@ -2130,12 +2176,18 @@ impl Namespace {
 
     /// Open a path, following symlinks up to a bounded depth.
     pub fn open(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
-        self.open_with(path, |fs, rel| fs.open(rel, flags, mode))
+        self.open_with(path, |fs, rel| fs.open(rel, flags, mode)).map(|(h, _)| h)
     }
 
     /// [`Namespace::open`] by [`FileSystem::open_mode`]: a program's open,
     /// whose O_CREAT makes the file with exactly `mode`.
     pub fn open_mode(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
+        self.open_with(path, |fs, rel| fs.open_mode(rel, flags, mode)).map(|(h, _)| h)
+    }
+
+    /// [`Self::open_mode`], and the number of the device of the
+    /// filesystem the file is in ([`FileSystem::dev`]): its `st_dev`.
+    pub fn open_mode_on(&self, path: &str, flags: u64, mode: u32) -> Result<(Arc<dyn FileHandle>, u64), Errno> {
         self.open_with(path, |fs, rel| fs.open_mode(rel, flags, mode))
     }
 
@@ -2143,10 +2195,10 @@ impl Namespace {
         &self,
         path: &str,
         open: impl Fn(&Arc<dyn FileSystem>, &str) -> Result<Arc<dyn FileHandle>, Errno>,
-    ) -> Result<Arc<dyn FileHandle>, Errno> {
+    ) -> Result<(Arc<dyn FileHandle>, u64), Errno> {
         let mut current = normalize(path, &self.cwd);
         if let Some((fs, rel)) = self.resolve_final(&current)? {
-            return open(fs, &rel);
+            return open(fs, &rel).map(|h| (h, fs.dev()));
         }
         for _ in 0..40 {
             let (fs, rel) = self.resolve(&current)?;
@@ -2161,7 +2213,7 @@ impl Namespace {
                         normalize(&target, &parent)
                     };
                 }
-                Err(_) => return open(fs, &rel),
+                Err(_) => return open(fs, &rel).map(|h| (h, fs.dev())),
             }
         }
         Err(Errno::ELOOP)
@@ -2247,6 +2299,37 @@ impl Namespace {
     pub fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
         let (fs, rel) = self.resolve(path)?;
         fs.metadata_nofollow(&rel)
+    }
+
+    /// [`Self::metadata`] (`follow`) or [`Self::metadata_nofollow`], and
+    /// the number of the device of the filesystem the file is in
+    /// ([`FileSystem::dev`]): what `stat` says of a path.
+    pub fn metadata_on(&self, path: &str, follow: bool) -> Result<(Metadata, u64), Errno> {
+        if !follow {
+            let (fs, rel) = self.resolve(path)?;
+            return Ok((fs.metadata_nofollow(&rel)?, fs.dev()));
+        }
+        let mut current = normalize_cow(path, &self.cwd);
+        // As `metadata`: in the root, one step.
+        if let Some(root) = self.mounts.get("/") {
+            if let Some(md) = root.walk_metadata(&current, &self.others)? {
+                return Ok((md, root.dev()));
+            }
+        }
+        for _ in 0..40 {
+            let (fs, rel) = self.resolve(&current)?;
+            match fs.read_link(&rel) {
+                Ok(target) => {
+                    current = std::borrow::Cow::Owned(if target.starts_with('/') {
+                        normalize(&target, "/")
+                    } else {
+                        normalize(&target, &parent_of(&current))
+                    });
+                }
+                Err(_) => return Ok((fs.metadata(&rel)?, fs.dev())),
+            }
+        }
+        Err(Errno::ELOOP)
     }
 
     pub fn read_link(&self, path: &str) -> Result<String, Errno> {
@@ -2462,6 +2545,8 @@ pub struct MountLine {
     pub record: mounted::Record,
     /// The filesystem's own options ([`FileSystem::show_options`]).
     pub fs_options: String,
+    /// The number of the device it is on ([`FileSystem::dev`]).
+    pub dev: u64,
 }
 
 impl MountLine {

@@ -880,6 +880,11 @@ pub mod option {
 }
 
 impl FileHandle for Socket {
+    /// A socket is in the sockets' filesystem.
+    fn fs_dev(&self) -> u64 {
+        crate::vfs::anon_dev(crate::vfs::DevKey::Kind("sockfs"))
+    }
+
     fn as_netlink(self: Arc<Self>) -> Option<Arc<Socket>> {
         Some(self)
     }

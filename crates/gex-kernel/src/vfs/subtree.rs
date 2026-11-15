@@ -36,6 +36,11 @@ impl FileSystem for Subtree {
     fn magic(&self) -> u64 {
         self.inner.magic()
     }
+    /// A part of a filesystem is on the device the whole is on: a bind
+    /// mount's files are the same files.
+    fn dev(&self) -> u64 {
+        self.inner.dev()
+    }
     fn mount_record(&self) -> Option<super::mounted::Record> {
         self.inner.mount_record()
     }

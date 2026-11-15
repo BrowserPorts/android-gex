@@ -151,6 +151,9 @@ impl FileSystem for Mount {
     fn fs_type(&self) -> &'static str {
         self.fs.fs_type()
     }
+    fn dev(&self) -> u64 {
+        self.fs.dev()
+    }
     fn magic(&self) -> u64 {
         self.fs.magic()
     }

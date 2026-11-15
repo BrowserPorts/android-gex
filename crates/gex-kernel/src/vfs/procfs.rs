@@ -185,7 +185,7 @@ fn mount_path(at: &str) -> String {
 }
 
 /// `/proc/self/mountinfo`: one line per mount, Linux's fields -- id,
-/// parent's id, device (`st_dev`, 0 everywhere here), root, mount point,
+/// parent's id, device (its files' `st_dev`), root, mount point,
 /// options, `-`, type, source, superblock options. The root's parent is 0,
 /// one not listed, as a chroot's is.
 pub fn mountinfo(table: &[crate::vfs::MountLine]) -> String {
@@ -203,7 +203,8 @@ pub fn mountinfo(table: &[crate::vfs::MountLine]) -> String {
                 .map_or(1, |p| crate::vfs::mount_id(p))
         };
         let id = crate::vfs::mount_id(at);
-        out.push_str(&format!("{id} {parent} 0:0 / {} {} - {} {} {}\n", mount_path(at), line.mount_options(), line.fs_type, mount_path(&line.record.source), line.super_options()));
+        let (major, minor) = (super::devices::major(line.dev), super::devices::minor(line.dev));
+        out.push_str(&format!("{id} {parent} {major}:{minor} / {} {} - {} {} {}\n", mount_path(at), line.mount_options(), line.fs_type, mount_path(&line.record.source), line.super_options()));
     }
     out
 }
@@ -612,6 +613,14 @@ impl ProcFs {
 impl FileSystem for ProcFs {
     fn fs_type(&self) -> &'static str {
         "proc"
+    }
+
+    /// One number: each process has a view of its own of the one proc
+    /// that is mounted, at `/proc`. (On Linux every mount of proc is a
+    /// filesystem of its own, with its own number; no second one can be
+    /// mounted here.)
+    fn dev(&self) -> u64 {
+        super::anon_dev(super::DevKey::Kind("proc"))
     }
     fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         // A directory opens for reading only.
@@ -1272,6 +1281,11 @@ impl SysCpuFs {
 impl FileSystem for SysCpuFs {
     fn fs_type(&self) -> &'static str {
         "sysfs"
+    }
+
+    /// A part of sysfs: sysfs's number.
+    fn dev(&self) -> u64 {
+        super::anon_dev(super::DevKey::Kind("sysfs"))
     }
     fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         let path = path.trim_matches('/');

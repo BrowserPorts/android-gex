@@ -286,6 +286,11 @@ impl FileSystem for SelinuxFs {
         "selinuxfs"
     }
 
+    /// One number, whichever mount is asked: every mount is the one filesystem.
+    fn dev(&self) -> u64 {
+        super::anon_dev(super::DevKey::Kind("selinuxfs"))
+    }
+
     fn magic(&self) -> u64 {
         MAGIC
     }

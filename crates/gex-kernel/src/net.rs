@@ -1944,6 +1944,11 @@ impl Socket {
 }
 
 impl FileHandle for Socket {
+    /// A socket is in the sockets' filesystem.
+    fn fs_dev(&self) -> u64 {
+        crate::vfs::anon_dev(crate::vfs::DevKey::Kind("sockfs"))
+    }
+
     fn as_inet_socket(self: Arc<Self>) -> Option<Arc<Socket>> {
         Some(self)
     }

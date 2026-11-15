@@ -3757,14 +3757,18 @@ impl PathIo<'_> {
         // follow a dangling symlink to `ENOENT` -- which is how tar sets the
         // mode on a symlink whose target does not exist yet.
         let mut tmpfile_path: Option<String> = None;
+        // The device of the filesystem the file is in: its `st_dev`.
+        let on;
         let handle = if flags & oflags::O_PATH != 0 {
-            let md = if flags & oflags::O_NOFOLLOW != 0 {
-                self.ns.metadata_nofollow(&p)?
+            let md;
+            (md, on) = if flags & oflags::O_NOFOLLOW != 0 {
+                self.ns.metadata_on(&p, false)?
             } else if let Some(n) = self.magic_fd(&p) {
                 // A descriptor's link names the descriptor's own file.
-                self.map.fds.get(n).map_err(|_| Errno::ENOENT)?.handle.metadata()?
+                let of = self.map.fds.get(n).map_err(|_| Errno::ENOENT)?;
+                (of.handle.metadata()?, of.dev())
             } else {
-                self.ns.metadata(&p)?
+                self.ns.metadata_on(&p, true)?
             };
             if flags & oflags::O_DIRECTORY != 0 && md.file_type != FileType::Directory {
                 return Err(Errno::ENOTDIR);
@@ -3775,10 +3779,10 @@ impl PathIo<'_> {
             // killed with the descriptor open, from a process that had this
             // pid (pids repeat from run to run). The next number, then.
             let mut tries = 0;
-            let (tmp, h) = loop {
+            let (tmp, (h, dev)) = loop {
                 let n = self.tmpfiles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let tmp = format!("{}/.gex-tmpfile-{}-{}", p.trim_end_matches('/'), self.pid, n);
-                match self.ns.open_mode(
+                match self.ns.open_mode_on(
                     &tmp,
                     oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL,
                     mode & 0o7777 & !self.fs.umask(),
@@ -3787,6 +3791,7 @@ impl PathIo<'_> {
                     r => break (tmp, r?),
                 }
             };
+            on = dev;
             // Kept named (not unlinked here) so `/proc/self/fd/N` resolves to the
             // file and the `linkat(..., AT_SYMLINK_FOLLOW)` idiom can hardlink it
             // into place; the name is removed when the descriptor closes (see
@@ -3819,7 +3824,8 @@ impl PathIo<'_> {
             // (Whether it makes one is looked at only where a new file
             // will want a label.)
             let makes = flags & oflags::O_CREAT != 0 && crate::selinux::loaded() && self.ns.metadata_nofollow(&p).is_err();
-            let h = self.ns.open_mode(&p, flags, mode & 0o7777 & !self.fs.umask())?;
+            let h;
+            (h, on) = self.ns.open_mode_on(&p, flags, mode & 0o7777 & !self.fs.umask())?;
             if makes {
                 self.label_new(&p);
             }
@@ -3848,6 +3854,7 @@ impl PathIo<'_> {
             Some(tp) => OpenFile::tmpfile(handle, tp, self.view.get(), flags, readable, writable),
             None => OpenFile::new(handle, p, flags, readable, writable),
         };
+        file.on(on);
         self.map.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
     }
 
@@ -3905,6 +3912,8 @@ impl PathIo<'_> {
             }
         };
         let file = OpenFile::new(handle, of.path.clone(), flags & !(oflags::O_CREAT | oflags::O_EXCL | oflags::O_TRUNC), readable, writable);
+        // The same file, in the same filesystem.
+        file.on(of.dev());
         self.map.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
     }
 
@@ -3962,18 +3971,14 @@ impl PathIo<'_> {
         buf: u64,
     ) -> SysResult {
         let raw = m.read_cstr(path, 4096)?;
-        let (md, mnt_id) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        let (md, dev, mnt_id) = if raw.is_empty() && flags & AT_EMPTY_PATH != 0 {
             let f = self.map.fds.get(dirfd)?;
             let id = if f.path.starts_with('/') { self.ns.mount_id_of(&f.path) } else { 1 };
-            (f.metadata()?, id)
+            (f.metadata()?, f.dev(), id)
         } else {
             let p = self.at_path(m, dirfd, path)?;
-            let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-                self.ns.metadata_nofollow(&p)?
-            } else {
-                self.ns.metadata(&p)?
-            };
-            (md, self.ns.mount_id_of(&p))
+            let (md, dev) = self.ns.metadata_on(&p, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+            (md, dev, self.ns.mount_id_of(&p))
         };
         let st = Kernel::stat_from(&md);
 
@@ -4016,15 +4021,19 @@ impl PathIo<'_> {
             put64(&mut out, at, t as u64);
             put32(&mut out, at + 8, ns);
         }
-        put32(&mut out, 128, (st.rdev >> 8) as u32);
-        put32(&mut out, 132, (st.rdev & 0xff) as u32);
+        put32(&mut out, 128, crate::vfs::devices::major(st.rdev));
+        put32(&mut out, 132, crate::vfs::devices::minor(st.rdev));
+        // `stx_dev_major`, `stx_dev_minor`: the filesystem's device.
+        put32(&mut out, 136, crate::vfs::devices::major(dev));
+        put32(&mut out, 140, crate::vfs::devices::minor(dev));
         m.write(buf, &out)?;
         Ok(0)
     }
 
     pub fn fstat(&self, m: &mut GuestMem<'_>, fd: i32, buf: u64) -> SysResult {
-        let md = self.map.fds.get(fd)?.metadata()?;
-        m.write(buf, &self.stat_owned(&md).encode_for(self.compat))?;
+        let f = self.map.fds.get(fd)?;
+        let md = f.metadata()?;
+        m.write(buf, &self.stat_owned(&md, f.dev()).encode_for(self.compat))?;
         Ok(0)
     }
 
@@ -4089,9 +4098,9 @@ impl PathIo<'_> {
     ///
     /// A file whose filesystem keeps its owner (a tmpfs, an ext4) is that
     /// owner's.
-    fn stat_owned(&self, md: &crate::vfs::Metadata) -> Stat {
+    fn stat_owned(&self, md: &crate::vfs::Metadata, dev: u64) -> Stat {
         let (uid, gid) = md.owner.unwrap_or((self.creds.uid(), self.creds.gid()));
-        Stat { uid, gid, ..Kernel::stat_from(md) }
+        Stat { dev, uid, gid, ..Kernel::stat_from(md) }
     }
 
     pub fn fstatat(
@@ -4131,14 +4140,10 @@ impl PathIo<'_> {
                 return self.fstat(m, n, buf).map_err(|e| if e == Errno::EBADF { Errno::ENOENT } else { e });
             }
         }
-        let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            self.ns.metadata_nofollow(&p)
-        } else {
-            self.ns.metadata(&p)
-        };
+        let md = self.ns.metadata_on(&p, flags & AT_SYMLINK_NOFOLLOW == 0);
         crate::phase::mark(7);
-        let md = md?;
-        m.write(buf, &self.stat_owned(&md).encode_for(self.compat))?;
+        let (md, dev) = md?;
+        m.write(buf, &self.stat_owned(&md, dev).encode_for(self.compat))?;
         crate::phase::mark(9);
         Ok(0)
     }

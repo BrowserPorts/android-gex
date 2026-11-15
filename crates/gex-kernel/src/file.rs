@@ -53,6 +53,10 @@ pub struct OpenFile {
     /// which file a description is, so a second `open` of a file finds the
     /// first one's shared mappings ([`OpenFile::same_file`]). Read once.
     ino: OnceLock<u64>,
+    /// The number of the device of the filesystem the file was opened in
+    /// ([`OpenFile::on`]); 0 for an object no path led to, whose kind
+    /// says ([`OpenFile::dev`]).
+    dev: AtomicU64,
 }
 
 /// An `O_TMPFILE`'s name, and the namespace it was made in.
@@ -129,6 +133,7 @@ impl OpenFile {
             unlink_on_close: None,
             locks: OnceLock::new(),
             ino: OnceLock::new(),
+            dev: AtomicU64::new(0),
         })
     }
 
@@ -149,6 +154,7 @@ impl OpenFile {
             unlink_on_close: Some(TmpName { path: path.clone(), ns }),
             locks: OnceLock::new(),
             ino: OnceLock::new(),
+            dev: AtomicU64::new(0),
             path,
             pos: Mutex::new(()),
             dir_pos: AtomicUsize::new(0),
@@ -308,6 +314,23 @@ impl OpenFile {
 
     pub fn metadata(&self) -> Result<Metadata, Errno> {
         self.handle.metadata()
+    }
+
+    /// The file was opened in the filesystem on device `dev`
+    /// ([`crate::vfs::FileSystem::dev`]): said once, by the `open` that
+    /// made the description.
+    pub fn on(&self, dev: u64) {
+        self.dev.store(dev, Ordering::Relaxed);
+    }
+
+    /// The number of the device its filesystem is on, its `st_dev`: the
+    /// one it was opened in, or its kind's
+    /// ([`FileHandle::fs_dev`]).
+    pub fn dev(&self) -> u64 {
+        match self.dev.load(Ordering::Relaxed) {
+            0 => self.handle.fs_dev(),
+            dev => dev,
+        }
     }
 
     /// A regular file's inode number (0 for anything else), asked once.
@@ -806,6 +829,11 @@ pub struct PipeEnd {
 }
 
 impl FileHandle for PipeEnd {
+    /// A pipe is in the pipes' filesystem.
+    fn fs_dev(&self) -> u64 {
+        crate::vfs::anon_dev(crate::vfs::DevKey::Kind("pipefs"))
+    }
+
     /// An empty pipe is not readable -- the trait default "yes" is right for a
     /// file and wrong here, and a `select` on it would spin ready/read-nothing.
     /// A write end is never readable (select would report it ready for

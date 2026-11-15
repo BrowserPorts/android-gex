@@ -638,6 +638,11 @@ impl Drop for UnixSocket {
 }
 
 impl FileHandle for UnixSocket {
+    /// A socket is in the sockets' filesystem.
+    fn fs_dev(&self) -> u64 {
+        crate::vfs::anon_dev(crate::vfs::DevKey::Kind("sockfs"))
+    }
+
     fn as_unix_socket(self: Arc<Self>) -> Option<Arc<UnixSocket>> {
         Some(self)
     }
@@ -1051,6 +1056,11 @@ impl Drop for UnixDgram {
 }
 
 impl FileHandle for UnixDgram {
+    /// A socket is in the sockets' filesystem.
+    fn fs_dev(&self) -> u64 {
+        crate::vfs::anon_dev(crate::vfs::DevKey::Kind("sockfs"))
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         self.recv_from(buf, false).map(|(n, _, _)| n as u64)
     }
@@ -1511,6 +1521,12 @@ impl MemFd {
 }
 
 impl FileHandle for MemFd {
+    /// A memfd is a file of the kernel's own tmpfs, the one shared
+    /// memory is in.
+    fn fs_dev(&self) -> u64 {
+        crate::vfs::anon_dev(crate::vfs::DevKey::Kind("shmem"))
+    }
+
     fn as_memfd(self: Arc<Self>) -> Option<Arc<MemFd>> {
         Some(self)
     }
@@ -2236,6 +2252,11 @@ impl Drop for RemoteUnix {
 }
 
 impl crate::vfs::FileHandle for RemoteUnix {
+    /// A socket is in the sockets' filesystem.
+    fn fs_dev(&self) -> u64 {
+        crate::vfs::anon_dev(crate::vfs::DevKey::Kind("sockfs"))
+    }
+
     fn is_global_socket(&self) -> bool {
         true
     }

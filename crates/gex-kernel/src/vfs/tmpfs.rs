@@ -2150,6 +2150,11 @@ impl TmpFs {
 }
 
 impl FileSystem for TmpFs {
+    /// The tree's number, whoever holds it.
+    fn dev(&self) -> u64 {
+        super::anon_dev(super::DevKey::Instance(fs_key(&self.inner)))
+    }
+
     fn open(&self, path: &str, flags: u64, _mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {
         self.open_as(path, flags, None)
     }

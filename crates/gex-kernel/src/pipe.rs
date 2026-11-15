@@ -594,6 +594,11 @@ impl Drop for RemotePipeEnd {
 }
 
 impl crate::vfs::FileHandle for RemotePipeEnd {
+    /// A pipe is in the pipes' filesystem.
+    fn fs_dev(&self) -> u64 {
+        crate::vfs::anon_dev(crate::vfs::DevKey::Kind("pipefs"))
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if self.write {
             return Err(Errno::EBADF);

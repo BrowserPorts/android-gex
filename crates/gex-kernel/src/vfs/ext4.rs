@@ -673,8 +673,7 @@ impl Ext4Fs {
         Ok(Ext4Fs(Arc::new(Ext4::new(dev)?)))
     }
 
-    /// A file's owner, its user and group: read here, though `stat`
-    /// does not say a file's owner yet.
+    /// A file's owner, its user and group.
     pub fn owner(&self, path: &str) -> Result<(u32, u32), Errno> {
         let i = self.0.find(path)?;
         Ok((i.uid, i.gid))
@@ -684,6 +683,15 @@ impl Ext4Fs {
 impl FileSystem for Ext4Fs {
     fn fs_type(&self) -> &'static str {
         "ext4"
+    }
+
+    /// The block device it is on, where it is on one (a test reads an
+    /// image from a plain file, which has no number to give).
+    fn dev(&self) -> u64 {
+        match self.0.dev.metadata() {
+            Ok(md) if md.file_type == FileType::BlockDevice && md.rdev != 0 => md.rdev,
+            _ => super::anon_dev(super::DevKey::Instance(Arc::as_ptr(&self.0) as usize)),
+        }
     }
 
     fn magic(&self) -> u64 {

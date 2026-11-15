@@ -28,6 +28,8 @@ pub struct HostFs {
     gate: Arc<super::RenameGate>,
     /// `root` held open, once a walk asks ([`host_walk`]).
     root_dir: std::sync::OnceLock<Option<File>>,
+    /// Its device number, once asked ([`FileSystem::dev`]).
+    dev: std::sync::OnceLock<u64>,
 }
 
 impl HostFs {
@@ -38,6 +40,7 @@ impl HostFs {
             canon: Default::default(),
             gate: Default::default(),
             root_dir: Default::default(),
+            dev: Default::default(),
         }
     }
 
@@ -48,6 +51,7 @@ impl HostFs {
             canon: Default::default(),
             gate: Default::default(),
             root_dir: Default::default(),
+            dev: Default::default(),
         }
     }
 
@@ -431,6 +435,19 @@ mod hostflag {
 }
 
 impl FileSystem for HostFs {
+    /// By the host's number for the filesystem the tree is on: two
+    /// mounts of one host tree (a sysroot, and a directory of it bound in
+    /// again) are one filesystem, whose files are the same files by
+    /// `st_dev` and `st_ino` as they are on the host. A tree that crosses
+    /// into another of the host's filesystems is taken as one all the
+    /// same, and two of its files could then share both numbers.
+    fn dev(&self) -> u64 {
+        *self.dev.get_or_init(|| match std::fs::metadata(&self.root) {
+            Ok(md) => super::anon_dev(super::DevKey::Host(md.dev())),
+            Err(_) => super::anon_dev(super::DevKey::Instance(self as *const Self as usize)),
+        })
+    }
+
     /// [`super::walk_links`], which asks the host about each directory on
     /// the path (a call per component), but with the host's word on a
     /// whole stretch of the path at once ([`host_walk`]). No link on the
