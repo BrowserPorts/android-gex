@@ -8,9 +8,10 @@
 //!
 //! `NETLINK_KOBJECT_UEVENT` is where device events are broadcast (group
 //! 1): Android's `ueventd` opens it before anything else and aborts
-//! without it, and udev's monitor listens to it. The kernel here announces
-//! no devices of its own yet; a process with `CAP_SYS_ADMIN` can have a
-//! uevent broadcast, as `lib/kobject_uevent.c` lets it.
+//! without it, and udev's monitor listens to it. The kernel's own events
+//! are its devices' ([`uevent`], which sysfs calls); a process with
+//! `CAP_SYS_ADMIN` can have a uevent broadcast too, as
+//! `lib/kobject_uevent.c` lets it.
 //!
 //! `NETLINK_ROUTE` answers the dumps that list the machine's network
 //! interfaces and their addresses, and nothing else.
@@ -805,6 +806,25 @@ impl Socket {
         }
         Ok(r)
     }
+}
+
+/// The number of the last uevent (`/sys/kernel/uevent_seqnum`).
+pub fn uevent_seqnum() -> u64 {
+    UEVENT_SEQNUM.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// A device's event, from the kernel (`kobject_uevent_env`): to group 1
+/// from port 0, as root's. `action@devpath`, then `ACTION`, `DEVPATH`,
+/// `SUBSYSTEM`, the variables given, and the event's number, each ended
+/// by a NUL.
+pub fn uevent(action: &str, devpath: &str, subsystem: &str, vars: &[(String, String)]) {
+    let seq = UEVENT_SEQNUM.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+    let mut data = format!("{action}@{devpath}\0ACTION={action}\0DEVPATH={devpath}\0SUBSYSTEM={subsystem}\0").into_bytes();
+    for (k, v) in vars {
+        data.extend_from_slice(format!("{k}={v}\0").as_bytes());
+    }
+    data.extend_from_slice(format!("SEQNUM={seq}\0").as_bytes());
+    broadcast(NETLINK_KOBJECT_UEVENT, None, &Datagram { data, from: 0, group: 1, cred: (0, 0, 0) }, 0, 1);
 }
 
 /// `uevent_net_broadcast`: a uevent sent by a process, given the next

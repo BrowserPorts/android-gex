@@ -26,6 +26,7 @@ pub mod remote;
 pub mod blocks;
 pub mod selinuxfs;
 pub mod subtree;
+pub mod sysfs;
 pub mod tmpfs;
 
 pub use binderfs::BinderFs;
@@ -35,6 +36,7 @@ pub use hostfs::HostFs;
 pub use procfs::{ProcFs, ProcSource, SysCpuFs};
 pub use remote::RemoteFs;
 pub use selinuxfs::SelinuxFs;
+pub use sysfs::SysFs;
 pub use tmpfs::TmpFs;
 
 /// What kind of thing a directory entry names.

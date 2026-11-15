@@ -4805,9 +4805,15 @@ impl PathIo<'_> {
                     Err(Errno::ENODEV)
                 }
             }
-            // An empty `/sys` is what most programs want from sysfs: they
-            // probe for a path, do not find it, and take the other branch.
-            "sysfs" | "debugfs" | "cgroup" | "cgroup2" => {
+            // The kernel's devices (crate::vfs::sysfs), which ueventd and
+            // udev make `/dev` from.
+            "sysfs" => {
+                self.view.mount_unless_there(&target, || Arc::new(crate::vfs::SysFs));
+                Ok(0)
+            }
+            // Empty, which is what most programs want of these: they probe
+            // for a path, do not find it, and take the other branch.
+            "debugfs" | "cgroup" | "cgroup2" => {
                 self.view.mount_unless_there(&target, || Arc::new(crate::vfs::TmpFs::new()));
                 Ok(0)
             }
