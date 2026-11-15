@@ -9222,7 +9222,7 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
             nr::SETPRIORITY => Ok(0),
             nr::SYSINFO => sysinfo(m, compat, a[0], f.procs, f.futex.clock),
             nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV => process_vm(f.procs, m, compat, n == nr::PROCESS_VM_WRITEV, a),
-            _ => prlimit(f.rlimits, f.io.fds, f.creds.uid(), m, a[1], a[2], a[3]),
+            _ => prlimit(f.rlimits, f.io.fds, f.creds.capable(CAP_SYS_RESOURCE), m, a[1], a[2], a[3]),
         }
     } else if is_socket_call(n) {
         // As the full call: a blocking `connect`, `accept` or `recvfrom`
@@ -14643,7 +14643,7 @@ impl Kernel {
     }
 
     fn sys_prlimit(&mut self, m: &mut GuestMem<'_>, resource: u64, new: u64, old: u64) -> SysResult {
-        prlimit(&self.rlimits, &self.fds, self.creds.uid(), m, resource, new, old)
+        prlimit(&self.rlimits, &self.fds, self.creds.capable(CAP_SYS_RESOURCE), m, resource, new, old)
     }
 }
 
@@ -14737,11 +14737,18 @@ pub fn sysinfo(m: &mut GuestMem<'_>, compat: bool, buf: u64, procs: &ProcTable, 
     Ok(0)
 }
 
+const CAP_SYS_RESOURCE: u64 = 24;
+
 /// `prlimit64(pid, resource, new, old)`, for the calling process (gex's
 /// processes set only their own). Limits are recorded and reported;
 /// RLIMIT_NOFILE is enforced by the descriptor table, the rest are not.
 /// Under the limits' own lock, read, checked and set at once.
-pub fn prlimit(rl: &Rlimits, fds: &FdTable, uid: u32, m: &mut GuestMem<'_>, resource: u64, new: u64, old: u64) -> SysResult {
+///
+/// As `do_prlimit` has it: a soft limit above the hard one is `EINVAL`;
+/// RLIMIT_NOFILE's hard limit past `fs.nr_open` is `EPERM` for anyone;
+/// raising a hard limit takes `CAP_SYS_RESOURCE` (`privileged`). Android's
+/// init raises its own to 524288 (`setrlimit nofile 32768 524288`).
+pub fn prlimit(rl: &Rlimits, fds: &FdTable, privileged: bool, m: &mut GuestMem<'_>, resource: u64, new: u64, old: u64) -> SysResult {
     let r = resource as usize;
     if r >= RLIM_NLIMITS {
         return Err(Errno::EINVAL);
@@ -14756,11 +14763,7 @@ pub fn prlimit(rl: &Rlimits, fds: &FdTable, uid: u32, m: &mut GuestMem<'_>, reso
         if soft > hard {
             return Err(Errno::EINVAL);
         }
-        // raising the hard limit takes privilege; NOFILE cannot pass
-        // what the table holds
-        if (hard > cur[1] && uid != 0)
-            || (r == RLIMIT_NOFILE && hard > crate::file::NOFILE_HARD as u64)
-        {
+        if (r == RLIMIT_NOFILE && hard > crate::file::NR_OPEN as u64) || (hard > cur[1] && !privileged) {
             return Err(Errno::EPERM);
         }
     }

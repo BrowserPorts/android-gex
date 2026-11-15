@@ -565,6 +565,7 @@ impl ProcFs {
             // glibc and musl both consult this before using large mappings.
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
             // The limit `F_SETPIPE_SZ` holds an unprivileged caller to.
+            "sys/fs/nr_open" => format!("{}\n", crate::file::NR_OPEN).into_bytes(),
             "sys/fs/pipe-max-size" => format!("{}\n", crate::pipe::PIPE_MAX_SIZE).into_bytes(),
             _ => return None,
         })
@@ -689,7 +690,7 @@ impl FileSystem for ProcFs {
             "sys" => vec!["fs", "kernel", "net", "vm"],
             "sys/net" => vec!["core"],
             "sys/net/core" => vec!["rmem_default", "rmem_max", "wmem_default", "wmem_max"],
-            "sys/fs" => vec!["pipe-max-size"],
+            "sys/fs" => vec!["nr_open", "pipe-max-size"],
             "sys/kernel" => vec!["osrelease", "pid_max", "random"],
             "sys/kernel/random" => vec!["boot_id", "entropy_avail", "poolsize", "uuid"],
             "sys/vm" => vec!["overcommit_memory"],

@@ -419,10 +419,11 @@ struct RecordLocks {
     files: Vec<String>,
 }
 
-/// `RLIMIT_NOFILE`, as Linux starts a process: 1024 soft, and the hard
-/// limit is what the table can hold.
+/// `RLIMIT_NOFILE`, as Linux starts a process: 1024 soft, 4096 hard.
 pub const NOFILE_SOFT: usize = 1024;
 pub const NOFILE_HARD: usize = 4096;
+/// `fs.nr_open`: the most the hard limit can be raised to, by anyone.
+pub const NR_OPEN: usize = 1 << 20;
 
 impl Default for FdTable {
     fn default() -> Self {
@@ -592,7 +593,7 @@ impl FdTable {
 
     /// `RLIMIT_NOFILE`'s soft limit (descriptors already above it stay).
     pub fn set_limit(&self, limit: usize) {
-        self.limit.store(limit.min(NOFILE_HARD), Ordering::Relaxed);
+        self.limit.store(limit.min(NR_OPEN), Ordering::Relaxed);
     }
 
     pub fn limit(&self) -> usize {
