@@ -427,6 +427,28 @@ impl crate::vfs::FileHandle for RemotePty {
         (self.remote.readable)(self.id, self.m()) != 0
     }
 
+    /// The master has something to read only when something was written:
+    /// its other end having closed is not that (`n_tty_poll`).
+    fn poll_in(&self) -> bool {
+        if self.master {
+            (self.remote.available)(self.id, 1) > 0
+        } else {
+            self.poll_readable()
+        }
+    }
+
+    /// The master's other end has closed (`TTY_OTHER_CLOSED`: every slave
+    /// closed, and the session that had it as its terminal gone), with
+    /// nothing left to read. Android's logwrap reads a child's output
+    /// from a master while `poll` says `POLLIN` and takes `POLLHUP` for
+    /// the child being done; told only that the master was readable, with
+    /// `EIO` to read, init polled it for ever after the first program it
+    /// ran so. (Linux says `POLLHUP` while there is still output to read
+    /// too; here it is said once that is read.)
+    fn poll_hup(&self) -> bool {
+        self.master && (self.remote.readable)(self.id, 1) != 0 && (self.remote.available)(self.id, 1) <= 0
+    }
+
     fn wait_queue(&self) -> u32 {
         (self.remote.queue)(self.id)
     }

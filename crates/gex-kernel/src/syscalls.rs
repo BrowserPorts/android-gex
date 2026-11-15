@@ -10665,7 +10665,7 @@ fn poll_revents_level(p: &PollFd) -> u16 {
         return POLLNVAL;
     };
     let mut r = 0;
-    if p.events & POLLIN != 0 && h.poll_readable() {
+    if p.events & POLLIN != 0 && h.poll_in() {
         r |= POLLIN;
     }
     // Whether a write would block is asked of the handle every time, not
@@ -19450,7 +19450,11 @@ mod tests {
             got.push(sys(&mut m, &mut k, nr::MKDIRAT, &[cwd, d, 0o777]));
             got.push(sys(&mut m, &mut k, nr::MKDIRAT, &[cwd, sub, 0o777]));
             got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[cwd, d, 0x22000, 0]));
-            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+            // (Its first eight bytes are the device, which is each
+            // kernel's own filesystem's number: there, and not compared.)
+            let stat = m.read(0x22000, 128).unwrap().to_vec();
+            assert_ne!(&stat[..8], &[0; 8]);
+            got.extend(stat.iter().enumerate().map(|(i, &b)| if i < 8 { 0 } else { b as i64 }));
             let file = sys(&mut m, &mut k, nr::OPENAT, &[cwd, sub_f, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o644]);
             got.push(file);
             let dir = sys(&mut m, &mut k, nr::OPENAT, &[cwd, sub, (oflags::O_RDONLY | oflags::O_DIRECTORY) as u64, 0]);

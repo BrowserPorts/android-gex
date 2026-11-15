@@ -496,6 +496,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         true
     }
 
+    /// What `poll` says as `POLLIN`: that there is something to read.
+    /// [`Self::poll_readable`], unless the two differ: a pseudoterminal's
+    /// master whose other end has closed lets a reader through (to its
+    /// `EIO`) and says `POLLHUP` alone.
+    fn poll_in(&self) -> bool {
+        self.poll_readable()
+    }
+
     /// Whether the other end has hung up: a pipe with no writers left, a
     /// stream socket shut down in both directions (its peer closed).
     /// `poll` and `epoll` report `POLLHUP` for it whether or not it was

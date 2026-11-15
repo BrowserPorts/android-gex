@@ -125,6 +125,7 @@ run() {
     dmctl) check "$1" "dmctl ok" 0 root ;;
     owners) check "$1" "owners ok" 0 root ;;
     statdev) check "$1" "statdev ok" 0 root ;;
+    ptyhup) check "$1" "ptyhup ok" 0 ;;
     waits)
         check "$1" "waits ok" 0
         # And with its time slowed, where its clocks and waits still agree.
@@ -143,7 +144,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup"
     for p in $all; do
         run "$p"
     done
