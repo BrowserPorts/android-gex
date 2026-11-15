@@ -115,6 +115,7 @@ run() {
     kmsg) check "$1" "kmsg ok" 0 root ;;
     sharedfutex) check "$1" "sharedfutex ok" 0 ;;
     mountns) check "$1" "mountns ok" 0 root ;;
+    uevent) check "$1" "uevent ok" 0 root ;;
     aosp/*) gtest "${1#aosp/}" ;;
     *)
         echo "FAIL $1: no such program"
@@ -128,7 +129,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent"
     for p in $all; do
         run "$p"
     done
