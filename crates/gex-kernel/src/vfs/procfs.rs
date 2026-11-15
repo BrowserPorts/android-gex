@@ -540,6 +540,10 @@ impl ProcFs {
                 None => crate::cpus::proc_stat().into_bytes(),
             },
             "filesystems" => b"nodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tbinder\nnodev\tselinuxfs\n\text4\n".to_vec(),
+            // What the kernel was started with: nothing, unless the host
+            // says (Android reads its `androidboot.` settings from these).
+            "cmdline" => format!("{}\n", KERNEL_CMDLINE.get().map_or("", String::as_str)).into_bytes(),
+            "bootconfig" => BOOTCONFIG.get()?.clone().into_bytes(),
             "sys/kernel/osrelease" => b"6.1.0-gex\n".to_vec(),
             "sys/kernel/pid_max" => b"32768\n".to_vec(),
             // The kernel's random numbers as files (drivers/char/random.c):
@@ -636,7 +640,7 @@ impl FileSystem for ProcFs {
                 for pid in pids {
                     out.push(DirEntry { name: pid.to_string(), file_type: FileType::Directory, ino: 1 });
                 }
-                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "mounts", "sys"] {
+                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "mounts", "sys", "cmdline", "filesystems"].into_iter().chain(BOOTCONFIG.get().map(|_| "bootconfig")) {
                     let file_type = match name {
                         "self" => FileType::Symlink,
                         "sys" => FileType::Directory,
@@ -763,6 +767,24 @@ impl FileSystem for ProcFs {
             }
         }
     }
+}
+
+/// The kernel's command line (`/proc/cmdline`) and boot configuration
+/// (`/proc/bootconfig`, there only when one was given), as the host that
+/// starts this kernel says they are.
+static KERNEL_CMDLINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static BOOTCONFIG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Say what `/proc/cmdline` reads (without its newline). The first call
+/// wins: a kernel is started once.
+pub fn set_kernel_cmdline(line: String) {
+    let _ = KERNEL_CMDLINE.set(line);
+}
+
+/// Say what `/proc/bootconfig` reads: `key = "value"` lines, as Linux
+/// prints the boot configuration it was given.
+pub fn set_bootconfig(text: String) {
+    let _ = BOOTCONFIG.set(text);
 }
 
 /// A random UUID as the kernel makes one (`generate_random_uuid`):
@@ -937,6 +959,18 @@ mod tests {
         for pid in ["1", "7", "42", "self", "loadavg"] {
             assert!(names.iter().any(|n| n == pid), "{pid} missing from {names:?}");
         }
+    }
+
+    /// With nothing said by the host: the kernel's command line is an
+    /// empty line, as a kernel started with none has it, and there is no
+    /// boot configuration.
+    #[test]
+    fn a_kernel_started_with_nothing_has_an_empty_command_line() {
+        let f = fs();
+        assert_eq!(read(&f, "cmdline"), "\n");
+        assert_eq!(f.open("bootconfig", 0, 0).err(), Some(Errno::ENOENT));
+        let names: Vec<String> = f.open("", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"cmdline".to_string()) && names.contains(&"filesystems".to_string()) && !names.contains(&"bootconfig".to_string()));
     }
 
     /// The kernel's random ids: `boot_id` the same for as long as the

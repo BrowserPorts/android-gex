@@ -192,6 +192,12 @@ pub struct RunOptions {
     /// it and libselinux looks for it. Off unless asked: a program that
     /// finds it takes SELinux to be on, and says so in what it prints.
     pub selinuxfs: bool,
+    /// What `/proc/cmdline` reads: the kernel's command line. Empty
+    /// unless given.
+    pub kernel_cmdline: Option<String>,
+    /// A file whose text `/proc/bootconfig` reads (`key = "value"`
+    /// lines); with none there is no such file.
+    pub bootconfig: Option<std::path::PathBuf>,
     /// Statically recompile each shared library as it is mapped, instead of
     /// letting the runtime translator find it a dispatch miss at a time. Off
     /// by default: measured slower (32s vs 0.60s warm on `dpkg --version`)
@@ -245,6 +251,8 @@ impl Default for RunOptions {
             wayland_gpu: false,
             gl: false,
             selinuxfs: false,
+            kernel_cmdline: None,
+            bootconfig: None,
             recompile_objects: false,
             profile: false,
             jit: false,
@@ -3682,6 +3690,13 @@ fn mount_filesystems(
     }
     if opts.selinuxfs {
         kernel.vfs.mount("/sys/fs/selinux", Arc::new(gex_kernel::vfs::SelinuxFs::of_kernel()));
+    }
+    if let Some(line) = &opts.kernel_cmdline {
+        gex_kernel::vfs::procfs::set_kernel_cmdline(line.clone());
+    }
+    if let Some(file) = &opts.bootconfig {
+        let text = std::fs::read_to_string(file).with_context(|| format!("--bootconfig {}", file.display()))?;
+        gex_kernel::vfs::procfs::set_bootconfig(text);
     }
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));

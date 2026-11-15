@@ -299,6 +299,12 @@ run options:
   --selinuxfs     mount selinuxfs at /sys/fs/selinux, as Android's init
                   leaves it: programs that look there find SELinux on, with
                   no policy until one is loaded
+  --kernel-cmdline LINE
+                  what /proc/cmdline reads (default: an empty line)
+  --bootconfig FILE
+                  what /proc/bootconfig reads: lines of a key, an equals
+                  sign and a value in double quotes (an Android's
+                  androidboot. settings); without it there is no such file
   --wayland-gpu   composite surfaces on the GPU through WebGPU, rather than
                   handing the host one client buffer at a time. Falls back to
                   the CPU, with a note, when there is no adapter
@@ -413,6 +419,14 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--wayland-gpu" => opts.wayland_gpu = true,
             "--gl" => opts.gl = true,
             "--selinuxfs" => opts.selinuxfs = true,
+            "--kernel-cmdline" => {
+                i += 1;
+                opts.kernel_cmdline = Some(args.get(i).context("--kernel-cmdline needs the line")?.clone());
+            }
+            "--bootconfig" => {
+                i += 1;
+                opts.bootconfig = Some(args.get(i).context("--bootconfig needs a file")?.into());
+            }
             "--wayland-out" => {
                 i += 1;
                 opts.wayland_out =
