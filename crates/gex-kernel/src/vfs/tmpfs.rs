@@ -652,8 +652,20 @@ enum Node {
     Device { rdev: u64, block: bool },
 }
 
+/// What a tmpfs was mounted with, for `/proc/mounts`.
+#[derive(Clone, Debug, Default)]
+struct Options {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size_kb: Option<u64>,
+    nr_inodes: Option<u64>,
+}
+
 #[derive(Debug, Default)]
 struct Inner {
+    /// The options it was mounted with, when a program mounted it.
+    options: Option<Options>,
     /// Path (relative to the mount, no leading slash) to node.
     nodes: BTreeMap<String, Node>,
     next_ino: u64,
@@ -1095,6 +1107,51 @@ impl TmpFs {
         TmpFs {
             inner: Arc::new(Shared { m: RwLock::new(inner), gate: Default::default(), store: Default::default(), pending: Default::default() }),
         }
+    }
+
+    /// A tmpfs as `mount -t tmpfs` makes one, with its options
+    /// (mm/shmem.c's): `mode`, the root directory's, 1777 when none is
+    /// given; `uid` and `gid`, its owner; `size`, `nr_blocks` and
+    /// `nr_inodes`, limits, which are read and shown and not kept to
+    /// (memory here is the host's to limit); `huge`, `mpol`, `inode32`,
+    /// `inode64`, `noswap`, which change nothing here. Anything else, or
+    /// a value that is not one, is `EINVAL`.
+    pub fn mounted(options: &str) -> Result<TmpFs, Errno> {
+        let fs = TmpFs::new();
+        let mut shown = Options { mode: 0o1777, ..Options::default() };
+        // A size: a number with k, m or g after it, or a percentage of
+        // memory (taken of the 4 GiB this kernel says it has).
+        let size = |v: &str| -> Result<u64, Errno> {
+            let (digits, scale) = match v.as_bytes().last() {
+                Some(b'k' | b'K') => (&v[..v.len() - 1], 1 << 10),
+                Some(b'm' | b'M') => (&v[..v.len() - 1], 1 << 20),
+                Some(b'g' | b'G') => (&v[..v.len() - 1], 1 << 30),
+                Some(b'%') => return v[..v.len() - 1].parse::<u64>().map(|p| (4u64 << 30) / 100 * p).map_err(|_| Errno::EINVAL),
+                _ => (v, 1),
+            };
+            digits.parse::<u64>().map(|n| n.saturating_mul(scale)).map_err(|_| Errno::EINVAL)
+        };
+        for option in options.split(',').filter(|o| !o.is_empty()) {
+            let (name, value) = option.split_once('=').map_or((option, None), |(n, v)| (n, Some(v)));
+            match (name, value) {
+                ("mode", Some(v)) => shown.mode = u32::from_str_radix(v, 8).map_err(|_| Errno::EINVAL)? & 0o7777,
+                ("uid", Some(v)) => shown.uid = v.parse().map_err(|_| Errno::EINVAL)?,
+                ("gid", Some(v)) => shown.gid = v.parse().map_err(|_| Errno::EINVAL)?,
+                // In kilobytes, rounded up to pages, as it is shown.
+                ("size", Some(v)) => shown.size_kb = Some(size(v)?.div_ceil(4096) * 4),
+                ("nr_blocks", Some(v)) => shown.size_kb = Some(size(v)?.saturating_mul(4)),
+                ("nr_inodes", Some(v)) => shown.nr_inodes = Some(size(v)?),
+                ("huge", Some("never" | "always" | "within_size" | "advise")) | ("mpol", Some(_)) => {}
+                ("inode32" | "inode64" | "noswap", None) => {}
+                _ => return Err(Errno::EINVAL),
+            }
+        }
+        {
+            let mut inner = fs.inner.lock().unwrap();
+            inner.chmod("", shown.mode)?;
+            inner.options = Some(shown);
+        }
+        Ok(fs)
     }
 
     /// Keep the contents of files made from now on in the block store
@@ -2034,6 +2091,32 @@ impl FileSystem for TmpFs {
 
     fn keeps_links(&self) -> bool {
         true
+    }
+
+    /// As `shmem_show_options`: what differs from a tmpfs mounted with
+    /// no options.
+    fn show_options(&self) -> String {
+        let inner = self.inner.read().unwrap();
+        let Some(o) = &inner.options else {
+            return String::new();
+        };
+        let mut out = String::new();
+        if let Some(kb) = o.size_kb {
+            out.push_str(&format!(",size={kb}k"));
+        }
+        if let Some(n) = o.nr_inodes {
+            out.push_str(&format!(",nr_inodes={n}"));
+        }
+        if o.mode != 0o1777 {
+            out.push_str(&format!(",mode={:03o}", o.mode));
+        }
+        if o.uid != 0 {
+            out.push_str(&format!(",uid={}", o.uid));
+        }
+        if o.gid != 0 {
+            out.push_str(&format!(",gid={}", o.gid));
+        }
+        out
     }
 
     fn open_mode(&self, path: &str, flags: u64, mode: u32) -> Result<Arc<dyn FileHandle>, Errno> {

@@ -33,6 +33,21 @@ impl Subtree {
 }
 
 impl FileSystem for Subtree {
+    fn magic(&self) -> u64 {
+        self.inner.magic()
+    }
+    fn mount_record(&self) -> Option<super::mounted::Record> {
+        self.inner.mount_record()
+    }
+    fn show_options(&self) -> String {
+        self.inner.show_options()
+    }
+    fn remount(&self, flags: u64) -> bool {
+        self.inner.remount(flags)
+    }
+    fn keeps_links(&self) -> bool {
+        self.inner.keeps_links()
+    }
     fn fs_type(&self) -> &'static str {
         self.inner.fs_type()
     }

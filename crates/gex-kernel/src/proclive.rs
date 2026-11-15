@@ -280,7 +280,7 @@ impl ProcSource for KernelProcSource {
     fn tty_of(&self, sid: i32) -> Option<(u32, i32)> {
         tty_of(self.0.get()?.ptys, sid)
     }
-    fn mount_table(&self) -> Vec<(String, &'static str)> {
+    fn mount_table(&self) -> Vec<crate::vfs::MountLine> {
         self.0.get().and_then(|l| l.vfs.upgrade()).map(|v| v.get().mount_table()).unwrap_or_default()
     }
     fn mount_changes(&self) -> (u64, u32) {

@@ -83,7 +83,7 @@ pub trait ProcSource: Send + Sync {
         None
     }
     /// The process's mounts ([`crate::vfs::Namespace::mount_table`]).
-    fn mount_table(&self) -> Vec<(String, &'static str)> {
+    fn mount_table(&self) -> Vec<crate::vfs::MountLine> {
         Vec::new()
     }
     /// How many times the mount table has changed, and the wait queue
@@ -188,28 +188,40 @@ fn mount_path(at: &str) -> String {
 /// parent's id, device (`st_dev`, 0 everywhere here), root, mount point,
 /// options, `-`, type, source, superblock options. The root's parent is 0,
 /// one not listed, as a chroot's is.
-pub fn mountinfo(table: &[(String, &'static str)]) -> String {
+pub fn mountinfo(table: &[crate::vfs::MountLine]) -> String {
     let mut out = String::new();
-    for (at, ty) in table {
+    for line in table {
+        let at = &line.at;
         let parent = if at == "/" {
             0
         } else {
             table
                 .iter()
-                .filter(|(p, _)| p != at && (p == "/" || at.strip_prefix(p.as_str()).is_some_and(|r| r.starts_with('/'))))
-                .max_by_key(|(p, _)| p.len())
-                .map_or(1, |(p, _)| crate::vfs::mount_id(p))
+                .map(|l| &l.at)
+                .filter(|p| *p != at && (*p == "/" || at.strip_prefix(p.as_str()).is_some_and(|r| r.starts_with('/'))))
+                .max_by_key(|p| p.len())
+                .map_or(1, |p| crate::vfs::mount_id(p))
         };
         let id = crate::vfs::mount_id(at);
-        out.push_str(&format!("{id} {parent} 0:0 / {} rw,relatime - {ty} {ty} rw\n", mount_path(at)));
+        out.push_str(&format!("{id} {parent} 0:0 / {} {} - {} {} {}\n", mount_path(at), line.mount_options(), line.fs_type, mount_path(&line.record.source), line.super_options()));
     }
     out
 }
 
 /// `/proc/mounts` (`/proc/self/mounts`, what `/etc/mtab` links to): source,
 /// mount point, type, options, and the two zeros.
-pub fn mounts(table: &[(String, &'static str)]) -> String {
-    table.iter().map(|(at, ty)| format!("{ty} {} {ty} rw,relatime 0 0\n", mount_path(at))).collect()
+pub fn mounts(table: &[crate::vfs::MountLine]) -> String {
+    // The filesystem's options, then the mount's, then the filesystem's
+    // own (`show_vfsmnt`).
+    table
+        .iter()
+        .map(|l| {
+            let own = &l.fs_options;
+            let sb = l.super_options();
+            let sb = sb.strip_suffix(own.as_str()).unwrap_or(&sb);
+            format!("{} {} {} {sb}{}{own} 0 0\n", mount_path(&l.record.source), mount_path(&l.at), l.fs_type, l.record.mount_options())
+        })
+        .collect()
 }
 
 /// A `/proc/<pid>/stat` line: all 52 fields, as Linux has them. `ps` and

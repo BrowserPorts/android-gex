@@ -51,6 +51,24 @@ pub fn loaded() -> bool {
     kernel_server().lock().unwrap_or_else(|e| e.into_inner()).policy().is_some()
 }
 
+/// Whether a mount of a filesystem of type `fstype` shows `seclabel`
+/// among its options (`selinux_is_sblabel_mnt`): once a policy is loaded,
+/// one whose files the policy labels by attribute, transition or task,
+/// and of those it labels by `genfscon` the few whose files can be
+/// relabelled all the same.
+pub fn shows_seclabel(fstype: &str) -> bool {
+    let server = kernel_server();
+    let server = server.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(policy) = server.policy() else {
+        return false;
+    };
+    match policy.fs_use(fstype).0 {
+        policy::fs_use::XATTR | policy::fs_use::TRANS | policy::fs_use::TASK => true,
+        policy::fs_use::GENFS => matches!(fstype, "sysfs" | "pstore" | "debugfs" | "tracefs" | "rootfs") || (matches!(fstype, "cgroup" | "cgroup2") && policy::POLICY_CAPABILITIES.iter().position(|c| *c == "cgroup_seclabel").is_some_and(|bit| policy.policycaps.get(bit as u32))),
+        _ => false,
+    }
+}
+
 /// The kernel's security server: the one every mount of selinuxfs is
 /// over, as Linux has one for the machine.
 pub fn kernel_server() -> Arc<Mutex<server::Server>> {

@@ -4099,7 +4099,11 @@ impl PathIo<'_> {
     pub fn faccessat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
         let p = self.at_path(m, dirfd, path)?;
         // A root guest (`--uid 0`) may read and write anything; execute
-        // still needs an execute bit, which the host checks.
+        // still needs an execute bit, which the host checks. Anything but
+        // what is in a read-only mount, which nobody writes.
+        if self.creds.ruid() == 0 && mode & 2 != 0 && self.ns.access(&p, 2) == Err(Errno::EROFS) {
+            return Err(Errno::EROFS);
+        }
         let mode = if self.creds.ruid() == 0 { mode & 1 } else { mode & 7 };
         self.ns.access(&p, mode).map(|_| 0)
     }
@@ -4762,6 +4766,12 @@ impl PathIo<'_> {
         const MS_REMOUNT: u64 = 32;
         const MS_BIND: u64 = 4096;
         if a[3] & MS_REMOUNT != 0 {
+            // A mount a program made takes the flags given now (read-only
+            // or not, nodev and the rest); one the kernel set up keeps
+            // none, and is as it was.
+            if let Some(fs) = self.view.get().mounted_at(&target) {
+                fs.remount(a[3]);
+            }
             return Ok(0);
         }
         // A bind: what is at the source, a directory or a file, is at the
@@ -4778,13 +4788,18 @@ impl PathIo<'_> {
             }
             return self.view.bind(&source, &target, a[3] & MS_REC != 0).map(|()| 0);
         }
+        // What the mount is from, as it was written (`/proc/mounts` shows
+        // it so), and the mount with its flags.
+        let source = if a[0] == 0 { "none".to_string() } else { String::from_utf8_lossy(&m.read_cstr(a[0], 4096)?).into_owned() };
+        let mounted = |fs: Arc<dyn crate::vfs::FileSystem>| crate::vfs::mounted::Mount::new(fs, &source, a[3]);
         match fstype.as_str() {
             "tmpfs" | "ramfs" => {
-                self.view.mount(&target, Arc::new(crate::vfs::TmpFs::new()));
+                let options = if a[4] == 0 { Vec::new() } else { m.read_cstr(a[4], 4096)? };
+                self.view.mount(&target, mounted(Arc::new(crate::vfs::TmpFs::mounted(&String::from_utf8_lossy(&options))?)));
                 Ok(0)
             }
             "devtmpfs" | "devfs" => {
-                self.view.mount(&target, Arc::new(crate::vfs::DevFs::new()));
+                self.view.mount(&target, mounted(Arc::new(crate::vfs::DevFs::new())));
                 Ok(0)
             }
             // A filesystem on a block device: ext4, which is ext2's and
@@ -4813,7 +4828,7 @@ impl PathIo<'_> {
                     }
                     return Err(if read_only { Errno::EACCES } else { Errno::EROFS });
                 }
-                self.view.mount(&target, Arc::new(crate::vfs::ext4::Ext4Fs::new(dev)?));
+                self.view.mount(&target, mounted(Arc::new(crate::vfs::ext4::Ext4Fs::new(dev)?)));
                 Ok(0)
             }
             // selinuxfs: every mount is the one filesystem, over the
@@ -4822,14 +4837,14 @@ impl PathIo<'_> {
                 if a[4] != 0 && !m.read_cstr(a[4], 4096)?.is_empty() {
                     return Err(Errno::EINVAL);
                 }
-                self.view.mount(&target, Arc::new(crate::vfs::SelinuxFs::of_kernel()));
+                self.view.mount(&target, mounted(Arc::new(crate::vfs::SelinuxFs::of_kernel())));
                 Ok(0)
             }
             // binderfs: every mount has binder devices of its own.
             "binder" => {
                 let data = if a[4] == 0 { Vec::new() } else { m.read_cstr(a[4], 4096)? };
                 let max = crate::vfs::BinderFs::options(&String::from_utf8_lossy(&data))?;
-                self.view.mount(&target, Arc::new(crate::vfs::BinderFs::new(max)?));
+                self.view.mount(&target, mounted(Arc::new(crate::vfs::BinderFs::new(max)?)));
                 Ok(0)
             }
             // `/proc` needs a source of process state that only the host can
@@ -4845,13 +4860,13 @@ impl PathIo<'_> {
             // The kernel's devices (crate::vfs::sysfs), which ueventd and
             // udev make `/dev` from.
             "sysfs" => {
-                self.view.mount_unless_there(&target, || Arc::new(crate::vfs::SysFs));
+                self.view.mount_unless_there(&target, || mounted(Arc::new(crate::vfs::SysFs)));
                 Ok(0)
             }
             // Empty, which is what most programs want of these: they probe
             // for a path, do not find it, and take the other branch.
             "debugfs" | "cgroup" | "cgroup2" => {
-                self.view.mount_unless_there(&target, || Arc::new(crate::vfs::TmpFs::new()));
+                self.view.mount_unless_there(&target, || mounted(Arc::new(crate::vfs::TmpFs::new())));
                 Ok(0)
             }
             _ => Err(Errno::ENODEV),

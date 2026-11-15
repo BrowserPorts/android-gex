@@ -19,6 +19,7 @@ pub mod hostcall;
 #[cfg(unix)]
 pub mod hostfs;
 pub mod kmsg;
+pub mod mounted;
 pub mod oss;
 pub mod peimage;
 pub mod procfs;
@@ -1052,6 +1053,26 @@ pub trait FileSystem: Send + Sync {
         false
     }
 
+    /// What this was mounted from, and with which flags, when it is a
+    /// mount a program made ([`mounted::Mount`]); `None` for one the
+    /// kernel or its host set up, which shows as its type, read-write.
+    fn mount_record(&self) -> Option<mounted::Record> {
+        None
+    }
+
+    /// `mount` with `MS_REMOUNT`: the mount's flags are now `flags`.
+    /// `false` for a mount that keeps none (it is as it was).
+    fn remount(&self, flags: u64) -> bool {
+        let _ = flags;
+        false
+    }
+
+    /// Its own options, as `/proc/mounts` shows them after the mount's:
+    /// each with a comma before it (a tmpfs's `,mode=755`).
+    fn show_options(&self) -> String {
+        String::new()
+    }
+
     /// Whether the namespace follows this filesystem's links to
     /// directories when it is mounted somewhere other than `/`: for one
     /// that keeps symbolic links a program makes or an image holds (tmpfs,
@@ -1837,10 +1858,17 @@ impl Namespace {
         self.others = others.join("\0");
     }
 
-    /// Every mount, parents before what is mounted under them: where, and
-    /// its [`FileSystem::fs_type`].
-    pub fn mount_table(&self) -> Vec<(String, &'static str)> {
-        self.mounts.iter().map(|(at, fs)| (at.clone(), fs.fs_type())).collect()
+    /// Every mount, parents before what is mounted under them: where,
+    /// its [`FileSystem::fs_type`], and what it was mounted from and how.
+    pub fn mount_table(&self) -> Vec<MountLine> {
+        self.mounts
+            .iter()
+            .map(|(at, fs)| {
+                let fs_type = fs.fs_type();
+                let record = fs.mount_record().unwrap_or(mounted::Record { source: fs_type.to_string(), flags: 0 });
+                MountLine { at: at.clone(), fs_type, record, fs_options: fs.show_options() }
+            })
+            .collect()
     }
 
     /// [`mount_id`] of the mount holding `path`, by its name: a symlink on
@@ -1866,6 +1894,11 @@ impl Namespace {
     /// Whether something is mounted at exactly this path.
     pub fn is_mount_point(&self, path: &str) -> bool {
         self.mounts.contains_key(&normalize(path, &self.cwd))
+    }
+
+    /// What is mounted at exactly this path.
+    pub fn mounted_at(&self, path: &str) -> Option<&Arc<dyn FileSystem>> {
+        self.mounts.get(&normalize(path, &self.cwd))
     }
 
     /// Find the backend responsible for `path`, and the path relative to it.
@@ -2279,6 +2312,34 @@ impl Namespace {
 impl Default for Vfs {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A mount as `/proc/mounts` and `/proc/self/mountinfo` list it.
+#[derive(Clone, Debug)]
+pub struct MountLine {
+    /// Where it is mounted.
+    pub at: String,
+    pub fs_type: &'static str,
+    /// What it was mounted from, and its flags.
+    pub record: mounted::Record,
+    /// The filesystem's own options ([`FileSystem::show_options`]).
+    pub fs_options: String,
+}
+
+impl MountLine {
+    /// The options of what is mounted: `ro` or `rw`, the flags that are
+    /// the filesystem's, `seclabel` where SELinux labels its files, and
+    /// its own.
+    pub fn super_options(&self) -> String {
+        let label = if crate::selinux::shows_seclabel(self.fs_type) { ",seclabel" } else { "" };
+        format!("{}{}{label}{}", if self.record.read_only() { "ro" } else { "rw" }, self.record.super_options(), self.fs_options)
+    }
+
+    /// The options of the mount: `ro` or `rw`, and the flags that are the
+    /// mount's.
+    pub fn mount_options(&self) -> String {
+        format!("{}{}", if self.record.read_only() { "ro" } else { "rw" }, self.record.mount_options())
     }
 }
 
