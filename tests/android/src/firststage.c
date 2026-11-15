@@ -6,11 +6,12 @@
 //   firststage [init's arguments...]     (default: selinux_setup)
 //
 // The mounts and nodes are first_stage_init.cpp's, in its order: a tmpfs
-// on /dev with pts, socket and dm-user in it, the kernel log, the random
-// devices, ptmx and null by number, and tmpfs on /mnt, /debug_ramdisk and
-// /second_stage_resources. Left out, and said: devpts on /dev/pts, where
-// the kernel cannot mount one; proc, sysfs and selinuxfs, which whoever
-// runs this has mounted already.
+// on /dev with pts, socket and dm-user in it, sysfs on /sys (which
+// ueventd makes /dev from: without it its cold boot finds no device),
+// the kernel log, the random devices, ptmx and null by number, and tmpfs
+// on /mnt, /debug_ramdisk and /second_stage_resources. Left out, and
+// said: devpts on /dev/pts, where the kernel cannot mount one; proc and
+// selinuxfs, which whoever runs this has mounted already.
 //
 // It must be the process that becomes init: what it mounts, init has.
 #define _GNU_SOURCE
@@ -35,6 +36,7 @@ int main(int argc, char **argv) {
     CHECK(mkdir("/dev/socket", 0755));
     CHECK(mkdir("/dev/dm-user", 0755));
     if (mount("devpts", "/dev/pts", "devpts", 0, NULL)) printf("firststage: no devpts on /dev/pts: errno %d\n", errno);
+    CHECK(mount("sysfs", "/sys", "sysfs", 0, NULL));
     CHECK(mknod("/dev/kmsg", S_IFCHR | 0600, makedev(1, 11)));
     CHECK(mknod("/dev/random", S_IFCHR | 0666, makedev(1, 8)));
     CHECK(mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9)));
