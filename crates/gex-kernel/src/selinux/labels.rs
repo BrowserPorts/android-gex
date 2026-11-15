@@ -12,7 +12,9 @@
 //! `selinux_inode_getsecurity`, `selinux_inode_setxattr`,
 //! `selinux_inode_init_security`), and as Linux 7.0 was seen to label and
 //! relabel files with testdata/labels.33 loaded. This is the reckoning
-//! alone: the system calls that use it are the kernel's. Not here: what
+//! alone: the system calls that use it are the kernel's, and
+//! tests/android/src/filelabel.c, which passes on Linux 7.0 and here,
+//! goes through them. Not here: what
 //! the policy lets a process relabel (`relabelfrom`, `relabelto`,
 //! `associate`), which waits for the hooks; a mount's `context=` options;
 //! and a process's own directory in proc, which is labelled as the

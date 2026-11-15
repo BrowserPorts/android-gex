@@ -111,6 +111,7 @@ run() {
     binderctx) check "$1" "binderctx ok" 0 ;;
     selinuxfs) check "$1" "selinuxfs ok" 0 root ;;
     procattr) check "$1" "procattr ok" 0 root ;;
+    filelabel) check "$1" "filelabel ok" 0 root ;;
     aosp/*) gtest "${1#aosp/}" ;;
     *)
         echo "FAIL $1: no such program"
@@ -124,7 +125,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel"
     for p in $all; do
         run "$p"
     done

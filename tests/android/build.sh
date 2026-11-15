@@ -34,10 +34,12 @@ if [ -z "$ndk" ] || [ ! -d "$ndk/toolchains/llvm/prebuilt/$host/bin" ]; then
     exit 1
 fi
 CC=$ndk/toolchains/llvm/prebuilt/$host/bin/clang
-# The policy selinuxfs.c carries, to load into the kernel it runs on.
-POLICY=$HERE/../../crates/gex-kernel/src/selinux/testdata/test.33
+# The policies the SELinux programs carry, to load into the kernel they
+# run on: the kernel crate's test policy, and the same with tmpfs labelled.
+DATA=$HERE/../../crates/gex-kernel/src/selinux/testdata
+POLICIES="-DTEST_POLICY=\"$DATA/test.33\" -DLABELS_POLICY=\"$DATA/labels.33\""
 
-for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx binderhost selinuxfs procattr smcall; do
-    "$CC" --target="$TARGET" -O2 -Wall -Werror -static -DTEST_POLICY="\"$POLICY\"" -Wl,--image-base=0x400000 -o "$OUT/$p" "$HERE/src/$p.c"
-    "$CC" --target="$TARGET" -O2 -Wall -Werror -static -DTEST_POLICY="\"$POLICY\"" -o "$OUT/low/$p" "$HERE/src/$p.c"
+for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx binderhost selinuxfs procattr filelabel smcall; do
+    "$CC" --target="$TARGET" -O2 -Wall -Werror -static $POLICIES -Wl,--image-base=0x400000 -o "$OUT/$p" "$HERE/src/$p.c"
+    "$CC" --target="$TARGET" -O2 -Wall -Werror -static $POLICIES -o "$OUT/low/$p" "$HERE/src/$p.c"
 done
