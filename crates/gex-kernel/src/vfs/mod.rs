@@ -522,6 +522,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// This handle as the device-mapper's control, when it is that.
+    fn as_dm(self: Arc<Self>) -> Option<Arc<crate::dm::Control>> {
+        None
+    }
+
     /// This handle as an open block device, when it is one.
     fn as_block(self: Arc<Self>) -> Option<Arc<crate::block::BlockFile>> {
         None

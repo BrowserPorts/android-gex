@@ -45,6 +45,11 @@ pub trait Attributes: Send + Sync + std::fmt::Debug {
     fn read(&self, path: &str) -> Option<(u32, String)>;
     /// A write, whole, to that file.
     fn write(&self, path: &str, data: &[u8]) -> Result<(), Errno>;
+    /// Where the link at `path` leads, when there is one there.
+    fn link(&self, path: &str) -> Option<String> {
+        let _ = path;
+        None
+    }
 }
 
 /// A device as the device model has it.
@@ -89,7 +94,7 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
         // The character devices this kernel always has, with the modes
         // Linux's drivers give them (drivers/char/mem.c,
         // drivers/tty/tty_io.c, drivers/block/loop.c).
-        let chars: [(&str, &str, u32, u32, Option<u32>); 10] = [
+        let chars: [(&str, &str, u32, u32, Option<u32>); 11] = [
             ("mem", "null", 1, 3, Some(0o666)),
             ("mem", "zero", 1, 5, Some(0o666)),
             ("mem", "full", 1, 7, Some(0o666)),
@@ -100,6 +105,7 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
             ("tty", "console", 5, 1, None),
             ("tty", "ptmx", 5, 2, Some(0o666)),
             ("misc", "loop-control", 10, 237, None),
+            ("misc", "device-mapper", 10, 236, None),
         ];
         Mutex::new(chars.iter().map(|(s, n, major, minor, mode)| Arc::new(Device { subsystem: s.to_string(), name: n.to_string(), major: *major, minor: *minor, mode: *mode, attrs: None })).collect())
     })
@@ -213,6 +219,9 @@ fn node(path: &str) -> Option<Node> {
             let d = device(s, n)?;
             let attrs = d.attrs.clone()?;
             let rest = rest.join("/");
+            if let Some(target) = attrs.link(&rest) {
+                return Some(Node::Link(target));
+            }
             match attrs.read(&rest) {
                 Some((mode, text)) => Node::Attr(d, rest, mode, text),
                 None => Node::Dir(attrs.list(&rest)?),

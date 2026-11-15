@@ -40,6 +40,7 @@ pub mod locks;
 pub mod netlink;
 pub mod block;
 pub mod loopdev;
+pub mod dm;
 pub mod file;
 pub mod fs;
 pub mod ftab;

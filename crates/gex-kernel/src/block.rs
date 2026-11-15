@@ -69,6 +69,20 @@ pub trait Disk: Send + Sync + std::fmt::Debug {
         let _ = name;
         None
     }
+    /// The disks it is made of, by number (`slaves/` in sysfs).
+    fn slaves(&self) -> Vec<u64> {
+        Vec::new()
+    }
+}
+
+/// The disk numbered `dev`, when there is one.
+pub fn disk(dev: u64) -> Option<Arc<dyn Disk>> {
+    entry(dev).map(|e| Arc::clone(&e.disk))
+}
+
+/// The name of the disk numbered `dev`.
+fn name_of(dev: u64) -> Option<String> {
+    entry(dev).map(|e| e.name.clone())
 }
 
 /// Who makes an ioctl: their descriptors, which a call may name one of,
@@ -156,12 +170,15 @@ impl sysfs::Attributes for Entry {
             "" => {
                 let mut v = files(&["diskseq", "hidden", "removable", "ro", "size"]);
                 v.push(("queue".to_string(), FileType::Directory));
+                v.push(("slaves".to_string(), FileType::Directory));
                 if let Some((name, _)) = self.disk.sysfs_dir() {
                     v.push((name.to_string(), FileType::Directory));
                 }
                 Some(v)
             }
             "queue" => Some(files(&["hw_sector_size", "logical_block_size", "nr_requests", "physical_block_size", "read_ahead_kb", "scheduler"])),
+            // A link to each disk it is made of.
+            "slaves" => Some(self.disk.slaves().into_iter().filter_map(name_of).map(|n| (n, FileType::Symlink)).collect()),
             other => match self.disk.sysfs_dir() {
                 Some((name, names)) if name == other => Some(files(&names)),
                 _ => None,
@@ -190,6 +207,11 @@ impl sysfs::Attributes for Entry {
                 (0o444, self.disk.sysfs_read(name)?)
             }
         })
+    }
+
+    fn link(&self, path: &str) -> Option<String> {
+        let name = path.strip_prefix("slaves/")?;
+        self.disk.slaves().into_iter().filter_map(name_of).any(|n| n == name).then(|| format!("../../{name}"))
     }
 
     fn write(&self, path: &str, data: &[u8]) -> Result<(), Errno> {

@@ -13808,6 +13808,15 @@ impl FdIo<'_> {
         // Masking to 32 bits is what the real kernel does and what makes those
         // read-direction ioctls match their numbers at all.
         let req = req & 0xffff_ffff;
+        // The device-mapper's control: a table may name a device by the
+        // path of its node, which is the caller's to look up.
+        if let Some(dm) = self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_dm()) {
+            let resolve = |path: &str| -> Result<u64, Errno> {
+                let md = self.ns.metadata(path)?;
+                if md.file_type == FileType::BlockDevice { Ok(md.rdev) } else { Err(Errno::ENOTBLK) }
+            };
+            return dm.ioctl(m, req, arg, &resolve);
+        }
         // A block device's: the block layer's and its driver's, which may
         // name a descriptor of the caller's (a loop device's file).
         if let Some(disk) = self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_block()) {
