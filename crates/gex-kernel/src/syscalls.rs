@@ -4932,14 +4932,14 @@ impl PathIo<'_> {
             return Err(Errno::ENOENT);
         }
         let abs = if p.starts_with('/') {
-            crate::vfs::normalize(&p, "/")
+            self.joined(p, "/")?
         } else if dirfd == AT_FDCWD {
             // Relative to the working directory, where it is now.
             let (cwd, moves) = self.fs.get_seen();
             if let Some(moves) = moves {
                 DIRS_SEEN.with(|d| d.borrow_mut().push(Seen::Cwd(moves)));
             }
-            crate::vfs::normalize(&p, &cwd)
+            self.joined(p, &cwd)?
         } else {
             self.at_dir_path(dirfd, &p)?
         };
@@ -4979,12 +4979,23 @@ impl PathIo<'_> {
         let f = self.map.fds.get(dirfd)?;
         if let Some((base, epoch)) = f.dir_at()? {
             DIRS_SEEN.with(|d| d.borrow_mut().push(Seen::Fd(dirfd, epoch)));
-            return Ok(crate::vfs::normalize(p, &base));
+            return self.joined(p, &base);
         }
         if f.metadata().is_ok_and(|md| md.file_type != crate::vfs::FileType::Directory) {
             return Err(Errno::ENOTDIR);
         }
-        Ok(crate::vfs::normalize(p, &f.path))
+        self.joined(p, &f.path)
+    }
+
+    /// `p` from directory `base`, normal: with a `..` in it, each taken
+    /// from where the names before it lead
+    /// ([`crate::vfs::Namespace::physical`]); with none, its text alone.
+    fn joined(&self, p: &str, base: &str) -> Result<String, Errno> {
+        if p.split('/').any(|c| c == "..") {
+            self.ns.physical(p, base)
+        } else {
+            Ok(crate::vfs::normalize(p, base))
+        }
     }
 }
 

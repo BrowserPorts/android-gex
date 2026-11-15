@@ -1914,6 +1914,64 @@ impl Namespace {
         self.mount_of(abs)
     }
 
+    /// `path` from the directory `base` (absolute), as [`normalize`] makes
+    /// it but with each `..` taken from where the names before it lead:
+    /// after a symbolic link to a directory it is that directory's
+    /// parent, not the link's, since Linux walks a path a name at a time.
+    /// What a `..` follows has to be there (`ENOENT`) and be a directory
+    /// (`ENOTDIR`). For a path with a `..` in it; any other is
+    /// `normalize`'s, with nothing asked.
+    pub fn physical(&self, path: &str, base: &str) -> Result<String, Errno> {
+        let absolute = path.starts_with('/');
+        let mut at = if absolute { "/".to_string() } else { base.to_string() };
+        // Whether `at` may have a link on it still: a relative path's
+        // directory may (it is kept as it was named), the root not.
+        let mut unfollowed = !absolute && at != "/";
+        for c in path.split('/') {
+            match c {
+                "" | "." => {}
+                ".." => {
+                    if unfollowed {
+                        at = self.followed(&at)?;
+                        unfollowed = false;
+                    }
+                    at = parent_of(&at);
+                }
+                c => {
+                    if at != "/" {
+                        at.push('/');
+                    }
+                    at.push_str(c);
+                    unfollowed = true;
+                }
+            }
+        }
+        Ok(at)
+    }
+
+    /// Absolute `abs`, which has to be a directory, with every link on it
+    /// followed, the last name's too.
+    fn followed(&self, abs: &str) -> Result<String, Errno> {
+        let mut current = abs.to_string();
+        for _ in 0..40 {
+            let dirs = match self.walk(&current, false)? {
+                Some(w) if !w.at_mount => w.path,
+                _ => self.through_dir_links(current)?,
+            };
+            let (fs, rel) = self.mount_of(dirs.clone())?;
+            match fs.read_link(&rel) {
+                Ok(target) => current = if target.starts_with('/') { normalize(&target, "/") } else { normalize(&target, &parent_of(&dirs)) },
+                Err(_) => {
+                    return match fs.metadata(&rel)?.file_type {
+                        FileType::Directory => Ok(dirs),
+                        _ => Err(Errno::ENOTDIR),
+                    };
+                }
+            }
+        }
+        Err(Errno::ELOOP)
+    }
+
     /// Absolute `abs` with every root-filesystem symlink on it followed,
     /// the last component's too: the name Linux's `/proc/self/fd/N` shows
     /// for a file opened by `abs`. `abs` itself when the walk fails or
@@ -2912,6 +2970,44 @@ mod tests {
         assert_eq!(vfs.read_link("/bin/sh").unwrap(), "dash");
         assert!(vfs.metadata("/bin/sh").is_ok());
         assert!(vfs.metadata("/bin/../lib/ld.so").is_ok());
+    }
+
+    /// A `..` is the parent of where the names before it lead, not of
+    /// the last name written.
+    #[test]
+    fn dotdot_is_taken_from_where_a_link_leads() {
+        let mut vfs = Vfs::new();
+        let root = Arc::new(TmpFs::new());
+        root.add_file("real/sub/deep", b"deep".to_vec());
+        root.add_file("real/inside", b"in".to_vec());
+        root.add_file("top", b"top".to_vec());
+        vfs.mount("/", root);
+        let other = Arc::new(TmpFs::new());
+        other.add_file("far/there", b"other".to_vec());
+        vfs.mount("/mnt", other);
+        vfs.symlink("real/sub", "/down").unwrap();
+        vfs.symlink("/mnt/far", "/across").unwrap();
+        vfs.symlink("/real", "/mnt/back").unwrap();
+        let p = |path: &str, base: &str| vfs.physical(path, base);
+        assert_eq!(p("/down/../inside", "/").unwrap(), "/real/inside");
+        assert_eq!(p("down/../inside", "/").unwrap(), "/real/inside");
+        assert_eq!(p("/real/sub/../inside", "/").unwrap(), "/real/inside");
+        assert_eq!(p("/across/../far/there", "/").unwrap(), "/mnt/far/there");
+        assert_eq!(p("/mnt/back/../top", "/").unwrap(), "/top");
+        assert_eq!(p("/down/../../top", "/").unwrap(), "/top");
+        // From a directory that was named through a link.
+        assert_eq!(p("../inside", "/down").unwrap(), "/real/inside");
+        assert_eq!(p("..", "/down").unwrap(), "/real");
+        assert_eq!(p("../..", "/real/sub").unwrap(), "/");
+        // The root's parent is the root.
+        assert_eq!(p("/../../top", "/").unwrap(), "/top");
+        assert_eq!(p("..", "/").unwrap(), "/");
+        // What a `..` follows has to be a directory that is there.
+        assert_eq!(p("/nothing/../top", "/"), Err(Errno::ENOENT));
+        assert_eq!(p("/top/../real", "/"), Err(Errno::ENOTDIR));
+        assert_eq!(p("/real/inside/..", "/"), Err(Errno::ENOTDIR));
+        // With no `..` it asks nothing.
+        assert_eq!(p("/nothing/./at//all", "/").unwrap(), "/nothing/at/all");
     }
 
     /// A mounted tmpfs's links to directories are followed too, wherever

@@ -6,15 +6,14 @@
 //   name, and a link to such a link: a file under the directory is found
 //   through each, for open, stat, access, a directory listing, and
 //   making, renaming and removing things.
+// - `..` after a link is the parent of where the link leads, from a
+//   path's start and from a directory entered through a link; after a
+//   name that is not there it is ENOENT, after a file ENOTDIR.
 // - A link out of the mount, into another mount (/proc/self): the files
 //   there.
 // - The last name's link is the caller's: lstat and readlink see it,
 //   O_NOFOLLOW refuses it.
 // - Links that lead to each other are ELOOP.
-//
-// Not checked, because gex has it wrong: `..` after a link is the parent
-// of where the link leads (`down/../inside` with down -> real/sub is
-// real/inside), and gex takes a path's `..` before it follows any link.
 //
 // Mounts a tmpfs of its own (root); without that right the program says
 // so and exits 77.
@@ -94,6 +93,16 @@ int main(void) {
     if (stat(at("rel/inside"), &a) || stat(at("real/inside"), &b) || a.st_ino != b.st_ino) die("stat through a link", a.st_ino, b.st_ino);
     if (access(at("abs/sub/deep"), R_OK)) die("access through a link", errno, 0);
     if (!has("rel", "inside") || !has("twice/sub", "deep")) die("a listing through a link", 0, 0);
+    // `..` is the parent of where the link leads.
+    reads("down/../inside", "in");
+    reads("down/../sub/../../real/inside", "in");
+    if (stat(at("nothing/../real"), &a) == 0 || errno != ENOENT) die(".. after a name that is not there", errno, 0);
+    if (stat(at("real/inside/../inside"), &a) == 0 || errno != ENOTDIR) die(".. after a file", errno, 0);
+    if (chdir(at("down"))) die("chdir into a link", errno, 0);
+    int up = open("../inside", O_RDONLY);
+    if (up < 0) die(".. from a directory entered through a link", errno, 0);
+    close(up);
+    if (chdir("/")) die("chdir", errno, 1);
     // Made, renamed and removed through one.
     put("rel/made", "new");
     reads("real/made", "new");
