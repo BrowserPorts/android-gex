@@ -938,6 +938,24 @@ fn new_engine() -> Result<Engine> {
     Engine::new(&config).context("creating the wasm engine")
 }
 
+/// `GEX_FIXED_RANDOM=<seed>`: what `getrandom` and `/dev/urandom` give is a
+/// function of the seed and of which program asks, the same in every run
+/// (`gex_kernel::entropy`). For a run whose programs place their own code
+/// at random (Android's: bionic's linker draws where each library goes), so
+/// that a second run finds the first one's translations; and for finding a
+/// fault twice. Never for a run anything trusts: the bytes are no secret.
+fn fixed_random() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Ok(seed) = std::env::var("GEX_FIXED_RANDOM") {
+            match seed.parse::<u64>() {
+                Ok(seed) => gex_kernel::entropy::fix(seed),
+                Err(_) => eprintln!("gex: GEX_FIXED_RANDOM={seed:?} is not a number: randomness is not fixed"),
+            }
+        }
+    });
+}
+
 fn run_program_with(
     program: &Program,
     opts: &RunOptions,
@@ -946,6 +964,7 @@ fn run_program_with(
 ) -> Result<(Exit, Stats)> {
     let fresh_process = inherited.is_none();
     gex_kernel::syscalls::set_thread_runners(gex_kernel::syscalls::ThreadRunners { take: take_runner, give: give_runner });
+    fixed_random();
     let image = &program.exe;
     // Before anything is translated: a 32-bit (i386) program's code is
     // decoded in compatibility mode, and the kernel below speaks its ABI.
@@ -2796,6 +2815,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             }
         }
         let mut child = k.fork_kernel();
+        gex_kernel::entropy::fork(k.pid, pid);
         child.pid = pid;
         child.tid = pid;
         child.forget_own_pidfds();
@@ -3444,6 +3464,8 @@ fn exec_program(
     // label, where it asked for nothing itself.
     kernel.exec_selinux(&exe_path);
     kernel.exec_signals(tid);
+    // Its randomness, in a run made to repeat, is this program's.
+    gex_kernel::entropy::exec(kernel.pid, &exe_path);
     kernel.exe_path = exe_path;
     let opts = RunOptions {
         // (a program its interpreter maps: the interpreter's command line

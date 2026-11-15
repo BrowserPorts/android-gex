@@ -462,6 +462,10 @@ impl FileHandle for DevDir {
 /// in again. Not a cryptographic generator: the host's entropy is not
 /// reachable from here.
 pub(crate) fn fill_random(buf: &mut [u8]) {
+    // A run made to repeat reads its own stream (`crate::entropy`).
+    if crate::entropy::fill(buf) {
+        return;
+    }
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
     const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;

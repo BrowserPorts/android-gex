@@ -9114,6 +9114,7 @@ impl FreeCall {
 pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall) -> FreeOutcome {
     // As [`Kernel::syscall`]: a signalfd answers for whoever asks it.
     crate::signalfd::enter(f.signals);
+    crate::entropy::enter(f.pid);
     // As [`Kernel::syscall`]: a thread with AArch64's tagged address ABI
     // on may pass tagged pointers.
     let a64 = a64_thread(f.io.compat, f.io.wasm32);
@@ -12064,6 +12065,8 @@ impl Kernel {
     pub fn syscall(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         // A signalfd answers for whoever asks it.
         crate::signalfd::enter(&self.signals);
+        // And randomness, in a run made to repeat (`crate::entropy`).
+        crate::entropy::enter(self.pid);
         // Other processes' write-backs into this one's shared mappings.
         self.mem.shared_maps().catch_up(m);
         // A thread with AArch64's tagged address ABI on may pass tagged
