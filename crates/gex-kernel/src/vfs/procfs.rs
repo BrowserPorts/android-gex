@@ -542,6 +542,13 @@ impl ProcFs {
             "filesystems" => b"nodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tbinder\nnodev\tselinuxfs\n\text4\n".to_vec(),
             "sys/kernel/osrelease" => b"6.1.0-gex\n".to_vec(),
             "sys/kernel/pid_max" => b"32768\n".to_vec(),
+            // The kernel's random numbers as files (drivers/char/random.c):
+            // an id made once for the boot, a new one at every read, and
+            // the pool's size and fill, which are both 256 since Linux
+            // 5.18.
+            "sys/kernel/random/boot_id" => format!("{}\n", uuid_text(boot_id())).into_bytes(),
+            "sys/kernel/random/uuid" => format!("{}\n", uuid_text(random_uuid())).into_bytes(),
+            "sys/kernel/random/entropy_avail" | "sys/kernel/random/poolsize" => b"256\n".to_vec(),
             // glibc and musl both consult this before using large mappings.
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
             // The limit `F_SETPIPE_SZ` holds an unprivileged caller to.
@@ -663,17 +670,20 @@ impl FileSystem for ProcFs {
             }
             "sys" => vec!["fs", "kernel", "vm"],
             "sys/fs" => vec!["pipe-max-size"],
-            "sys/kernel" => vec!["osrelease", "pid_max"],
+            "sys/kernel" => vec!["osrelease", "pid_max", "random"],
+            "sys/kernel/random" => vec!["boot_id", "entropy_avail", "poolsize", "uuid"],
             "sys/vm" => vec!["overcommit_memory"],
             _ => return Err(Errno::ENOENT),
         };
-        // `sys` holds directories, the directories under it files.
+        // `sys` holds directories, the directories under it files (and
+        // `sys/kernel` one directory more).
         let file_type = if path == "sys" { FileType::Directory } else { FileType::Regular };
+        let is_dir = |name: &str| (path == "self" && name == "attr") || (path == "sys/kernel" && name == "random");
         let mut out = base_entries();
         for name in entries {
             out.push(DirEntry {
                 name: name.to_string(),
-                file_type: if path == "self" && name == "attr" { FileType::Directory } else { file_type },
+                file_type: if is_dir(name) { FileType::Directory } else { file_type },
                 ino: 1,
             });
         }
@@ -718,7 +728,7 @@ impl FileSystem for ProcFs {
             };
         }
         match path.as_str() {
-            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/fs" | "sys/kernel" | "sys/vm" => Ok(Metadata::dir()),
+            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/fs" | "sys/kernel" | "sys/kernel/random" | "sys/vm" => Ok(Metadata::dir()),
             "self/exe" | "self/cwd" => Ok(Metadata {
                 file_type: FileType::Symlink,
                 size: 0,
@@ -753,6 +763,32 @@ impl FileSystem for ProcFs {
             }
         }
     }
+}
+
+/// A random UUID as the kernel makes one (`generate_random_uuid`):
+/// sixteen random bytes, marked version 4 of the DCE variant.
+fn random_uuid() -> [u8; 16] {
+    let mut id = [0u8; 16];
+    super::devfs::fill_random(&mut id);
+    id[6] = id[6] & 0x0f | 0x40;
+    id[8] = id[8] & 0x3f | 0x80;
+    id
+}
+
+/// `/proc/sys/kernel/random/boot_id`: one id for as long as the kernel
+/// runs, made when first asked for. It is this kernel's: natively that is
+/// every process's, as it has to be; a host whose processes are each a
+/// kernel of their own (the page's) would give each its own, and has to
+/// hand one down instead before anything there compares them.
+fn boot_id() -> [u8; 16] {
+    static ID: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    *ID.get_or_init(random_uuid)
+}
+
+/// An id as `%pU` prints it: 8-4-4-4-12 hex digits.
+fn uuid_text(id: [u8; 16]) -> String {
+    let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!("{}-{}-{}-{}-{}", hex(&id[..4]), hex(&id[4..6]), hex(&id[6..8]), hex(&id[8..10]), hex(&id[10..]))
 }
 
 fn attr_metadata(which: usize) -> Metadata {
@@ -901,6 +937,30 @@ mod tests {
         for pid in ["1", "7", "42", "self", "loadavg"] {
             assert!(names.iter().any(|n| n == pid), "{pid} missing from {names:?}");
         }
+    }
+
+    /// The kernel's random ids: `boot_id` the same for as long as the
+    /// kernel runs, `uuid` new at every read, each a version 4 UUID in
+    /// 36 characters and a newline (libbinder dies of a `boot_id` of any
+    /// other length).
+    #[test]
+    fn the_boot_has_an_id_and_every_read_a_new_one() {
+        let f = fs();
+        let boot = read(&f, "sys/kernel/random/boot_id");
+        assert_eq!(boot, read(&f, "sys/kernel/random/boot_id"));
+        let one = read(&f, "sys/kernel/random/uuid");
+        assert_ne!(one, read(&f, "sys/kernel/random/uuid"));
+        for id in [&boot, &one] {
+            let b = id.as_bytes();
+            assert_eq!((b.len(), b[36], b[14]), (37, b'\n', b'4'), "{id}");
+            assert!(matches!(b[19], b'8' | b'9' | b'a' | b'b'), "{id}");
+            assert!(b[..36].iter().enumerate().all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { *c == b'-' } else { c.is_ascii_hexdigit() && !c.is_ascii_uppercase() }), "{id}");
+        }
+        assert_eq!((read(&f, "sys/kernel/random/entropy_avail"), read(&f, "sys/kernel/random/poolsize")), ("256\n".to_string(), "256\n".to_string()));
+        let names: Vec<(String, FileType)> = f.open("sys/kernel", 0, 0).unwrap().read_dir().unwrap().into_iter().map(|e| (e.name, e.file_type)).collect();
+        assert!(names.contains(&("random".to_string(), FileType::Directory)) && names.contains(&("osrelease".to_string(), FileType::Regular)));
+        assert_eq!(f.metadata("sys/kernel/random").unwrap().file_type, FileType::Directory);
+        assert_eq!(f.open("sys/kernel/random", 0, 0).unwrap().read_dir().unwrap().len(), 6);
     }
 
     #[test]
