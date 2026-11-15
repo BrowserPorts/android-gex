@@ -28,6 +28,11 @@ export GEX_FIXED_RANDOM="${GEX_FIXED_RANDOM:-1}"
 if [ "$GEXC" != native ] && [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
     export GEX_CACHE_BUILD="$name"
 fi
+# gexc runs as root, as the native side does: the root keeps the image's
+# owners (root.sh), and a gexc that is the host's root says them.
+gexc() {
+    sudo env GEX_FIXED_RANDOM="$GEX_FIXED_RANDOM" ${GEX_CACHE_BUILD:+GEX_CACHE_BUILD="$GEX_CACHE_BUILD"} "$@"
+}
 CLIENT=$HERE/../bin/smcall
 [ -x "$CLIENT" ] || { echo "servicemanager.sh: no $CLIENT (tests/android/build.sh)" >&2; exit 1; }
 ENVS="PATH=/system/bin HOME=/ ANDROID_ROOT=/system ANDROID_DATA=/data TMPDIR=/data/local/tmp"
@@ -65,7 +70,7 @@ sys.exit(0 if os.write(fd, data) == len(data) else 1)" "$POLICY" || { echo "serv
 else
     args=""
     for e in $ENVS; do args="$args --env $e"; done
-    out=$(cd "$ROOT" && timeout "${TIMEOUT:-180}" "$GEXC" run --argv0 /system/bin/sh --uid 0 --mem64 --selinuxfs $args \
+    out=$(cd "$ROOT" && gexc timeout "${TIMEOUT:-180}" "$GEXC" run --argv0 /system/bin/sh --uid 0 --mem64 --selinuxfs $args \
         --bind "$CLIENT=/smcall" --sysroot "$ROOT" "$ROOT/system/bin/sh" -c "
             load_policy /vendor/etc/selinux/precompiled_sepolicy || exit 1
             /system/bin/servicemanager &

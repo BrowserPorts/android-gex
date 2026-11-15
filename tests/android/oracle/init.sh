@@ -29,12 +29,17 @@ export GEX_FIXED_RANDOM="${GEX_FIXED_RANDOM:-1}"
 if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
     export GEX_CACHE_BUILD="$name"
 fi
+# gexc runs as root, as the native side does: the root keeps the image's
+# owners (root.sh), and a gexc that is the host's root says them.
+gexc() {
+    sudo env GEX_FIXED_RANDOM="$GEX_FIXED_RANDOM" ${GEX_CACHE_BUILD:+GEX_CACHE_BUILD="$GEX_CACHE_BUILD"} "$@"
+}
 FIRST=$HERE/../bin/firststage
 [ -x "$FIRST" ] || { echo "init.sh: no $FIRST (tests/android/build.sh)" >&2; exit 1; }
 CONFIG=$(mktemp)
 ERR=$(mktemp)
 printf 'androidboot.selinux = "permissive"\nandroidboot.hardware = "ranchu"\n' >"$CONFIG"
-(cd "$ROOT" && timeout "${TIMEOUT:-150}" "$GEXC" run --argv0 /firststage --uid 0 --mem64 --selinuxfs --bootconfig "$CONFIG" \
+(cd "$ROOT" && gexc timeout "${TIMEOUT:-150}" "$GEXC" run --argv0 /firststage --uid 0 --mem64 --selinuxfs --bootconfig "$CONFIG" \
     --bind "$FIRST=/firststage" --sysroot "$ROOT" "$FIRST" "$@" 2>"$ERR")
 echo "init.sh: gexc exited $? (124: still running at the time limit)"
 grep -a '^\[kmsg\]' "$ERR" | sed 's/^\[kmsg\] //'

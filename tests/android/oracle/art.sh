@@ -24,6 +24,11 @@ export GEX_FIXED_RANDOM="${GEX_FIXED_RANDOM:-1}"
 if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
     export GEX_CACHE_BUILD="$name"
 fi
+# gexc runs as root, as the native side does: the root keeps the image's
+# owners (root.sh), and a gexc that is the host's root says them.
+gexc() {
+    sudo env GEX_FIXED_RANDOM="$GEX_FIXED_RANDOM" ${GEX_CACHE_BUILD:+GEX_CACHE_BUILD="$GEX_CACHE_BUILD"} "$@"
+}
 : "${D8_JAR:?set D8_JAR to an Android SDK build-tools d8.jar}"
 
 work=$(mktemp -d)
@@ -47,7 +52,7 @@ for interp in -Xint ""; do
     name="art${interp:+ $interp}"
     set -- "-Xbootclasspath:$BCP" -Xusejit:false $interp -cp /data/local/tmp/hello.jar Hello
     native=$(sudo timeout 120 env -i $ENVS /usr/sbin/chroot "$ROOT" $VM "$@" 2>/dev/null) || true
-    gex=$(cd "$ROOT" && timeout 1800 "$GEXC" run --argv0 $VM --uid 0 --mem64 $args --sysroot "$ROOT" "$ROOT$VM" "$@" 2>/dev/null) || true
+    gex=$(cd "$ROOT" && gexc timeout 1800 "$GEXC" run --argv0 $VM --uid 0 --mem64 $args --sysroot "$ROOT" "$ROOT$VM" "$@" 2>/dev/null) || true
     if [ -n "$native" ] && [ "$native" = "$gex" ]; then
         printf '%s\n' "$gex"
         echo "PASS $name"

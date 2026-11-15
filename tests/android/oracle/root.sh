@@ -13,10 +13,11 @@
 # from them.
 #
 # Needs an arm64 Linux host (the last step runs linkerconfig from the
-# image), root through sudo, python3, rsync and unzip. The tree ends up
-# owned by the caller so that gexc can read it; what the image's owners
-# were is in the partition images. It leaves /proc mounted and /dev bound
-# in the root: unmount both before removing it.
+# image), root through sudo, python3, rsync and unzip. The tree keeps the
+# image's owners, modes and labels, so most of it is root's and some of it
+# only root reads: gexc is run on it as root (compare.sh and the rest do),
+# and then says of each file the owner the image gave it. It leaves /proc
+# mounted and /dev bound in the root: unmount both before removing it.
 set -eu
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 IMAGE=$1
@@ -46,15 +47,14 @@ for apex in "$ROOT"/system/apex/*.apex "$ROOT"/system_ext/apex/*.apex "$ROOT"/pr
     copy "$WORK/apex_payload.img" "$ROOT/apex/$(basename "$apex" .apex)"
 done
 sudo rm -f "$WORK/apex_payload.img"
-sudo chown -R "$(id -u):$(id -g)" "$ROOT"
-chmod -R u+rwX "$ROOT"
 
-python3 "$HERE/apexinfo.py" "$ROOT"
+sudo python3 "$HERE/apexinfo.py" "$ROOT"
 # linkerconfig is the image's own program: it wants /proc and /dev as any
 # Android program does. They stay mounted for the runs that follow.
 mountpoint -q "$ROOT/proc" || sudo mount -t proc proc "$ROOT/proc"
 mountpoint -q "$ROOT/dev" || sudo mount --bind /dev "$ROOT/dev"
 sudo env -i PATH=/system/bin /usr/sbin/chroot "$ROOT" /apex/com.android.runtime/bin/linkerconfig --target /linkerconfig
-sudo chown -R "$(id -u):$(id -g)" "$ROOT/linkerconfig"
-mkdir -p "$ROOT/data/local/tmp"
+# As init.rc makes them: /data/local for root, /data/local/tmp for shell.
+sudo install -d -o 0 -g 0 -m 0751 "$ROOT/data/local"
+sudo install -d -o 2000 -g 2000 -m 0771 "$ROOT/data/local/tmp"
 echo "$ROOT"

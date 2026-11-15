@@ -26,6 +26,11 @@ export GEX_FIXED_RANDOM="${GEX_FIXED_RANDOM:-1}"
 if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
     export GEX_CACHE_BUILD="$name"
 fi
+# gexc runs as root, as the native side does: the root keeps the image's
+# owners (root.sh), and a gexc that is the host's root says them.
+gexc() {
+    sudo env GEX_FIXED_RANDOM="$GEX_FIXED_RANDOM" ${GEX_CACHE_BUILD:+GEX_CACHE_BUILD="$GEX_CACHE_BUILD"} "$@"
+}
 ENVS="PATH=/system/bin HOME=/ ANDROID_ROOT=/system ANDROID_DATA=/data TMPDIR=/data/local/tmp"
 ERR=$(mktemp)
 mountpoint -q "$ROOT/proc" || sudo mount -t proc proc "$ROOT/proc"
@@ -38,9 +43,7 @@ while IFS= read -r line; do
     [ -z "$line" ] && continue
     n=$(sudo timeout 60 env -i $ENVS /usr/sbin/chroot "$ROOT" /system/bin/sh -c "$line" 2>/dev/null)
     ns=$?
-    # What the native run made as root, gexc's run must be able to change.
-    sudo chown -R "$(id -u)" "$ROOT/data" 2>/dev/null
-    g=$(cd "$ROOT" && timeout 300 "$GEXC" run --argv0 /system/bin/sh --uid 0 --mem64 $args --sysroot "$ROOT" "$ROOT/system/bin/sh" -c "$line" 2>>"$ERR")
+    g=$(cd "$ROOT" && gexc timeout 300 "$GEXC" run --argv0 /system/bin/sh --uid 0 --mem64 $args --sysroot "$ROOT" "$ROOT/system/bin/sh" -c "$line" 2>>"$ERR")
     gs=$?
     if [ "$n" = "$g" ] && [ $ns -eq $gs ]; then
         same=$((same + 1))
