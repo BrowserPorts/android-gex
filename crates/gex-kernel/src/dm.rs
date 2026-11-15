@@ -14,7 +14,9 @@
 //!   (252:n), with no disk behind it until it is given a table (its node
 //!   is `ENXIO` and sysfs has nothing of it). `EBUSY` for a name or uuid
 //!   in use; `EINVAL` for a name that is empty or has a slash.
-//! - `DM_DEV_STATUS`, by name or by uuid (`ENXIO` for neither): its
+//! - `DM_DEV_STATUS`, by name, by uuid or by number, one of them only
+//!   (`ENXIO` for none and for a number with another, `EINVAL` for a name
+//!   with a uuid, in every call but the one that makes a device): its
 //!   number, how many have it open, and its flags: suspended, read-only,
 //!   a table in use, a table waiting.
 //! - `DM_TABLE_LOAD`: a table that waits: targets end to end from sector
@@ -329,20 +331,27 @@ fn cstr(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// The device a request names: by its name, or with none by its uuid.
-/// `ENXIO` for one that is not there.
+/// The device a request names (`__find_device_hash_cell`): by its uuid,
+/// by its name, or by its number, and by one of them only (a number with
+/// either of the others names nothing; both of the others is refused
+/// before this). `ENXIO` for one that is not there.
 fn find(devices: &BTreeMap<u32, Arc<Mapped>>, r: &Request<'_>) -> Result<Arc<Mapped>, Errno> {
-    if r.name.is_empty() && r.uuid.is_empty() {
-        return Err(Errno::ENXIO);
+    let by = |is: &dyn Fn(&Mapped) -> bool| devices.values().find(|d| is(d)).cloned().ok_or(Errno::ENXIO);
+    if !r.uuid.is_empty() {
+        if r.dev != 0 {
+            return Err(Errno::ENXIO);
+        }
+        by(&|d| d.state().uuid == r.uuid)
+    } else if !r.name.is_empty() {
+        if r.dev != 0 {
+            return Err(Errno::ENXIO);
+        }
+        by(&|d| d.state().name == r.name)
+    } else if r.dev != 0 && major(r.dev) == DM_MAJOR {
+        devices.get(&minor(r.dev)).cloned().ok_or(Errno::ENXIO)
+    } else {
+        Err(Errno::ENXIO)
     }
-    devices
-        .values()
-        .find(|d| {
-            let st = d.state();
-            if r.name.is_empty() { st.uuid == r.uuid } else { st.name == r.name }
-        })
-        .cloned()
-        .ok_or(Errno::ENXIO)
 }
 
 /// `check_name`: not empty, and no slash.
@@ -452,6 +461,12 @@ fn table_status(table: &Table, words: bool) -> Vec<u8> {
 
 /// One request (`ctl_ioctl`'s commands).
 fn handle(cmd: u64, r: &Request<'_>, resolve: Resolve<'_>) -> Result<Answer, Errno> {
+    // `validate_params`: a device is named by its name or by its uuid,
+    // not both, but in the call that makes it with both (and the calls
+    // that name none: the version, the lists, removing all).
+    if !matches!(cmd, 0 | 1 | 2 | 3 | 13) && !r.name.is_empty() && !r.uuid.is_empty() {
+        return Err(Errno::EINVAL);
+    }
     let mut devices = DEVICES.lock().unwrap_or_else(|e| e.into_inner());
     let mut answer = Answer::default();
     match cmd {
