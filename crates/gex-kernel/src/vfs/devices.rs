@@ -5,9 +5,9 @@
 //!
 //! The numbers are Linux's (Documentation/admin-guide/devices.txt). Here
 //! so far: the memory devices 1:3 (null), 1:5 (zero), 1:7 (full), 1:8 and
-//! 1:9 (random, urandom), and the terminals 5:0 and 5:1 (tty, console).
-//! Any other number opens as `ENXIO`, as a number no driver has does: the
-//! kernel log 1:11 among them, which is not here yet, and 5:2, the
+//! 1:9 (random, urandom) and 1:11 (kmsg, the kernel's log: [`super::kmsg`]),
+//! and the terminals 5:0 and 5:1 (tty, console). Any other number opens
+//! as `ENXIO`, as a number no driver has does: 5:2 among them, the
 //! pseudoterminal multiplexer, which the kernel opens by its path.
 
 use super::{FileHandle, Metadata};

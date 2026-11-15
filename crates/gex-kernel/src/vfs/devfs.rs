@@ -53,6 +53,8 @@ impl std::fmt::Debug for DevHandle {
 /// the memory devices and the terminals, by Linux's numbers.
 pub(super) fn open_numbered(dev: u64, node: super::devices::NodeMeta) -> Option<Arc<dyn FileHandle>> {
     let device = match (super::devices::major(dev), super::devices::minor(dev)) {
+        // The kernel's log: each open reads it from its own place.
+        (1, 11) => return Some(super::kmsg::Kmsg::open(Some(node))),
         (1, 3) => Device::Null,
         (1, 5) => Device::Zero,
         (1, 7) => Device::Full,
@@ -130,7 +132,10 @@ pub struct DevFs {
 
 impl DevFs {
     pub fn new() -> DevFs {
-        DevFs { extra: Vec::new(), per_open: Vec::new(), pts: None, links: Vec::new() }
+        let mut dev = DevFs { extra: Vec::new(), per_open: Vec::new(), pts: None, links: Vec::new() };
+        // The kernel's log: every open reads it from its own place.
+        dev.add_per_open("kmsg", Arc::new(|| super::kmsg::Kmsg::open(None) as Arc<dyn FileHandle>));
+        dev
     }
 
     /// `/dev/ptmx` and `/dev/pts`, with `list` saying which pts numbers exist.

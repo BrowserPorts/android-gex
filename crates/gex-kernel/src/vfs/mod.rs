@@ -17,6 +17,7 @@ pub mod hostcall;
 // instead.
 #[cfg(unix)]
 pub mod hostfs;
+pub mod kmsg;
 pub mod oss;
 pub mod peimage;
 pub mod procfs;
