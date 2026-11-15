@@ -4159,7 +4159,7 @@ fn keep(s: std::sync::Arc<UnixSocket>) -> i32 {
 /// JavaScript, passes zeros: root).
 #[no_mangle]
 pub extern "C" fn k_sock_bind(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
-    sock_bind(path_of_raw(path, path_len), Cred { pid, uid, gid })
+    sock_bind(path_of_raw(path, path_len), Cred { pid, uid, gid, sid: 0 })
 }
 
 fn sock_bind(p: String, cred: Cred) -> i32 {
@@ -4191,7 +4191,7 @@ pub extern "C" fn k_sock_rename(from: gex_kmem::PAddr, from_len: u32, to: gex_km
 /// `SO_PEERCRED` reports). Returns this end's id, or a negated errno.
 #[no_mangle]
 pub extern "C" fn k_sock_connect(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32, addr: u32, port: u32) -> i32 {
-    sock_connect(path_of_raw(path, path_len), Cred { pid, uid, gid }, addr, port)
+    sock_connect(path_of_raw(path, path_len), Cred { pid, uid, gid, sid: 0 }, addr, port)
 }
 
 /// `addr` and `port`: the IPv4 address a loopback TCP end connects from,
@@ -4350,7 +4350,7 @@ pub extern "C" fn k_sock_peer_addr(id: i32, out: gex_kmem::PAddr) -> i32 {
 #[no_mangle]
 pub extern "C" fn k_sock_pair(out: gex_kmem::PAddr, pid: i32, uid: u32, gid: u32) -> i32 {
     let (a, b) = UnixSocket::pair();
-    UnixSocket::set_pair_cred(&a, &b, Cred { pid, uid, gid });
+    UnixSocket::set_pair_cred(&a, &b, Cred { pid, uid, gid, sid: 0 });
     let ids = [keep(a) as u32, keep(b) as u32];
     let mut bytes = [0u8; 8];
     bytes[..4].copy_from_slice(&ids[0].to_le_bytes());
@@ -4422,11 +4422,11 @@ unsafe fn kernel_bytes_mut<'a>(at: gex_kmem::PAddr, len: u32) -> &'a mut [u8] {
 // module's memory rather than a process's (the loopback ports and UDP's
 // streams are unix sockets in the table above).
 extern "C" fn kl_sock_bind(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32) -> i32 {
-    sock_bind(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned(), Cred { pid, uid, gid })
+    sock_bind(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned(), Cred { pid, uid, gid, sid: 0 })
 }
 
 extern "C" fn kl_sock_connect(path: gex_kmem::PAddr, path_len: u32, pid: i32, uid: u32, gid: u32, addr: u32, port: u32) -> i32 {
-    sock_connect(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned(), Cred { pid, uid, gid }, addr, port)
+    sock_connect(String::from_utf8_lossy(unsafe { kernel_bytes(path, path_len) }).into_owned(), Cred { pid, uid, gid, sid: 0 }, addr, port)
 }
 
 extern "C" fn kl_sock_peer_addr(id: i32, out: gex_kmem::PAddr) -> i32 {

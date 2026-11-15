@@ -1628,7 +1628,10 @@ pub struct FdIo<'a> {
 impl FdIo<'_> {
     /// This process's credentials as `struct ucred` has them.
     pub fn cred(&self) -> unix::Cred {
-        unix::Cred { pid: self.pid, uid: self.creds.uid(), gid: self.creds.gid() }
+        // Its sockets are what it asked them to be (`sockcreate`), or it.
+        let ids = self.creds.sec();
+        let sid = if ids[crate::selinux::procattr::SOCKCREATE] != 0 { ids[crate::selinux::procattr::SOCKCREATE] } else { ids[crate::selinux::procattr::CURRENT] };
+        unix::Cred { pid: self.pid, uid: self.creds.uid(), gid: self.creds.gid(), sid }
     }
 
     /// `eventfd2`: a counting descriptor an event loop pokes to wake itself.
@@ -2377,7 +2380,7 @@ impl FdIo<'_> {
         if control == 0 || used > len {
             return Ok(0);
         }
-        let c = peer.unwrap_or(unix::Cred { pid: 0, uid: 65534, gid: 65534 });
+        let c = peer.unwrap_or(unix::Cred { pid: 0, uid: 65534, gid: 65534, sid: 0 });
         self.msg_wr(m, control, 0, cmsg_len)?;
         m.write_u32(control + w, SOL_SOCKET)?;
         m.write_u32(control + w + 4, SCM_CREDENTIALS)?;
@@ -4580,6 +4583,19 @@ impl PathIo<'_> {
         } else {
             String::from_utf8_lossy(&m.read_cstr(a[2], 64)?).into_owned()
         };
+        // A change of how a mount's own changes spread to other mount
+        // namespaces (`MS_SHARED` and its kin, with no type and no
+        // source): of what is mounted at the target, or `EINVAL`. There is
+        // nothing for it to change here, where no mount spreads anywhere
+        // (a process's mount table is its own, which is the opposite fault:
+        // Linux's is shared until it is unshared).
+        const MS_UNBINDABLE: u64 = 1 << 17;
+        const MS_PRIVATE: u64 = 1 << 18;
+        const MS_SLAVE: u64 = 1 << 19;
+        const MS_SHARED: u64 = 1 << 20;
+        if a[3] & (MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED) != 0 {
+            return if self.ns.is_mount_point(&target) { Ok(0) } else { Err(Errno::EINVAL) };
+        }
         // A remount or a bind of something already there changes nothing gex
         // models, and reporting failure would stop an init script that is in
         // fact fine.
@@ -6091,16 +6107,41 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         }
         return Ok(0);
     }
-    // A pidfd for the peer (Linux 6.5) and its security label: gex has
-    // neither, and says so as a kernel without them does. A success here
-    // hands back descriptor 0 as the peer's pidfd, which dbus-daemon
-    // duplicates and later closes -- its own standard input, and then
-    // whatever took that number next.
+    // A pidfd for the peer (Linux 6.5): gex has none, and says so as a
+    // kernel without them does. A success here hands back descriptor 0 as
+    // the peer's pidfd, which dbus-daemon duplicates and later closes --
+    // its own standard input, and then whatever took that number next.
     const SO_PEERSEC: u64 = 31;
     const SO_PEERPIDFD: u64 = 77;
-    if level == SOL_SOCKET && matches!(name, SO_PEERSEC | SO_PEERPIDFD) {
+    if level == SOL_SOCKET && name == SO_PEERPIDFD {
         socket_family_type(io, fd)?;
         return Err(Errno::ENOPROTOOPT);
+    }
+    // The peer's SELinux context (`selinux_socket_getpeersec_stream`):
+    // the context of the socket the far end of a connected stream socket
+    // was made as, with its NUL. `ERANGE` and the length wanted for a
+    // buffer too short; `ENOPROTOOPT` for a socket with no such peer (not
+    // connected, a datagram socket, an end whose maker is not known).
+    // Android's property service takes nothing from a client it cannot
+    // name this way.
+    if level == SOL_SOCKET && name == SO_PEERSEC {
+        socket_family_type(io, fd)?;
+        let sid = io.unix_of(fd).ok().filter(|s| s.stream).and_then(|s| s.peer_cred()).map_or(0, |c| c.sid);
+        if sid == 0 {
+            return Err(Errno::ENOPROTOOPT);
+        }
+        let context = crate::selinux::secid_to_secctx(sid)?;
+        let room = if optlen != 0 { m.read_u32(optlen)? as usize } else { 0 };
+        if optlen != 0 {
+            m.write_u32(optlen, context.len() as u32)?;
+        }
+        if room < context.len() {
+            return Err(Errno::ERANGE);
+        }
+        if val != 0 {
+            m.write(val, &context)?;
+        }
+        return Ok(0);
     }
     if level == SOL_SOCKET && name == SO_ERROR {
         // A unix socket (local or the global kernel's) has no connect
@@ -6143,7 +6184,7 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
             .ok()
             .and_then(|s| s.peer_cred())
             .or_else(|| io.remote_unix_of(fd).ok().and_then(|s| s.peer_cred()))
-            .unwrap_or(unix::Cred { pid: 0, uid: me.uid, gid: me.gid });
+            .unwrap_or(unix::Cred { pid: 0, uid: me.uid, gid: me.gid, sid: 0 });
         let mut bytes = [0u8; 12];
         bytes[0..4].copy_from_slice(&peer.pid.to_le_bytes());
         bytes[4..8].copy_from_slice(&peer.uid.to_le_bytes());
@@ -15967,14 +16008,22 @@ mod tests {
             set_args(&mut m, at, nr::GETSOCKOPT, &[c, 1, 4, 0x20500, 0]);
             call(&mut m, &mut k);
             assert_eq!((ret(&m, at), m.read_u32(0x20500).unwrap()), (0, 0));
-            // No peer pidfd and no security label, as on a kernel without
-            // them: an error, not descriptor 0 or an empty label.
-            for opt in [31u64, 77] {
-                m.write_u32(0x205f0, 4).unwrap();
-                set_args(&mut m, at, nr::GETSOCKOPT, &[s as u64, 1, opt, 0x20500, 0x205f0]);
-                call(&mut m, &mut k);
-                assert_eq!(ret(&m, at), -92, "getsockopt option {opt}");
-            }
+            // No peer pidfd, as on a kernel without them: an error, not
+            // descriptor 0.
+            m.write_u32(0x205f0, 4).unwrap();
+            set_args(&mut m, at, nr::GETSOCKOPT, &[s as u64, 1, 77, 0x20500, 0x205f0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), -92, "SO_PEERPIDFD");
+            // The peer's SELinux context (SO_PEERSEC): before a policy
+            // every process is "kernel". Too short a buffer is ERANGE,
+            // with the length wanted.
+            set_args(&mut m, at, nr::GETSOCKOPT, &[s as u64, 1, 31, 0x20500, 0x205f0]);
+            call(&mut m, &mut k);
+            assert_eq!((ret(&m, at), m.read_u32(0x205f0).unwrap()), (-34, 7), "SO_PEERSEC into four bytes");
+            m.write_u32(0x205f0, 64).unwrap();
+            set_args(&mut m, at, nr::GETSOCKOPT, &[s as u64, 1, 31, 0x20500, 0x205f0]);
+            call(&mut m, &mut k);
+            assert_eq!((ret(&m, at), m.read_u32(0x205f0).unwrap(), m.read(0x20500, 7).unwrap()), (0, 7, &b"kernel\0"[..]), "SO_PEERSEC");
             // A buffer size reads back as Linux's default, its length
             // written; an option this kernel does not have is refused.
             m.write_u32(0x205f0, 4).unwrap();

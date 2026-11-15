@@ -254,6 +254,10 @@ pub struct Cred {
     pub pid: i32,
     pub uid: u32,
     pub gid: u32,
+    /// The SELinux SID of the socket the process made (`SO_PEERSEC`'s):
+    /// what it asked its sockets to be, or else what it is. 0 where that
+    /// is not known (an end the page's global kernel holds).
+    pub sid: u32,
 }
 
 impl UnixSocket {
@@ -2104,7 +2108,7 @@ impl RemoteUnix {
             return None;
         }
         let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
-        Some(Cred { pid: w(0) as i32, uid: w(1), gid: w(2) })
+        Some(Cred { pid: w(0) as i32, uid: w(1), gid: w(2), sid: 0 })
     }
 
     pub fn new(id: i32, listening: bool, peer: Option<String>, remote: Remote) -> RemoteUnix {

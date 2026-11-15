@@ -15,6 +15,8 @@
 //   directory, and not through a descriptor it was left by its parent.
 // - A fork has its parent's; an execve makes the process what it asked to
 //   be, with what it was as prev, and forgets every request.
+// - A stream socket's peer is known by the context its socket was made
+//   as (SO_PEERSEC): its maker's, or what the maker asked for its sockets.
 //
 // The policy is the kernel crate's test policy, built in and loaded into
 // the kernel the program runs on, as selinuxfs.c does: on Linux this
@@ -30,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -293,6 +296,33 @@ int main(int argc, char **argv) {
     if (pid == 0) run_again("kept");
     wait_ok(pid, "the program run again as it was");
     puts_and_reads("current", KERNEL_T, 29, 29, KERNEL_T);
+
+    // What a socket's peer is (SO_PEERSEC, libselinux's getpeercon): the
+    // context of the socket at the far end of a stream, which is its
+    // maker's unless the maker asked otherwise for its sockets.
+    int sv[2];
+    char ctx[128];
+    socklen_t len = sizeof ctx;
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv)) die("socketpair", 0, 0);
+    if (getsockopt(sv[0], SOL_SOCKET, SO_PEERSEC, ctx, &len)) die("SO_PEERSEC", errno, 0);
+    if (len != sizeof KERNEL_T || memcmp(ctx, KERNEL_T, sizeof KERNEL_T)) die("a peer's context", len, sizeof KERNEL_T);
+    len = 4;
+    if (getsockopt(sv[1], SOL_SOCKET, SO_PEERSEC, ctx, &len) != -1 || errno != ERANGE || len != sizeof KERNEL_T) die("SO_PEERSEC into a short buffer", errno, len);
+    close(sv[0]);
+    close(sv[1]);
+    if (put("sockcreate", FILE_T) != 27) die("a request for sockets", errno, 0);
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv)) die("socketpair", 0, 0);
+    len = sizeof ctx;
+    if (getsockopt(sv[0], SOL_SOCKET, SO_PEERSEC, ctx, &len) || len != sizeof FILE_T || memcmp(ctx, FILE_T, sizeof FILE_T)) die("the peer of a socket asked for", errno, len);
+    close(sv[0]);
+    close(sv[1]);
+    if (put("sockcreate", "")) die("the request taken back", errno, 0);
+    // A datagram socket has no such peer.
+    if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sv)) die("socketpair", 0, 0);
+    len = sizeof ctx;
+    if (getsockopt(sv[0], SOL_SOCKET, SO_PEERSEC, ctx, &len) != -1 || errno != ENOPROTOOPT) die("SO_PEERSEC of a datagram socket", errno, ENOPROTOOPT);
+    close(sv[0]);
+    close(sv[1]);
 
     printf("procattr ok\n");
     return 0;
