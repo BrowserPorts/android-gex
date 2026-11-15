@@ -3,6 +3,10 @@
 // loader finds the program's real path this way, and its linker
 // configuration by that path. /proc/self/maps lists the program's own
 // code by the same path.
+//
+// A descriptor's link followed is the descriptor's file itself, whatever
+// the link reads: the standard input's, whose name here is a terminal's,
+// a pipe's or nothing a path can find, stats as the descriptor does.
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -57,6 +61,18 @@ int main(void) {
     }
     if (maps) fclose(maps);
     if (!named) status |= 32;
+
+    // The standard input, whatever it is: its link reads something, and
+    // followed it is the descriptor's own file. A pipe is put there when
+    // there is none, so that there is something to ask about.
+    int ends[2];
+    if (fstat(0, &a) && (pipe(ends) || dup2(ends[0], 0) != 0)) status |= 64;
+    if (name_of(0, by_fd) || !by_fd[0]) status |= 64;
+    if (fstat(0, &a) || stat("/proc/self/fd/0", &b) || a.st_ino != b.st_ino || a.st_dev != b.st_dev || a.st_mode != b.st_mode) status |= 128;
+    if (stat("/proc/self/fd/987", &b) == 0) status |= 256;
+    fd = open("/proc/self/fd/0", O_PATH);
+    if (fd < 0 || fstat(fd, &b) || a.st_ino != b.st_ino || a.st_mode != b.st_mode) status |= 512;
+    close(fd);
 
     if (status) {
         printf("procfd %d (%s, %s)\n", status, exe, by_fd);

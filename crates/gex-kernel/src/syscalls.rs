@@ -3771,6 +3771,9 @@ impl PathIo<'_> {
         let handle = if flags & oflags::O_PATH != 0 {
             let md = if flags & oflags::O_NOFOLLOW != 0 {
                 self.ns.metadata_nofollow(&p)?
+            } else if let Some(n) = self.magic_fd(&p) {
+                // A descriptor's link names the descriptor's own file.
+                self.map.fds.get(n).map_err(|_| Errno::ENOENT)?.handle.metadata()?
             } else {
                 self.ns.metadata(&p)?
             };
@@ -4072,6 +4075,15 @@ impl PathIo<'_> {
         // The path as read: not read again (`at_path`).
         let p = self.at_path_cow(dirfd, std::str::from_utf8(raw).map_err(|_| Errno::EINVAL)?)?;
         crate::phase::mark(6);
+        // A descriptor's magic link, followed, is the descriptor's file
+        // itself, whatever name the link reads back (a pipe's and a
+        // removed file's name nothing; the host's standard streams' lead
+        // back to the link).
+        if flags & AT_SYMLINK_NOFOLLOW == 0 {
+            if let Some(n) = self.magic_fd(&p) {
+                return self.fstat(m, n, buf).map_err(|e| if e == Errno::EBADF { Errno::ENOENT } else { e });
+            }
+        }
         let md = if flags & AT_SYMLINK_NOFOLLOW != 0 {
             self.ns.metadata_nofollow(&p)
         } else {

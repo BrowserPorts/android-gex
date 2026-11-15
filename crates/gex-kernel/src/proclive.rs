@@ -213,7 +213,13 @@ impl ProcSource for KernelProcSource {
                         }
                         format!("/{}", parts.join("/"))
                     };
-                    if to == at {
+                    // A link to a descriptor's own link names a descriptor,
+                    // not a file: the name ends here. The host's standard
+                    // streams are `/dev/stdin` and its kin, which lead to
+                    // `/proc/self/fd/0`: following that asked this
+                    // question again, of the same descriptor, without end.
+                    let fd_link = to.strip_prefix("/proc/").and_then(|r| r.split_once("/fd/")).is_some_and(|(who, n)| !who.contains('/') && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+                    if to == at || fd_link {
                         break;
                     }
                     at = v.canonical(&to);
