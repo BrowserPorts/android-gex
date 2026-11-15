@@ -58,3 +58,23 @@ impl GuestMemory {
         &self.inner
     }
 }
+
+/// Give the host back what its allocator keeps of memory the program has
+/// freed (glibc's `malloc_trim`; nothing on a host with another
+/// allocator). Here with the other thing the host cannot say safely: glibc
+/// keeps what a thread frees in that thread's own arena, and a guest
+/// process's threads each free tens of megabytes when it ends
+/// (`gex_native`'s `trim_heap`).
+pub fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: glibc's own call, which takes each arena's lock itself and
+        // may be made from any thread at any time.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
+}

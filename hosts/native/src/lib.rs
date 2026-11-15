@@ -3027,9 +3027,31 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             let (st, done) = status;
             *st.lock().unwrap_or_else(|e| e.into_inner()) = Some(wstatus);
             done.notify_all();
+            trim_heap();
         })
         .context("spawning a child process")?;
     Ok(())
+}
+
+/// A guest process has ended: give the host back what the allocator kept
+/// of it. Every thread of a process has its own copy of the process's
+/// translated code (a store's instances and tables, tens of megabytes),
+/// allocated on its host thread, and glibc keeps what a thread frees in
+/// that thread's arena: Android's `apexd-bootstrap`, sixty threads, left
+/// 3 GiB resident behind it that nothing was using. Not oftener than every
+/// two seconds: the call walks the whole heap.
+fn trim_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2)) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+        drop(last);
+        gex_mem::trim_heap();
+    }
 }
 
 /// A child a signal ended says so, once, as a shell would. A crash (a signal
@@ -6445,7 +6467,30 @@ fn install_unit(
         .unwrap()
         .instances
         .push(instance);
+    store_stats(cx.as_context_mut());
     Ok(())
+}
+
+/// `GEX_STORE_STATS=1`: what a thread's own copy of the translated code
+/// comes to, said each time it has taken another 500 modules. A wasm table
+/// cannot be shared between stores, so every thread of a process
+/// instantiates every module and has dispatch tables of its own: the cost
+/// of a thread is the process's translated code, and this is how much.
+fn store_stats(mut cx: impl wasmtime::AsContextMut<Data = HostState>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("GEX_STORE_STATS").is_some()) {
+        return;
+    }
+    let (instances, tables, tid) = {
+        let data = cx.as_context().data();
+        let Some(jit) = data.jit.as_ref() else { return };
+        (jit.instances.len(), jit.tables.clone(), data.thread.tid)
+    };
+    if instances % 500 != 0 {
+        return;
+    }
+    let slots: u64 = tables.iter().map(|t| t.size(cx.as_context_mut())).sum();
+    eprintln!("gex: thread {tid}: {instances} modules, {} tables of {slots} slots ({} MiB of slots)", tables.len(), slots * 8 >> 20);
 }
 
 /// Write `unit`'s directory entries that are still the page table's, checked
