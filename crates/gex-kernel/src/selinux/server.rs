@@ -794,6 +794,96 @@ mod tests {
         println!("{asked} questions, each answered as the kernel answered it");
     }
 
+    /// The labels a kernel gave files with a policy loaded, against what
+    /// the policy's rules say of them: `GEX_SELINUX_POLICY` names the
+    /// policy and `GEX_SELINUX_LABELS` the kernel's labels, a line a file
+    /// (its path, its filesystem's type, where that is mounted, the
+    /// file's class, its label, tab between) and a line for something
+    /// newly made (`new file in <dir> (<type>)`, its label). A system
+    /// image's policy is not kept here. The Android 17 image's has been
+    /// through this against Linux 7.0's labels: 59 files of proc, sysfs,
+    /// selinuxfs, binderfs and the other filesystems genfscon labels, 7
+    /// of ext4 and hugetlbfs, and 2 made new in tmpfs.
+    ///
+    /// What is looked at: a file of a filesystem labelled by `genfscon`
+    /// has the context of the rule its path falls under, for its class,
+    /// or is unlabeled; one of a filesystem with no rule at all is
+    /// unlabeled; one of a filesystem labelled by attribute that has no
+    /// attribute is the `file` SID's; something a process makes in a
+    /// filesystem labelled by transition is what the policy makes of the
+    /// process and the filesystem. Not looked at, as not the rules' to
+    /// say: a process's own directory in proc, which is the process's;
+    /// symbolic links, which take the filesystem's context without the
+    /// capability that gives them rules; selinuxfs's `null`; and what was
+    /// made before the policy was loaded in a filesystem labelled by
+    /// transition.
+    #[test]
+    #[ignore = "needs GEX_SELINUX_POLICY and GEX_SELINUX_LABELS"]
+    fn its_labels_for_a_policy_given_are_a_kernels() {
+        use crate::selinux::policy::fs_use;
+        let policy = std::fs::read(std::env::var("GEX_SELINUX_POLICY").expect("GEX_SELINUX_POLICY")).unwrap();
+        let labels = std::fs::read_to_string(std::env::var("GEX_SELINUX_LABELS").expect("GEX_SELINUX_LABELS")).unwrap();
+        let mut s = Server::default();
+        s.load(&policy).unwrap();
+        let unlabeled = s.sid_to_context(SID_UNLABELED, false).unwrap();
+        let file_sid = s.sid_to_context(5, false).unwrap();
+        let kernel = s.sid_to_context(SID_KERNEL, false).unwrap();
+        let (mut genfs, mut other, mut made) = (0, 0, 0);
+        for line in labels.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if let [what, label] = f.as_slice() {
+                // "new file in /dev/shm (tmpfs)": made by a process of the
+                // kernel's context, as every process of that boot was.
+                let Some(rest) = what.strip_prefix("new ") else { continue };
+                let class = if rest.starts_with("dir") { "dir" } else { "file" };
+                let Some(fstype) = rest.rsplit_once('(').map(|(_, t)| t.trim_end_matches(')')) else { continue };
+                let p = s.policy().unwrap();
+                let (behavior, context) = p.fs_use(fstype);
+                if behavior != fs_use::TRANS {
+                    continue;
+                }
+                let fs_context = p.context_string(context.unwrap());
+                let class = p.class_named(class).unwrap();
+                let (task, fs) = (s.context_to_sid(&kernel).unwrap(), s.context_to_sid(&fs_context).unwrap());
+                let sid = s.compute_sid(task, fs, class, av::TRANSITION, None).unwrap();
+                assert_eq!(s.sid_to_context(sid, false).as_deref(), Ok(*label), "{what}");
+                made += 1;
+                continue;
+            }
+            let [path, fstype, mount, class, label] = f.as_slice() else { continue };
+            let p = s.policy().unwrap();
+            let (behavior, _) = p.fs_use(fstype);
+            let own = path.starts_with("/proc/1") || path.starts_with("/proc/self/");
+            if *class == "lnk_file" || own || (*fstype == "selinuxfs" && path.ends_with("/null")) {
+                continue;
+            }
+            let class_number = p.class_named(class).unwrap();
+            match behavior {
+                fs_use::GENFS => {
+                    let within = match path.strip_prefix(mount.trim_end_matches('/')) {
+                        Some("") | None => "/",
+                        Some(rest) => rest,
+                    };
+                    let want = p.genfs_context(fstype, within, class_number).map_or(unlabeled.clone(), |c| p.context_string(c));
+                    assert_eq!(want, *label, "{path} of {fstype}");
+                    genfs += 1;
+                }
+                fs_use::NONE => {
+                    assert_eq!(unlabeled, *label, "{path} of {fstype}, which no rule labels");
+                    other += 1;
+                }
+                // The oracle's own files have no attribute.
+                fs_use::XATTR => {
+                    assert_eq!(file_sid, *label, "{path} of {fstype}, with no attribute");
+                    other += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(genfs > 0 && other > 0 && made > 0, "{genfs} {other} {made}");
+        println!("{genfs} files by genfscon, {other} with no rule or no attribute, {made} newly made: each labelled as the kernel labelled it");
+    }
+
     /// When another policy takes a policy's place, a SID keeps its number
     /// and its context goes over name by name. As Linux showed with
     /// other.33 (test.conf with its init_t named start_t) loaded over

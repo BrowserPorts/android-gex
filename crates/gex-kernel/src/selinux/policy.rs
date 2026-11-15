@@ -2061,9 +2061,11 @@ mod tests {
         println!("{asked} questions, each answered as the kernel answered it");
     }
 
-    /// The labelling rules of test.conf, from the reference's lookups
-    /// (not yet seen on a kernel's files): `fs_use_*` by type, `genfscon`
-    /// by the longest path a file's begins with, for its class.
+    /// The labelling rules of test.conf, by the reference's lookups:
+    /// `fs_use_*` by type, `genfscon` by the longest path a file's begins
+    /// with, for its class. (The same lookups over the Android policy
+    /// give the labels Linux 7.0 gave: `server`'s
+    /// `its_labels_for_a_policy_given_are_a_kernels`.)
     #[test]
     fn a_filesystem_is_labelled_as_the_policy_says() {
         let p = Policy::read(V33).unwrap();
