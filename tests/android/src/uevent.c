@@ -21,6 +21,7 @@
 //   send to another socket or to a group at all (EPERM from the send).
 // - MSG_PEEK leaves a datagram; MSG_TRUNC returns its whole length when
 //   the buffer was shorter, and what did not fit is gone.
+// - net.core.rmem_max can be set, and is the limit from then.
 // - A listener that falls behind loses events and is told once (ENOBUFS),
 //   then reads what it has: as many as the kernel counts its buffer to
 //   hold.
@@ -62,6 +63,17 @@ static int sysctl(const char *name) {
     if (fd < 0 || read(fd, text, sizeof text - 1) <= 0) die(path, fd, 0);
     close(fd);
     return atoi(text);
+}
+
+// Set a limit under /proc/sys/net/core: 0, or the errno.
+static int set_sysctl(const char *name, const char *text) {
+    char path[128];
+    snprintf(path, sizeof path, "/proc/sys/net/core/%s", name);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) die(path, fd, 1);
+    int e = write(fd, text, strlen(text)) == (ssize_t)strlen(text) ? 0 : errno;
+    close(fd);
+    return e;
 }
 
 static int uevent_socket(void) {
@@ -374,6 +386,19 @@ int main(void) {
     len = request(buf, text, 60, 0);
     if (send(second, buf, len, 0) != (ssize_t)len) die("a request after the flood", errno, 0);
     mine(s, &g, sizeof g.data, 0);
+
+    // The limit moved, as Android's init moves it (init.rc writes 262144
+    // to rmem_max and wmem_max): what a socket may ask for follows. A
+    // limit below the least a buffer may be, or not a number, is EINVAL.
+    char was[32];
+    snprintf(was, sizeof was, "%d\n", rmem_max);
+    if (set_sysctl("rmem_max", "262144\n")) die("setting rmem_max", errno, 0);
+    if (sysctl("rmem_max") != 262144) die("rmem_max after it was set", sysctl("rmem_max"), 0);
+    int third = uevent_socket();
+    if (setsockopt(third, SOL_SOCKET, SO_RCVBUF, &want, sizeof want) || getint(third, SOL_SOCKET, SO_RCVBUF) != 2 * 262144) die("a buffer under the new limit", getint(third, SOL_SOCKET, SO_RCVBUF), 0);
+    close(third);
+    if (set_sysctl("rmem_max", "1") != EINVAL || set_sysctl("rmem_max", "many") != EINVAL || sysctl("rmem_max") != 262144) die("what is not a limit", errno, sysctl("rmem_max"));
+    if (set_sysctl("rmem_max", was) || sysctl("rmem_max") != rmem_max) die("putting rmem_max back", errno, 0);
 
     printf("uevent ok\n");
     return 0;

@@ -284,6 +284,31 @@ struct Generated {
     data: Vec<u8>,
 }
 
+/// A setting under `/proc/sys` that can be set: its value as it was at
+/// the open to read, and a write of a number to set it
+/// (`proc_dointvec_minmax`: the number, with space around it or a newline
+/// after; `EINVAL` for anything else and for a value out of its range).
+#[derive(Debug)]
+struct Sysctl {
+    file: Generated,
+    name: String,
+}
+
+impl FileHandle for Sysctl {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        self.file.read_at(offset, buf)
+    }
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        let text = std::str::from_utf8(buf).map_err(|_| Errno::EINVAL)?.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0');
+        let value: u32 = text.parse().map_err(|_| Errno::EINVAL)?;
+        crate::netlink::sysctl::set(&self.name, value)?;
+        Ok(buf.len() as u64)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { mode: 0o644, ..self.file.metadata()? })
+    }
+}
+
 /// `/proc/self/mountinfo` as opened: the table then, and, as Linux's, a
 /// wakeup at each later change of the mount table, which a wait reports
 /// as `POLLPRI` (with `POLLERR`) once. libmount's monitor waits on it,
@@ -560,8 +585,7 @@ impl ProcFs {
             "sys/kernel/random/entropy_avail" | "sys/kernel/random/poolsize" => b"256\n".to_vec(),
             // What a socket's buffers start as and the most a process may
             // ask for without privilege (crate::netlink keeps to them).
-            "sys/net/core/rmem_default" | "sys/net/core/wmem_default" => format!("{}\n", crate::netlink::BUF_DEFAULT).into_bytes(),
-            "sys/net/core/rmem_max" | "sys/net/core/wmem_max" => format!("{}\n", crate::netlink::BUF_MAX).into_bytes(),
+            p if p.strip_prefix("sys/net/core/").is_some_and(|n| crate::netlink::sysctl::get(n).is_some()) => format!("{}\n", crate::netlink::sysctl::get(&p["sys/net/core/".len()..]).unwrap()).into_bytes(),
             // glibc and musl both consult this before using large mappings.
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
             // The limit `F_SETPIPE_SZ` holds an unprivileged caller to.
@@ -605,6 +629,11 @@ impl FileSystem for ProcFs {
                 crate::signalfd::note_running();
             }
             return Ok(Arc::new(Attr { source: Arc::clone(&self.source), who, which }));
+        }
+        // A setting that can be set: the socket buffers' limits.
+        if let Some(name) = path.strip_prefix("sys/net/core/").filter(|n| crate::netlink::sysctl::get(n).is_some()) {
+            let data = self.generate(&path, tid).unwrap_or_default();
+            return Ok(Arc::new(Sysctl { file: Generated { data }, name: name.to_string() }));
         }
         if let Some(data) = self.generate(&path, tid) {
             return Ok(Arc::new(Generated { data }));
@@ -721,10 +750,12 @@ impl FileSystem for ProcFs {
             return Ok(attr_metadata(which));
         }
         if self.generate(&path, tid).is_some() {
+            // The settings that can be set say so.
+            let settable = path.strip_prefix("sys/net/core/").is_some_and(|n| crate::netlink::sysctl::get(n).is_some());
             return Ok(Metadata {
                 file_type: FileType::Regular,
                 size: 0,
-                mode: 0o444,
+                mode: if settable { 0o644 } else { 0o444 },
                 ino: 1,
                 mtime: 0,
                 nlink: 1,

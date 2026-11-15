@@ -229,14 +229,37 @@ pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
 /// `SOL_NETLINK`.
 pub const SOL_NETLINK: u64 = 270;
 
-/// `net.core.rmem_default` and `wmem_default`, `rmem_max` and `wmem_max`,
-/// as Linux 6.18 starts with them: what a socket's buffers are, and the
-/// most `SO_RCVBUF` and `SO_SNDBUF` give without `CAP_NET_ADMIN`.
-pub const BUF_DEFAULT: u32 = 212_992;
-pub const BUF_MAX: u32 = 4 << 20;
 /// `SOCK_MIN_RCVBUF` and `SOCK_MIN_SNDBUF`.
 const MIN_RCVBUF: u32 = 2304;
 const MIN_SNDBUF: u32 = 4608;
+
+/// `net.core.rmem_default`, `rmem_max`, `wmem_default` and `wmem_max`:
+/// what a socket's buffers start as, and the most `SO_RCVBUF` and
+/// `SO_SNDBUF` give without `CAP_NET_ADMIN`. They start as Linux 6.18's
+/// and are set through `/proc/sys/net/core` (Android's `init.rc` sets
+/// both maxima to 262144).
+pub mod sysctl {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static VALUES: [AtomicU32; 4] = [AtomicU32::new(212_992), AtomicU32::new(4 << 20), AtomicU32::new(212_992), AtomicU32::new(4 << 20)];
+    pub const NAMES: [&str; 4] = ["rmem_default", "rmem_max", "wmem_default", "wmem_max"];
+
+    pub fn get(name: &str) -> Option<u32> {
+        NAMES.iter().position(|n| *n == name).map(|i| VALUES[i].load(Ordering::Acquire))
+    }
+
+    /// Set one: no less than the least a buffer of its kind may be
+    /// (`EINVAL` below it, as the kernel's table has their minima).
+    pub fn set(name: &str, value: u32) -> Result<(), crate::errno::Errno> {
+        let i = NAMES.iter().position(|n| *n == name).ok_or(crate::errno::Errno::ENOENT)?;
+        let least = if name.starts_with('r') { super::MIN_RCVBUF } else { super::MIN_SNDBUF };
+        if value < least || value > i32::MAX as u32 {
+            return Err(crate::errno::Errno::EINVAL);
+        }
+        VALUES[i].store(value, Ordering::Release);
+        Ok(())
+    }
+}
 /// `UEVENT_BUFFER_SIZE`: the most a uevent sent from userspace may be, its
 /// sequence number included.
 const UEVENT_BUFFER_SIZE: usize = 2048;
@@ -429,8 +452,8 @@ impl Socket {
                 dst_portid: 0,
                 dst_group: 0,
                 connected: false,
-                rcvbuf: BUF_DEFAULT,
-                sndbuf: BUF_DEFAULT,
+                rcvbuf: sysctl::get("rmem_default").unwrap(),
+                sndbuf: sysctl::get("wmem_default").unwrap(),
                 passcred: false,
                 no_enobufs: false,
                 cap_ack: false,
@@ -560,13 +583,13 @@ impl Socket {
     /// been found able): twice what is asked, as Linux keeps it, and what
     /// is asked no more than `rmem_max` unless forced.
     pub fn set_rcvbuf(&self, val: i32, force: bool) {
-        let val = if force { val.max(0) as u32 } else { (val as u32).min(BUF_MAX) };
+        let val = if force { val.max(0) as u32 } else { (val as u32).min(sysctl::get("rmem_max").unwrap()) };
         self.state().rcvbuf = (val.min(i32::MAX as u32 / 2) * 2).max(MIN_RCVBUF);
     }
 
     /// `SO_SNDBUF` and `SO_SNDBUFFORCE`, likewise.
     pub fn set_sndbuf(&self, val: i32, force: bool) {
-        let val = if force { val.max(0) as u32 } else { (val as u32).min(BUF_MAX) };
+        let val = if force { val.max(0) as u32 } else { (val as u32).min(sysctl::get("wmem_max").unwrap()) };
         self.state().sndbuf = (val.min(i32::MAX as u32 / 2) * 2).max(MIN_SNDBUF);
     }
 
