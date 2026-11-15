@@ -188,6 +188,10 @@ pub struct RunOptions {
     /// Give the guest a graphics device at `/dev/gex-gl`, so its GL calls run
     /// on the host's GL. See the `gl` module.
     pub gl: bool,
+    /// Mount selinuxfs at `/sys/fs/selinux`, where Android's init mounts
+    /// it and libselinux looks for it. Off unless asked: a program that
+    /// finds it takes SELinux to be on, and says so in what it prints.
+    pub selinuxfs: bool,
     /// Statically recompile each shared library as it is mapped, instead of
     /// letting the runtime translator find it a dispatch miss at a time. Off
     /// by default: measured slower (32s vs 0.60s warm on `dpkg --version`)
@@ -240,6 +244,7 @@ impl Default for RunOptions {
             wayland_out: None,
             wayland_gpu: false,
             gl: false,
+            selinuxfs: false,
             recompile_objects: false,
             profile: false,
             jit: false,
@@ -3670,6 +3675,9 @@ fn mount_filesystems(
     match gex_kernel::vfs::BinderFs::new(gex_kernel::vfs::BinderFs::options("").expect("no options")) {
         Ok(binderfs) => kernel.vfs.mount("/dev/binderfs", Arc::new(binderfs)),
         Err(e) => eprintln!("[gex] no binderfs: {e:?}"),
+    }
+    if opts.selinuxfs {
+        kernel.vfs.mount("/sys/fs/selinux", Arc::new(gex_kernel::vfs::SelinuxFs::of_kernel()));
     }
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));

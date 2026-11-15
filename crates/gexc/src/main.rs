@@ -296,6 +296,9 @@ run options:
                   write each composited screen as PATH-NNN.ppm
   --gl            give the guest /dev/gex-gl, so a program linked against the
                   guest's libGLESv2 runs its OpenGL on the host's
+  --selinuxfs     mount selinuxfs at /sys/fs/selinux, as Android's init
+                  leaves it: programs that look there find SELinux on, with
+                  no policy until one is loaded
   --wayland-gpu   composite surfaces on the GPU through WebGPU, rather than
                   handing the host one client buffer at a time. Falls back to
                   the CPU, with a note, when there is no adapter
@@ -409,6 +412,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             }
             "--wayland-gpu" => opts.wayland_gpu = true,
             "--gl" => opts.gl = true,
+            "--selinuxfs" => opts.selinuxfs = true,
             "--wayland-out" => {
                 i += 1;
                 opts.wayland_out =
