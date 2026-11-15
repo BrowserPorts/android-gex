@@ -845,11 +845,16 @@ pub mod host_xattr {
     }
 
     /// A file's SELinux label, and the host attribute it is kept in: the
-    /// host keeps `security.` for itself, so the guest's label is one of
-    /// the host's `user.` attributes, which the guest does not see under
-    /// that name. (Where the host keeps no `user.` attribute for a kind
-    /// of file, Linux's symbolic links and devices, that file's label is
-    /// not kept, and setting it says so.)
+    /// host keeps `security.` for itself, so a label the guest sets is one
+    /// of the host's `user.` attributes, which the guest does not see
+    /// under that name. (Where the host keeps no `user.` attribute for a
+    /// kind of file, Linux's symbolic links and devices, that file's
+    /// label cannot be set, and setting it says so.)
+    ///
+    /// A file the guest has not labelled has the label the host's own
+    /// `security.selinux` gives it, where the host has one to read: a
+    /// tree unpacked from an Android image with its attributes kept is
+    /// labelled as the image was.
     const LABEL: &str = "security.selinux";
     const HOST_LABEL: &str = "user.gex.selinux";
 
@@ -870,9 +875,25 @@ pub mod host_xattr {
         let calls = CALLS.get().ok_or(Errno::EOPNOTSUPP)?;
         let not_user = |e: Errno| if e == Errno::EOPNOTSUPP { Errno::ENODATA } else { e };
         match op {
+            XattrOp::Get { name: LABEL, buf } => match calls(&on, XattrOp::Get { name: HOST_LABEL, buf: &mut *buf }) {
+                // Not labelled here: as the host's file is.
+                Err(Errno::ENODATA) => calls(&on, XattrOp::Get { name: LABEL, buf }).map_err(|_| Errno::ENODATA),
+                r => r,
+            },
             XattrOp::Get { name, buf } => {
                 let name = host_name(name).map_err(not_user)?;
                 calls(&on, XattrOp::Get { name, buf })
+            }
+            XattrOp::Set { name: LABEL, value, flags } => {
+                // There already, for XATTR_CREATE, if the host's file has
+                // one; and then there to replace, for XATTR_REPLACE.
+                let host_has = calls(&on, XattrOp::Get { name: LABEL, buf: &mut [] }).is_ok();
+                let ours = calls(&on, XattrOp::Get { name: HOST_LABEL, buf: &mut [] }).is_ok();
+                if flags & super::super::XATTR_CREATE != 0 && (host_has || ours) {
+                    return Err(Errno::EEXIST);
+                }
+                let flags = if host_has && !ours { flags & !super::super::XATTR_REPLACE } else { flags };
+                calls(&on, XattrOp::Set { name: HOST_LABEL, value, flags })
             }
             XattrOp::Set { name, value, flags } => {
                 let name = host_name(name)?;
@@ -888,9 +909,14 @@ pub mod host_xattr {
                 let mut all = vec![0u8; size];
                 let got = calls(&on, XattrOp::List { buf: &mut all })?;
                 all.truncate(got);
+                // Its label once, whether the guest's or the host's own.
                 let mut mine = Vec::new();
-                for name in all.split(|&c| c == 0).filter(|n| n.starts_with(b"user.")) {
-                    mine.extend_from_slice(if name == HOST_LABEL.as_bytes() { LABEL.as_bytes() } else { name });
+                if all.split(|&c| c == 0).any(|n| n == HOST_LABEL.as_bytes() || n == LABEL.as_bytes()) {
+                    mine.extend_from_slice(LABEL.as_bytes());
+                    mine.push(0);
+                }
+                for name in all.split(|&c| c == 0).filter(|n| n.starts_with(b"user.") && *n != HOST_LABEL.as_bytes()) {
+                    mine.extend_from_slice(name);
                     mine.push(0);
                 }
                 if buf.is_empty() {
