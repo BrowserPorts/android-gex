@@ -31,6 +31,15 @@ pub mod server;
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// `security_secid_to_secctx`: a SID's context as the loaded policy
+/// writes it, with the NUL that ends it; before a policy, a kernel SID's
+/// name.
+pub fn secid_to_secctx(sid: u32) -> Result<Vec<u8>, crate::errno::Errno> {
+    let server = kernel_server();
+    let text = server.lock().unwrap_or_else(|e| e.into_inner()).sid_to_context(sid, false).map_err(|_| crate::errno::Errno::EINVAL)?;
+    Ok([text.as_bytes(), b"\0"].concat())
+}
+
 /// The kernel's security server: the one every mount of selinuxfs is
 /// over, as Linux has one for the machine.
 pub fn kernel_server() -> Arc<Mutex<server::Server>> {

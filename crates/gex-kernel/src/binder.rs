@@ -22,9 +22,12 @@
 //! The devices are binderfs's ([`crate::vfs::BinderFs`]): each mount has
 //! its own, each device its own context manager.
 //!
-//! A node that asks for its callers' security contexts gets what the
-//! kernel's security module says of them ([`Caller::secctx`]); with no
-//! module, as now, a call to such a node fails as Linux's does.
+//! A node that asks for its callers' security contexts gets what SELinux
+//! says of them: the context of the SID a caller had when it first used
+//! the device ([`Caller::secid`]; Linux takes the credentials it opened
+//! the device with), as the policy loaded when the call is made writes
+//! it. A caller with no SID, which only this module's own tests make,
+//! fails as a call does on a Linux with no security module.
 //!
 //! Not here: the reports of failed calls over netlink, a feature binderfs
 //! here does not say it has. A node's scheduling priority is taken and has
@@ -152,10 +155,10 @@ pub struct Caller<'a> {
     pub nonblock: bool,
     /// The clock a wait's time limit is measured on.
     pub clock: crate::syscalls::ClockFn,
-    /// Its security context as the kernel's security module names it, the
-    /// terminating NUL included (`security_secid_to_secctx`); `None` when
-    /// there is no module to name one.
-    pub secctx: Option<&'a [u8]>,
+    /// The SID of its credentials (`security_cred_getsecid`), which a
+    /// node that asks is told the context of; `None` where there is no
+    /// security module to give one.
+    pub secid: Option<u32>,
 }
 
 fn nanos(clock: crate::syscalls::ClockFn) -> u128 {
@@ -245,8 +248,8 @@ struct Proc {
     ctx: u64,
     pid: i32,
     euid: u32,
-    /// Its security context, as its first use of the device found it.
-    secctx: Option<Vec<u8>>,
+    /// Its SID, as its first use of the device found it.
+    secid: Option<u32>,
     dead: bool,
     /// `BINDER_FREEZE`: no call reaches it, and what arrived since.
     is_frozen: bool,
@@ -1276,10 +1279,14 @@ impl State {
             return Err(failed(Errno::EINVAL));
         }
         // The sender's security context, for a node that asked for it, at
-        // the end of the extra space. With no security module there is
+        // the end of the extra space: its SID's, as text with its NUL
+        // (`security_secid_to_secctx`). With no security module there is
         // none to give, and the call fails.
         let secctx = match target_node.filter(|n| self.nodes[n].sec_ctx) {
-            Some(_) => Some(self.procs[&proc].secctx.clone().ok_or(failed(Errno(95)))?),
+            Some(_) => {
+                let sid = self.procs[&proc].secid.ok_or(failed(Errno(95)))?;
+                Some(crate::selinux::secid_to_secctx(sid).map_err(failed)?)
+            }
             None => None,
         };
         let ctx_len = secctx.as_ref().map_or(0, |c| align8(c.len() as u64));
@@ -2060,7 +2067,7 @@ impl BinderFile {
         // that inherited the descriptor) may not use it.
         if p.pid == 0 {
             (p.pid, p.euid) = (cx.pid, cx.euid);
-            p.secctx = cx.secctx.map(<[u8]>::to_vec);
+            p.secid = cx.secid;
         } else if p.pid != cx.pid {
             return Outcome::Done(Err(Errno::EINVAL));
         }
@@ -2449,7 +2456,7 @@ mod tests {
         }
 
         fn ioctl(&self, m: &mut GuestMem<'_>, request: u64, arg: u64) -> Outcome {
-            let cx = Caller { pid: self.pid, tid: self.pid, euid: 1000, fds: &self.fds, nonblock: false, clock: || (0, 0), secctx: None };
+            let cx = Caller { pid: self.pid, tid: self.pid, euid: 1000, fds: &self.fds, nonblock: false, clock: || (0, 0), secid: None };
             self.file.ioctl(&cx, m, request, arg)
         }
 

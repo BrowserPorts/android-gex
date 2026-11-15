@@ -13613,8 +13613,7 @@ impl Kernel {
             fds: &self.fds,
             nonblock: file.flags() & crate::fs::oflags::O_NONBLOCK != 0,
             clock: self.clock,
-            // No security module names a process's context yet.
-            secctx: None,
+            secid: Some(self.creds.sec()[crate::selinux::procattr::CURRENT]),
         };
         // Whatever it queued may be what another thread waits for.
         self.fd_activity = true;

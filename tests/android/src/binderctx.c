@@ -151,11 +151,13 @@ int main(void) {
     if (back[1] == BR_TRANSACTION_COMPLETE) {
         // It arrived, and the manager found the context to be ours.
         if (back[2] != BR_REPLY || !named) die("a call that arrived", back[2], named);
+        printf("binderctx: the call arrived with the caller's context, %s\n", mine);
     } else {
         if (back[1] != BR_FAILED_REPLY || bwr.read_consumed != 8) die("a call that did not arrive", back[1], bwr.read_consumed);
         struct extended_error ee;
         if (ioctl(fd, GET_EXTENDED_ERROR, &ee)) die("extended error", 0, 0);
         if (ee.command != BR_FAILED_REPLY || (ee.param != -EOPNOTSUPP && !(named && ee.param == -EINVAL))) die("the refusal's extended error", ee.command, ee.param);
+        printf("binderctx: the call was refused, error %d: no module names the caller's credentials\n", -ee.param);
     }
     kill(mgr, SIGKILL);
     waitpid(mgr, NULL, 0);
