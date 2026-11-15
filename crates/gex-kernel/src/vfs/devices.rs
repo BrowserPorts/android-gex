@@ -6,9 +6,12 @@
 //! The numbers are Linux's (Documentation/admin-guide/devices.txt). Here
 //! so far: the memory devices 1:3 (null), 1:5 (zero), 1:7 (full), 1:8 and
 //! 1:9 (random, urandom) and 1:11 (kmsg, the kernel's log: [`super::kmsg`]),
-//! and the terminals 5:0 and 5:1 (tty, console). Any other number opens
-//! as `ENXIO`, as a number no driver has does: 5:2 among them, the
-//! pseudoterminal multiplexer, which the kernel opens by its path.
+//! the terminals 5:0 and 5:1 (tty, console), and 10:237, the loop
+//! devices' control (crate::loopdev). Any other number opens as `ENXIO`,
+//! as a number no driver has does: 5:2 among them, the pseudoterminal
+//! multiplexer, which the kernel opens by its path.
+//!
+//! A block device node opens as the disk of its number (crate::block).
 
 use super::{FileHandle, Metadata};
 use crate::errno::Errno;
@@ -36,6 +39,11 @@ pub fn minor(dev: u64) -> u32 {
 /// Open character device `dev` through the node `node` describes.
 pub fn open_char(dev: u64, node: NodeMeta) -> Result<Arc<dyn FileHandle>, Errno> {
     super::devfs::open_numbered(dev, node).ok_or(Errno::ENXIO)
+}
+
+/// Open block device `dev` through the node `node` describes.
+pub fn open_block(dev: u64, node: NodeMeta) -> Result<Arc<dyn FileHandle>, Errno> {
+    crate::block::open(dev, node)
 }
 
 #[cfg(test)]

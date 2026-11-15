@@ -119,6 +119,8 @@ run() {
     rlimit) check "$1" "rlimit ok" 0 root ;;
     sysdev) check "$1" "sysdev ok" 0 root ;;
     dirlink) check "$1" "dirlink ok" 0 root ;;
+    loopdev) check "$1" "loopdev ok" 0 root ;;
+    ext4mount) check "$1" "ext4mount ok" 0 root ;;
     aosp/*) gtest "${1#aosp/}" ;;
     *)
         echo "FAIL $1: no such program"
@@ -132,7 +134,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount"
     for p in $all; do
         run "$p"
     done

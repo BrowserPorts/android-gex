@@ -30,8 +30,8 @@
 //!
 //! Not as Linux: no checksum is verified (`metadata_csum`, the group
 //! descriptors'); a file's owner is read but no file of this kernel
-//! reports one yet; and FIFOs, sockets and block device nodes are there
-//! to `stat` but do not open.
+//! reports one yet; and FIFOs and sockets are there to `stat` but do not
+//! open.
 
 use super::{DirEntry, FileHandle, FileSystem, FileType, Metadata, Times, XattrOp};
 use crate::errno::{Errno, SysResult};
@@ -120,7 +120,8 @@ impl Inode {
         match self.kind() {
             S_IFDIR => FileType::Directory,
             S_IFLNK => FileType::Symlink,
-            S_IFCHR | S_IFBLK => FileType::CharDevice,
+            S_IFCHR => FileType::CharDevice,
+            S_IFBLK => FileType::BlockDevice,
             S_IFIFO => FileType::Fifo,
             S_IFSOCK => FileType::Socket,
             _ => FileType::Regular,
@@ -712,7 +713,8 @@ impl FileSystem for Ext4Fs {
                     let file_type = match e.kind {
                         1 => FileType::Regular,
                         2 => FileType::Directory,
-                        3 | 4 => FileType::CharDevice,
+                        3 => FileType::CharDevice,
+                        4 => FileType::BlockDevice,
                         5 => FileType::Fifo,
                         6 => FileType::Socket,
                         7 => FileType::Symlink,
@@ -731,14 +733,18 @@ impl FileSystem for Ext4Fs {
             }
             // The namespace follows a link before it opens.
             S_IFLNK => Err(Errno::ELOOP),
-            // A character device is the one its number names, as a node
-            // in any filesystem is.
+            // A device is the one its number names, as a node in any
+            // filesystem is.
             S_IFCHR => {
                 let md = inode.metadata();
                 super::devices::open_char(md.rdev, Arc::new(move || md.clone()))
             }
+            S_IFBLK => {
+                let md = inode.metadata();
+                super::devices::open_block(md.rdev, Arc::new(move || md.clone()))
+            }
             _ => {
-                unimplemented("opening a FIFO, a socket or a block device in an ext4");
+                unimplemented("opening a FIFO or a socket in an ext4");
                 Err(Errno::ENXIO)
             }
         }
@@ -850,7 +856,8 @@ mod tests {
                 "f" => FileType::Regular,
                 "d" => FileType::Directory,
                 "l" => FileType::Symlink,
-                "c" | "b" => FileType::CharDevice,
+                "c" => FileType::CharDevice,
+                "b" => FileType::BlockDevice,
                 "p" => FileType::Fifo,
                 _ => FileType::Socket,
             };

@@ -292,7 +292,10 @@ impl OpenFile {
         let base = match whence {
             0 => 0,
             1 => self.offset.load(Ordering::Relaxed),
-            2 => self.handle.metadata()?.size,
+            2 => match self.handle.device_size() {
+                Some(size) => size,
+                None => self.handle.metadata()?.size,
+            },
             _ => return Err(Errno::EINVAL),
         };
         let new = base as i64 + offset;

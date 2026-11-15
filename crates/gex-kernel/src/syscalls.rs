@@ -4277,27 +4277,23 @@ impl PathIo<'_> {
                 self.label_new(&p);
                 Ok(0)
             }
-            // S_IFCHR
-            0o020000 => {
+            // S_IFCHR, S_IFBLK
+            kind @ (0o020000 | 0o060000) => {
                 if !self.creds.capable(CAP_MKNOD) {
                     return Err(Errno::EPERM);
                 }
-                self.ns.mknod(&p, perm, dev & 0xffff_ffff)?;
+                self.ns.mknod(&p, perm | (kind & 0o060000), dev & 0xffff_ffff)?;
                 self.label_new(&p);
                 Ok(0)
             }
             // S_IFDIR: mkdir's to make.
             0o040000 => Err(Errno::EPERM),
-            // S_IFIFO, S_IFBLK, S_IFSOCK
-            kind @ (0o010000 | 0o060000 | 0o140000) => {
+            // S_IFIFO, S_IFSOCK
+            kind @ (0o010000 | 0o140000) => {
                 static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 let bit = 1 << (kind >> 13);
                 if SAID.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
-                    let what = match kind {
-                        0o010000 => "a FIFO",
-                        0o060000 => "a block device",
-                        _ => "a socket",
-                    };
+                    let what = if kind == 0o010000 { "a FIFO" } else { "a socket" };
                     eprintln!("[gex] mknod: {what} is not implemented -> EPERM ({p})");
                 }
                 Err(Errno::EPERM)
@@ -4789,6 +4785,35 @@ impl PathIo<'_> {
             }
             "devtmpfs" | "devfs" => {
                 self.view.mount(&target, Arc::new(crate::vfs::DevFs::new()));
+                Ok(0)
+            }
+            // A filesystem on a block device: ext4, which is ext2's and
+            // ext3's driver too, read-only (crate::vfs::ext4). The source
+            // is opened as the mount's own, and stays open while it is
+            // mounted: a loop device that clears itself does so when the
+            // filesystem lets go of it.
+            "ext4" | "ext3" | "ext2" => {
+                const MS_RDONLY: u64 = 1;
+                let source = self.at_path(m, AT_FDCWD, a[0])?;
+                if self.ns.metadata(&source)?.file_type != FileType::BlockDevice {
+                    return Err(Errno::ENOTBLK);
+                }
+                let dev = self.ns.open(&source, oflags::O_RDONLY, 0)?;
+                if a[4] != 0 && !m.read_cstr(a[4], 4096)?.is_empty() {
+                    eprintln!("[gex] mount: options for ext4 are not implemented -> EINVAL ({})", String::from_utf8_lossy(&m.read_cstr(a[4], 4096)?));
+                    return Err(Errno::EINVAL);
+                }
+                if a[3] & MS_RDONLY == 0 {
+                    // Linux refuses a read-only device so; a device that
+                    // can be written it would mount for writing, which
+                    // this cannot.
+                    let read_only = Arc::clone(&dev).as_block().is_some_and(|b| b.disk().read_only());
+                    if !read_only {
+                        eprintln!("[gex] mount: an ext4 mounted for writing is not implemented -> EROFS ({source})");
+                    }
+                    return Err(if read_only { Errno::EACCES } else { Errno::EROFS });
+                }
+                self.view.mount(&target, Arc::new(crate::vfs::ext4::Ext4Fs::new(dev)?));
                 Ok(0)
             }
             // selinuxfs: every mount is the one filesystem, over the
@@ -13757,6 +13782,12 @@ impl FdIo<'_> {
         // Masking to 32 bits is what the real kernel does and what makes those
         // read-direction ioctls match their numbers at all.
         let req = req & 0xffff_ffff;
+        // A block device's: the block layer's and its driver's, which may
+        // name a descriptor of the caller's (a loop device's file).
+        if let Some(disk) = self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_block()) {
+            let cx = crate::block::Caller { fds: self.fds, compat: self.compat };
+            return disk.ioctl(&cx, m, req, arg).unwrap_or(Err(Errno::ENOTTY));
+        }
         // The terminal's own requests. `_IOC` encodes direction and size into
         // the number, which is why the four `termios2` calls and the pty ones
         // look nothing like the rest: they are not arbitrary, they are

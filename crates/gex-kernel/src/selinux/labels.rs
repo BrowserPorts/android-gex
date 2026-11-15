@@ -60,6 +60,7 @@ pub fn class_of(kind: crate::vfs::FileType) -> &'static str {
         FileType::Directory => "dir",
         FileType::Symlink => "lnk_file",
         FileType::CharDevice => "chr_file",
+        FileType::BlockDevice => "blk_file",
         FileType::Fifo => "fifo_file",
         FileType::Socket => "sock_file",
     }

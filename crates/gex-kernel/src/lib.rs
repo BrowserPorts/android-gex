@@ -38,6 +38,8 @@ pub mod eventfd;
 pub mod inotify;
 pub mod locks;
 pub mod netlink;
+pub mod block;
+pub mod loopdev;
 pub mod file;
 pub mod fs;
 pub mod ftab;

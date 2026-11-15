@@ -55,6 +55,8 @@ pub(super) fn open_numbered(dev: u64, node: super::devices::NodeMeta) -> Option<
     let device = match (super::devices::major(dev), super::devices::minor(dev)) {
         // The kernel's log: each open reads it from its own place.
         (1, 11) => return Some(super::kmsg::Kmsg::open(Some(node))),
+        // The loop devices' control.
+        (10, 237) => return Some(crate::loopdev::Control::open(Some(node))),
         (1, 3) => Device::Null,
         (1, 5) => Device::Zero,
         (1, 7) => Device::Full,

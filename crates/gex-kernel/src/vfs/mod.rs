@@ -47,6 +47,7 @@ pub enum FileType {
     Directory,
     Symlink,
     CharDevice,
+    BlockDevice,
     Fifo,
     Socket,
 }
@@ -59,6 +60,7 @@ impl FileType {
             FileType::Directory => 0o040000,
             FileType::Symlink => 0o120000,
             FileType::CharDevice => 0o020000,
+            FileType::BlockDevice => 0o060000,
             FileType::Fifo => 0o010000,
             FileType::Socket => 0o140000,
         }
@@ -69,6 +71,7 @@ impl FileType {
             FileType::Fifo => 1,
             FileType::CharDevice => 2,
             FileType::Directory => 4,
+            FileType::BlockDevice => 6,
             FileType::Regular => 8,
             FileType::Symlink => 10,
             FileType::Socket => 12,
@@ -515,6 +518,18 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
 
     /// This handle as an internet socket, when it is one.
     fn as_inet_socket(self: Arc<Self>) -> Option<Arc<crate::net::Socket>> {
+        None
+    }
+
+    /// This handle as an open block device, when it is one.
+    fn as_block(self: Arc<Self>) -> Option<Arc<crate::block::BlockFile>> {
+        None
+    }
+
+    /// The size of the device behind this handle, when it is a block
+    /// device: where `lseek` to the end goes, which `fstat`'s size (0 for
+    /// a device) does not say.
+    fn device_size(&self) -> Option<u64> {
         None
     }
 
@@ -1013,9 +1028,10 @@ pub trait FileSystem: Send + Sync {
         Err(Errno::EROFS)
     }
 
-    /// `mknod` of a character device: a node at `path`, with `mode`'s
-    /// permission bits, that opens as device number `rdev`
-    /// ([`devices`]). A filesystem that keeps no device nodes says
+    /// `mknod` of a device: a node at `path`, with `mode`'s permission
+    /// bits, that opens as device number `rdev` ([`devices`]): a block
+    /// device when `mode` has `S_IFBLK`'s bits (0o060000), else a
+    /// character device. A filesystem that keeps no device nodes says
     /// `EPERM`, as Linux's that cannot (vfat) do.
     fn mknod(&self, path: &str, mode: u32, rdev: u64) -> Result<(), Errno> {
         let _ = (path, mode, rdev);
@@ -2233,7 +2249,7 @@ impl Namespace {
         fs.mksocket(&rel)
     }
 
-    /// Create a character device node ([`FileSystem::mknod`]).
+    /// Create a device node ([`FileSystem::mknod`]).
     pub fn mknod(&self, path: &str, mode: u32, rdev: u64) -> Result<(), Errno> {
         let (fs, rel) = self.resolve(path)?;
         fs.mknod(&rel, mode, rdev)
