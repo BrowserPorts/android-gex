@@ -365,6 +365,22 @@ pub enum SyscallOutcome {
 }
 
 impl BlockOp {
+    /// This wait lasting, by the host's time, what its time is by the
+    /// guest's ([`set_time_scale`]): every time a wait carries is how long
+    /// from now, and a host counts it on its own clock.
+    pub fn slowed(mut self) -> BlockOp {
+        let n = time_scale();
+        if n > 1 {
+            match &mut self {
+                BlockOp::FutexWait { deadline, .. } | BlockOp::FutexLockPi { deadline, .. } | BlockOp::Poll { deadline, .. } => *deadline = deadline.map(|d| d.saturating_mul(n)),
+                BlockOp::SigWait { timeout, .. } => *timeout = timeout.map(|d| d.saturating_mul(n)),
+                BlockOp::Sleep(d) => *d = d.saturating_mul(n),
+                BlockOp::SigSuspend { .. } | BlockOp::ReadStream { .. } | BlockOp::Connect { .. } | BlockOp::AcceptWait { .. } | BlockOp::WriteStream { .. } | BlockOp::WaitChild { .. } | BlockOp::FileLock { .. } => {}
+            }
+        }
+        self
+    }
+
     /// This wait with the tag taken off every guest address it holds: what
     /// a thread with AArch64's tagged address ABI on has asked for. The
     /// host that runs the wait reads and writes at those addresses long
@@ -10457,12 +10473,46 @@ pub fn ident_call(m: &mut GuestMem<'_>, ctx_addr: u64, compat: bool, ids: &Ident
     set_result(m, ctx_addr, v as u64).is_ok()
 }
 
+/// How many times slower than the host's the guest's time runs
+/// ([`set_time_scale`]); 1 when it runs with it.
+static TIME_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// From now the guest's time runs `n` times slower than the host's: its
+/// clocks ([`system_clock`]) advance a second in `n` of the host's, and a
+/// wait it gives a time to lasts `n` times as long ([`BlockOp::slowed`]).
+///
+/// Translated code is slower than the processor it was written for, and a
+/// program that waits a fixed time for another to get somewhere counts
+/// in seconds, not in instructions. Android's apexd gives ueventd twenty
+/// seconds to make `/dev/loop-control`, which a device makes within one;
+/// ueventd translated needs over a minute, and apexd goes on without
+/// loop devices. With the guest's seconds as long as they need to be,
+/// both get the time the image's authors gave them. What the guest sees
+/// stays consistent: a sleep of a second is a second by its own clocks.
+/// For a host to call before its first program runs; 0 is taken as 1.
+pub fn set_time_scale(n: u32) {
+    TIME_SCALE.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What [`set_time_scale`] set.
+pub fn time_scale() -> u32 {
+    TIME_SCALE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn system_clock() -> (u64, u32) {
     #[cfg(not(target_family = "wasm"))]
     {
-        let now = std::time::SystemTime::now()
+        let mut now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
+        // Slowed ([`set_time_scale`]): from when the first slowed reading
+        // was taken, that much less of the host's time has gone by.
+        let scale = time_scale();
+        if scale > 1 {
+            static START: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+            let start = *START.get_or_init(|| now);
+            now = start + now.saturating_sub(start) / scale;
+        }
         (now.as_secs(), now.subsec_nanos())
     }
     // Standing still is wrong but it is not a panic, and a host that cares

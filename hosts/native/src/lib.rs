@@ -953,6 +953,16 @@ fn fixed_random() {
                 Err(_) => eprintln!("gex: GEX_FIXED_RANDOM={seed:?} is not a number: randomness is not fixed"),
             }
         }
+        // `GEX_TIME_SCALE=<n>`: the guest's time runs n times slower than
+        // the host's (`gex_kernel::syscalls::set_time_scale`), for programs
+        // that give one another a fixed time and are run too slowly here
+        // to keep to it.
+        if let Ok(n) = std::env::var("GEX_TIME_SCALE") {
+            match n.parse::<u32>() {
+                Ok(n) if n >= 1 => gex_kernel::syscalls::set_time_scale(n),
+                _ => eprintln!("gex: GEX_TIME_SCALE={n:?} is not a number of 1 or more: time is not slowed"),
+            }
+        }
     });
 }
 
@@ -1963,6 +1973,8 @@ fn perform_block(
     interrupted: &dyn Fn() -> bool,
 ) -> Result<u64, gex_kernel::errno::Errno> {
     use gex_kernel::errno::Errno;
+    // A wait's time is the guest's; this host counts it on its own clock.
+    let op = op.slowed();
     /// One turn of a wait loop: let the host do its work, then give up if a
     /// signal has arrived.
     ///
@@ -5428,10 +5440,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     if let Some(c) = lockstep::counter() {
                         return c;
                     }
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default();
-                    now.as_nanos() as i64
+                    // (The guest's clock: slowed with it, GEX_TIME_SCALE.)
+                    let (secs, nanos) = gex_kernel::syscalls::system_clock();
+                    (secs as i64).wrapping_mul(1_000_000_000).wrapping_add(nanos as i64)
                 }
                 // MIDR_EL1: a plausible Cortex-A72.
                 -7 => 0x410f_d083,
