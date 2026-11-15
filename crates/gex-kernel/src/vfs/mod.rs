@@ -12,6 +12,7 @@ pub mod binderfs;
 pub mod devfs;
 pub mod devices;
 pub mod evdev;
+pub mod ext4;
 pub mod hostcall;
 // Passthrough to the host's own filesystem; the browser gets `opfs`/`httpfs`
 // instead.

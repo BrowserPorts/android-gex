@@ -57,6 +57,8 @@ impl Errno {
     pub const EINPROGRESS: Errno = Errno(115);
     pub const EPROTONOSUPPORT: Errno = Errno(93);
     pub const ESOCKTNOSUPPORT: Errno = Errno(94);
+    /// "Structure needs cleaning": a filesystem's `EFSCORRUPTED`.
+    pub const EUCLEAN: Errno = Errno(117);
     pub const ENOBUFS: Errno = Errno(105);
     pub const ENETUNREACH: Errno = Errno(101);
     pub const ENOTSOCK: Errno = Errno(88);
