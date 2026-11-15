@@ -624,6 +624,7 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 

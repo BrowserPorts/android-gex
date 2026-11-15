@@ -155,6 +155,7 @@ impl Found {
             nlink: if self.kind == Kind::Dir { 2 + self.subdirs } else { 1 },
             rdev: if self.kind == Kind::Null { makedev(1, 3) } else { 0 },
             times: Default::default(),
+            owner: None,
         }
     }
 }

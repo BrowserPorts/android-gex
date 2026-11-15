@@ -106,6 +106,7 @@ impl FileHandle for DevHandle {
             nlink: 1,
             rdev: rdev_of(self.device),
             times: Default::default(),
+            owner: None,
         })
     }
 
@@ -166,6 +167,7 @@ impl DevFs {
             nlink: 1,
             rdev,
             times: Default::default(),
+            owner: None,
         })
     }
 
@@ -270,6 +272,7 @@ impl FileSystem for DevFs {
                 nlink: 1,
                 rdev: rdev_of(device),
                 times: Default::default(),
+                owner: None,
             });
         }
         // A device the host added (`add`): what its handle says, as `fstat`
@@ -302,6 +305,7 @@ impl FileSystem for DevFs {
                 nlink: 1,
                 rdev: 0,
                 times: Default::default(),
+                owner: None,
             });
         }
         Err(Errno::ENOENT)
@@ -593,6 +597,7 @@ mod tests {
                     nlink: 1,
                     rdev: 0,
                     times: Default::default(),
+                    owner: None,
                 })
             }
             fn ioctl(

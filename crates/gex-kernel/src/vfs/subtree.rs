@@ -93,6 +93,9 @@ impl FileSystem for Subtree {
     fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
         self.inner.chmod(&self.at(path), mode)
     }
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        self.inner.chown(&self.at(path), uid, gid)
+    }
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
         self.inner.set_mtime(&self.at(path), secs)
     }

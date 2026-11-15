@@ -282,6 +282,7 @@ impl PageFs {
             nlink: if ft == FileType::Directory { 2 } else { 1 },
             rdev: 0,
             times: Default::default(),
+            owner: None,
         }
     }
 

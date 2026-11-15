@@ -439,6 +439,7 @@ impl FileHandle for GlDevice {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 

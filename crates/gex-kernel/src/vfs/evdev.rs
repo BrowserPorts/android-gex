@@ -171,6 +171,7 @@ pub fn metadata(pad: usize) -> Option<Metadata> {
         // makedev(13, 64 + N), as evdev's.
         rdev: (13 << 8) | (64 + pad as u64),
         times: Default::default(),
+        owner: None,
     })
 }
 
@@ -475,6 +476,7 @@ impl FileHandle for JoyHandle {
             nlink: 1,
             rdev: (13 << 8) | (64 + self.pad as u64),
             times: Default::default(),
+            owner: None,
         }))
     }
 

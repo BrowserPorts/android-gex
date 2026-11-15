@@ -100,6 +100,7 @@ impl FileHandle for Pipe {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 

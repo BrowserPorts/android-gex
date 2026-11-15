@@ -2311,7 +2311,7 @@ impl Drop for BinderFile {
 }
 
 fn device_metadata() -> Metadata {
-    Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o600, ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default() }
+    Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o600, ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None }
 }
 
 impl FileHandle for BinderFile {

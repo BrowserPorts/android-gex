@@ -154,6 +154,7 @@ impl Inode {
             nlink: self.links as u32,
             rdev: self.rdev(),
             times: Times { mtime_ns: self.mtime.1, atime: self.atime.0, atime_ns: self.atime.1, ctime: self.ctime.0, ctime_ns: self.ctime.1 },
+            owner: Some((self.uid, self.gid)),
         }
     }
 }
@@ -771,6 +772,10 @@ impl FileSystem for Ext4Fs {
     }
 
     fn set_mtime(&self, path: &str, _secs: i64) -> Result<(), Errno> {
+        self.0.find(path).and(Err(Errno::EROFS))
+    }
+
+    fn chown(&self, path: &str, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), Errno> {
         self.0.find(path).and(Err(Errno::EROFS))
     }
 }

@@ -382,6 +382,7 @@ impl FileHandle for Generated {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 }
@@ -773,6 +774,7 @@ impl FileSystem for ProcFs {
                 nlink: 1,
                 rdev: 0,
                 times: Default::default(),
+                owner: None,
             });
         }
         if let Some((e, rest)) = self.other(&path) {
@@ -787,6 +789,7 @@ impl FileSystem for ProcFs {
                     nlink: 1,
                     rdev: 0,
                     times: Default::default(),
+                    owner: None,
                 }),
                 _ => Err(Errno::ENOENT),
             };
@@ -803,6 +806,7 @@ impl FileSystem for ProcFs {
                 nlink: 1,
                 rdev: 0,
                 times: Default::default(),
+                owner: None,
             }),
             _ => Err(Errno::ENOENT),
         }
@@ -876,7 +880,7 @@ fn uuid_text(id: [u8; 16]) -> String {
 }
 
 fn attr_metadata(which: usize) -> Metadata {
-    Metadata { file_type: FileType::Regular, size: 0, mode: procattr::mode(which), ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default() }
+    Metadata { file_type: FileType::Regular, size: 0, mode: procattr::mode(which), ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None }
 }
 
 /// A file of a process's `attr`, open: its SELinux context, or one it has
@@ -1298,6 +1302,7 @@ impl FileSystem for SysCpuFs {
                 nlink: 1,
                 rdev: 0,
                 times: Default::default(),
+                owner: None,
             });
         }
         Self::dir(path).map(|_| Metadata::dir()).ok_or(Errno::ENOENT)

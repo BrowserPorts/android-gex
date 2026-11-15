@@ -228,7 +228,7 @@ impl FileHandle for Kmsg {
     fn metadata(&self) -> Result<Metadata, Errno> {
         match &self.node {
             Some(node) => Ok(node()),
-            None => Ok(Metadata { file_type: super::FileType::CharDevice, size: 0, mode: 0o644, ino: 1, mtime: 0, nlink: 1, rdev: super::devices::makedev(1, 11), times: Default::default() }),
+            None => Ok(Metadata { file_type: super::FileType::CharDevice, size: 0, mode: 0o644, ino: 1, mtime: 0, nlink: 1, rdev: super::devices::makedev(1, 11), times: Default::default(), owner: None }),
         }
     }
 }

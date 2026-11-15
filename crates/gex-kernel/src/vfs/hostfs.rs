@@ -158,7 +158,35 @@ pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
             ctime: md.ctime(),
             ctime_ns: md.ctime_nsec() as u32,
         },
+        // The host's owner, when this process could have made a file of
+        // any owner there (it runs as the host's root, over a tree
+        // unpacked with its owners kept); else none is said, since the
+        // files are all the one host user's.
+        owner: host_is_root().then(|| (md.uid(), md.gid())),
     }
+}
+
+/// Whether this process is the host's root: by the owner of its own
+/// directory in the host's /proc (a Linux host; any other is taken not
+/// to be).
+fn host_is_root() -> bool {
+    static ROOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ROOT.get_or_init(|| std::fs::metadata("/proc/self").is_ok_and(|md| md.uid() == 0))
+}
+
+/// A file just made at `host` is the guest process's that made it
+/// ([`super::Maker`]). The host made it its own process's; where that is
+/// the host's root, and owners are said, it is given over here. Its group
+/// is left as the host made it in a directory that hands its group down.
+fn made(host: &Path) -> Result<(), Errno> {
+    if !host_is_root() {
+        return Ok(());
+    }
+    let Some((uid, gid)) = super::Maker::current() else {
+        return Ok(());
+    };
+    let handed = host.parent().and_then(|p| std::fs::metadata(p).ok()).is_some_and(|m| m.mode() & 0o2000 != 0);
+    std::os::unix::fs::lchown(host, Some(uid), (!handed).then_some(gid)).map_err(|e| Errno::from_io(&e))
 }
 
 /// An open host file.
@@ -243,6 +271,19 @@ fn file_times(atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> std::fs::
 }
 
 impl FileHandle for HostHandle {
+    /// The host's own `fchown`, where the host's owners are the ones said
+    /// (`host_is_root`); nowhere else is there an owner to change.
+    fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Option<Result<(), Errno>> {
+        if !host_is_root() {
+            return None;
+        }
+        let r = std::os::unix::fs::fchown(&*self.file.lock().unwrap_or_else(|e| e.into_inner()), uid, gid).map_err(|e| Errno::from_io(&e));
+        if r.is_ok() {
+            self.note(crate::inotify::mask::ATTRIB);
+        }
+        Some(r)
+    }
+
     fn xattr(&self, op: super::XattrOp<'_>) -> Option<Result<usize, Errno>> {
         use std::os::unix::io::AsRawFd;
         let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
@@ -519,6 +560,9 @@ impl FileSystem for HostFs {
         }
         opts.custom_flags(custom);
         let file = opts.open(&host).map_err(|e| Errno::from_io(&e))?;
+        if md.is_err() && flags & oflags::O_CREAT != 0 {
+            made(&host)?;
+        }
         // A FIFO, socket or device has no offset: read and write it as is.
         let stream = file.metadata().is_ok_and(|m| !m.is_file());
         let h = HostHandle {
@@ -609,6 +653,7 @@ impl FileSystem for HostFs {
             .mode((mode & 0o7777) | 0o700)
             .create(&host)
             .map_err(|e| Errno::from_io(&e))?;
+        made(&host)?;
         hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
@@ -685,6 +730,23 @@ impl FileSystem for HostFs {
         Ok(())
     }
 
+    /// The host's own `lchown`, where the host's owners are the ones said
+    /// (this process is the host's root); elsewhere every file is the one
+    /// host user's, `stat` says the caller's ids, and the call is taken
+    /// for a file that is there without effect.
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        let host = self.host_path(path)?;
+        if !host_is_root() {
+            return std::fs::symlink_metadata(&host).map(|_| ()).map_err(|e| Errno::from_io(&e));
+        }
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        std::os::unix::fs::lchown(&host, uid, gid).map_err(|e| Errno::from_io(&e))?;
+        hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::ATTRIB, 0);
+        Ok(())
+    }
+
     fn xattr(&self, path: &str, op: super::XattrOp<'_>) -> Result<usize, Errno> {
         if self.read_only && matches!(op, super::XattrOp::Set { .. } | super::XattrOp::Remove { .. }) {
             return Err(Errno::EROFS);
@@ -756,6 +818,7 @@ impl FileSystem for HostFs {
         }
         let host = self.host_path(path)?;
         std::os::unix::fs::symlink(Path::new(target), &host).map_err(|e| Errno::from_io(&e))?;
+        made(&host)?;
         hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
@@ -770,6 +833,7 @@ impl FileSystem for HostFs {
         match std::os::unix::net::UnixListener::bind(&host) {
             Ok(l) => {
                 drop(l);
+                made(&host)?;
                 hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::CREATE, 0);
                 Ok(())
             }

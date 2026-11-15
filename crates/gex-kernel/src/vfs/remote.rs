@@ -201,6 +201,7 @@ pub fn decode_meta(b: &[u8]) -> Metadata {
             ctime: u64at(52) as i64,
             ctime_ns: u32at(60),
         },
+        owner: None,
     }
 }
 

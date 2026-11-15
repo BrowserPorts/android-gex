@@ -3603,6 +3603,8 @@ impl PathIo<'_> {
     }
 
     fn call_once(&self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> Option<SysResult> {
+        // What this call makes is the caller's (crate::vfs::Maker).
+        let _maker = crate::vfs::Maker::enter(self.creds.uid(), self.creds.gid());
         Some(match n {
             nr::OPENAT => self.openat(m, a[0] as i32, a[1], oflags::from_guest(a[2], self.compat), a[3] as u32),
             nr::OPENAT2 => self.openat2(m, a[0] as i32, a[1], a[2], a[3]),
@@ -3639,21 +3641,8 @@ impl PathIo<'_> {
             // it. Refusing would be worse than accepting -- tar treats a
             // failed chown while unpacking as a failure to unpack.
             // Ownership is not kept, but the file must be there.
-            nr::FCHOWN => self.map.fds.get(a[0] as i32).map(|_| 0),
-            nr::FCHOWNAT => {
-                let empty = m.read_cstr(a[1], 4096).map(|r| r.is_empty()).unwrap_or(false);
-                if empty && a[4] & AT_EMPTY_PATH != 0 {
-                    self.map.fds.get(a[0] as i32).map(|_| 0)
-                } else {
-                    self.at_path(m, a[0] as i32, a[1]).and_then(|p| {
-                        if a[4] & AT_SYMLINK_NOFOLLOW != 0 {
-                            self.ns.metadata_nofollow(&p).map(|_| 0)
-                        } else {
-                            self.ns.metadata(&p).map(|_| 0)
-                        }
-                    })
-                }
-            }
+            nr::FCHOWN => self.sys_fchown(a[0] as i32, a[1] as u32, a[2] as u32),
+            nr::FCHOWNAT => self.sys_fchownat(m, a),
             _ => return None,
         })
     }
@@ -4009,8 +3998,9 @@ impl PathIo<'_> {
         put64(&mut out, 144, mnt_id);
         put32(&mut out, 4, st.blksize as u32);
         put32(&mut out, 16, st.nlink as u32);
-        put32(&mut out, 20, self.creds.uid());
-        put32(&mut out, 24, self.creds.gid());
+        let (uid, gid) = md.owner.unwrap_or((self.creds.uid(), self.creds.gid()));
+        put32(&mut out, 20, uid);
+        put32(&mut out, 24, gid);
         out[28..30].copy_from_slice(&(st.mode as u16).to_le_bytes());
         put64(&mut out, 32, st.ino);
         put64(&mut out, 40, st.size as u64);
@@ -4038,13 +4028,70 @@ impl PathIo<'_> {
         Ok(0)
     }
 
+    /// `fchown`: of the open file itself, whatever has become of its
+    /// name. One whose filesystem keeps no owner (and a pipe, a socket)
+    /// takes it without effect, as before.
+    fn sys_fchown(&self, fd: i32, uid: u32, gid: u32) -> SysResult {
+        let f = self.map.fds.get(fd)?;
+        let (uid, gid) = self.may_chown(&f.handle.metadata()?, uid, gid)?;
+        f.handle.chown(uid, gid).unwrap_or(Ok(())).map(|_| 0)
+    }
+
+    /// Whether the caller may give a file of metadata `md` to `uid` and
+    /// `gid`, each -1 for "as it is" (`chown_ok`, `chgrp_ok`): its user
+    /// changes only for one with `CAP_CHOWN`; its group, for its owner,
+    /// to a group the owner is in, and for one with `CAP_CHOWN` to any.
+    /// `EPERM` otherwise. A file whose filesystem keeps no owner is not
+    /// asked about: the call does nothing there, and is taken as it
+    /// always was. What is to be set.
+    fn may_chown(&self, md: &crate::vfs::Metadata, uid: u32, gid: u32) -> Result<(Option<u32>, Option<u32>), Errno> {
+        const CAP_CHOWN: u64 = 0;
+        let uid = (uid != u32::MAX).then_some(uid);
+        let gid = (gid != u32::MAX).then_some(gid);
+        if let Some((owner, group)) = md.owner {
+            let me = self.creds.uid();
+            if !self.creds.capable(CAP_CHOWN) {
+                if uid.is_some_and(|u| u != owner || me != owner) {
+                    return Err(Errno::EPERM);
+                }
+                if gid.is_some_and(|g| me != owner || (g != group && !self.creds.in_group(g))) {
+                    return Err(Errno::EPERM);
+                }
+            }
+        }
+        Ok((uid, gid))
+    }
+
+    /// `fchownat`: by path, the last link followed unless asked not to,
+    /// or with an empty path and `AT_EMPTY_PATH` the descriptor's file.
+    fn sys_fchownat(&self, m: &GuestMem<'_>, a: [u64; 6]) -> SysResult {
+        let empty = m.read_cstr(a[1], 4096).map(|r| r.is_empty()).unwrap_or(false);
+        if empty && a[4] & AT_EMPTY_PATH != 0 {
+            return self.sys_fchown(a[0] as i32, a[2] as u32, a[3] as u32);
+        }
+        let p = self.at_path(m, a[0] as i32, a[1])?;
+        self.chown(&p, a[4] & AT_SYMLINK_NOFOLLOW == 0, a[2] as u32, a[3] as u32)
+    }
+
+    /// `chown` of the file at `path`, its last link followed with
+    /// `follow`, by the rules of [`Self::may_chown`].
+    fn chown(&self, path: &str, follow: bool, uid: u32, gid: u32) -> SysResult {
+        let md = if follow { self.ns.metadata(path)? } else { self.ns.metadata_nofollow(path)? };
+        let (uid, gid) = self.may_chown(&md, uid, gid)?;
+        self.ns.chown(path, follow, uid, gid).map(|_| 0)
+    }
+
     /// [`Kernel::stat_from`], owned by the process's own ids, as `statx`
     /// reports them: a program that stats its files and compares the owner
     /// with `getuid` (Wine's prefix check) sees itself. Before, `stat` and
     /// `fstat` said root, so only 32-bit programs (whose libc stats through
     /// `statx`) passed.
+    ///
+    /// A file whose filesystem keeps its owner (a tmpfs, an ext4) is that
+    /// owner's.
     fn stat_owned(&self, md: &crate::vfs::Metadata) -> Stat {
-        Stat { uid: self.creds.uid(), gid: self.creds.gid(), ..Kernel::stat_from(md) }
+        let (uid, gid) = md.owner.unwrap_or((self.creds.uid(), self.creds.gid()));
+        Stat { uid, gid, ..Kernel::stat_from(md) }
     }
 
     pub fn fstatat(
@@ -6074,6 +6121,8 @@ impl NetIo<'_> {
     }
 
     pub fn unix_bind(&self, io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64, cwd: &str) -> SysResult {
+        // The socket's file, when it makes one, is the caller's.
+        let _maker = crate::vfs::Maker::enter(io.creds.uid(), io.creds.gid());
         if let Ok(d) = io.dgram_of(fd) {
             let path = Kernel::sockaddr_un(m, addr, len)?;
             let path = if path.starts_with('\0') { path } else { crate::vfs::normalize(&path, cwd) };
@@ -7057,6 +7106,10 @@ pub struct Creds {
     /// last exec, and what it has asked for its next exec and for the
     /// files, keys and sockets it makes (0: nothing asked).
     sec: [std::sync::atomic::AtomicU32; 6],
+    /// The supplementary groups (`setgroups`): a fork's copy has them,
+    /// an exec keeps them. Not in [`Creds::save`]'s bytes: a process the
+    /// table of another kernel describes reads as having none.
+    groups: std::sync::Mutex<Vec<u32>>,
 }
 
 /// The securebits (include/uapi/linux/securebits.h): each has a lock bit
@@ -7094,7 +7147,24 @@ impl Creds {
             ambient: 0.into(),
             securebits: 0.into(),
             sec: crate::selinux::procattr::INITIAL.map(std::sync::atomic::AtomicU32::new),
+            groups: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// The supplementary groups (`getgroups`).
+    pub fn groups(&self) -> Vec<u32> {
+        self.groups.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `setgroups`, the caller having been found able.
+    pub fn set_groups(&self, groups: Vec<u32>) {
+        *self.groups.lock().unwrap_or_else(|e| e.into_inner()) = groups;
+    }
+
+    /// Whether `gid` is the effective group or one of the supplementary
+    /// ones (`in_group_p`).
+    pub fn in_group(&self, gid: u32) -> bool {
+        self.gid() == gid || self.groups.lock().unwrap_or_else(|e| e.into_inner()).contains(&gid)
     }
 
     /// SELinux's ids for the process ([`crate::selinux::procattr::NAMES`]).
@@ -7133,6 +7203,7 @@ impl Creds {
     pub fn fork(&self) -> Arc<Creds> {
         let c = Creds::blank(0, 0);
         c.restore(&self.save());
+        c.set_groups(self.groups());
         Arc::new(c)
     }
 
@@ -8527,8 +8598,37 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
             Ok(0)
         }
         nr::MEMBARRIER => Ok(0),
-        // No supplementary groups. `getgroups(0, _)` asks for the count.
-        nr::GETGROUPS | nr::SETGROUPS => Ok(0),
+        // The supplementary groups. `getgroups(0, _)` asks how many;
+        // room for fewer than there are is `EINVAL`.
+        nr::GETGROUPS => {
+            let groups = io.creds.groups();
+            if a[0] as i32 == 0 {
+                return Ok(groups.len() as u64);
+            }
+            if (a[0] as i32) < 0 || (a[0] as usize) < groups.len() {
+                return Err(Errno::EINVAL);
+            }
+            for (i, g) in groups.iter().enumerate() {
+                m.write_u32(a[1] + 4 * i as u64, *g)?;
+            }
+            Ok(groups.len() as u64)
+        }
+        // With `CAP_SETGID`; no more than `NGROUPS_MAX`.
+        nr::SETGROUPS => {
+            const CAP_SETGID: u64 = 6;
+            if !io.creds.capable(CAP_SETGID) {
+                return Err(Errno::EPERM);
+            }
+            if a[0] > 65536 {
+                return Err(Errno::EINVAL);
+            }
+            let mut groups = Vec::with_capacity(a[0] as usize);
+            for i in 0..a[0] {
+                groups.push(m.read_u32(a[1] + 4 * i)?);
+            }
+            io.creds.set_groups(groups);
+            Ok(0)
+        }
         nr::GETPPID => Ok(procs.ppid(io.pid) as u64),
         nr::ARCH_PRCTL => arch_prctl(m, ctx_addr, a[0], a[1]),
         nr::NOOP_OK => Ok(0),
@@ -19351,8 +19451,10 @@ mod tests {
                 0,
                 0,
                 e(Errno::ENOENT),
-                0,
-                0,
+                // The two chowns to root, of what this process made:
+                // not without `CAP_CHOWN`.
+                e(Errno::EPERM),
+                e(Errno::EPERM),
                 0,
                 0,
                 e(Errno::ENOTEMPTY),
@@ -19536,7 +19638,10 @@ mod tests {
         let g = &seen[0];
         assert!(g[0] >= 3 && g[1] > g[0] && g[2] == 3, "{:?}", &g[..3]);
         let n = g.len();
-        assert_eq!(&g[n - 27..n - 10], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -(Errno::ENOTEMPTY.0 as i64), 0, 0, -(Errno::ENOENT.0 as i64)]);
+        // (The three chowns to root, of files this process made: `EPERM`
+        // without `CAP_CHOWN`.)
+        let eperm = -(Errno::EPERM.0 as i64);
+        assert_eq!(&g[n - 27..n - 10], &[0, 0, 0, 0, 0, 0, 0, eperm, eperm, eperm, 0, 0, 0, -(Errno::ENOTEMPTY.0 as i64), 0, 0, -(Errno::ENOENT.0 as i64)]);
         assert_eq!(&g[n - 10..], &[0, 0, 0x1234, 0, 0, 1, 0, 1, 0, 7]);
     }
 

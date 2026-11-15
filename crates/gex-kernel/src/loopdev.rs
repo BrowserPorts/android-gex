@@ -479,7 +479,7 @@ impl FileHandle for Control {
     fn metadata(&self) -> Result<Metadata, Errno> {
         Ok(match &self.node {
             Some(node) => node(),
-            None => Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o660, ino: crate::vfs::anon_ino(self as *const Self as *const u8), mtime: 0, nlink: 1, rdev: makedev(10, 237), times: Default::default() },
+            None => Metadata { file_type: FileType::CharDevice, size: 0, mode: 0o660, ino: crate::vfs::anon_ino(self as *const Self as *const u8), mtime: 0, nlink: 1, rdev: makedev(10, 237), times: Default::default(), owner: None },
         })
     }
 

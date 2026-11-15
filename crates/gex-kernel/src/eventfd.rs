@@ -105,6 +105,7 @@ impl FileHandle for EventFd {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 

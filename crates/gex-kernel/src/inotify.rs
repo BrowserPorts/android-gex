@@ -489,6 +489,7 @@ impl FileHandle for Inotify {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 

@@ -225,6 +225,10 @@ impl FileSystem for Mount {
         self.writable()?;
         self.fs.chmod(path, mode)
     }
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        self.writable()?;
+        self.fs.chown(path, uid, gid)
+    }
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
         self.writable()?;
         self.fs.set_mtime(path, secs)

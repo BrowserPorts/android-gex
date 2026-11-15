@@ -694,6 +694,10 @@ struct Inner {
     /// and every hard link; dropped with the inode's last name. Sparse:
     /// Wine's DOS attributes (`user.DOSATTRIB`) are on a few files.
     xattrs: BTreeMap<u64, BTreeMap<String, Vec<u8>>>,
+    /// Each inode's owner, user and group, where it has one: what a
+    /// program's call made, or `chown` gave. One the kernel or its host
+    /// put here has none, and reads as its reader's own.
+    owners: BTreeMap<u64, (u32, u32)>,
 }
 
 impl Inner {
@@ -744,12 +748,49 @@ impl Inner {
         Ok(())
     }
 
-    /// Name `path` inode `ino`, and count the link.
+    /// Name `path` inode `ino`, and count the link. An inode named for
+    /// the first time by a program's call is its maker's
+    /// ([`super::Maker`]): the user, and the group, or the directory's
+    /// group when the directory hands its group down (`S_ISGID`).
     fn set_ino(&mut self, path: String, ino: u64) {
+        if !self.links.contains_key(&ino) {
+            if let Some((uid, gid)) = super::Maker::current() {
+                let parent = path.rfind('/').map_or("", |i| &path[..i]);
+                let handed = self.modes.get(parent).is_some_and(|m| m & 0o2000 != 0);
+                let gid = if handed { self.inos.get(parent).and_then(|i| self.owners.get(i)).map_or(gid, |o| o.1) } else { gid };
+                self.owners.insert(ino, (uid, gid));
+            }
+        }
         if let Some(old) = self.inos.insert(path, ino) {
             self.unlink_ino(old);
         }
         *self.links.entry(ino).or_insert(0) += 1;
+    }
+
+    /// `chown` of the node at `path`: its user, its group, or both. A
+    /// file that is not a directory loses its set-user-id bit, and its
+    /// set-group-id bit if its group may execute it, as Linux takes them
+    /// whoever asks. A node with no owner yet is taken to be `whose`
+    /// (the caller's, as `stat` says of it) in what is not being set.
+    fn chown(&mut self, path: &str, uid: Option<u32>, gid: Option<u32>, whose: (u32, u32)) -> Result<(), Errno> {
+        let Some(node) = self.nodes.get(path) else {
+            return Err(self.missing(path));
+        };
+        let is_dir = matches!(node, Node::Dir);
+        let Some(ino) = self.inos.get(path).copied() else {
+            return Err(Errno::ENOENT);
+        };
+        let now = self.owners.get(&ino).copied().unwrap_or(whose);
+        self.owners.insert(ino, (uid.unwrap_or(now.0), gid.unwrap_or(now.1)));
+        if !is_dir && (uid.is_some() || gid.is_some()) {
+            if let Some(mode) = self.modes.get(path).copied() {
+                let cleared = mode & !0o4000 & if mode & 0o010 != 0 { !0o2000 } else { !0 };
+                if cleared != mode {
+                    self.chmod(path, cleared)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Forget `path`'s inode, and the link; the inode it had.
@@ -765,6 +806,7 @@ impl Inner {
             if *n == 0 {
                 self.links.remove(&ino);
                 self.xattrs.remove(&ino);
+                self.owners.remove(&ino);
             }
         }
     }
@@ -924,7 +966,10 @@ impl TmpFs {
             return Err(Errno::EEXIST);
         }
         inner.parent_ok(path)?;
-        let mode = mode & 0o7777;
+        // A directory made in one that hands its group down does too.
+        let parent = path.rfind('/').map_or("", |i| &path[..i]);
+        let handed = inner.modes.get(parent).is_some_and(|m| m & 0o2000 != 0);
+        let mode = mode & 0o7777 | if handed { 0o2000 } else { 0 };
         if mode != Metadata::dir().mode {
             inner.modes.insert(path.to_string(), mode);
         }
@@ -1149,6 +1194,7 @@ impl TmpFs {
         {
             let mut inner = fs.inner.lock().unwrap();
             inner.chmod("", shown.mode)?;
+            inner.owners.insert(1, (shown.uid, shown.gid));
             inner.options = Some(shown);
         }
         Ok(fs)
@@ -1467,6 +1513,7 @@ impl TmpFs {
     /// [`TmpFs::meta_at`] of `node`, found at `path`.
     fn meta_of(inner: &Inner, path: &str, node: &Node) -> Result<Metadata, Errno> {
         let ino = TmpFs::ino_of(inner, path);
+        let owner = inner.owners.get(&ino).copied();
         let mtime = || inner.mtimes.get(path).copied().unwrap_or(0);
         match node {
             Node::File(f) => Ok(Metadata {
@@ -1479,6 +1526,7 @@ impl TmpFs {
                 nlink: inner.nlink(ino),
                 rdev: 0,
                 times: f.times(),
+                owner,
             }),
             Node::Dir => {
                 let d = Metadata::dir();
@@ -1487,6 +1535,7 @@ impl TmpFs {
                     mtime: mtime(),
                     nlink: TmpFs::dir_nlink(inner, path),
                     mode: inner.modes.get(path).copied().unwrap_or(d.mode),
+                    owner,
                     ..d
                 })
             }
@@ -1499,6 +1548,7 @@ impl TmpFs {
                 nlink: 1,
                 rdev: 0,
                 times: Default::default(),
+                owner,
             }),
             Node::Socket => Ok(Metadata {
                 file_type: FileType::Socket,
@@ -1509,6 +1559,7 @@ impl TmpFs {
                 nlink: 1,
                 rdev: 0,
                 times: Default::default(),
+                owner,
             }),
             Node::Device { rdev, block } => Ok(Metadata {
                 file_type: if *block { FileType::BlockDevice } else { FileType::CharDevice },
@@ -1519,6 +1570,7 @@ impl TmpFs {
                 nlink: inner.nlink(ino),
                 rdev: *rdev,
                 times: Default::default(),
+                owner,
             }),
         }
     }
@@ -1639,6 +1691,17 @@ impl TmpHandle {
 }
 
 impl FileHandle for TmpHandle {
+    fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Option<Result<(), Errno>> {
+        let whose = super::Maker::current().unwrap_or((0, 0));
+        let mut inner = self.inner.lock().unwrap();
+        // By the name it has now; one with no name left has no owner
+        // kept for it either.
+        Some(match self.here(&inner) {
+            Some(path) => inner.chown(&path, uid, gid, whose),
+            None => Ok(()),
+        })
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         let Some(file) = &self.file else {
             return Err(Errno::EISDIR);
@@ -1742,12 +1805,13 @@ impl FileHandle for TmpHandle {
         if let Some(file) = &self.file {
             // Its mode by the name it was opened under while that still
             // names it, else by any name it has now, else the last one's.
-            let mode = {
+            let (mode, owner) = {
                 let inner = self.inner.read().unwrap();
-                match self.here(&inner) {
+                let mode = match self.here(&inner) {
                     Some(p) => inner.modes.get(&p).copied().unwrap_or(0o644),
                     None => file.gone_mode.load(Ordering::Relaxed),
-                }
+                };
+                (mode, inner.owners.get(&file.ino).copied())
             };
             return Ok(Metadata {
                 file_type: FileType::Regular,
@@ -1758,6 +1822,7 @@ impl FileHandle for TmpHandle {
                 nlink: 1,
                 rdev: 0,
                 times: file.times(),
+                owner,
             });
         }
         let inner = self.inner.read().unwrap();
@@ -2093,6 +2158,13 @@ impl FileSystem for TmpFs {
         true
     }
 
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        // What is not being set stays its owner's: its reader's own, for
+        // a node that has none yet, and that is whoever asks this.
+        let whose = super::Maker::current().unwrap_or((0, 0));
+        self.inner.lock().unwrap().chown(path, uid, gid, whose)
+    }
+
     /// As `shmem_show_options`: what differs from a tmpfs mounted with
     /// no options.
     fn show_options(&self) -> String {
@@ -2416,6 +2488,48 @@ fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mount's `uid=` and `gid=` are its root's owner; what is made in it
+    /// with nobody said to be making it has none.
+    #[test]
+    fn a_mount_is_its_options_owners() {
+        let fs = TmpFs::mounted("mode=0755,uid=7,gid=8").unwrap();
+        assert_eq!(fs.metadata("").unwrap().owner, Some((7, 8)));
+        assert_eq!(fs.metadata("").unwrap().mode, 0o755);
+        fs.mkdir("d", 0o755).unwrap();
+        assert_eq!(fs.metadata("d").unwrap().owner, None);
+        let _maker = crate::vfs::Maker::enter(1000, 1001);
+        fs.mkdir("mine", 0o2755).unwrap();
+        assert_eq!(fs.metadata("mine").unwrap().owner, Some((1000, 1001)));
+        fs.chown("mine", None, Some(2000)).unwrap();
+        fs.mkdir("mine/handed", 0o755).unwrap();
+        assert_eq!(fs.metadata("mine/handed").unwrap().owner, Some((1000, 2000)));
+        assert_eq!(fs.metadata("mine/handed").unwrap().mode & 0o2000, 0o2000);
+        // A file and a link are their maker's; a chown takes a file's
+        // set-id bits (the group's only when the group may execute) and
+        // leaves a directory's; the owner goes where the name goes, and an
+        // open file's is changed by the file.
+        let f = fs.open_mode("f", oflags::O_CREAT | oflags::O_RDWR, 0o6755).unwrap();
+        fs.symlink("f", "l").unwrap();
+        assert_eq!(fs.metadata("f").unwrap().owner, Some((1000, 1001)));
+        assert_eq!(fs.metadata_nofollow("l").unwrap().owner, Some((1000, 1001)));
+        fs.chown("l", Some(11), Some(12)).unwrap();
+        assert_eq!(fs.metadata_nofollow("l").unwrap().owner, Some((11, 12)));
+        assert_eq!(fs.metadata("f").unwrap().owner, Some((1000, 1001)));
+        fs.chown("f", Some(23), None).unwrap();
+        assert_eq!(fs.metadata("f").unwrap().owner, Some((23, 1001)));
+        assert_eq!(fs.metadata("f").unwrap().mode, 0o755);
+        fs.chmod("f", 0o2644).unwrap();
+        fs.chown("f", None, Some(24)).unwrap();
+        assert_eq!(fs.metadata("f").unwrap().mode, 0o2644);
+        fs.chown("mine", Some(27), Some(28)).unwrap();
+        assert_eq!(fs.metadata("mine").unwrap().mode, 0o2755);
+        fs.rename("f", "g").unwrap();
+        f.chown(Some(21), Some(22)).unwrap().unwrap();
+        assert_eq!(fs.metadata("g").unwrap().owner, Some((21, 22)));
+        assert_eq!(f.metadata().unwrap().owner, Some((21, 22)));
+        assert_eq!(fs.chown("nothing", Some(1), Some(1)), Err(Errno::ENOENT));
+    }
 
     /// A program making or removing a name moves its directory's time, as on
     /// Linux; seeding does not. A KService database built with the image

@@ -2117,6 +2117,7 @@ impl FileHandle for StdinQueue {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 
@@ -2329,6 +2330,7 @@ impl FileHandle for Tty {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 
@@ -2395,6 +2397,7 @@ impl FileHandle for Console {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 

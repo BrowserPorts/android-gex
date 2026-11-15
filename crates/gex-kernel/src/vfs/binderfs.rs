@@ -94,6 +94,7 @@ fn node_metadata(minor: u32, mode: &AtomicU32) -> Metadata {
         nlink: 1,
         rdev: rdev(minor),
         times: Default::default(),
+        owner: None,
     }
 }
 
@@ -169,7 +170,7 @@ fn feature(path: &str) -> Option<usize> {
 }
 
 fn feature_metadata(i: usize) -> Metadata {
-    Metadata { file_type: FileType::Regular, size: 0, mode: 0o444, ino: FEATURES_INO + 1 + i as u64, mtime: 0, nlink: 1, rdev: 0, times: Default::default() }
+    Metadata { file_type: FileType::Regular, size: 0, mode: 0o444, ino: FEATURES_INO + 1 + i as u64, mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None }
 }
 
 fn features_metadata() -> Metadata {

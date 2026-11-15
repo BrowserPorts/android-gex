@@ -107,6 +107,11 @@ pub struct Metadata {
     /// The other times and the nanoseconds, where the filesystem keeps
     /// them (the host's). All zero: every time is `mtime`, whole seconds.
     pub times: Times,
+    /// Its owner, user and group, where the filesystem keeps one (a
+    /// tmpfs, an ext4). `None` where it keeps none: `stat` then says the
+    /// caller's own ids, as it always did, so a program that compares a
+    /// file's owner with itself sees itself.
+    pub owner: Option<(u32, u32)>,
 }
 
 /// `st_atim`, `st_ctim` and the nanoseconds of `st_mtim`.
@@ -130,6 +135,7 @@ impl Metadata {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         }
     }
     pub fn dir() -> Metadata {
@@ -142,6 +148,7 @@ impl Metadata {
             nlink: 2,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         }
     }
 }
@@ -391,6 +398,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// itself; `None` sends the caller to [`FileSystem::chmod`] by name.
     fn chmod(&self, mode: u32) -> Option<Result<(), Errno>> {
         let _ = mode;
+        None
+    }
+
+    /// `fchown` of the open file itself, wherever its name has gone;
+    /// `None` where the handle's filesystem keeps no owner, and the call
+    /// is taken without effect.
+    fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Option<Result<(), Errno>> {
+        let _ = (uid, gid);
         None
     }
 
@@ -928,6 +943,7 @@ pub trait FileSystem: Send + Sync {
                 nlink: 1,
                 rdev: 0,
                 times: Default::default(),
+                owner: None,
             });
         }
         self.metadata(path)
@@ -997,6 +1013,16 @@ pub trait FileSystem: Send + Sync {
         let _ = (path, mode);
         Ok(())
     }
+    /// Change a file's owner (`chown`; a final symlink is the link's own):
+    /// its user, its group, or both. Who may is the caller's to have
+    /// checked. A filesystem that keeps no owners accepts it for a file
+    /// that is there and does nothing, as it always did: tar treats a
+    /// failed chown while unpacking as a failure to unpack.
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        let _ = (uid, gid);
+        self.metadata_nofollow(path).map(|_| ())
+    }
+
     /// Set a file's modification time (seconds since the epoch), for
     /// `utimensat`. Filesystems that keep no times accept it and do nothing.
     fn set_mtime(&self, path: &str, secs: i64) -> Result<(), Errno> {
@@ -1361,7 +1387,7 @@ impl FileHandle for MountNsFile {
         Err(Errno::EINVAL)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o444, ino: self.0.id(), mtime: 0, nlink: 1, rdev: 0, times: Default::default() })
+        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o444, ino: self.0.id(), mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None })
     }
     fn as_mount_ns(self: Arc<Self>) -> Option<Arc<MountNs>> {
         Some(Arc::clone(&self.0))
@@ -2288,6 +2314,24 @@ impl Namespace {
         fs.xattr(&rel, op)
     }
 
+    /// [`FileSystem::chown`] of `path`, a final symlink followed with
+    /// `follow`.
+    pub fn chown(&self, path: &str, follow: bool, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        let abs = normalize(path, &self.cwd);
+        if let Some((fs, rel)) = self.resolve_walked(&abs, follow)? {
+            return fs.chown(&rel, uid, gid);
+        }
+        let mut current = abs;
+        for _ in 0..40 {
+            let (fs, rel) = self.resolve(&current)?;
+            match fs.read_link(&rel) {
+                Ok(target) if follow => current = if target.starts_with('/') { normalize(&target, "/") } else { normalize(&target, &parent_of(&current)) },
+                _ => return fs.chown(&rel, uid, gid),
+            }
+        }
+        Err(Errno::ELOOP)
+    }
+
     /// Set the modification time of `path`, following a final symlink when
     /// `follow` (as `utimensat` does without `AT_SYMLINK_NOFOLLOW`).
     pub fn set_mtime(&self, path: &str, secs: i64, follow: bool) -> Result<(), Errno> {
@@ -2375,6 +2419,36 @@ impl Namespace {
 impl Default for Vfs {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+thread_local! {
+    static MAKER: std::cell::Cell<Option<(u32, u32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whose a file made now is: the user and group of the process making
+/// the call this thread is in. A filesystem that keeps owners gives what
+/// it makes to them ([`Maker::current`]); the call says who it is for as
+/// long as it lasts ([`Maker::enter`]), since making a file is asked of a
+/// filesystem by path, with no word of who asks.
+pub struct Maker(Option<(u32, u32)>);
+
+impl Maker {
+    /// From now until the value is dropped, files are made by `uid` and
+    /// `gid` (the caller's filesystem ids).
+    pub fn enter(uid: u32, gid: u32) -> Maker {
+        Maker(MAKER.with(|m| m.replace(Some((uid, gid)))))
+    }
+
+    /// Who makes a file now; `None` when it is the kernel or its host.
+    pub fn current() -> Option<(u32, u32)> {
+        MAKER.with(|m| m.get())
+    }
+}
+
+impl Drop for Maker {
+    fn drop(&mut self) {
+        MAKER.with(|m| m.set(self.0));
     }
 }
 

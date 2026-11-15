@@ -660,6 +660,7 @@ impl FileHandle for UnixSocket {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 
@@ -1077,6 +1078,7 @@ impl FileHandle for UnixDgram {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 
@@ -1600,6 +1602,7 @@ impl FileHandle for MemFd {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 }
@@ -1957,6 +1960,7 @@ impl FileHandle for EpollSet {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 }
@@ -2270,6 +2274,7 @@ impl crate::vfs::FileHandle for RemoteUnix {
             nlink: 1,
             rdev: 0,
             times: Default::default(),
+            owner: None,
         })
     }
 
