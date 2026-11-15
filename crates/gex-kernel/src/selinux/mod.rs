@@ -20,11 +20,16 @@
 //! [`crate::vfs::SelinuxFs`] is the filesystem that serves them, which a
 //! program mounts by its type.
 //!
-//! Still to come, and nothing here pretends otherwise: `/proc/<pid>/attr`,
-//! the labels of files, and the hooks that ask. No host mounts selinuxfs
+//! [`procattr`] is a process's own context and what it asks for, and
+//! [`labels`] what a file's label is and may become.
+//!
+//! Still to come, and nothing here pretends otherwise: the system calls
+//! that read and set a file's label, the transition an `execve` makes by
+//! it, and the hooks that ask. No host mounts selinuxfs
 //! of itself, so a program that looks for SELinux and has not mounted it
 //! finds it absent.
 
+pub mod labels;
 pub mod policy;
 pub mod procattr;
 pub mod server;
