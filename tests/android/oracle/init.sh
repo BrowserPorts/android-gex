@@ -21,6 +21,14 @@ ROOT=$(CDPATH='' cd -- "$1" && pwd)
 shift
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 GEXC=${GEXC:-$HERE/../../../target/big64/release/gexc}
+# Each program reads the same random bytes in every run, so that bionic's
+# linker puts its libraries where it did last time and gexc finds their
+# translations made (GEX_FIXED_RANDOM); and those outlive a rebuild of
+# gexc that left the translator alone (cache-id.sh).
+export GEX_FIXED_RANDOM="${GEX_FIXED_RANDOM:-1}"
+if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
+    export GEX_CACHE_BUILD="$name"
+fi
 FIRST=$HERE/../bin/firststage
 [ -x "$FIRST" ] || { echo "init.sh: no $FIRST (tests/android/build.sh)" >&2; exit 1; }
 CONFIG=$(mktemp)
