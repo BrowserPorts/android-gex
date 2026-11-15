@@ -11,7 +11,10 @@
 # selinuxfs and gives a boot configuration that says not to enforce.
 # GEXC is the gexc to use, built with the big64 feature as for
 # compare.sh; TIMEOUT is how long to let init run (default 150 seconds:
-# an init that boots does not end).
+# an init that boots does not end). GEX_TIME_SCALE, when set, slows the
+# guest's time that many times: the image's programs give one another
+# seconds (apexd gives ueventd twenty for its device nodes), which
+# translated they do not keep to.
 #
 # What init writes to the kernel's log is printed, and after it anything
 # else gexc said. This is a look at how far init gets, not a test with an
@@ -26,13 +29,17 @@ GEXC=${GEXC:-$HERE/../../../target/big64/release/gexc}
 # translations made (GEX_FIXED_RANDOM); and those outlive a rebuild of
 # gexc that left the translator alone (cache-id.sh).
 export GEX_FIXED_RANDOM="${GEX_FIXED_RANDOM:-1}"
+# Room for what an image's programs come to: the cache keeps 4 GiB unless
+# told, and a boot's translations and a comparison's push one another out.
+export GEX_CACHE_MAX_BYTES="${GEX_CACHE_MAX_BYTES:-34359738368}"
 if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
     export GEX_CACHE_BUILD="$name"
 fi
 # gexc runs as root, as the native side does: the root keeps the image's
 # owners (root.sh), and a gexc that is the host's root says them.
 gexc() {
-    sudo env GEX_FIXED_RANDOM="$GEX_FIXED_RANDOM" ${GEX_CACHE_BUILD:+GEX_CACHE_BUILD="$GEX_CACHE_BUILD"} "$@"
+    sudo env GEX_FIXED_RANDOM="$GEX_FIXED_RANDOM" GEX_CACHE_MAX_BYTES="$GEX_CACHE_MAX_BYTES" \
+        ${GEX_CACHE_BUILD:+GEX_CACHE_BUILD="$GEX_CACHE_BUILD"} ${GEX_TIME_SCALE:+GEX_TIME_SCALE="$GEX_TIME_SCALE"} "$@"
 }
 FIRST=$HERE/../bin/firststage
 [ -x "$FIRST" ] || { echo "init.sh: no $FIRST (tests/android/build.sh)" >&2; exit 1; }
