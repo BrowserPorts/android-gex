@@ -18,6 +18,12 @@ set -eu
 ROOT=$(CDPATH='' cd -- "$1" && pwd)
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 GEXC=${GEXC:-$HERE/../../../target/big64/release/gexc}
+# As compare.sh: the same random bytes for each program in every run, so
+# that gexc finds its translations made, and a name for the build.
+export GEX_FIXED_RANDOM="${GEX_FIXED_RANDOM:-1}"
+if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
+    export GEX_CACHE_BUILD="$name"
+fi
 : "${D8_JAR:?set D8_JAR to an Android SDK build-tools d8.jar}"
 
 work=$(mktemp -d)

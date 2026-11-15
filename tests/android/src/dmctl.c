@@ -7,7 +7,9 @@
 //   disk behind it (its node is ENXIO, sysfs has nothing) until it is
 //   given a table. A name in use is EBUSY; a name with a slash in it, or
 //   none, EINVAL.
-// - DM_DEV_STATUS finds it by name or by uuid (ENXIO for neither), with
+// - DM_DEV_STATUS finds it by name, by uuid or by number, one of them
+//   only (ENXIO for none and for a number with another, EINVAL for a
+//   name with a uuid), with
 //   its number and what tables it has.
 // - DM_LIST_DEVICES lists it.
 // - DM_TABLE_LOAD gives it a table that waits: targets end to end from
@@ -183,6 +185,29 @@ int main(void) {
     start(&r, NULL, 0);
     strcpy(r.io.uuid, uuid);
     if (call(DM_DEV_STATUS, &r) || r.io.dev != dev || strcmp(r.io.name, name)) die("DM_DEV_STATUS by uuid", errno, r.io.dev);
+    // And by its number (ueventd asks so, of each device it hears of),
+    // which answers with both; by one of the three only.
+    start(&r, NULL, 0);
+    r.io.dev = dev;
+    if (call(DM_DEV_STATUS, &r) || r.io.dev != dev || strcmp(r.io.name, name) || strcmp(r.io.uuid, uuid)) die("DM_DEV_STATUS by number", errno, r.io.dev);
+    start(&r, name, 0);
+    r.io.dev = dev;
+    if (call(DM_DEV_STATUS, &r) != ENXIO) die("DM_DEV_STATUS by name and number", errno, 0);
+    start(&r, name, 0);
+    strcpy(r.io.uuid, uuid);
+    if (call(DM_DEV_STATUS, &r) != EINVAL) die("DM_DEV_STATUS by name and uuid", errno, 0);
+    start(&r, NULL, 0);
+    strcpy(r.io.uuid, uuid);
+    r.io.dev = dev;
+    if (call(DM_DEV_STATUS, &r) != ENXIO) die("DM_DEV_STATUS by uuid and number", errno, 0);
+    start(&r, NULL, 0);
+    r.io.dev = makedev(major(dev), 1000);
+    if (call(DM_DEV_STATUS, &r) != ENXIO) die("DM_DEV_STATUS by a number no device has", errno, 0);
+    start(&r, NULL, 0);
+    r.io.dev = makedev(1, 3);
+    if (call(DM_DEV_STATUS, &r) != ENXIO) die("DM_DEV_STATUS by another driver's number", errno, 0);
+    start(&r, NULL, 0);
+    if (call(DM_DEV_STATUS, &r) != ENXIO) die("DM_DEV_STATUS by nothing", errno, 0);
     start(&r, "gex-dm-nothing", 0);
     if (call(DM_DEV_STATUS, &r) != ENXIO) die("DM_DEV_STATUS of nothing", errno, 0);
     // Listed.

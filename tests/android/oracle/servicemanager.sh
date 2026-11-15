@@ -22,6 +22,12 @@ set -u
 ROOT=$(CDPATH='' cd -- "$1" && pwd)
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 GEXC=${GEXC:-$HERE/../../../target/big64/release/gexc}
+# As compare.sh: the same random bytes for each program in every run, so
+# that gexc finds its translations made, and a name for the build.
+export GEX_FIXED_RANDOM="${GEX_FIXED_RANDOM:-1}"
+if [ "$GEXC" != native ] && [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
+    export GEX_CACHE_BUILD="$name"
+fi
 CLIENT=$HERE/../bin/smcall
 [ -x "$CLIENT" ] || { echo "servicemanager.sh: no $CLIENT (tests/android/build.sh)" >&2; exit 1; }
 ENVS="PATH=/system/bin HOME=/ ANDROID_ROOT=/system ANDROID_DATA=/data TMPDIR=/data/local/tmp"

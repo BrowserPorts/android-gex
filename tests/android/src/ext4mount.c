@@ -9,7 +9,8 @@
 // (apex.txt beside it).
 //
 // - mount -t ext4 of the device, read-only: its files read as they are,
-//   with their sizes, modes, owners, link counts and times; a file with holes
+//   with their sizes, modes, owners, link counts and times, and the
+//   device's number for their st_dev; a file with holes
 //   reads zeros in them; two names of one file are one inode.
 // - Symbolic links: a short one, a long one, an absolute one; a path
 //   through a link to a directory beside it.
@@ -163,6 +164,10 @@ int main(void) {
 
     // Its files.
     struct stat st, other;
+    // They are on the device: its number is their st_dev, the mount's own
+    // directory's too.
+    if (stat(in(top, "loop"), &other) || !S_ISBLK(other.st_mode) || stat(in(mnt, "bin/tool"), &st) || st.st_dev != other.st_rdev) die("a file's device", st.st_dev, other.st_rdev);
+    if (stat(mnt, &st) || st.st_dev != other.st_rdev) die("the mount's device", st.st_dev, other.st_rdev);
     file_is("apex_manifest.pb", 39, 0xd13faeaee057b8b5ull);
     file_is("bin/tool", 6393, 0x97d370ab2901a149ull);
     file_is("lib64/libfixture.so", 36393, 0x0db7e255b679f3d5ull);
