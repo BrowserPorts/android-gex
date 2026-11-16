@@ -8148,9 +8148,13 @@ export class Gex {
       return;
     }
     // A miss the shim called a catch-up (`gex_ftab_behind`) traps here with
-    // units off too: the log carries every installed provider.
+    // units off too: the log carries every installed provider. A binding
+    // queued since (a class adapter's bridge, `bridge_native`) is written
+    // either way: with the log replayed already, the miss that queued it
+    // would otherwise find no bridge.
     if (!(this.#cgenMode & 3) || !e.gex_cgen_wanted) {
       if (e.gex_ftab_behind?.()) this.#cgenCatchUp();
+      else if (this.#cgen) this.#wasmdllCatchUp();
       return;
     }
     for (let u = e.gex_cgen_wanted(); u >= 0; u = e.gex_cgen_wanted()) {
