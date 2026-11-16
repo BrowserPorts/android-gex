@@ -853,8 +853,10 @@ struct GexIcall : PassInfoMixin<GexIcall> {
   }
 
   // i386 facts (their own encoding: gex reads facts as an opaque key, but
-  // for FACT_REFUSED): the convention, a struct return's kind, and up to
-  // two structs by value, each its parameter (plus one) and its stack words.
+  // for FACT_REFUSED): the convention (bits 0-1), a struct return's kind
+  // (bits 2-3), and up to four structs by value, six bits each from bit 4:
+  // the parameters since the one before (or the first), 0 to 7, and its
+  // stack words, 1 to 7 (so an entry is never 0).
   static constexpr uint32_t I_SRET_REG = 1u << 2, I_SRET_MEM = 1u << 3;
 
   // F's i386 class: its wasm32 type in CT (pointers and integers of up to
@@ -877,7 +879,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       return nullptr;
     };
     uint32_t f = conv;
-    unsigned nbv = 0;
+    unsigned nbv = 0, next = 0;
     std::vector<Type *> ps;
     for (unsigned i = 0; i < FT->getNumParams(); i++) {
       if (i == 0 && F.hasParamAttribute(0, Attribute::StructRet)) {
@@ -887,8 +889,9 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       }
       if (Type *BT = F.getParamByValType(i)) {
         uint64_t words = (DL.getTypeAllocSize(BT) + 3) / 4;
-        if (nbv == 2 || i + 1 > 31 || words == 0 || words > 31) return false;
-        f |= (uint32_t)(((i + 1) | words << 5) << (4 + 10 * nbv++));
+        if (nbv == 4 || i - next > 7 || words == 0 || words > 7) return false;
+        f |= (uint32_t)((i - next) | words << 3) << (4 + 6 * nbv++);
+        next = i + 1;
         ps.push_back(I32);
         continue;
       }
@@ -906,9 +909,15 @@ struct GexIcall : PassInfoMixin<GexIcall> {
 
   // The words of the by-value struct at parameter i in i386 facts, or 0.
   static unsigned byvalWords(uint32_t facts, unsigned i) {
-    for (unsigned k = 0; k < 2; k++) {
-      uint32_t e = facts >> (4 + 10 * k) & 0x3ff;
-      if ((e & 31) == i + 1) return e >> 5;
+    // (a struct return's parameter is the first: the count starts there)
+    unsigned next = 0;
+    for (unsigned k = 0; k < 4; k++) {
+      uint32_t e = facts >> (4 + 6 * k) & 63;
+      if (!e) return 0;
+      unsigned at = next + (e & 7);
+      if (at == i) return e >> 3;
+      if (at > i) return 0;
+      next = at + 1;
     }
     return 0;
   }
