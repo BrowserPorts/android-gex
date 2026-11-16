@@ -250,7 +250,22 @@ cxx = tool in ('g++', 'c++', 'clang++')
 if args[:1] == ['-dumpmachine']:
     print('x86_64-w64-mingw32'); sys.exit(0)
 cc = os.path.join(W, 'wcc64++' if cxx else 'wcc64')
-base = ['-D_WIN32', '-D_UCRT', '-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL', '-D__stdcall=', '-D__cdecl=', '-D__fastcall=', '-D__thiscall=', '-D__vectorcall=', '-D_stdcall=', '-D_cdecl=', '-D_fastcall=', '-D_thiscall=', '-D__MINGW32__', '-D__MINGW64__', '-Wno-ignored-attributes', '-Wno-unknown-attributes', '-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__', '-fPIC', '-Wno-unused-command-line-argument',
+# the SDK headers: mingw-w64's (MINGW_INCLUDE, installed by mingw-headers.py),
+# or Wine's own; before them either way the headers of gexcc-win's own
+# runtime (include-rt: what libmingwex has for MinGW)
+if conf.get('MINGW_INCLUDE'):
+    # (clang defines _GNU_SOURCE for C++ on the wasm target, as on Linux;
+    # a MinGW clang doesn't, and with it mingw-w64's stdio.h takes libmingwex's
+    # printf)
+    sdk_dirs = ['-U_GNU_SOURCE', '-D__GEXW_SDK_X64__', '-isystem', here + '/include-rt', '-isystem', here + '/include-mingw-pre',
+                '-isystem', conf['MINGW_INCLUDE']]
+    crt_dirs = []
+else:
+    sdk_dirs = ['-isystem', here + '/include-rt', '-isystem', here + '/include-pre', '-isystem', B + '/include', '-isystem', S + '/include']
+    crt_dirs = ['-isystem', S + '/include/msvcrt']
+    # (MinGW's names Wine's headers lack, and Wine's wide-char mode)
+    sdk_dirs += ['-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL']
+base = ['-D_WIN32', '-D_UCRT', '-D__stdcall=', '-D__cdecl=', '-D__fastcall=', '-D__thiscall=', '-D__vectorcall=', '-D_stdcall=', '-D_cdecl=', '-D_fastcall=', '-D_thiscall=', '-D__MINGW32__', '-D__MINGW64__', '-Wno-ignored-attributes', '-Wno-unknown-attributes', '-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__', '-fPIC', '-Wno-unused-command-line-argument',
         # (long is 32-bit here, but what the backend lowers these builtins to
         # returns the target's 64-bit long)
         '-fno-builtin-lround', '-fno-builtin-lroundf', '-fno-builtin-lroundl', '-fno-builtin-lrint',
@@ -258,15 +273,17 @@ base = ['-D_WIN32', '-D_UCRT', '-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL', '-D__s
         # libc++ calls __builtin_lround* directly; the backend types those with a 64-bit long
         *['-D__builtin_%s=%s' % (n, n) for n in ('lround', 'lroundf', 'lroundl', 'lrint', 'lrintf', 'lrintl')],
         # (system dirs: a program's own -I comes first, its config.h before Wine's)
-        '-isystem', here + '/include-pre', '-isystem', B + '/include', '-isystem', S + '/include']
+        *sdk_dirs]
 if cxx:
     # (COM methods that return a struct, Direct2D's GetSize and the rest, as
     # Windows returns them and Wine's C implementations do: through a
     # pointer the method also returns, the headers' explicit form)
-    base = ['-include', here + '/include/gexcc-win-cxx.h', '-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER',
+    # (with mingw-w64's headers only math.h: libc++'s lround and lrint call the
+    # C runtime's, the -D__builtin_lround=lround below and the rest)
+    base = ['-include', 'math.h' if conf.get('MINGW_INCLUDE') else here + '/include/gexcc-win-cxx.h', '-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER',
             '-DWIDL_EXPLICIT_AGGREGATE_RETURNS'] + base
 # (__forceinline as MinGW's _mingw.h has it)
-base += ['-isystem', S + '/include/msvcrt', '-idirafter', here + '/include', '-fdeclspec',
+base += [*crt_dirs, '-idirafter', here + '/include', '-fdeclspec',
          '-D__forceinline=__inline__ __attribute__((__always_inline__))',
          # (dllexport and dllimport as the GexLLP64 plugin's attributes: default
          # visibility, what the wasm target exports and imports by)

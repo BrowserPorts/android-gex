@@ -9,6 +9,8 @@
 # WINE_SRC    its source tree (headers, nls)
 # GEX_WASM64_SYSROOT  the wasm64 sysroot wcc64 compiles with
 #                     (toolchain/sysroot/build64.sh)
+# MINGW_HEADERS       optional: mingw-w64's mingw-w64-headers directory; programs
+#                     then compile against its headers, not Wine's
 # Then C++: toolchain/gexcc/windows/build-cxx.sh PREFIX LLVM_SRC.
 # Out: PREFIX/bin/x86_64-w64-mingw32-{gcc,g++,cc,c++,windres,ar,ranlib,nm,
 # strip,objcopy,objdump}, PREFIX/lib/gexcc-win (the runtime every program
@@ -25,6 +27,10 @@ done
 L=$PREFIX/lib/gexcc-win
 mkdir -p "$PREFIX/bin" "$L" "$PREFIX/share/gexcc-win"
 printf 'WINE_BUILD=%s\nWINE_SRC=%s\nSYSROOT64=%s\nCXX=%s\n' "$WB" "$WS" "$(realpath "$GEX_WASM64_SYSROOT")" "$PREFIX/cxx" > "$L/config"
+if [ -n "${MINGW_HEADERS:-}" ]; then
+  python3 "$HERE/mingw-headers.py" "$(realpath "$MINGW_HEADERS")" "$L/include-mingw"
+  echo "MINGW_INCLUDE=$L/include-mingw" >> "$L/config"
+fi
 for t in gcc g++ cc c++ windres ar ranlib nm strip objcopy objdump; do
   ln -sfn "$HERE/gexcc-win" "$PREFIX/bin/x86_64-w64-mingw32-$t"
 done
