@@ -3131,6 +3131,32 @@ fn report_first_end(spawn: &SpawnContext, pid: i32, exit: &Exit) {
     procs.report_end(pid, exit.wait_status());
 }
 
+/// The message an Android program aborts with, if it left one. bionic's
+/// `android_set_abort_message` (every `LOG(FATAL)` and failed `CHECK`
+/// goes through it) puts the text in a mapping it names "abort message",
+/// after two magic numbers and the mapping's size, for the crash dumper to
+/// find. Android's own dumper is another process that reads the dying one
+/// with ptrace, which there is none of here, and the text goes to logd
+/// otherwise, so a daemon that aborts during boot said nothing anyone
+/// could see: vold's abort, which makes init reboot, was one line with no
+/// reason. Said with the crash, as the detail of the signal.
+fn abort_message(state: &mut HostState, data: &[u8]) -> Option<String> {
+    const MAGIC: [u64; 2] = [0xb18e_4088_6ac3_88f0, 0xc6df_ba75_5a1d_e0b5];
+    let at = state.with_kernel(|k| {
+        k.mem.lock().vmas().iter().find(|v| v.anon_name.as_deref() == Some("abort message")).map(|v| (v.start, v.end))
+    })?;
+    let bytes = data.get(at.0 as usize..at.1 as usize)?;
+    let word = |i: usize| bytes.get(i..i + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    if word(0)? != MAGIC[0] || word(8)? != MAGIC[1] {
+        return None;
+    }
+    // The size is the whole record's; the text is what is left of it, to
+    // its NUL, and not more than a screenful.
+    let text = bytes.get(24..(word(16)? as usize).min(bytes.len()))?;
+    let text = &text[..text.iter().position(|b| *b == 0).unwrap_or(text.len()).min(2048)];
+    Some(format!("abort message: {}", String::from_utf8_lossy(text).trim_end()))
+}
+
 /// A crash's one line on the host's console.
 fn crash_line(c: &gex_kernel::proc::Crash) {
     let name = if c.name.is_empty() { String::new() } else { format!(" ({})", c.name) };
@@ -5063,13 +5089,18 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(StopExecution.into())
                 }
                 SyscallOutcome::Killed { signal, core } => {
+                    // What the program said it was aborting for, when it is
+                    // bionic's and said (`abort_message`; 6 is SIGABRT).
+                    let said = (signal as i32 == 6).then(|| abort_message(state, memory.bytes())).flatten();
                     state.exit = Some(Exit::Signal {
                         signal: signal as i32,
                         pc: pc as u64,
-                        detail: format!(
-                            "killed by signal {signal}{}",
-                            if core { " (core dumped)" } else { "" }
-                        ),
+                        detail: said.unwrap_or_else(|| {
+                            format!(
+                                "killed by signal {signal}{}",
+                                if core { " (core dumped)" } else { "" }
+                            )
+                        }),
                         internal: false,
                     });
                     Err(StopExecution.into())
