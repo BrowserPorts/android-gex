@@ -233,7 +233,9 @@ if cxx:
     # pointer the method also returns, the headers' explicit form)
     base = ['-include', here + '/include/gexcc-win-cxx.h', '-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER',
             '-DWIDL_EXPLICIT_AGGREGATE_RETURNS'] + base
-base += ['-isystem', S + '/include/msvcrt', '-idirafter', here + '/include', '-fdeclspec']
+# (__forceinline as MinGW's _mingw.h has it)
+base += ['-isystem', S + '/include/msvcrt', '-idirafter', here + '/include', '-fdeclspec',
+         '-D__forceinline=__inline__ __attribute__((__always_inline__))']
 # compile-only modes
 if any(a in ('-c', '-S', '-E', '-M', '-MM') for a in args) or not any(not a.startswith('-') for a in args):
     if cxx and '-fno-exceptions' not in args:
