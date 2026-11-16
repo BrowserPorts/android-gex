@@ -662,6 +662,14 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// needs it, hence the default.
     fn claim_session(&self, _sid: i32) {}
 
+    /// The session a terminal of the global kernel's is the controlling
+    /// terminal of, 0 for none; `None` for anything that is not one.
+    /// Asked before [`Self::claim_session`]: a terminal a living session
+    /// has is not another's to claim.
+    fn session(&self) -> Option<i32> {
+        None
+    }
+
     /// The pts number of a pseudoterminal's master: what `TIOCGPTPEER`
     /// opens the slave of. The syscall layer opens it, as only it installs
     /// descriptors. `None` for anything else.

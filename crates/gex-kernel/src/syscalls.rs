@@ -3725,8 +3725,11 @@ impl PathIo<'_> {
         // of it.
         if !master && flags & oflags::O_NOCTTY == 0 {
             let leader = self.procs.sid(self.pid, 0) == Ok(self.pid);
-            if leader {
-                use crate::vfs::FileHandle;
+            // (One no living session has: an open does not take a terminal
+            // from its session, `tty_open_proc_set_tty`.)
+            use crate::vfs::FileHandle;
+            let free = handle.session().is_none_or(|held| held == 0 || held == self.pid || !self.procs.alive(held));
+            if leader && free {
                 handle.claim_session(self.pid);
             }
         }
@@ -14102,6 +14105,12 @@ impl FdIo<'_> {
         // `FileHandle::claim_session`.
         if req == TIOCSCTTY {
             let sid = procs.sid(self.pid, 0).unwrap_or(self.pid);
+            // Not one a living session has (`tiocsctty`), unless asked to
+            // take it from that session (`arg`, as for a local terminal
+            // below).
+            if file.handle.session().is_some_and(|held| held != 0 && held != sid && procs.alive(held)) && arg == 0 {
+                return Err(Errno::EPERM);
+            }
             file.handle.claim_session(sid);
         }
         if let Some(r) = file.handle.ioctl(m, req, arg) {
@@ -14312,7 +14321,14 @@ impl FdIo<'_> {
                 // `arg` non-zero is the steal-it-anyway form, which only root
                 // may use -- and here everybody is root often enough that
                 // refusing it would be the surprising answer.
-                if held != 0 && held != sid && arg == 0 {
+                // A session whose leader has ended holds nothing: Linux lets
+                // the terminal go as the leader exits (`disassociate_ctty`).
+                // Android's init gives the console to a shell, and to the
+                // next one when that shell ends; refused, the second shell
+                // was never the terminal's foreground group and asked for
+                // ever to be (a `kill(0, SIGTTIN)` and a `tcgetpgrp`, eighty
+                // thousand times a second).
+                if held != 0 && held != sid && procs.alive(held) && arg == 0 {
                     return Err(Errno::EPERM);
                 }
                 tty.set_sid(sid);

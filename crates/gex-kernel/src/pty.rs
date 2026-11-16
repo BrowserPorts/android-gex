@@ -461,6 +461,10 @@ impl crate::vfs::FileHandle for RemotePty {
         if self.master { Some((self.remote.ptn)(self.id)) } else { None }
     }
 
+    fn session(&self) -> Option<i32> {
+        Some((self.remote.sid)(self.id))
+    }
+
     fn claim_session(&self, sid: i32) {
         // What `TIOCSCTTY` means for a pty that lives in the global kernel.
         //
