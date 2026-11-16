@@ -17,6 +17,11 @@
  *                      memory gex's own memory for the thread (its
  *                      provider stack) has no room; says "outgrow thread
  *                      ran" from the thread
+ *   outgrow retry      says "outgrow retrying", then asks for the 3.5 GiB
+ *                      (committed) again and again, as an allocator that
+ *                      cannot go on without it does (OpenBLAS's buffers);
+ *                      gex ends it at the second ask. Says "outgrow retry
+ *                      gave up" and exits 0 if it was never ended
  *   outgrow twice M    runs `outgrow M` twice, one after the other
  *                      (CreateProcess each), and says how each ended
  *   outgrow each M X.. the same for each program X (a copy of this one),
@@ -95,6 +100,20 @@ int main(int argc, char **argv) {
             return 3;
         }
         WaitForSingleObject(h, INFINITE);
+        return 0;
+    }
+    if (!strcmp(mode, "retry")) {
+        int i;
+
+        printf("outgrow retrying\n");
+        fflush(stdout);
+        for (i = 0; i < 100000; i++) {
+            if ((p = VirtualAlloc(NULL, BIG, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))) {
+                printf("outgrow big %s\n", (ULONG_PTR)p >= ((ULONG_PTR)1 << 32) ? "high" : "low");
+                return 0;
+            }
+        }
+        printf("outgrow retry gave up\n");
         return 0;
     }
     p = VirtualAlloc(NULL, BIG, MEM_RESERVE, PAGE_NOACCESS);

@@ -1041,8 +1041,11 @@ pub fn outgrow_module(pid: i32, file: &str, m64: bool) {
         return;
     }
     if let Some(o) = OUTGROW.lock().iter_mut().find(|o| o.pid == pid) {
-        if file.rsplit('/').next() == Some("winepe.wasm") {
-            o.core_m64.get_or_insert(m64);
+        // (a WoW64 process loads a second Wine core, its 32-bit side's,
+        // which an install's memory64 twin has no build of either: that
+        // core is then the module that cannot move)
+        if file.rsplit('/').next() == Some("winepe.wasm") && o.core_m64.is_none() {
+            o.core_m64 = Some(m64);
         } else if !m64 {
             o.no64.get_or_insert_with(|| file.to_string());
         }
