@@ -2,6 +2,7 @@
  * compatibility headers: Wine's include tree has no WRL) */
 #pragma once
 #include <windows.h>
+#include <intsafe.h>
 #include <winstring.h>
 #include <roapi.h>
 #include <cwchar>
