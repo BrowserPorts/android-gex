@@ -229,6 +229,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     if (dll) await one('exitshape', join(F, 'exitshape.c'), ['-O2', `-I${F}`], { extra: [dll, `${dll}.wasm`], want: /exitshape: shapes agree\nexitshape ok/ });
   }
   await one('fontset', join(F, 'fontset.c'), ['-O1', '-ldwrite'], { want: /fontset: system bold 700 regular 400\nfontset: in memory 400\nfontset ok/ });
+  await one('glyphs', join(F, 'glyphs.c'), ['-O1', '-ldwrite'], { want: /glyphs: system [1-9]\d* heap [1-9]\d* static [1-9]\d*\nglyphs ok/ });
   if (want('missimp')) {
     // an import no DLL exports: a stub, listed at the link; the program
     // runs, and a call of it ends the process as Wine's stubs do
@@ -356,10 +357,11 @@ export async function guestNative(t, w, o = {}, pre = '', only = null, { thunks 
     return t.check(`${pre}convdll: build`, false, String(e.message));
   }
   // (the class adapters' directory is a data export of the module; entry
-  // thunks' pairs are another)
+  // thunks' pairs are another. With thunks, the C runtime linked in, built
+  // with class adapters, still brings a directory: a bound thunk wins.)
   const mod = readFileSync(`${dll}.wasm`);
   const has = (n) => mod.includes(Buffer.from(n));
-  t.check(`${pre}convdll: ${thunks ? 'entry thunks, no class adapters' : 'class adapters, no entry thunks'}`, thunks ? has('__gexe.') && !has('__gexw_adapters') : has('__gexw_adapters') && !has('__gexe.'), `adapters ${has('__gexw_adapters')}, thunks ${has('__gexe.')}`);
+  t.check(`${pre}convdll: ${thunks ? 'entry thunks' : 'class adapters, no entry thunks'}`, thunks ? has('__gexe.') : has('__gexw_adapters') && !has('__gexe.'), `adapters ${has('__gexw_adapters')}, thunks ${has('__gexe.')}`);
   const src = { convmatrix: 'convmain' };
   for (const n of progs) {
     let exe;
