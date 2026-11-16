@@ -3700,6 +3700,7 @@ impl PathIo<'_> {
                     fds: self.map.fds,
                     ns: self.ns,
                     capable: self.creds.capable(CAP_BPF) || self.creds.capable(CAP_SYS_ADMIN),
+                    admin: self.creds.capable(CAP_SYS_ADMIN),
                     uid: self.creds.uid(),
                     gid: self.creds.gid(),
                     umask: self.fs.umask(),
@@ -8910,12 +8911,13 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
 }
 
 /// The release gex says it is (`uname -r`, `/proc/sys/kernel/osrelease`,
-/// `/proc/version`): the Android common kernel line its Android work
-/// follows, android17-6.18. Android 17 refuses less than 6.1.57 (its
-/// network BPF loader stops the boot, "Android V+ requires 6.1 kernel to
-/// be 6.1.57+"), and what this kernel does is written after 6.18's
-/// behaviour, and checked against Linux 7.0's.
-pub const KERNEL_RELEASE: &str = "6.18.0-gex";
+/// `/proc/version`): the Android common kernel its Android work follows,
+/// android17-6.18 at 6.18.33, which is what the reference checkout holds.
+/// Android 17's network BPF loader holds a kernel to a least sublevel of
+/// its line ("Android V+ requires 6.18 kernel to be 6.18.9+"), and what
+/// this kernel does is written after that source and checked against
+/// Linux 7.0.
+pub const KERNEL_RELEASE: &str = "6.18.33-gex";
 
 /// `uname`: the kernel gex says it is.
 fn uname(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
