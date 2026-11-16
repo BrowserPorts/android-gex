@@ -4738,7 +4738,11 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // table is still shorter than N — a hard trap, not a recoverable
             // miss. Catching up here closes that window; dpkg's decompressor
             // hit it with two threads a moment apart.
-            catch_up_in_caller(&mut caller)?;
+            // (Left to the miss and the trap, which do recover, when a
+            // thread is to take code only as it needs it: `lazy_catch_up`.)
+            if !lazy_catch_up() {
+                catch_up_in_caller(&mut caller)?;
+            }
             let memory = caller
                 .data()
                 .memory
@@ -5782,7 +5786,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             profile::poll(&mut caller)?;
             // Same reason as the syscall hook: a loop that never calls the
             // kernel still reaches a back-edge, and this is where it does.
-            catch_up_in_caller(&mut caller)?;
+            if !lazy_catch_up() {
+                catch_up_in_caller(&mut caller)?;
+            }
             let memory = caller
                 .data()
                 .memory
@@ -6243,6 +6249,26 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
         (units.first(), units.last())
     );
     bail!("{pc:#x} keeps missing dispatch after translation (retranslation livelock)")
+}
+
+/// `GEX_LAZY_CATCH_UP=1`: a thread takes what other threads have translated
+/// only when it needs some of it, not at every system call and safepoint.
+///
+/// Every thread has its own instance of every translated module and its
+/// own tables (a table cannot be shared between stores), so catching up is
+/// what a thread's memory is made of: 60 MiB in Android's apexd, whose
+/// sixty threads all caught up with whatever any one of them translated,
+/// the ones asleep in a retry loop as much as the one doing the work, until
+/// the host had no memory left. A thread that runs only code it already
+/// has needs none of it. It finds out that it needs more by a miss (a slot
+/// of its table that holds nothing yet: the miss handler replays first) or
+/// by the trap of a slot past its table's end (the run loop and a call-out
+/// replay and take the transfer again; both write the target into the
+/// context first, so nothing is lost). Off unless asked: the eager way is
+/// the one every other program has been run with.
+fn lazy_catch_up() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_LAZY_CATCH_UP").is_some_and(|v| v != "0"))
 }
 
 /// Replay anything this store has not seen, cheaply enough to call often: the
