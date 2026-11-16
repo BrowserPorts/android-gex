@@ -218,7 +218,7 @@ cxx = tool in ('g++', 'c++', 'clang++')
 if args[:1] == ['-dumpmachine']:
     print('x86_64-w64-mingw32'); sys.exit(0)
 cc = os.path.join(W, 'wcc64++' if cxx else 'wcc64')
-base = ['-D_WIN32', '-D_UCRT', '-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL', '-D__stdcall=', '-D__cdecl=', '-D__fastcall=', '-D__thiscall=', '-D__vectorcall=', '-D__MINGW32__', '-D__MINGW64__', '-Wno-ignored-attributes', '-Wno-unknown-attributes', '-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__', '-fPIC', '-Wno-unused-command-line-argument',
+base = ['-D_WIN32', '-D_UCRT', '-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL', '-D__stdcall=', '-D__cdecl=', '-D__fastcall=', '-D__thiscall=', '-D__vectorcall=', '-D_stdcall=', '-D_cdecl=', '-D_fastcall=', '-D_thiscall=', '-D__MINGW32__', '-D__MINGW64__', '-Wno-ignored-attributes', '-Wno-unknown-attributes', '-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__', '-fPIC', '-Wno-unused-command-line-argument',
         # (long is 32-bit here, but what the backend lowers these builtins to
         # returns the target's 64-bit long)
         '-fno-builtin-lround', '-fno-builtin-lroundf', '-fno-builtin-lroundl', '-fno-builtin-lrint',
