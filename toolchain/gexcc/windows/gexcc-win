@@ -280,7 +280,10 @@ if cxx:
     # pointer the method also returns, the headers' explicit form)
     # (with mingw-w64's headers only math.h: libc++'s lround and lrint call the
     # C runtime's, the -D__builtin_lround=lround below and the rest)
-    base = ['-include', 'math.h' if conf.get('MINGW_INCLUDE') else here + '/include/gexcc-win-cxx.h', '-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER',
+    # (not when only preprocessing: what a program preprocesses, such as
+    # JavaScript sources, would carry the header's lines)
+    pre = '-E' in args
+    base = ([] if pre else ['-include', 'math.h' if conf.get('MINGW_INCLUDE') else here + '/include/gexcc-win-cxx.h']) + ['-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER',
             '-DWIDL_EXPLICIT_AGGREGATE_RETURNS'] + base
 # (__forceinline as MinGW's _mingw.h has it)
 base += [*crt_dirs, '-idirafter', here + '/include', '-fdeclspec',
