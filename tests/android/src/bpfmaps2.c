@@ -58,6 +58,19 @@ static const char expected[] =
     "hash mmapable: -22\n"
     "array no prealloc: -22\n"
     "hash read-only for programs: 0\n"
+    "devmap value 6: -22\n"
+    "devmap read-only for programs asked: -22\n"
+    "devmap: 0\n"
+    "devmap flags: 0x80\n"
+    "devmap lo: 0\n"
+    "devmap ifindex 999: -22\n"
+    "devmap ifindex 0: -22\n"
+    "devmap EXIST of a missing key: 0\n"
+    "devmap NOEXIST of a key there: -17\n"
+    "devmap a third: -7\n"
+    "devmap lookup: 0 1\n"
+    "devmap delete: 0\n"
+    "devmap delete again: -2\n"
 ;
 
 static char out_buf[8192];
@@ -202,6 +215,31 @@ int main(void) {
     SAY("hash mmapable: %ld\n", MADE(make(BPF_MAP_TYPE_HASH, 4, 8, 2, BPF_F_MMAPABLE)));
     SAY("array no prealloc: %ld\n", MADE(make(BPF_MAP_TYPE_ARRAY, 4, 8, 2, BPF_F_NO_PREALLOC)));
     SAY("hash read-only for programs: %ld\n", MADE(make(BPF_MAP_TYPE_HASH, 4, 8, 2, BPF_F_RDONLY_PROG)));
+
+    // A devmap hash: interfaces by key.
+    SAY("devmap value 6: %ld\n", MADE(make(BPF_MAP_TYPE_DEVMAP_HASH, 4, 6, 2, 0)));
+    SAY("devmap read-only for programs asked: %ld\n", MADE(make(BPF_MAP_TYPE_DEVMAP_HASH, 4, 4, 2, BPF_F_RDONLY_PROG)));
+    long dm = make(BPF_MAP_TYPE_DEVMAP_HASH, 4, 4, 2, 0);
+    SAY("devmap: %ld\n", MADE(dm));
+    struct bpf_map_info mi;
+    memset(&mi, 0, sizeof mi);
+    union bpf_attr ia;
+    memset(&ia, 0, sizeof ia);
+    ia.info.bpf_fd = dm;
+    ia.info.info_len = sizeof mi;
+    ia.info.info = (uintptr_t)&mi;
+    sys_bpf(BPF_OBJ_GET_INFO_BY_FD, &ia, sizeof ia);
+    SAY("devmap flags: %#x\n", mi.map_flags);
+    uint32_t lo = 1, none = 999, zero = 0, got32 = 0;
+    SAY("devmap lo: %ld\n", elem(BPF_MAP_UPDATE_ELEM, dm, &k1, &lo, BPF_ANY));
+    SAY("devmap ifindex 999: %ld\n", elem(BPF_MAP_UPDATE_ELEM, dm, &k2, &none, BPF_ANY));
+    SAY("devmap ifindex 0: %ld\n", elem(BPF_MAP_UPDATE_ELEM, dm, &k2, &zero, BPF_ANY));
+    SAY("devmap EXIST of a missing key: %ld\n", elem(BPF_MAP_UPDATE_ELEM, dm, &k2, &lo, BPF_EXIST));
+    SAY("devmap NOEXIST of a key there: %ld\n", elem(BPF_MAP_UPDATE_ELEM, dm, &k1, &lo, BPF_NOEXIST));
+    SAY("devmap a third: %ld\n", elem(BPF_MAP_UPDATE_ELEM, dm, &k3, &lo, BPF_ANY));
+    SAY("devmap lookup: %ld %u\n", elem(BPF_MAP_LOOKUP_ELEM, dm, &k1, &got32, 0), got32);
+    SAY("devmap delete: %ld\n", elem(BPF_MAP_DELETE_ELEM, dm, &k1, NULL, 0));
+    SAY("devmap delete again: %ld\n", elem(BPF_MAP_DELETE_ELEM, dm, &k1, NULL, 0));
 
     if (expected[0] && strcmp(out_buf, expected) != 0) {
         printf("bpfmaps2: not what Linux shows\n");

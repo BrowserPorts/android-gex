@@ -42,6 +42,7 @@ pub mod map_type {
     pub const PERCPU_ARRAY: u32 = 6;
     pub const LRU_HASH: u32 = 9;
     pub const LPM_TRIE: u32 = 11;
+    pub const DEVMAP_HASH: u32 = 25;
 }
 
 /// Map creation flags (`BPF_F_*`).
@@ -251,11 +252,22 @@ impl Map {
                 }
                 Data::Lpm(Vec::new())
             }
+            map_type::DEVMAP_HASH => {
+                // `dev_map_alloc_check`: a key of four bytes, a value of an
+                // ifindex or an ifindex and a program.
+                if key_size != 4 || !matches!(value_size, 4 | 8) || flags & !(NUMA_NODE | RDONLY | WRONLY) != 0 || max_entries > 1 << 31 {
+                    return Err(Errno::EINVAL);
+                }
+                Data::Hash(Hash::default())
+            }
             other => {
                 unsupported_type(other);
                 return Err(Errno::EINVAL);
             }
         };
+        // A devmap's lookup gives programs the ifindex itself, so they may
+        // not write it (`dev_map_init_map`).
+        let flags = if ty == map_type::DEVMAP_HASH { flags | RDONLY_PROG } else { flags };
         Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(data) })
     }
 
@@ -368,6 +380,34 @@ impl Map {
                         Ok(())
                     }
                 }
+            }
+            Data::Hash(h) if self.ty == map_type::DEVMAP_HASH => {
+                // `__dev_map_hash_update_elem`: an interface there is (the
+                // program, if any, the caller has made its id).
+                let ifindex = u32::from_le_bytes(value[..4].try_into().unwrap());
+                if flags > EXIST || ifindex == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let there = h.at.get(key).copied();
+                if there.is_some() && flags == NOEXIST {
+                    return Err(Errno::EEXIST);
+                }
+                if !crate::netlink::iface_exists(ifindex) {
+                    return Err(Errno::EINVAL);
+                }
+                match there {
+                    Some(o) => h.order.get_mut(&o).unwrap().1 = value.to_vec(),
+                    None => {
+                        if h.order.len() as u32 >= max {
+                            return Err(Errno::E2BIG);
+                        }
+                        let o = h.next;
+                        h.next += 1;
+                        h.order.insert(o, (key.to_vec(), value.to_vec()));
+                        h.at.insert(key.to_vec(), o);
+                    }
+                }
+                Ok(())
             }
             Data::Hash(h) => {
                 let lru = self.ty == map_type::LRU_HASH;
@@ -685,7 +725,21 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
                     if !w {
                         return Err(Errno::EPERM);
                     }
-                    let value = m.read(u64_at(16), map.user_value_size())?.to_vec();
+                    let mut value = m.read(u64_at(16), map.user_value_size())?.to_vec();
+                    // A devmap's program, by its descriptor: an XDP program
+                    // for a devmap, kept by its id (`__dev_map_alloc_node`).
+                    if map.ty == map_type::DEVMAP_HASH && value.len() == 8 {
+                        let fd = i32::from_le_bytes(value[4..8].try_into().unwrap());
+                        let id = if fd > 0 {
+                            match c.fds.get(fd).ok().and_then(|f| f.handle.bpf_object()) {
+                                Some(Object::Prog(p)) if p.ty == crate::bpfprog::prog_type::XDP && p.expected_attach == crate::bpfprog::attach::XDP_DEVMAP => p.id,
+                                _ => return Err(Errno::EINVAL),
+                            }
+                        } else {
+                            0
+                        };
+                        value[4..8].copy_from_slice(&id.to_le_bytes());
+                    }
                     map.update(key.as_deref().unwrap(), &value, u64_at(24))?;
                 }
                 cmd::MAP_DELETE_ELEM => {

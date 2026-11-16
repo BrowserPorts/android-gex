@@ -105,6 +105,12 @@ pub fn local_for(peer: u32) -> u32 {
     }
 }
 
+/// Whether there is a network interface of index `index`
+/// (`dev_get_by_index`).
+pub fn iface_exists(index: u32) -> bool {
+    IFACES.iter().any(|i| i.index == index)
+}
+
 const IFACES: [Iface; 2] = [
     Iface {
         index: 1,

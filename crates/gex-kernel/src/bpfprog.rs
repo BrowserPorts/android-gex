@@ -65,6 +65,7 @@ pub mod attach {
     pub const INET6_GETPEERNAME: u32 = 30;
     pub const INET4_GETSOCKNAME: u32 = 31;
     pub const INET6_GETSOCKNAME: u32 = 32;
+    pub const XDP_DEVMAP: u32 = 33;
     pub const INET_SOCK_RELEASE: u32 = 34;
     pub const SK_LOOKUP: u32 = 36;
     pub const SK_REUSEPORT_SELECT: u32 = 39;
