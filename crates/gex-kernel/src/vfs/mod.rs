@@ -1208,6 +1208,21 @@ fn within(abs: &str, at: &str) -> bool {
     abs.starts_with(at) && matches!(abs.as_bytes().get(at.len()), None | Some(b'/'))
 }
 
+/// The place `rest` ("" or "/a/b") below `root` ("" or "/x") in a
+/// filesystem: "/x/a/b".
+fn place(root: &str, rest: &str) -> String {
+    format!("{root}{rest}")
+}
+
+/// What is left of the place `loc` below `root` ("" for `root` itself, else
+/// "/a/b"), if it is there.
+fn below<'a>(loc: &'a str, root: &str) -> Option<&'a str> {
+    if root.is_empty() {
+        return Some(loc);
+    }
+    within(loc, root).then(|| &loc[root.len()..])
+}
+
 /// A process's mount table and working directory, and its published
 /// [`Namespace`]: what a caller without the kernel lock reads
 /// ([`Vfs::view`]). Every lookup is the
@@ -1276,6 +1291,13 @@ pub enum Propagation {
 #[derive(Clone)]
 struct Mounted {
     fs: Arc<dyn FileSystem>,
+    /// The filesystem it shows a part of, and which part: `fs` itself and
+    /// "" for a filesystem mounted whole, the source's filesystem and the
+    /// directory in it for a bind mount (whose `fs` is that directory).
+    /// Peers show the same filesystem; where in it a mount is made says
+    /// where in each peer it goes (Linux's propagation is by dentry).
+    origin: Arc<dyn FileSystem>,
+    root: String,
     /// The peer group it is in, if it is shared: the mounts in the other
     /// namespaces that are this mount there.
     group: Option<u64>,
@@ -1336,51 +1358,89 @@ impl MountNs {
         self.changes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// The mount a mount at `at` would be made on: the one at `at` itself,
+    /// which it covers, else the one `at` is in. With where it is, and
+    /// where `at` is in the filesystem that mount shows.
+    fn covering<'a>(table: &'a BTreeMap<String, Mounted>, at: &str) -> Option<(&'a String, &'a Mounted, String)> {
+        let (k, m) = table.get_key_value(at).or_else(|| Self::parent(table, at))?;
+        Some((k, m, place(&m.root, &at[if k == "/" { 0 } else { k.len() }..])))
+    }
+
+    /// Where the place `loc` of `origin` is in each namespace whose mount
+    /// shows it and is in `group` (or, for `slaves`, takes from it): the
+    /// namespace, the path there, and whether that mount is a slave.
+    fn receivers(origin: &Arc<dyn FileSystem>, loc: &str, group: u64) -> Vec<(Arc<MountNs>, String, bool)> {
+        let mut out = Vec::new();
+        for ns in Self::all() {
+            let table = ns.lock();
+            for (k, m) in table.iter() {
+                let slave = m.master == Some(group);
+                if !(m.group == Some(group) || slave) || !Arc::ptr_eq(&m.origin, origin) {
+                    continue;
+                }
+                // A peer that shows only a part of the filesystem has what
+                // is made in that part.
+                let Some(rest) = below(loc, &m.root) else { continue };
+                let path = if rest.is_empty() { k.clone() } else if k == "/" { rest.to_string() } else { format!("{k}{rest}") };
+                out.push((Arc::clone(&ns), path, slave));
+            }
+        }
+        out
+    }
+
     /// Mount `fs` at `at`, replacing what was mounted there (or, with
-    /// `unless_there`, leaving it: whether it mounted). Under a shared
-    /// mount it is mounted in every namespace that has that mount, as a
-    /// peer or as a slave, and is shared itself there.
-    fn mount(self: &Arc<Self>, at: String, fs: Arc<dyn FileSystem>, unless_there: bool) -> bool {
-        // Where it spreads is this namespace's to say: by the mount it is
-        // made under here.
+    /// `unless_there`, leaving it: whether it mounted). `origin` and
+    /// `root` are what it shows (`fs` and "" for a filesystem mounted
+    /// whole); `join`, the peer group of a bind mount's shared source,
+    /// which the bind mount is in as well.
+    ///
+    /// A mount is made on the mount it covers, if there is one at `at`,
+    /// else on the one `at` is in; when that one is shared it is made in
+    /// each of its peers too, where the same place of the same filesystem
+    /// is (a bind mount's peers are elsewhere than it), and in their slaves
+    /// as a slave. What is made under a shared mount is shared, in a group
+    /// of its own with its copies (`attach_recursive_mnt`).
+    fn mount(self: &Arc<Self>, at: String, fs: Arc<dyn FileSystem>, origin: Arc<dyn FileSystem>, root: String, join: Option<u64>, unless_there: bool) -> bool {
         let spread = {
             let mut table = self.lock();
             if unless_there && table.contains_key(&at) {
                 return false;
             }
-            match Self::parent(&table, &at).map(|(k, m)| (k.clone(), m.group)) {
-                Some((parent, Some(group))) => (parent, group),
+            match Self::covering(&table, &at).map(|(_, m, loc)| (m.group, Arc::clone(&m.origin), loc)) {
+                Some((Some(group), cover, loc)) => (group, cover, loc),
                 _ => {
-                    table.insert(at, Mounted { fs, group: None, master: None });
+                    table.insert(at, Mounted { fs, origin, root, group: join, master: None });
                     self.count();
                     return true;
                 }
             }
         };
-        let (parent, group) = spread;
-        let new = next_group();
-        for ns in Self::all() {
-            let mut table = ns.lock();
-            let mounted = match Self::parent(&table, &at) {
-                Some((k, m)) if *k == parent && m.group == Some(group) => Mounted { fs: Arc::clone(&fs), group: Some(new), master: None },
-                Some((k, m)) if *k == parent && m.master == Some(group) => Mounted { fs: Arc::clone(&fs), group: None, master: Some(new) },
-                _ => continue,
+        let (group, cover, loc) = spread;
+        let new = join.unwrap_or_else(next_group);
+        for (ns, path, slave) in Self::receivers(&cover, &loc, group) {
+            let m = Mounted {
+                fs: Arc::clone(&fs),
+                origin: Arc::clone(&origin),
+                root: root.clone(),
+                group: if slave { None } else { Some(new) },
+                master: if slave { Some(new) } else { None },
             };
-            table.insert(at.clone(), mounted);
+            ns.lock().insert(path, m);
             ns.count();
         }
         true
     }
 
     /// Remove the mount at exactly `at`: whether there was one. Under a
-    /// shared mount it goes from every namespace that has that mount and
-    /// this one under it.
+    /// shared mount it goes from each peer of that mount, and each slave,
+    /// where the same mount was made.
     fn unmount(self: &Arc<Self>, at: &str) -> bool {
-        let (parent, group, gone) = {
+        let (group, cover, loc, gone) = {
             let mut table = self.lock();
             let Some(gone) = table.get(at).cloned() else { return false };
-            match Self::parent(&table, at).map(|(k, m)| (k.clone(), m.group)) {
-                Some((parent, Some(group))) => (parent, group, gone),
+            let parent = Self::parent(&table, at).map(|(k, m)| (m.group, Arc::clone(&m.origin), place(&m.root, &at[if k == "/" { 0 } else { k.len() }..])));
+            match parent {
+                Some((Some(group), cover, loc)) => (group, cover, loc, gone),
                 _ => {
                     table.remove(at);
                     self.count();
@@ -1388,15 +1448,20 @@ impl MountNs {
                 }
             }
         };
-        for ns in Self::all() {
+        let mut done = false;
+        for (ns, path, _) in Self::receivers(&cover, &loc, group) {
             let mut table = ns.lock();
-            let under = matches!(Self::parent(&table, at), Some((k, m)) if *k == parent && (m.group == Some(group) || m.master == Some(group)));
             // The same mount there: the filesystem that spread with it.
-            let same = table.get(at).is_some_and(|m| Arc::ptr_eq(&m.fs, &gone.fs));
-            if same && (under || Arc::ptr_eq(&ns, self)) {
-                table.remove(at);
+            if table.get(&path).is_some_and(|m| Arc::ptr_eq(&m.fs, &gone.fs)) {
+                table.remove(&path);
+                done |= Arc::ptr_eq(&ns, self) && path == at;
+                drop(table);
                 ns.count();
             }
+        }
+        if !done {
+            self.lock().remove(at);
+            self.count();
         }
         true
     }
@@ -1638,7 +1703,7 @@ impl VfsView {
     /// for every process in it, and wherever it spreads to.
     pub fn mount(&self, at: &str, fs: Arc<dyn FileSystem>) {
         let at = self.outer(at);
-        self.mount_ns().mount(at, fs, false);
+        self.mount_ns().mount(at, Arc::clone(&fs), fs, String::new(), None, false);
         self.sync();
     }
 
@@ -1684,27 +1749,40 @@ impl VfsView {
 
     /// A bind mount: what is at `source` (absolute) is at `target` too,
     /// and with `recursive` so is each thing mounted under it, where it
-    /// is from the source. The same files, not copies. (It spreads as any
-    /// mount made at the target does: Linux has it join the source's
-    /// peers when the source is shared, which is not kept.)
+    /// is from the source. The same files, not copies. A bind of a shared
+    /// mount is that mount's peer (and each copy under it its source's),
+    /// and the bind spreads as any mount made at the target does.
     pub fn bind(&self, source: &str, target: &str, recursive: bool) -> Result<(), Errno> {
         let cur = self.get();
         let source = normalize(source, &cur.cwd);
         let (fs, rel) = cur.mount_of(source.clone())?;
         let root: Arc<dyn FileSystem> = if rel.is_empty() { Arc::clone(fs) } else { Arc::new(subtree::Subtree::new(Arc::clone(fs), &rel)) };
+        let target = normalize(target, &cur.cwd);
+        let ns = self.mount_ns();
+        // The source's mount as the namespace has it (a process's own
+        // mount, its /proc, is not there: bound as a filesystem of no
+        // group).
+        let outer = self.outer(&source);
+        let table = ns.lock().clone();
+        let from = MountNs::covering(&table, &outer).filter(|(_, m, _)| Arc::ptr_eq(&m.fs, fs) || Arc::ptr_eq(&m.origin, fs));
+        let (origin, place_of, join) = match &from {
+            Some((_, m, loc)) => (Arc::clone(&m.origin), loc.clone(), m.group),
+            None => (Arc::clone(&root), String::new(), None),
+        };
         // What is mounted under the source now: looked up before anything
         // is mounted, since the target may be under the source itself.
-        let under: Vec<(String, Arc<dyn FileSystem>)> = if recursive {
-            let inside = |at: &str| at != source && (source == "/" || within(at, &source));
-            cur.mounts.iter().filter(|(at, _)| inside(at)).map(|(at, fs)| (if source == "/" { at.clone() } else { at[source.len()..].to_string() }, Arc::clone(fs))).collect()
+        let under: Vec<(String, Mounted)> = if recursive {
+            let inside = |at: &str| at != outer && (outer == "/" || within(at, &outer));
+            table.iter().filter(|(at, _)| inside(at)).map(|(at, m)| (if outer == "/" { at.clone() } else { at[outer.len()..].to_string() }, m.clone())).collect()
         } else {
             Vec::new()
         };
-        let target = normalize(target, &cur.cwd);
-        self.mount(&target, root);
-        for (rest, fs) in under {
-            self.mount(&format!("{}{rest}", target.trim_end_matches('/')), fs);
+        let target = self.outer(&target);
+        ns.mount(target.clone(), root, origin, place_of, join, false);
+        for (rest, m) in under {
+            ns.mount(format!("{}{rest}", target.trim_end_matches('/')), m.fs, m.origin, m.root, m.group, false);
         }
+        self.sync();
         Ok(())
     }
 
@@ -1715,7 +1793,8 @@ impl VfsView {
         if self.own().contains_key(&at) || self.mount_ns().lock().contains_key(&at) {
             return false;
         }
-        let mounted = self.mount_ns().mount(at, fs(), true);
+        let fs = fs();
+        let mounted = self.mount_ns().mount(at, Arc::clone(&fs), fs, String::new(), None, true);
         self.sync();
         mounted
     }
