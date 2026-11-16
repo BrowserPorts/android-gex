@@ -13,9 +13,10 @@
 // - the socket's file is a socket, and takes an owner (lchown) and a
 //   mode (fchmodat with AT_SYMLINK_NOFOLLOW);
 // - SO_PASSCRED set before the bind is still set after it;
-// - the program run with the descriptor open (this one, again) finds it
-//   open (F_GETFD), of the kind it was made (SO_TYPE), and bound where
-//   it was.
+// - the socket is made to close at an exec (SOCK_CLOEXEC) and init's
+//   child takes that off (F_SETFD) before it runs the service; the
+//   program run (this one, again) finds the descriptor open (F_GETFD),
+//   of the kind it was made (SO_TYPE), and bound where it was.
 // A datagram sent to the datagram socket is read with who sent it
 // (SCM_CREDENTIALS: the sender's process, user and group).
 // A stream and a seqpacket socket are listening when init says so
@@ -110,7 +111,8 @@ int main(int argc, char **argv) {
         int type = types[i], listening = type != SOCK_DGRAM;
         struct sockaddr_un addr = {.sun_family = AF_UNIX};
         snprintf(addr.sun_path, sizeof addr.sun_path, "%s/sock%d", dir, i);
-        int fd = socket(PF_UNIX, type, 0);
+        // Closed at an exec unless said otherwise, as init makes it.
+        int fd = socket(PF_UNIX, type | SOCK_CLOEXEC, 0);
         int on = 1;
         if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &on, sizeof on)) die("socket", type, errno);
         if (bind(fd, (struct sockaddr *)&addr, sizeof addr)) die("bind", type, errno);
@@ -127,6 +129,9 @@ int main(int argc, char **argv) {
             snprintf(a, sizeof a, "%d", fd);
             snprintf(b, sizeof b, "%d", type);
             if (listening) setenv("CTLSOCK_LISTENING", "1", 1);
+            // init's child says otherwise just before it runs the service.
+            int flags = fcntl(fd, F_GETFD);
+            if (!(flags & FD_CLOEXEC) || fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC)) _exit(125);
             execl("/proc/self/exe", argv[0], "service", a, b, addr.sun_path, (char *)NULL);
             _exit(126);
         }
