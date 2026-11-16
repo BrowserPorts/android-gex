@@ -133,6 +133,38 @@ def compile_wmain(cmd, obj):
     return r
 
 
+def compile_coff_asm(cc, args, src):
+    """-c of one assembly file SRC written for a COFF assembler: preprocessed
+    (with the dependency flags, which belong to this step), rewritten by
+    coffasm.py, then assembled."""
+    tmp = tempfile.mkdtemp()
+    try:
+        pre, fixed = os.path.join(tmp, 'pre.s'), os.path.join(tmp, 'coff.s')
+        if src.endswith('.S'):
+            a, i = [], 0
+            while i < len(args):
+                if args[i] == '-c': i += 1; continue
+                if args[i] == '-o': a += ['-o', pre]; i += 2; continue
+                a.append(args[i]); i += 1
+            # (the dependency file's target: the object, not this step's output)
+            if '-o' in args and not any(x.startswith(('-MT', '-MQ')) for x in args):
+                a += ['-MT', args[args.index('-o') + 1]]
+            r = subprocess.call(cc + ['-E', '-x', 'assembler-with-cpp'] + a)
+            if r: return r
+        else:
+            shutil.copy(src, pre)
+        subprocess.check_call([sys.executable, os.path.join(here, 'coffasm.py'), pre, fixed])
+        a, i = [], 0
+        while i < len(args):
+            x = args[i]
+            if x in ('-MF', '-MT', '-MQ'): i += 2; continue
+            if x in ('-MD', '-MMD', '-MP') or x.startswith(('-MF', '-MT', '-MQ', '-Wp,-M')): i += 1; continue
+            a.append(fixed if x == src else x); i += 1
+        return subprocess.call(cc + a)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def expand_rsp(args):
     """@FILE arguments (a response file, one or more arguments a line,
     shell-quoted) replaced by their contents, as gcc and clang read them;
@@ -238,11 +270,19 @@ base += ['-isystem', S + '/include/msvcrt', '-idirafter', here + '/include', '-f
          '-D__forceinline=__inline__ __attribute__((__always_inline__))',
          # (dllexport and dllimport as the GexLLP64 plugin's attributes: default
          # visibility, what the wasm target exports and imports by)
-         '-Ddllexport=__gexw_dllexport', '-Ddllimport=__gexw_dllimport']
+         '-Ddllexport=__gexw_dllexport', '-Ddllimport=__gexw_dllimport',
+         # (wasm code has no return address to read; the wasm back end refuses
+         # the builtin outside Emscripten)
+         '-D__builtin_return_address(level)=((void *)0)']
 # compile-only modes
 if any(a in ('-c', '-S', '-E', '-M', '-MM') for a in args) or not any(not a.startswith('-') for a in args):
     if cxx and '-fno-exceptions' not in args:
         base += ['-fexceptions', '-fwasm-exceptions']
+    # assembly written for MinGW's COFF assembler (coffasm.py), preprocessed
+    # first when it is .S
+    asms = [a for a in args if a.endswith(('.S', '.s')) and not a.startswith('-')]
+    if '-c' in args and len(asms) == 1:
+        sys.exit(compile_coff_asm([cc] + base, args, asms[0]))
     # -c: wmain's type is checked once the object is made (compile_wmain)
     srcs = [a for a in args if a.endswith(('.c', '.cc', '.cpp', '.cxx')) and not a.startswith('-')]
     if '-c' not in args or not srcs or any(a in ('-E', '-S', '-M', '-MM') for a in args):
