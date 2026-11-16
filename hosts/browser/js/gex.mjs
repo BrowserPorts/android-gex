@@ -19,6 +19,7 @@ import { xcEnter, xcLeave, xcRead, xcSleep, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
 import { logNamed, logOn, logRoutine } from "./log.mjs";
 import { frameOf } from './dgram-frames.mjs';
+import { noteFetch } from './fetch-note.mjs';
 
 /** The longest an exec waits for the other memory flavour's runtime. */
 const OTHER_WAIT_MS = 300_000;
@@ -2264,12 +2265,18 @@ export class Gex {
           const was = Atomics.load(g, 0);
           if (was === 0 || (was < 0 && Atomics.compareExchange(g, 0, was, 0) === was)) globalThis.GEX_ASK_OTHER();
           // A slow link's few MB, but never for ever.
-          for (const until = perf.now() + OTHER_WAIT_MS; perf.now() < until;) {
-            const s = Atomics.load(g, 0);
-            if (s === 1 || s < 0) return s;
-            Atomics.wait(g, 0, s, 1000);
+          let done = null;
+          try {
+            for (const until = perf.now() + OTHER_WAIT_MS; perf.now() < until;) {
+              const s = Atomics.load(g, 0);
+              if (s === 1 || s < 0) return s;
+              done ??= noteFetch('the other memory flavour\'s runtime');
+              Atomics.wait(g, 0, s, 1000);
+            }
+            return -110; // ETIMEDOUT
+          } finally {
+            done?.();
           }
-          return -110; // ETIMEDOUT
         },
         // `ptr` is an i64 (a BigInt) from the wasm64 shim, whose thread
         // stacks sit above 4 GiB: cut to 32 bits, a thread's stderr printed

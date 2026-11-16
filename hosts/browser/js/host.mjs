@@ -80,10 +80,55 @@ function watchLibraries() {
 /** A Worker's note (fetch-note.mjs): seen here, and said on the channel for
  *  the page (app.js `watchFetches`), which this side's own channel is not
  *  handed back. */
-function relayNote(note) {
+function relayNote(note, pid) {
   seeLibrary(note?.status);
+  watchWait(note, pid);
   watchLibraries();
   try { libChannel?.postMessage(note); } catch {}
+}
+
+// A Worker's fetch or wait that has gone on for WAIT_SAY_MS (a noted fetch,
+// fetch-note.mjs: a lazy file's read, a unit's file, the fill), said once
+// with what it waits on and for which process, and again when it ends: a
+// process stuck in one shows up as that line, not as silence.
+const WAIT_SAY_MS = 10_000;
+const waits = new Map();
+const waitSums = new Map();
+let waitTimer = null;
+function watchWait(note, pid) {
+  if (!note?.id || (note.phase !== 'start' && note.phase !== 'end')) return;
+  if (note.phase === 'end') {
+    const w = waits.get(note.id);
+    waits.delete(note.id);
+    if (w?.said) inform(`[gex] pid ${w.pid}: done waiting on ${w.what} after ${((performance.now() - w.t0) / 1000).toFixed(1)} s`);
+    // Short waits that add up: a process making one blocking fetch after
+    // another (each image's unit file) on a slow link.
+    else if (w) {
+      const a = waitSums.get(w.pid) ?? { n: 0, ms: 0, from: w.t0 };
+      a.n++;
+      a.ms += performance.now() - w.t0;
+      a.last = w.what;
+      waitSums.set(w.pid, a);
+      if (a.ms >= WAIT_SAY_MS) {
+        inform(`[gex] pid ${w.pid}: ${a.n} fetches waited ${(a.ms / 1000).toFixed(1)} s in the last ${((performance.now() - a.from) / 1000).toFixed(0)} s (the last ${a.last})`);
+        waitSums.delete(w.pid);
+      }
+    }
+  } else waits.set(note.id, { what: note.what, owner: note.owner, pid: pid ?? '?', t0: performance.now(), said: false });
+  if ((waits.size || waitSums.size) && !waitTimer) {
+    waitTimer = setInterval(() => {
+      const now = performance.now();
+      // (a sum as old as a minute starts again)
+      for (const [pid, a] of waitSums) if (now - a.from > 60_000) waitSums.delete(pid);
+      for (const w of waits.values()) {
+        if (w.said || now - w.t0 < WAIT_SAY_MS) continue;
+        w.said = true;
+        inform(`[gex] pid ${w.pid}${w.owner ? ` (${w.owner})` : ''}: waiting ${((now - w.t0) / 1000).toFixed(0)} s on ${w.what}`);
+      }
+      if (!waits.size && !waitSums.size) { clearInterval(waitTimer); waitTimer = null; }
+    }, 2000);
+    waitTimer.unref?.();
+  }
 }
 
 function crashed(what) {
@@ -1775,7 +1820,7 @@ export class ProcessHost {
         break;
       }
       case 'note':
-        relayNote(m.note);
+        relayNote(m.note, pid);
         break;
       case 'loadOther':
         // An exec waits on the gate (`#otherGate`) for the answer.
