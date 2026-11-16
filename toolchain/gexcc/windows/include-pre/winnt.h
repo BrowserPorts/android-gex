@@ -1,6 +1,6 @@
 /* winnt.h for Windows programs (gexcc-win): Wine's, with the process
  * mitigation policies' structures the Windows SDK's declares (to drop once
- * Wine's winnt.h declares them) */
+ * Wine's winnt.h declares them) and __debugbreak */
 #include_next <winnt.h>
 #ifndef GEXCC_WIN_WINNT_H
 #define GEXCC_WIN_WINNT_H
@@ -145,5 +145,8 @@ typedef struct _PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY {
         } DUMMYSTRUCTNAME;
     } DUMMYUNIONNAME;
 } PROCESS_MITIGATION_USER_SHADOW_STACK_POLICY, *PPROCESS_MITIGATION_USER_SHADOW_STACK_POLICY;
+
+/* the breakpoint an x64 compiler has built in */
+static __inline__ void __debugbreak(void) { __builtin_debugtrap(); }
 
 #endif
