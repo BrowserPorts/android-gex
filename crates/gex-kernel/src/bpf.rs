@@ -39,6 +39,24 @@ pub mod cmd {
 pub mod map_type {
     pub const HASH: u32 = 1;
     pub const ARRAY: u32 = 2;
+    pub const PERCPU_ARRAY: u32 = 6;
+    pub const LRU_HASH: u32 = 9;
+    pub const LPM_TRIE: u32 = 11;
+}
+
+/// Map creation flags (`BPF_F_*`).
+pub mod map_flag {
+    pub const NO_PREALLOC: u32 = 1 << 0;
+    pub const NO_COMMON_LRU: u32 = 1 << 1;
+    pub const NUMA_NODE: u32 = 1 << 2;
+    pub const RDONLY: u32 = 1 << 3;
+    pub const WRONLY: u32 = 1 << 4;
+    pub const ZERO_SEED: u32 = 1 << 6;
+    pub const RDONLY_PROG: u32 = 1 << 7;
+    pub const WRONLY_PROG: u32 = 1 << 8;
+    pub const MMAPABLE: u32 = 1 << 10;
+    /// `BPF_F_ACCESS_MASK`.
+    pub const ACCESS: u32 = RDONLY | WRONLY | RDONLY_PROG | WRONLY_PROG;
 }
 
 /// `BPF_ANY`, `BPF_NOEXIST`, `BPF_EXIST`, `BPF_F_LOCK`: an update's flags.
@@ -96,8 +114,15 @@ enum Data {
     /// `max_entries` values, every one there, zero until written.
     Array(Vec<u8>),
     /// Values by key, in the order they were put there (which
-    /// `BPF_MAP_GET_NEXT_KEY` walks).
+    /// `BPF_MAP_GET_NEXT_KEY` walks). An LRU hash keeps them in the order
+    /// they were last used, and when full puts out the least recent.
     Hash(Hash),
+    /// `max_entries` elements of a value for each possible CPU, each
+    /// value rounded up to eight bytes, as user space reads and writes
+    /// them.
+    PercpuArray(Vec<u8>),
+    /// Prefixes (bits of the key's data) and their values.
+    Lpm(Vec<(u32, Vec<u8>, Vec<u8>)>),
 }
 
 fn next_map_id() -> u32 {
@@ -164,21 +189,67 @@ impl Map {
         if value_size == 0 || max_entries == 0 || key_size > MAX_KEY {
             return Err(Errno::EINVAL);
         }
+        // A per-CPU value's size has a limit (`PCPU_MIN_UNIT_SIZE`).
+        if ty == map_type::PERCPU_ARRAY && value_size > 32 << 10 {
+            return Err(Errno::E2BIG);
+        }
+        use map_flag::*;
+        let flags_ok = |allowed: u32| -> Result<(), Errno> {
+            if flags & !allowed != 0 {
+                unsupported_flags(flags & !allowed);
+                return Err(Errno::EINVAL);
+            }
+            // (Read-only and write-only for user space at once is nothing.)
+            if flags & (RDONLY | WRONLY) == RDONLY | WRONLY || flags & (RDONLY_PROG | WRONLY_PROG) == RDONLY_PROG | WRONLY_PROG {
+                return Err(Errno::EINVAL);
+            }
+            Ok(())
+        };
         let data = match ty {
             map_type::ARRAY => {
-                if key_size != 4 || flags != 0 {
-                    unsupported_flags(flags);
+                flags_ok(NUMA_NODE | ACCESS | MMAPABLE)?;
+                if key_size != 4 {
                     return Err(Errno::EINVAL);
                 }
                 let len = (value_size as u64).checked_mul(max_entries as u64).filter(|n| *n < 1 << 32).ok_or(Errno::ENOMEM)?;
-                Data::Array(vec![0; len as usize])
-            }
-            map_type::HASH => {
-                if key_size == 0 || flags != 0 {
-                    unsupported_flags(flags);
+                if flags & MMAPABLE != 0 {
+                    unsupported_flags(MMAPABLE);
                     return Err(Errno::EINVAL);
                 }
+                Data::Array(vec![0; len as usize])
+            }
+            map_type::PERCPU_ARRAY => {
+                flags_ok(NUMA_NODE | ACCESS)?;
+                if key_size != 4 {
+                    return Err(Errno::EINVAL);
+                }
+                let each = (value_size as u64).next_multiple_of(8) * crate::cpus::count() as u64;
+                let len = each.checked_mul(max_entries as u64).filter(|n| *n < 1 << 32).ok_or(Errno::ENOMEM)?;
+                Data::PercpuArray(vec![0; len as usize])
+            }
+            map_type::HASH | map_type::LRU_HASH => {
+                let lru = ty == map_type::LRU_HASH;
+                flags_ok(NO_PREALLOC | NUMA_NODE | ACCESS | ZERO_SEED | if lru { NO_COMMON_LRU } else { 0 })?;
+                if key_size == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                // An LRU's elements are made ahead (`htab_map_alloc_check`).
+                if lru && flags & NO_PREALLOC != 0 {
+                    return Err(crate::btf::ENOTSUPP);
+                }
                 Data::Hash(Hash::default())
+            }
+            map_type::LPM_TRIE => {
+                // `trie_alloc`: no elements made ahead, a key of a prefix
+                // length and 1 to 256 bytes of data.
+                if flags & NO_PREALLOC == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                flags_ok(NO_PREALLOC | NUMA_NODE | ACCESS)?;
+                if !(5..=4 + 256).contains(&key_size) {
+                    return Err(Errno::EINVAL);
+                }
+                Data::Lpm(Vec::new())
             }
             other => {
                 unsupported_type(other);
@@ -190,6 +261,16 @@ impl Map {
 
     pub fn value_size(&self) -> u32 {
         self.value_size
+    }
+
+    /// How many bytes a value is to user space: a per-CPU map's, one for
+    /// each possible CPU, each rounded up to eight bytes.
+    pub fn user_value_size(&self) -> usize {
+        if self.ty == map_type::PERCPU_ARRAY {
+            self.value_size.next_multiple_of(8) as usize * crate::cpus::count() as usize
+        } else {
+            self.value_size as usize
+        }
     }
 
     /// Whether a program may take the address of its value directly
@@ -217,6 +298,15 @@ impl Map {
                 Ok(v[i as usize * vs..(i as usize + 1) * vs].to_vec())
             }
             Data::Hash(h) => h.at.get(key).map(|o| h.order[o].1.clone()).ok_or(Errno::ENOENT),
+            Data::PercpuArray(v) => {
+                let i = self.index(key);
+                if i >= self.max_entries {
+                    return Err(Errno::ENOENT);
+                }
+                let each = self.user_value_size();
+                Ok(v[i as usize * each..(i as usize + 1) * each].to_vec())
+            }
+            Data::Lpm(t) => lpm_match(t, key).map(|(_, _, v)| v.clone()).ok_or(Errno::ENOENT),
         }
     }
 
@@ -243,18 +333,70 @@ impl Map {
                 v[i as usize * vs..(i as usize + 1) * vs].copy_from_slice(value);
                 Ok(())
             }
+            Data::PercpuArray(v) => {
+                let i = self.index(key);
+                if i >= max {
+                    return Err(Errno::E2BIG);
+                }
+                if flags == NOEXIST {
+                    return Err(Errno::EEXIST);
+                }
+                let each = self.user_value_size();
+                v[i as usize * each..(i as usize + 1) * each].copy_from_slice(&value[..each]);
+                Ok(())
+            }
+            Data::Lpm(t) => {
+                // `trie_update_elem`: a prefix no longer than the data,
+                // the flags as a hash's, ENOSPC when full.
+                let (plen, data) = lpm_key(key);
+                if plen as usize > data.len() * 8 {
+                    return Err(Errno::EINVAL);
+                }
+                let at = t.iter().position(|(p, d, _)| *p == plen && prefix_eq(d, &data, plen));
+                match (at, flags) {
+                    (Some(_), NOEXIST) => Err(Errno::EEXIST),
+                    (None, EXIST) => Err(Errno::ENOENT),
+                    (Some(i), _) => {
+                        t[i].2 = value.to_vec();
+                        Ok(())
+                    }
+                    (None, _) => {
+                        if t.len() as u32 >= max {
+                            return Err(Errno::ENOSPC);
+                        }
+                        t.push((plen, masked(&data, plen), value.to_vec()));
+                        Ok(())
+                    }
+                }
+            }
             Data::Hash(h) => {
+                let lru = self.ty == map_type::LRU_HASH;
                 let there = h.at.get(key).copied();
                 match (there, flags) {
                     (Some(_), NOEXIST) => Err(Errno::EEXIST),
                     (None, EXIST) => Err(Errno::ENOENT),
                     (Some(o), _) => {
-                        h.order.get_mut(&o).unwrap().1 = value.to_vec();
+                        if lru {
+                            // Used now: last to go.
+                            let (k, _) = h.order.remove(&o).unwrap();
+                            let n = h.next;
+                            h.next += 1;
+                            h.order.insert(n, (k, value.to_vec()));
+                            h.at.insert(key.to_vec(), n);
+                        } else {
+                            h.order.get_mut(&o).unwrap().1 = value.to_vec();
+                        }
                         Ok(())
                     }
                     (None, _) => {
                         if h.order.len() as u32 >= max {
-                            return Err(Errno::E2BIG);
+                            if !lru {
+                                return Err(Errno::E2BIG);
+                            }
+                            // Full: the least recently used makes room.
+                            let (&oldest, _) = h.order.iter().next().unwrap();
+                            let (k, _) = h.order.remove(&oldest).unwrap();
+                            h.at.remove(&k);
                         }
                         let o = h.next;
                         h.next += 1;
@@ -269,7 +411,13 @@ impl Map {
 
     pub fn delete(&self, key: &[u8]) -> Result<(), Errno> {
         match &mut *self.lock() {
-            Data::Array(_) => Err(Errno::EINVAL),
+            Data::Array(_) | Data::PercpuArray(_) => Err(Errno::EINVAL),
+            Data::Lpm(t) => {
+                let (plen, data) = lpm_key(key);
+                let at = t.iter().position(|(p, d, _)| *p == plen && prefix_eq(d, &data, plen)).ok_or(Errno::ENOENT)?;
+                t.remove(at);
+                Ok(())
+            }
             Data::Hash(h) => {
                 let o = h.at.remove(key).ok_or(Errno::ENOENT)?;
                 h.order.remove(&o);
@@ -291,6 +439,35 @@ impl Map {
                     return Err(Errno::ENOENT);
                 }
                 Ok(next.to_le_bytes().to_vec())
+            }
+            Data::PercpuArray(_) => {
+                let next = match key.map(|k| self.index(k)) {
+                    Some(i) if i < self.max_entries => i + 1,
+                    _ => 0,
+                };
+                if next >= self.max_entries {
+                    return Err(Errno::ENOENT);
+                }
+                Ok(next.to_le_bytes().to_vec())
+            }
+            Data::Lpm(t) => {
+                // The trie's post-order: what is under a prefix before it,
+                // the 0 side before the 1 side (`trie_get_next_key`); from
+                // none, or from a key that is not there, the first.
+                let mut sorted: Vec<&(u32, Vec<u8>, Vec<u8>)> = t.iter().collect();
+                sorted.sort_by(|a, b| lpm_order(a, b));
+                let at = key.and_then(|key| {
+                    let (plen, data) = lpm_key(key);
+                    sorted.iter().position(|(p, d, _)| *p == plen && prefix_eq(d, &data, plen))
+                });
+                let next = match at {
+                    Some(i) => sorted.get(i + 1),
+                    None => sorted.first(),
+                };
+                let (p, d, _) = next.ok_or(Errno::ENOENT)?;
+                let mut out = p.to_le_bytes().to_vec();
+                out.extend_from_slice(d);
+                Ok(out)
             }
             Data::Hash(h) => {
                 let at = key.and_then(|key| h.at.get(key).copied());
@@ -379,6 +556,12 @@ pub struct Caller<'a> {
 }
 
 fn install(c: &Caller<'_>, obj: Object, read: bool, write: bool) -> crate::errno::SysResult {
+    // A map made read-only or write-only for user space gives no
+    // descriptor that does the other (`map_get_sys_perms`).
+    let (read, write) = match &obj {
+        Object::Map(m) => (read && m.flags & map_flag::WRONLY == 0, write && m.flags & map_flag::RDONLY == 0),
+        _ => (read, write),
+    };
     let (handle, name): (Arc<dyn FileHandle>, &str) = match obj {
         Object::Map(map) => (Arc::new(MapFile { map, read, write }), "anon_inode:bpf-map"),
         Object::Btf(btf) => (Arc::new(crate::btf::BtfFile(btf)), "anon_inode:btf"),
@@ -502,7 +685,7 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
                     if !w {
                         return Err(Errno::EPERM);
                     }
-                    let value = m.read(u64_at(16), map.value_size as usize)?.to_vec();
+                    let value = m.read(u64_at(16), map.user_value_size())?.to_vec();
                     map.update(key.as_deref().unwrap(), &value, u64_at(24))?;
                 }
                 cmd::MAP_DELETE_ELEM => {
@@ -783,4 +966,49 @@ fn check_log(buf: u64, size: u32, level: u32) -> Result<(), Errno> {
 
 fn path_at(m: &GuestMem<'_>, at: u64) -> Result<String, Errno> {
     String::from_utf8(m.read_cstr(at, 4096)?).map_err(|_| Errno::EINVAL)
+}
+
+/// An LPM trie's key: its prefix length and its data.
+fn lpm_key(key: &[u8]) -> (u32, Vec<u8>) {
+    (u32::from_le_bytes(key[..4].try_into().unwrap()), key[4..].to_vec())
+}
+
+/// The bit `i` of `data`, the most significant first.
+fn bit_of(data: &[u8], i: u32) -> u8 {
+    data[i as usize / 8] >> (7 - i % 8) & 1
+}
+
+/// `data` with every bit past `plen` cleared.
+fn masked(data: &[u8], plen: u32) -> Vec<u8> {
+    let mut out = data.to_vec();
+    for i in plen..(data.len() * 8) as u32 {
+        out[i as usize / 8] &= !(0x80 >> (i % 8));
+    }
+    out
+}
+
+/// Whether `a` and `b` agree in their first `plen` bits.
+fn prefix_eq(a: &[u8], b: &[u8], plen: u32) -> bool {
+    (0..plen).all(|i| bit_of(a, i) == bit_of(b, i))
+}
+
+/// The longest prefix in `t` that `key`'s data begins with, no longer
+/// than `key`'s own prefix length.
+fn lpm_match<'a>(t: &'a [(u32, Vec<u8>, Vec<u8>)], key: &[u8]) -> Option<&'a (u32, Vec<u8>, Vec<u8>)> {
+    let (plen, data) = lpm_key(key);
+    t.iter().filter(|(p, d, _)| *p <= plen && prefix_eq(d, &data, *p)).max_by_key(|(p, _, _)| *p)
+}
+
+/// The trie's post-order: a prefix after what is under it; between two
+/// that part, the one on the 0 side first.
+fn lpm_order(a: &&(u32, Vec<u8>, Vec<u8>), b: &&(u32, Vec<u8>, Vec<u8>)) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let (pa, da, _) = a;
+    let (pb, db, _) = b;
+    let common = (0..(*pa).min(*pb)).find(|&i| bit_of(da, i) != bit_of(db, i));
+    match common {
+        Some(i) => bit_of(da, i).cmp(&bit_of(db, i)),
+        // One is a prefix of the other: the longer (under it) first.
+        None => pb.cmp(pa),
+    }
 }
