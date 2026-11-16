@@ -12,7 +12,8 @@
  *   - paused in a window and taken up, and a window cut by the network: every byte still sent once (a frame
  *     cut in the middle is taken up from its next byte);
  *   - a read of a frame near the end while the download is about 10% through: its own ranged request at once,
- *     not 'low'; the bytes sent twice at most the window in flight then;
+ *     not 'low', the window in flight cut short for it and none begun before it; the bytes sent twice at
+ *     most the window in flight then;
  *   - a first visit cut short, then a second: the second asks only for the frames the first did not keep;
  *   - a page cache that refuses every frame (its quota): every byte still sent once, and no refetch loop;
  *   - and with no download, reads of every frame one by one: the last ones read again from the kept bytes
@@ -194,6 +195,10 @@ if (isMainThread) {
     check(`the read's frame asked for at once, not low (${JSON.stringify(mine)}, ${took} ms)`, mine && took < 25 * 4 * 3);
     check('its bytes right', n === 50 && r.mem.subarray(4096, 4146).every((x, j) => x === want[(NFRAMES - 2) * FRAME + 7 + j]));
     await until(() => doneMsg(r), 3000);
+    // and the download stopped for it: the window in flight when it came (the last one begun before the
+    // read's own) cut short, taken up after
+    const q = r.reqs(), win = q.slice(0, q.findIndex((x) => x.lo === frames[NFRAMES - 2][0] && x.low === 0)).filter((x) => x.low === 1).at(-1);
+    check(`the download stopped for the read (the window in flight ${JSON.stringify(win)})`, !!win && win.sent < win.asked);
     const w = wire(r.reqs()), p = progress(r);
     check(`every byte sent, twice at most the window in flight then (${JSON.stringify(w)} of ${SIZE}; in flight ${JSON.stringify(inflight)})`, w.missing === 0 && w.sent <= SIZE + inflight.asked && w.twice <= inflight.asked);
     check(`the stream never asked for the read's frame (${JSON.stringify(r.reqs().filter((x) => x.low === 1 && x.lo <= frames[NFRAMES - 2][0] && x.lo + x.asked > frames[NFRAMES - 2][0]))})`,

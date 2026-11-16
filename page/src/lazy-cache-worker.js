@@ -137,7 +137,13 @@ async function read(cache, url, from, len) {
     // Tried a few times with waits between, then held as failed by chunk
     // (as a rest bundle's frame): reads of it fail at once until the hold ends.
     for (let c = k; c <= stop; c++) if (failed.held(`${url}#c${c}`)) throw heldError;
-    const got = await retryAsync(() => fetchRange(url, lo, hi + 1));
+    demandBegin();
+    let got;
+    try {
+      got = await retryAsync(() => fetchRange(url, lo, hi + 1));
+    } finally {
+      demandEnd();
+    }
     if (!got) {
       for (let c = k; c <= stop; c++) failed.failed(`${url}#c${c}`);
       throw new Error(`${url} @${lo}: no answer`);
@@ -290,13 +296,27 @@ function storeWhole(url, b) {
 // flight): a read's (`ahead` false), kept packed and stored, or the background's (`ahead`), stored only when the
 // page's cache holds the bundle's frames (packed otherwise).
 const fetching = new Map();
-let demand = 0;
+// Reads in flight (a frame or a lazy file's bytes a reader waits for): while there is one, the background
+// download stops, its window in flight cut short (taken up after from the byte it reached), so a read's
+// bytes never queue behind background ones on the connection.
+let demand = 0, yielded = false;
+function demandBegin() {
+  demand++;
+  if (aheadAbort) {
+    yielded = true;
+    aheadAbort.abort();
+  }
+}
+function demandEnd() {
+  demand--;
+  wakeAhead();
+}
 function fetchFrame(url, b, k, ahead) {
   const key = `${url}#${k}`;
   let p = fetching.get(key);
   if (p) return p;
   const [o, n] = b.frames[k];
-  if (!ahead) demand++;
+  if (!ahead) demandBegin();
   p = getRange(url, o, o + n, ahead ? 'low' : undefined).then((got) => {
     if (!ahead || !store_ || !b.h) keepPacked(key, got);
     store(url, b, k, got);
@@ -304,8 +324,7 @@ function fetchFrame(url, b, k, ahead) {
     return got;
   }).finally(() => {
     fetching.delete(key);
-    if (!ahead) demand--;
-    wakeAhead();
+    if (!ahead) demandEnd();
   });
   fetching.set(key, p);
   return p;
@@ -472,14 +491,15 @@ async function ahead(urls) {
       if (store_ && b.h) {
         // window after window; one cut short is taken up again from the first frame not held, a few times
         for (let fails = 0; ;) {
-          while (aheadPaused) await new Promise((r) => { aheadWaiter = r; });
+          while (aheadPaused || demand > 0) await new Promise((r) => { aheadWaiter = r; });
           if (thrifty()) return;
           const win = await nextWindow(url, b);
           if (!win) break;
           // the frames left are a read's, in flight: their end is waited for (one that fails is fetched here)
           if (!win.length) { await Promise.allSettled([...fetching].filter(([k]) => k.startsWith(`${url}#`)).map(([, p]) => p)); continue; }
           if (await streamWindow(url, b, win[0], win[1])) { fails = 0; continue; }
-          if (aheadPaused) continue;
+          // (cut short for a read, or by a pause: no failure)
+          if (aheadPaused || yielded) { yielded = false; continue; }
           if (++fails > 4) break;
           await new Promise((r) => setTimeout(r, 2000 << (fails - 1)));
         }
