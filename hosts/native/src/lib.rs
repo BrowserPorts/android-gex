@@ -457,6 +457,10 @@ struct Jit {
     instances: Vec<wasmtime::Instance>,
     /// Registry entries already instantiated into this store.
     replayed: usize,
+    /// Units of the registry this store has passed over without taking
+    /// them, in the registry's order ([`replay_into`]): what a thread that
+    /// takes code only as it needs it has not needed yet.
+    deferred: Vec<Arc<CompiledUnit>>,
     limits: gex_xlate::BlockLimits,
     /// This store's function table (`ftab`), made at the first need.
     ftab: Option<ftab::Store>,
@@ -484,6 +488,23 @@ struct CompiledUnit {
     /// and slot packed as a directory entry: addresses a function body
     /// serves.
     bridges: Vec<u32>,
+    /// The guest pages it has code on or gave slots to ([`CompiledUnit::pages`]).
+    pages: std::sync::OnceLock<Vec<u64>>,
+}
+
+impl CompiledUnit {
+    /// The guest pages (`gex_abi::page_key`, the process's own mode) this
+    /// unit has a block on or allocated slots for, in order: what a thread
+    /// that takes code only as it needs it looks a page up in
+    /// ([`replay_into`]).
+    fn pages(&self) -> &[u64] {
+        self.pages.get_or_init(|| {
+            let mut pages: Vec<u64> = self.exported_blocks.iter().map(|(a, _)| gex_abi::page_key(*a, false)).chain(self.dir_entries.iter().map(|(p, _)| *p)).collect();
+            pages.sort_unstable();
+            pages.dedup();
+            pages
+        })
+    }
 }
 
 /// Runtime translation state shared by every guest thread.
@@ -1453,6 +1474,7 @@ fn run_program_with(
             cache: jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
+            deferred: Vec::new(),
             limits: xlate.limits,
             ftab: None,
         });
@@ -3220,11 +3242,12 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             cache: cx.jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
+            deferred: Vec::new(),
             limits: cx.limits,
             ftab: None,
         });
     }
-    catch_up_table(&mut store)?;
+    replay_into(&mut store, Take::at_start())?;
     if cx.opts.aot_only {
         aot_only::bind_root(&mut store, &instance)?;
     }
@@ -3608,6 +3631,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             cache: cx.jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
+            deferred: Vec::new(),
             limits: cx.limits,
             ftab: None,
         });
@@ -3615,8 +3639,9 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
 
     // This thread's table starts with only what the image module installed,
     // so everything translated since has to be replayed into it before the
-    // first branch reaches for it.
-    catch_up_table(&mut store)?;
+    // first branch reaches for it (or, for a thread that takes code only
+    // as it needs it, when its first branch misses: `Take::at_start`).
+    replay_into(&mut store, Take::at_start())?;
 
     let entry = {
         let data = cx.memory.bytes();
@@ -3689,19 +3714,87 @@ fn end_process(cx: &SpawnContext, exit: Exit) {
 
 /// Instantiate every registry entry into this store, outside a wasm frame.
 fn catch_up_table(store: &mut Store<HostState>) -> Result<()> {
-    let Some(jit) = store.data().jit.as_ref() else {
-        return Ok(());
-    };
-    let (shared, from) = (Arc::clone(&jit.shared), jit.replayed);
-    let pending: Vec<Arc<CompiledUnit>> = {
-        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.registry[from.min(sh.registry.len())..].to_vec()
-    };
-    for unit in &pending {
-        install_unit(&mut *store, unit)?;
-        store.data_mut().jit.as_mut().unwrap().replayed += 1;
+    replay_into(&mut *store, Take::All).map(|_| ())
+}
+
+/// What a replay of the registry installs in a store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Take {
+    /// Everything the store has not got.
+    All,
+    /// What has code on one guest page, or gave it slots: the page a
+    /// thread is about to run code on.
+    Page(u64),
+    /// Nothing with code: a thread that has run nothing yet.
+    Nothing,
+}
+
+impl Take {
+    /// What a thread that wants the code at `pc` takes: that page's, when
+    /// threads take code only as they need it ([`lazy_catch_up`]; not for a
+    /// process with code in two modes, whose pages are keyed by mode).
+    fn at(pc: u64) -> Take {
+        if lazy_catch_up() && !gex_abi::X86 {
+            Take::Page(gex_abi::page_key(pc, false))
+        } else {
+            Take::All
+        }
     }
-    Ok(())
+
+    /// What a thread takes before it has run anything.
+    fn at_start() -> Take {
+        if lazy_catch_up() && !gex_abi::X86 {
+            Take::Nothing
+        } else {
+            Take::All
+        }
+    }
+}
+
+/// Bring a store up to date with the registry: every unit it has not seen
+/// is installed or, when `take` does not want it, kept for a later replay
+/// (`Jit::deferred`), with the ones kept before looked at again first, in
+/// the registry's order. A unit with no module (slots for the function
+/// table's bridges) is always taken. Whether anything was installed.
+///
+/// A thread's own copy of a module is what a thread costs (a table cannot
+/// be shared between stores): taking only the modules with code on the
+/// pages a thread runs keeps a thread that runs little small, where every
+/// thread of Android's apexd had all 1,500 modules of the process.
+fn replay_into(mut cx: impl wasmtime::AsContextMut<Data = HostState>, take: Take) -> Result<bool> {
+    let (pending, deferred) = {
+        let mut store = cx.as_context_mut();
+        let Some(jit) = store.data_mut().jit.as_mut() else {
+            return Ok(false);
+        };
+        let pending: Vec<Arc<CompiledUnit>> = {
+            let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+            sh.registry[jit.replayed.min(sh.registry.len())..].to_vec()
+        };
+        jit.replayed += pending.len();
+        (pending, std::mem::take(&mut jit.deferred))
+    };
+    let mut installed = false;
+    let mut keep = Vec::new();
+    for unit in deferred.into_iter().chain(pending) {
+        let wanted = unit.module.is_none()
+            || match take {
+                Take::All => true,
+                Take::Page(page) => unit.pages().binary_search(&page).is_ok(),
+                Take::Nothing => false,
+            };
+        if wanted {
+            install_unit(cx.as_context_mut(), &unit)?;
+            installed = true;
+        } else {
+            keep.push(unit);
+        }
+    }
+    let mut store = cx.as_context_mut();
+    if let Some(jit) = store.data_mut().jit.as_mut() {
+        jit.deferred = keep;
+    }
+    Ok(installed)
 }
 
 /// What `--busybox` presents (the applets toolchain/busybox/busybox.config
@@ -5996,7 +6089,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // the shared registry is far cheaper than translating again, and it is
     // also how a newly spawned thread fills a table that starts out holding
     // only what the image module put there.
-    let replayed_any = replay_registry(caller)?;
+    let replayed_any = replay_registry_taking(caller, Take::at(pc))?;
     if replayed_any && {
         let jit = caller.data().jit.as_ref().unwrap();
         let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -6181,7 +6274,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // push -- which is exactly what filled one store with ten thousand
     // instances of the same modules.
     publish_unit(&shared, &translated_module, module, stats.blocks)?;
-    replay_registry(caller)?;
+    replay_registry_taking(caller, Take::at(pc))?;
 
     // If the address that faulted did not end up with code, resuming would
     // fault again at the same place forever. Say so instead -- unless its
@@ -6283,7 +6376,8 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
 }
 
 /// `GEX_LAZY_CATCH_UP=1`: a thread takes what other threads have translated
-/// only when it needs some of it, not at every system call and safepoint.
+/// only when it needs some of it, and then only what it needs, not all of
+/// it at every system call and safepoint.
 ///
 /// Every thread has its own instance of every translated module and its
 /// own tables (a table cannot be shared between stores), so catching up is
@@ -6295,8 +6389,11 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
 /// of its table that holds nothing yet: the miss handler replays first) or
 /// by the trap of a slot past its table's end (the run loop and a call-out
 /// replay and take the transfer again; both write the target into the
-/// context first, so nothing is lost). Off unless asked: the eager way is
-/// the one every other program has been run with.
+/// context first, so nothing is lost), and what it takes then is the
+/// modules with code on the page it was going to ([`Take`],
+/// [`replay_into`]); the rest it keeps note of. A thread starts with
+/// none. Off unless asked: the eager way is the one every other program
+/// has been run with.
 fn lazy_catch_up() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GEX_LAZY_CATCH_UP").is_some_and(|v| v != "0"))
@@ -6310,10 +6407,11 @@ fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<bool> {
     let behind = match caller.data().jit.as_ref() {
         // Nothing published past this store's watermark: no lock (every
         // syscall and safepoint comes through here).
-        Some(jit) if REGISTRY_LEN.load(std::sync::atomic::Ordering::Acquire) <= jit.replayed => false,
+        // (Or passed over and kept: this catch-up takes those too.)
+        Some(jit) if REGISTRY_LEN.load(std::sync::atomic::Ordering::Acquire) <= jit.replayed && jit.deferred.is_empty() => false,
         Some(jit) => {
             let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
-            sh.registry.len() > jit.replayed
+            sh.registry.len() > jit.replayed || !jit.deferred.is_empty()
         }
         None => false,
     };
@@ -6324,22 +6422,13 @@ fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<bool> {
 }
 
 fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
-    let (shared, from) = {
-        let Some(jit) = caller.data().jit.as_ref() else {
-            return Ok(false);
-        };
-        (Arc::clone(&jit.shared), jit.replayed)
-    };
-    let pending: Vec<Arc<CompiledUnit>> = {
-        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        if sh.registry.len() <= from {
-            return Ok(false);
-        }
-        sh.registry[from..].to_vec()
-    };
-    for unit in &pending {
-        install_unit(&mut *caller, unit)?;
-        caller.data_mut().jit.as_mut().unwrap().replayed += 1;
+    replay_registry_taking(caller, Take::All)
+}
+
+/// [`replay_registry`] of what `take` wants ([`replay_into`]).
+fn replay_registry_taking(caller: &mut Caller<'_, HostState>, take: Take) -> Result<bool> {
+    if !replay_into(&mut *caller, take)? {
+        return Ok(false);
     }
     refresh_callouts(&mut *caller)?;
     Ok(true)
@@ -6369,6 +6458,7 @@ fn publish_unit(
         dir_entries: translated.dir_entries.clone(),
         table_slots: translated.table_slots,
         bridges: Vec::new(),
+        pages: Default::default(),
     });
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     for &(page, base) in &translated.dir_entries {
@@ -7925,18 +8015,24 @@ fn catch_up_and_resume(store: &mut Store<HostState>, ctx_addr: u64) -> Result<Op
     let behind = match store.data().jit.as_ref() {
         Some(jit) => {
             let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
-            sh.registry.len() > jit.replayed
+            sh.registry.len() > jit.replayed || !jit.deferred.is_empty()
         }
         None => return Ok(None),
     };
     if !behind {
         return Ok(None);
     }
-    catch_up_table(store)?;
     let Some(memory) = store.data().memory.clone() else {
         return Ok(None);
     };
+    // Where the transfer was going: both kinds write it into the context
+    // before they take it.
     let pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
+    // What has code there; and if that is nothing, all there is, so that
+    // a trap nothing answers is reported and not taken again for ever.
+    if !replay_into(&mut *store, Take::at(pc))? && !replay_into(&mut *store, Take::All)? {
+        return Ok(None);
+    }
     Ok((pc != 0).then_some(pc))
 }
 
