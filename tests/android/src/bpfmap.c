@@ -118,6 +118,9 @@ static const char expected[] =
     "info: 0 type 1 key 4 value 8 max 2 flags 0 name gex_hash len 88\n"
     "attr with a tail: -22\n"
     "command 999: -22\n"
+    "map ids: rising 1, ours there 1, ended -2\n"
+    "lookup 20 by id: 0\n"
+    "an id that is not: -2\n"
     "unlink pinned: 0\n"
 ;
 
@@ -240,6 +243,29 @@ int main(void) {
     big[sizeof big - 1] = 1;
     SAY("attr with a tail: %ld\n", sys_bpf(BPF_MAP_CREATE, ba, sizeof big));
     SAY("command 999: %ld\n", sys_bpf(999, ba, sizeof(union bpf_attr)));
+
+    // By id: the ids there are rise, ours is one, and gives the map.
+    uint32_t id = 0, ours = info.id;
+    int rising = 1, found = 0;
+    long rr;
+    for (;;) {
+        union bpf_attr na;
+        memset(&na, 0, sizeof na);
+        na.start_id = id;
+        rr = sys_bpf(BPF_MAP_GET_NEXT_ID, &na, sizeof na);
+        if (rr) break;
+        if (na.next_id <= id) rising = 0;
+        if (na.next_id == ours) found = 1;
+        id = na.next_id;
+    }
+    SAY("map ids: rising %d, ours there %d, ended %ld\n", rising, found, rr);
+    union bpf_attr fa;
+    memset(&fa, 0, sizeof fa);
+    fa.map_id = ours;
+    long byid = sys_bpf(BPF_MAP_GET_FD_BY_ID, &fa, sizeof fa);
+    SAY("lookup 20 by id: %ld\n", elem(BPF_MAP_LOOKUP_ELEM, byid, &a2, &out, 0));
+    fa.map_id = 0x7ffffff0;
+    SAY("an id that is not: %ld\n", sys_bpf(BPF_MAP_GET_FD_BY_ID, &fa, sizeof fa));
 
     snprintf(path, sizeof path, "%s/sub/map_gex", dir);
     SAY("unlink pinned: %d\n", unlink(path) ? -errno : 0);

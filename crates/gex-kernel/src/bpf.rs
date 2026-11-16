@@ -7,7 +7,8 @@
 //! the system server and the rest open the pinned maps (`BPF_OBJ_GET`)
 //! and read and write them. Here so far: the array and hash maps, their
 //! element calls, pins and `BPF_OBJ_GET`, a map's description
-//! (`BPF_OBJ_GET_INFO_BY_FD`). Not yet, and refused as unknown: programs
+//! (`BPF_OBJ_GET_INFO_BY_FD`), maps by id (`BPF_MAP_GET_NEXT_ID`,
+//! `BPF_MAP_GET_FD_BY_ID`). Not yet, and refused as unknown: programs
 //! (`BPF_PROG_LOAD` and attaching them), BTF, the other map types.
 
 use crate::errno::Errno;
@@ -25,6 +26,9 @@ pub mod cmd {
     pub const MAP_GET_NEXT_KEY: u64 = 4;
     pub const OBJ_PIN: u64 = 6;
     pub const OBJ_GET: u64 = 7;
+    pub const PROG_GET_NEXT_ID: u64 = 11;
+    pub const MAP_GET_NEXT_ID: u64 = 12;
+    pub const MAP_GET_FD_BY_ID: u64 = 14;
     pub const OBJ_GET_INFO_BY_FD: u64 = 15;
 }
 
@@ -92,6 +96,23 @@ enum Data {
 fn next_map_id() -> u32 {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Every map there is, by id, for `BPF_MAP_GET_NEXT_ID` and
+/// `BPF_MAP_GET_FD_BY_ID`: a map is there while a descriptor or a pin
+/// holds it.
+static MAPS: Mutex<BTreeMap<u32, std::sync::Weak<Map>>> = Mutex::new(BTreeMap::new());
+
+fn register(map: &Arc<Map>) {
+    let mut maps = MAPS.lock().unwrap_or_else(|e| e.into_inner());
+    maps.retain(|_, m| m.strong_count() > 0);
+    maps.insert(map.id, Arc::downgrade(map));
+}
+
+/// The live map with the least id above `after`.
+fn map_after(after: u32) -> Option<Arc<Map>> {
+    let maps = MAPS.lock().unwrap_or_else(|e| e.into_inner());
+    maps.range(after.saturating_add(1)..).find_map(|(_, m)| m.upgrade())
 }
 
 impl Map {
@@ -298,6 +319,8 @@ pub struct Caller<'a> {
     pub ns: &'a crate::vfs::Namespace,
     /// `CAP_BPF` or `CAP_SYS_ADMIN`.
     pub capable: bool,
+    /// `CAP_SYS_ADMIN`.
+    pub admin: bool,
     pub uid: u32,
     pub gid: u32,
     pub umask: u32,
@@ -363,8 +386,9 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
                 say_once("a map with an inner map, a device, BTF or extra");
                 return Err(Errno::EINVAL);
             }
-            let map = Map::create(ty, key, value, max, flags, name)?;
-            install(c, Object::Map(Arc::new(map)), true, true)
+            let map = Arc::new(Map::create(ty, key, value, max, flags, name)?);
+            register(&map);
+            install(c, Object::Map(map), true, true)
         }
         cmd::MAP_LOOKUP_ELEM | cmd::MAP_UPDATE_ELEM | cmd::MAP_DELETE_ELEM | cmd::MAP_GET_NEXT_KEY => {
             zero_from(32)?;
@@ -426,6 +450,34 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             let path = path_at(m, u64_at(0))?;
             let obj = c.ns.bpf_get(&path)?;
             install(c, obj, flags & F_WRONLY == 0, flags & F_RDONLY == 0)
+        }
+        // The objects there are, by id: root's to ask (`CAP_SYS_ADMIN`).
+        cmd::PROG_GET_NEXT_ID | cmd::MAP_GET_NEXT_ID => {
+            zero_from(12)?;
+            if !c.admin {
+                return Err(Errno::EPERM);
+            }
+            let next = match cmd {
+                // No program is loaded here yet.
+                cmd::PROG_GET_NEXT_ID => None,
+                _ => map_after(u32_at(0)).map(|m| m.id),
+            };
+            let next = next.ok_or(Errno::ENOENT)?;
+            m.write_u32(attr + 4, next)?;
+            Ok(0)
+        }
+        cmd::MAP_GET_FD_BY_ID => {
+            zero_from(12)?;
+            if !c.admin {
+                return Err(Errno::EPERM);
+            }
+            let flags = u32_at(8);
+            if flags & !(F_RDONLY | F_WRONLY) != 0 || flags == F_RDONLY | F_WRONLY {
+                return Err(Errno::EINVAL);
+            }
+            let id = u32_at(0);
+            let map = map_after(id.wrapping_sub(1)).filter(|m| m.id == id).ok_or(Errno::ENOENT)?;
+            install(c, Object::Map(map), flags & F_WRONLY == 0, flags & F_RDONLY == 0)
         }
         cmd::OBJ_GET_INFO_BY_FD => {
             zero_from(16)?;
