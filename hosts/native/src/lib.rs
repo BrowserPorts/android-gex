@@ -968,6 +968,7 @@ fn new_engine() -> Result<Engine> {
 fn fixed_random() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        gex_mem::raise_open_files();
         if let Ok(seed) = std::env::var("GEX_FIXED_RANDOM") {
             match seed.parse::<u64>() {
                 Ok(seed) => gex_kernel::entropy::fix(seed),

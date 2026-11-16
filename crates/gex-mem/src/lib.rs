@@ -78,3 +78,48 @@ pub fn trim_heap() {
         }
     }
 }
+
+/// Let the host process open as many files as its hard limit allows (the
+/// soft limit is 1024 on most Linux hosts). A run's guest processes share
+/// the host's descriptors: every file a guest has open on the host's
+/// filesystem is one, and so is every translation mapped from the cache,
+/// thousands in a process that loads many libraries
+/// (`gex_cache`'s `artifact`). Nothing when the host says no; the limit
+/// stays what it was.
+pub fn raise_open_files() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        #[repr(C)]
+        struct Rlimit {
+            cur: u64,
+            max: u64,
+        }
+        extern "C" {
+            fn getrlimit(resource: i32, rlim: *mut Rlimit) -> i32;
+            fn setrlimit(resource: i32, rlim: *const Rlimit) -> i32;
+        }
+        #[cfg(target_os = "linux")]
+        const RLIMIT_NOFILE: i32 = 7;
+        #[cfg(target_os = "macos")]
+        const RLIMIT_NOFILE: i32 = 8;
+        // macOS refuses a soft limit above OPEN_MAX whatever the hard one
+        // says (setrlimit(2)).
+        #[cfg(target_os = "linux")]
+        const MOST: u64 = u64::MAX;
+        #[cfg(target_os = "macos")]
+        const MOST: u64 = 10240;
+        let mut l = Rlimit { cur: 0, max: 0 };
+        // SAFETY: both calls read or write the one struct given, which is
+        // the layout of `struct rlimit` on these hosts (two 64-bit limits).
+        unsafe {
+            if getrlimit(RLIMIT_NOFILE, &mut l) != 0 {
+                return;
+            }
+            let want = l.max.min(MOST);
+            if want > l.cur {
+                l.cur = want;
+                setrlimit(RLIMIT_NOFILE, &l);
+            }
+        }
+    }
+}
