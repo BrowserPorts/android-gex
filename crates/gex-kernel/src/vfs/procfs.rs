@@ -807,7 +807,7 @@ impl ProcFs {
                 "CPU revision\t: 3\n\n",
             ))
             .into_bytes(),
-            "version" => b"Linux version 6.1.0-gex (gex@puter) #1 SMP\n".to_vec(),
+            "version" => format!("Linux version {} (gex@puter) #1 SMP\n", crate::syscalls::KERNEL_RELEASE).into_bytes(),
             "uptime" => match s.system() {
                 Some(sys) => uptime_text(&sys, crate::cpus::count() as u64).into_bytes(),
                 None => b"1000.00 1000.00\n".to_vec(),
@@ -824,7 +824,7 @@ impl ProcFs {
             // says (Android reads its `androidboot.` settings from these).
             "cmdline" => format!("{}\n", KERNEL_CMDLINE.get().map_or("", String::as_str)).into_bytes(),
             "bootconfig" => BOOTCONFIG.get()?.clone().into_bytes(),
-            "sys/kernel/osrelease" => b"6.1.0-gex\n".to_vec(),
+            "sys/kernel/osrelease" => format!("{}\n", crate::syscalls::KERNEL_RELEASE).into_bytes(),
             "sys/kernel/pid_max" => b"32768\n".to_vec(),
             // The kernel's random numbers as files (drivers/char/random.c):
             // an id made once for the boot, a new one at every read, and

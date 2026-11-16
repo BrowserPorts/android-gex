@@ -8885,12 +8885,20 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
     }
 }
 
+/// The release gex says it is (`uname -r`, `/proc/sys/kernel/osrelease`,
+/// `/proc/version`): the Android common kernel line its Android work
+/// follows, android17-6.18. Android 17 refuses less than 6.1.57 (its
+/// network BPF loader stops the boot, "Android V+ requires 6.1 kernel to
+/// be 6.1.57+"), and what this kernel does is written after 6.18's
+/// behaviour, and checked against Linux 7.0's.
+pub const KERNEL_RELEASE: &str = "6.18.0-gex";
+
 /// `uname`: the kernel gex says it is.
 fn uname(m: &mut GuestMem<'_>, compat: bool, buf: u64) -> SysResult {
     let fields = [
         "Linux",
         "gex",
-        "6.1.0-gex",
+        KERNEL_RELEASE,
         "#1 SMP gex",
         // An i386 process on the x86 build; a wasm32 program on the
         // AArch64 build is part of an aarch64 system (its dpkg and
