@@ -652,6 +652,11 @@ enum Node {
     Device { rdev: u64, block: bool },
 }
 
+/// A bound socket's file as `bind` makes it: 0777 less the usual umask
+/// (the caller's own is not looked at yet). `chmod` changes it, as init
+/// does for every socket it makes for a service.
+const SOCKET_MODE: u32 = 0o755;
+
 /// What a tmpfs was mounted with, for `/proc/mounts`.
 #[derive(Clone, Debug, Default)]
 struct Options {
@@ -737,6 +742,7 @@ impl Inner {
         let default = match self.nodes.get(path) {
             None => return Err(Errno::ENOENT),
             Some(Node::Dir) => Metadata::dir().mode,
+            Some(Node::Socket) => SOCKET_MODE,
             Some(_) => 0o644,
         };
         let mode = mode & 0o7777;
@@ -1553,7 +1559,7 @@ impl TmpFs {
             Node::Socket => Ok(Metadata {
                 file_type: FileType::Socket,
                 size: 0,
-                mode: 0o755,
+                mode: inner.modes.get(path).copied().unwrap_or(SOCKET_MODE),
                 ino,
                 mtime: mtime(),
                 nlink: 1,

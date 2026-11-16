@@ -2436,7 +2436,7 @@ impl FdIo<'_> {
                     data.extend_from_slice(m.read(base, len.min(1 << 22))?);
                 }
             }
-            return d.send_to(&data, to.as_deref());
+            return d.send_to(&data, to.as_deref(), Some(self.cred()));
         }
         if let Ok(sock) = self.netlink_of(fd) {
             // To `msg_name` when it has a length, else where the socket is
@@ -2523,7 +2523,7 @@ impl FdIo<'_> {
             }
         }
         let mut tmp = vec![0u8; want];
-        let (n, whole, from) = d.recv_from(&mut tmp, peek)?;
+        let (n, whole, from, sender) = d.recv_from(&mut tmp, peek)?;
         let mut at = 0usize;
         for (base, len) in parts {
             if at >= n {
@@ -2543,7 +2543,10 @@ impl FdIo<'_> {
                 }
             }
         }
-        self.msg_wr(m, msg, 5, 0)?;
+        // Who sent it, for a socket that asked (`SO_PASSCRED`).
+        let (control, controllen) = (self.msg_rd(m, msg, 4)?, self.msg_rd(m, msg, 5)?);
+        let written = if d.passcred() { self.write_scm_creds(m, control, controllen, sender)? } else { 0 };
+        self.msg_wr(m, msg, 5, written)?;
         const MSG_TRUNC: u32 = 0x20;
         m.write_u32(msg + if self.compat { 24 } else { 48 }, if whole > n { MSG_TRUNC } else { 0 })?;
         Ok(n as u64)
@@ -5919,6 +5922,8 @@ impl NetIo<'_> {
                         s.set_passcred(on);
                     } else if let Ok(s) = io.remote_unix_of(fd) {
                         s.set_passcred(on);
+                    } else if let Ok(s) = io.dgram_of(fd) {
+                        s.set_passcred(on);
                     }
                 }
                 Ok(0)
@@ -6032,6 +6037,9 @@ impl NetIo<'_> {
                 return Err(Errno::EPROTONOSUPPORT);
             }
             let sock = Arc::new(unix::UnixSocket::new(true));
+            if kind == 5 {
+                sock.set_seqpacket();
+            }
             let nonblock = ty & SOCK_NONBLOCK != 0;
             sock.set_nonblocking(nonblock);
             let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -6340,7 +6348,7 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
         } else {
             None
         };
-        return d.send_to(&data, to.as_deref());
+        return d.send_to(&data, to.as_deref(), Some(io.cred()));
     }
     if let Ok(sock) = io.netlink_of(fd) {
         let to = if dest != 0 && dest_len != 0 { Some(FdIo::read_sockaddr_nl(m, dest, dest_len)?) } else { None };
@@ -6364,7 +6372,7 @@ fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, fl
     let len = (len as usize).min(1 << 22);
     let mut tmp = vec![0u8; len];
     if let Ok(d) = io.dgram_of(fd) {
-        let (n, whole, from) = d.recv_from(&mut tmp, flags & Kernel::MSG_PEEK != 0)?;
+        let (n, whole, from, _) = d.recv_from(&mut tmp, flags & Kernel::MSG_PEEK != 0)?;
         m.write(buf, &tmp[..n])?;
         if addr != 0 {
             match from {
@@ -6498,7 +6506,11 @@ fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     if let Ok(s) = io.netlink_of(fd) {
         return Ok((16, s.kind()));
     }
-    if io.unix_of(fd).is_ok() || io.remote_unix_of(fd).is_ok() {
+    if let Ok(s) = io.unix_of(fd) {
+        const SOCK_SEQPACKET: u32 = 5;
+        return Ok((AF_UNIX, if s.is_seqpacket() { SOCK_SEQPACKET } else { SOCK_STREAM }));
+    }
+    if io.remote_unix_of(fd).is_ok() {
         return Ok((AF_UNIX, SOCK_STREAM));
     }
     let f = io.fds.get(fd)?;
@@ -6642,7 +6654,7 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         (SOL_SOCKET, 1 | 2 | 5 | 6 | 9 | 10 | 11 | 12 | 15 | 29 | 34 | 36) => (0, 4),
         // SO_PASSCRED, as set
         (SOL_SOCKET, 16) => {
-            let on = io.unix_of(fd).map(|s| s.passcred()).or_else(|_| io.remote_unix_of(fd).map(|s| s.passcred())).unwrap_or(false);
+            let on = io.unix_of(fd).map(|s| s.passcred()).or_else(|_| io.remote_unix_of(fd).map(|s| s.passcred())).or_else(|_| io.dgram_of(fd).map(|s| s.passcred())).unwrap_or(false);
             (on as u64, 4)
         }
         // SO_SNDBUF, SO_RCVBUF: Linux's defaults, as it reports them
@@ -6651,7 +6663,10 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         // SO_RCVLOWAT, SO_SNDLOWAT
         (SOL_SOCKET, 18 | 19) => (1, 4),
         // SO_ACCEPTCONN
-        (SOL_SOCKET, 30) => (io.socket_of(fd).map(|s| s.is_listening()).unwrap_or(false) as u64, 4),
+        (SOL_SOCKET, 30) => {
+            let listening = io.socket_of(fd).map(|s| s.is_listening()).or_else(|_| io.unix_of(fd).map(|s| s.is_listening())).unwrap_or(false);
+            (listening as u64, 4)
+        }
         // SO_LINGER: off (struct linger, two ints)
         (SOL_SOCKET, 13) => (0, 8),
         // SO_RCVTIMEO, SO_SNDTIMEO (and their 64-bit-time forms): none
@@ -19279,14 +19294,22 @@ mod tests {
             got.push(f);
             m.write(0x21000, b"twelve bytes").unwrap();
             got.push(sys(&mut m, &mut k, nr::WRITE, &[f as u64, 0x21000, 12]));
+            // (A stat's first eight bytes, and a statx's at 136, are the
+            // device: each kernel's own filesystem's number, there and not
+            // compared.)
+            let stat = |m: &GuestMem<'_>, at: u64, len: usize, dev: std::ops::Range<usize>| -> Vec<i64> {
+                let bytes = m.read(at, len).unwrap().to_vec();
+                assert!(bytes[dev.clone()].iter().any(|b| *b != 0));
+                bytes.iter().enumerate().map(|(i, &b)| if dev.contains(&i) { 0 } else { b as i64 }).collect()
+            };
             got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[dir as u64, 0x20500, 0x22000, 0]));
-            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+            got.extend(stat(&m, 0x22000, 128, 0..8));
             got.push(sys(&mut m, &mut k, nr::NEWFSTATAT, &[dir as u64, 0x20500, 0x22000, AT_SYMLINK_NOFOLLOW]));
-            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+            got.extend(stat(&m, 0x22000, 128, 0..8));
             got.push(sys(&mut m, &mut k, nr::FSTAT, &[f as u64, 0x22000]));
-            got.extend(m.read(0x22000, 128).unwrap().iter().map(|&b| b as i64));
+            got.extend(stat(&m, 0x22000, 128, 0..8));
             got.push(sys(&mut m, &mut k, nr::STATX, &[cwd, 0x20300, 0, 0x7ff, 0x23000]));
-            got.extend(m.read(0x23000, 256).unwrap().iter().map(|&b| b as i64));
+            got.extend(stat(&m, 0x23000, 256, 136..144));
             // the mount's id, the same for the file and for the root
             // (systemd's chase compares them)
             let sx = m.read(0x23000, 256).unwrap();

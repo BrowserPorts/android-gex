@@ -246,6 +246,8 @@ pub struct UnixSocket {
     gone: AtomicBool,
     /// `SO_PASSCRED`: each `recvmsg` says who sent it (`SCM_CREDENTIALS`).
     passcred: AtomicBool,
+    /// Made `SOCK_SEQPACKET` ([`UnixSocket::set_seqpacket`]).
+    seqpacket: AtomicBool,
 }
 
 /// A process's credentials as `struct ucred` has them: pid, uid, gid.
@@ -275,7 +277,24 @@ impl UnixSocket {
             peer_addr: Mutex::new(None),
             gone: AtomicBool::new(false),
             passcred: AtomicBool::new(false),
+            seqpacket: AtomicBool::new(false),
         }
+    }
+
+    /// The socket was made `SOCK_SEQPACKET`: what `SO_TYPE` says of it.
+    /// (Its messages are not kept apart yet: it carries bytes as a stream
+    /// socket does.)
+    pub fn set_seqpacket(&self) {
+        self.seqpacket.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_seqpacket(&self) -> bool {
+        self.seqpacket.load(Ordering::Relaxed)
+    }
+
+    /// Whether `listen` has been called on it (`SO_ACCEPTCONN`).
+    pub fn is_listening(&self) -> bool {
+        matches!(&*self.role.lock().unwrap(), Role::Listening { .. })
     }
 
     /// `SO_PASSCRED`, set and read.
@@ -929,9 +948,13 @@ pub struct UnixDgram {
     /// Where `send` goes: a socketpair's other end, or the socket bound to
     /// the name `connect` gave (the name too, for `getpeername`).
     peer: Mutex<Option<(Weak<UnixDgram>, Option<String>)>>,
-    /// Datagrams waiting to be read, each with its sender's name.
-    inbox: Mutex<VecDeque<(Vec<u8>, Option<String>)>>,
+    /// Datagrams waiting to be read, each with its sender's name and who
+    /// sent it.
+    inbox: Mutex<VecDeque<(Vec<u8>, Option<String>, Option<Cred>)>>,
     nonblocking: AtomicBool,
+    /// `SO_PASSCRED`: each datagram read with `recvmsg` says who sent it
+    /// (`SCM_CREDENTIALS`). Android's logd takes a log line only with it.
+    passcred: AtomicBool,
     /// Who waits on it (`crate::wait`): readers.
     queue: crate::wait::Queue,
 }
@@ -945,8 +968,18 @@ impl UnixDgram {
             peer: Mutex::new(None),
             inbox: Mutex::new(VecDeque::new()),
             nonblocking: AtomicBool::new(false),
+            passcred: AtomicBool::new(false),
             queue: crate::wait::Queue::new(),
         })
+    }
+
+    /// `SO_PASSCRED`, set and read.
+    pub fn set_passcred(&self, on: bool) {
+        self.passcred.store(on, Ordering::Relaxed);
+    }
+
+    pub fn passcred(&self) -> bool {
+        self.passcred.load(Ordering::Relaxed)
     }
 
     /// `socketpair(AF_UNIX, SOCK_DGRAM)`: two sockets connected to each other.
@@ -996,21 +1029,22 @@ impl UnixDgram {
         Ok(0)
     }
 
-    /// Queue `data` for this socket from `from`.
-    fn deliver(&self, data: &[u8], from: Option<String>) -> SysResult {
+    /// Queue `data` for this socket from `from`, sent by `cred`.
+    fn deliver(&self, data: &[u8], from: Option<String>, cred: Option<Cred>) -> SysResult {
         let mut inbox = self.inbox.lock().unwrap();
-        let held: usize = inbox.iter().map(|(d, _)| d.len()).sum();
+        let held: usize = inbox.iter().map(|(d, _, _)| d.len()).sum();
         if inbox.len() >= DGRAM_QUEUE || held + data.len() > DGRAM_BYTES {
             return Err(Errno::EAGAIN);
         }
-        inbox.push_back((data.to_vec(), from));
+        inbox.push_back((data.to_vec(), from, cred));
         drop(inbox);
         self.queue.notify();
         Ok(data.len() as u64)
     }
 
-    /// `sendto`: to the socket bound to `to`, or (`None`) to the connected one.
-    pub fn send_to(&self, data: &[u8], to: Option<&str>) -> SysResult {
+    /// `sendto`: to the socket bound to `to`, or (`None`) to the connected
+    /// one, from the process `cred` is.
+    pub fn send_to(&self, data: &[u8], to: Option<&str>, cred: Option<Cred>) -> SysResult {
         if data.len() > DGRAM_BYTES {
             return Err(Errno::EMSGSIZE);
         }
@@ -1021,21 +1055,23 @@ impl UnixDgram {
                 None => return Err(Errno::ENOTCONN),
             },
         };
-        target.deliver(data, self.name())
+        target.deliver(data, self.name(), cred)
     }
 
-    /// `recvfrom`: the next datagram (what does not fit in `buf` is lost) and
-    /// who sent it; its whole length too, for `MSG_TRUNC`.
-    pub fn recv_from(&self, buf: &mut [u8], peek: bool) -> Result<(usize, usize, Option<String>), Errno> {
+    /// `recvfrom`: the next datagram (what does not fit in `buf` is lost),
+    /// the name of the socket that sent it and the process that did; its
+    /// whole length too, for `MSG_TRUNC`.
+    #[allow(clippy::type_complexity)]
+    pub fn recv_from(&self, buf: &mut [u8], peek: bool) -> Result<(usize, usize, Option<String>, Option<Cred>), Errno> {
         let mut inbox = self.inbox.lock().unwrap();
-        let (data, from) = if peek {
+        let (data, from, cred) = if peek {
             inbox.front().cloned().ok_or(Errno::EAGAIN)?
         } else {
             inbox.pop_front().ok_or(Errno::EAGAIN)?
         };
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
-        Ok((n, data.len(), from))
+        Ok((n, data.len(), from, cred))
     }
 }
 
@@ -1062,7 +1098,7 @@ impl FileHandle for UnixDgram {
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
-        self.recv_from(buf, false).map(|(n, _, _)| n as u64)
+        self.recv_from(buf, false).map(|(n, _, _, _)| n as u64)
     }
 
     /// `write` and `send` with no address: to the connected socket. The
@@ -1075,7 +1111,7 @@ impl FileHandle for UnixDgram {
             Some((w, _)) => w.upgrade().ok_or(Errno::ECONNREFUSED)?,
             None => return Err(Errno::ENOTCONN),
         };
-        target.deliver(buf, self.name())
+        target.deliver(buf, self.name(), None)
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
@@ -1113,7 +1149,7 @@ impl FileHandle for UnixDgram {
     }
 
     fn available(&self) -> Option<u64> {
-        Some(self.inbox.lock().unwrap().front().map_or(0, |(d, _)| d.len() as u64))
+        Some(self.inbox.lock().unwrap().front().map_or(0, |(d, _, _)| d.len() as u64))
     }
 
     fn as_unix_dgram(self: Arc<Self>) -> Option<Arc<UnixDgram>> {
