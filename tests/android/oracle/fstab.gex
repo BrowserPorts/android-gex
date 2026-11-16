@@ -1,0 +1,16 @@
+# The storage of the device gex is, for init.sh's boot: bound over the
+# image's /vendor/etc/fstab.ranchu.
+#
+# The image's own fstab describes the emulator's disks: system, vendor and
+# the rest as logical partitions of a super partition, mapped by the
+# device-mapper and mounted by first-stage init; /data an ext4 on a block
+# device, encrypted file by file and by its metadata. Here the system's
+# partitions are the root's directories already (root.sh), and vold stops
+# the boot when a partition its fstab calls logical is not a mapped device.
+# So the system's partitions are not listed, and /data is what gex has for
+# it: a tmpfs, the owner and mode init gives the directory. No encryption,
+# quota, checkpoint or verity is asked of it, which Android then goes
+# without.
+#
+#<src>  <mnt_point>  <type>  <mnt_flags and options>                              <fs_mgr_flags>
+tmpfs   /data        tmpfs   nosuid,nodev,noatime,mode=0771,uid=1000,gid=1000     latemount

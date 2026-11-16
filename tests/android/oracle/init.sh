@@ -9,6 +9,9 @@
 # /system/bin/init with the arguments given (default: selinux_setup,
 # which loads the image's policy and runs the second stage). gexc mounts
 # selinuxfs and gives a boot configuration that says not to enforce.
+# The image's fstab, which describes the emulator's disks, is covered by
+# fstab.gex, which describes what is here: no partitions to map, and a
+# tmpfs for /data.
 # GEXC is the gexc to use, built with the big64 feature as for
 # compare.sh; TIMEOUT is how long to let init run (default 150 seconds:
 # an init that boots does not end). GEX_TIME_SCALE, when set, slows the
@@ -48,7 +51,7 @@ CONFIG=$(mktemp)
 ERR=$(mktemp)
 printf 'androidboot.selinux = "permissive"\nandroidboot.hardware = "ranchu"\n' >"$CONFIG"
 (cd "$ROOT" && gexc timeout "${TIMEOUT:-150}" "$GEXC" run --argv0 /firststage --uid 0 --mem64 --selinuxfs --bootconfig "$CONFIG" \
-    --bind "$FIRST=/firststage" --sysroot "$ROOT" "$FIRST" "$@" 2>"$ERR")
+    --bind "$FIRST=/firststage" --bind "$HERE/fstab.gex=/vendor/etc/fstab.ranchu" --sysroot "$ROOT" "$FIRST" "$@" 2>"$ERR")
 echo "init.sh: gexc exited $? (124: still running at the time limit)"
 grep -a '^\[kmsg\]' "$ERR" | sed 's/^\[kmsg\] //'
 echo "init.sh: and gexc said:"
