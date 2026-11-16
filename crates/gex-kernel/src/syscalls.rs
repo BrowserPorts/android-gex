@@ -7131,6 +7131,12 @@ pub struct Creds {
     /// an exec keeps them. Not in [`Creds::save`]'s bytes: a process the
     /// table of another kernel describes reads as having none.
     groups: std::sync::Mutex<Vec<u32>>,
+    /// `oom_score_adj` and the least it may be set to without
+    /// `CAP_SYS_RESOURCE` (`signal->oom_score_adj`, `oom_score_adj_min`).
+    /// Here because it has the ids' life: a fork's copy has it and an
+    /// exec keeps it. Nothing reads it to choose a process to end: this
+    /// kernel ends none for want of memory.
+    oom: [std::sync::atomic::AtomicI32; 2],
 }
 
 /// The securebits (include/uapi/linux/securebits.h): each has a lock bit
@@ -7169,7 +7175,34 @@ impl Creds {
             securebits: 0.into(),
             sec: crate::selinux::procattr::INITIAL.map(std::sync::atomic::AtomicU32::new),
             groups: std::sync::Mutex::new(Vec::new()),
+            oom: [const { std::sync::atomic::AtomicI32::new(0) }; 2],
         }
+    }
+
+    /// `/proc/<pid>/oom_score_adj` as it reads.
+    pub fn oom_score_adj(&self) -> i32 {
+        self.oom[0].load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A write of `value` to it by a process whose ids these are
+    /// (`__set_oom_adj`): from -1000 to 1000 (`EINVAL`), and not below
+    /// the least it has been set to by one with `CAP_SYS_RESOURCE`
+    /// unless the writer has it too (`EACCES`), who moves that least.
+    pub fn set_oom_score_adj(&self, value: i32) -> Result<(), Errno> {
+        const CAP_SYS_RESOURCE: u64 = 24;
+        use std::sync::atomic::Ordering::Relaxed;
+        if !(-1000..=1000).contains(&value) {
+            return Err(Errno::EINVAL);
+        }
+        let privileged = self.capable(CAP_SYS_RESOURCE);
+        if value < self.oom[1].load(Relaxed) && !privileged {
+            return Err(Errno::EACCES);
+        }
+        self.oom[0].store(value, Relaxed);
+        if privileged {
+            self.oom[1].store(value, Relaxed);
+        }
+        Ok(())
     }
 
     /// The supplementary groups (`getgroups`).
@@ -7225,6 +7258,9 @@ impl Creds {
         let c = Creds::blank(0, 0);
         c.restore(&self.save());
         c.set_groups(self.groups());
+        for (mine, its) in c.oom.iter().zip(&self.oom) {
+            mine.store(its.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+        }
         Arc::new(c)
     }
 

@@ -120,6 +120,13 @@ impl ProcSource for KernelProcSource {
         }
         Ok(l.creds.capable(CAP_MAC_ADMIN))
     }
+    fn oom_score_adj(&self) -> Option<i32> {
+        self.0.get().map(|l| l.creds.oom_score_adj())
+    }
+    fn set_oom_score_adj(&self, value: i32) -> Result<(), crate::errno::Errno> {
+        let l = self.0.get().ok_or(crate::errno::Errno::ESRCH)?;
+        l.creds.set_oom_score_adj(value)
+    }
     fn set_attr_id(&self, which: usize, sid: u32) {
         if let Some(l) = self.0.get() {
             l.creds.set_sec(which, sid);

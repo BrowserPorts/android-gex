@@ -35,6 +35,15 @@ pub trait ProcSource: Send + Sync {
     fn mount_ns_id(&self) -> Option<u64> {
         None
     }
+    /// The process's `oom_score_adj`, where the source keeps one.
+    fn oom_score_adj(&self) -> Option<i32> {
+        None
+    }
+    /// A write of `value` to it by the process itself
+    /// ([`crate::syscalls::Creds::set_oom_score_adj`]).
+    fn set_oom_score_adj(&self, _value: i32) -> Result<(), Errno> {
+        Err(Errno::ENOENT)
+    }
     /// Set one of the process's SELinux ids.
     fn set_attr_id(&self, which: usize, sid: u32) {
         let _ = (which, sid);
@@ -297,28 +306,181 @@ struct Generated {
     data: Vec<u8>,
 }
 
+/// `/proc/<pid>/oom_score_adj`: how much to prefer the process when one
+/// has to be ended for want of memory, -1000 (never) to 1000. It reads as
+/// it is when read, and a write is a number as `kstrtoint` reads one
+/// (space around it stripped, a sign, base by its beginning), which the
+/// process's ids decide on ([`crate::syscalls::Creds::set_oom_score_adj`]).
+/// Android's init writes -1000 to its own; lmkd and the activity manager
+/// write every app's.
+struct OomScoreAdj {
+    source: Arc<dyn ProcSource>,
+}
+
+impl std::fmt::Debug for OomScoreAdj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OomScoreAdj")
+    }
+}
+
+impl FileHandle for OomScoreAdj {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        Generated { data: format!("{}\n", self.source.oom_score_adj().unwrap_or(0)).into_bytes() }.read_at(offset, buf)
+    }
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        // `PROC_NUMBUF` less one is all that is looked at.
+        let text = std::str::from_utf8(&buf[..buf.len().min(12)]).map_err(|_| Errno::EINVAL)?;
+        let text = text.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0');
+        let (negative, digits) = match text.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, text.strip_prefix('+').unwrap_or(text)),
+        };
+        let (base, digits) = if let Some(rest) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+            (16, rest)
+        } else if digits.len() > 1 && digits.starts_with('0') {
+            (8, &digits[1..])
+        } else {
+            (10, digits)
+        };
+        if digits.is_empty() || digits.starts_with(['+', '-']) {
+            return Err(Errno::EINVAL);
+        }
+        let value = i64::from_str_radix(digits, base).map_err(|_| Errno::EINVAL)?;
+        let value = i32::try_from(if negative { -value } else { value }).map_err(|_| Errno::EINVAL)?;
+        self.source.set_oom_score_adj(value)?;
+        Ok(buf.len() as u64)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { mode: 0o644, ..Generated { data: Vec::new() }.metadata()? })
+    }
+}
+
 /// A setting under `/proc/sys` that can be set: its value as it was at
 /// the open to read, and a write of a number to set it
-/// (`proc_dointvec_minmax`: the number, with space around it or a newline
-/// after; `EINVAL` for anything else and for a value out of its range).
+/// (`proc_dointvec_minmax`; `EINVAL` for what is not a number and for a
+/// value out of its range).
+///
+/// A read gives the value as it is when it is read, not as it was at the
+/// open: Android's init keeps one descriptor open to read a setting back
+/// after each write of it through another.
 #[derive(Debug)]
 struct Sysctl {
-    file: Generated,
-    name: String,
+    which: Setting,
+}
+
+/// Which setting a [`Sysctl`] is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Setting {
+    /// `net.core.<name>`: a socket buffer's limit.
+    NetCore(String),
+    /// `vm.mmap_rnd_bits`.
+    MmapRndBits,
+}
+
+impl Setting {
+    /// The setting at `path` (under `/proc`), if it is one that can be set.
+    fn at(path: &str) -> Option<Setting> {
+        if path == "sys/vm/mmap_rnd_bits" {
+            return Some(Setting::MmapRndBits);
+        }
+        let name = path.strip_prefix("sys/net/core/")?;
+        crate::netlink::sysctl::get(name).map(|_| Setting::NetCore(name.to_string()))
+    }
+
+    /// Its value now, as its file reads.
+    fn text(&self) -> Vec<u8> {
+        let value = match self {
+            Setting::NetCore(name) => crate::netlink::sysctl::get(name).unwrap_or(0),
+            Setting::MmapRndBits => mmap_rnd_bits::get(),
+        };
+        format!("{value}\n").into_bytes()
+    }
+
+    /// Its file's mode: the socket limits are anyone's to read, the
+    /// address space's randomness root's alone.
+    fn mode(&self) -> u32 {
+        match self {
+            Setting::NetCore(_) => 0o644,
+            Setting::MmapRndBits => 0o600,
+        }
+    }
+}
+
+/// `vm.mmap_rnd_bits`: how many bits of a mapping's address are random.
+/// Its range is arm64's with 4 KiB pages and the 39-bit address space
+/// Android's kernels are built with (`ARCH_MMAP_RND_BITS_MIN`, `_MAX`: 18
+/// to 24), and it starts at the least, as a kernel configured without a
+/// choice does. Android's init sets it as high as it will go and will not
+/// boot unless 24 is taken. **Kept and not applied:** where gex puts a
+/// mapping is not random at all, which is said the first time it is set.
+/// (There is no `mmap_rnd_compat_bits`: this kernel runs no 32-bit ARM.)
+pub mod mmap_rnd_bits {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    pub const MIN: i64 = 18;
+    pub const MAX: i64 = 24;
+    static BITS: AtomicU32 = AtomicU32::new(MIN as u32);
+
+    pub fn get() -> u32 {
+        BITS.load(Ordering::Relaxed)
+    }
+
+    pub fn set(value: i64) -> Result<(), crate::errno::Errno> {
+        if !(MIN..=MAX).contains(&value) {
+            return Err(crate::errno::Errno::EINVAL);
+        }
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| eprintln!("[gex] vm.mmap_rnd_bits is kept and not applied: mappings are not placed at random"));
+        BITS.store(value as u32, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// The number a write to a setting gives, and how much of the write that
+/// was (`proc_get_long`, `__do_proc_dointvec`): space before it, a minus
+/// sign, then digits in the base their beginning says (`0x` sixteen, `0`
+/// eight, else ten), ended by the end, a NUL or more space. The space
+/// after it is taken with it and what follows is left: a write of two
+/// numbers is a short write of the first. `EINVAL` for anything else.
+fn sysctl_number(buf: &[u8]) -> Result<(i64, usize), Errno> {
+    let space = |b: &u8| matches!(b, b' ' | b'\t' | b'\n');
+    let mut at = buf.iter().take_while(|b| space(b)).count();
+    let negative = buf.get(at) == Some(&b'-');
+    at += negative as usize;
+    let rest = &buf[at..];
+    let (base, skip) = if rest.len() > 1 && rest[0] == b'0' && (rest[1] | 0x20) == b'x' {
+        (16, 2)
+    } else if rest.len() > 1 && rest[0] == b'0' && rest[1].is_ascii_digit() {
+        (8, 1)
+    } else {
+        (10, 0)
+    };
+    at += skip;
+    let digits = buf[at..].iter().take_while(|b| (**b as char).is_digit(base)).count();
+    let end = at + digits;
+    if digits == 0 || !buf.get(end).is_none_or(|b| space(b) || *b == 0) {
+        return Err(Errno::EINVAL);
+    }
+    let text = std::str::from_utf8(&buf[at..end]).map_err(|_| Errno::EINVAL)?;
+    let value = i64::from_str_radix(text, base).map_err(|_| Errno::EINVAL)?;
+    let after = buf[end..].iter().take_while(|b| space(b)).count();
+    Ok((if negative { -value } else { value }, end + after))
 }
 
 impl FileHandle for Sysctl {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
-        self.file.read_at(offset, buf)
+        Generated { data: self.which.text() }.read_at(offset, buf)
     }
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
-        let text = std::str::from_utf8(buf).map_err(|_| Errno::EINVAL)?.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0');
-        let value: u32 = text.parse().map_err(|_| Errno::EINVAL)?;
-        crate::netlink::sysctl::set(&self.name, value)?;
-        Ok(buf.len() as u64)
+        let (value, taken) = sysctl_number(buf)?;
+        match &self.which {
+            Setting::NetCore(name) => crate::netlink::sysctl::set(name, u32::try_from(value).map_err(|_| Errno::EINVAL)?)?,
+            Setting::MmapRndBits => mmap_rnd_bits::set(value)?,
+        }
+        Ok(taken as u64)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { mode: 0o644, ..self.file.metadata()? })
+        Ok(Metadata { mode: self.which.mode(), ..Generated { data: Vec::new() }.metadata()? })
     }
 }
 
@@ -513,6 +675,7 @@ impl ProcFs {
             "self/cmdline" => s.cmdline(),
             "self/environ" => s.environ(),
             "self/auxv" => s.auxv(),
+            "self/oom_score_adj" => format!("{}\n", s.oom_score_adj()?).into_bytes(),
             "self/stat" => s.stat(id, self.tasks_of("self").len(), task().as_ref()).into_bytes(),
             "self/status" => s.status(id, self.tasks_of("self").len(), task().as_ref()).into_bytes(),
             "self/statm" => statm_text(&s.usage()).into_bytes(),
@@ -653,10 +816,13 @@ impl FileSystem for ProcFs {
             }
             return Ok(Arc::new(Attr { source: Arc::clone(&self.source), who, which }));
         }
-        // A setting that can be set: the socket buffers' limits.
-        if let Some(name) = path.strip_prefix("sys/net/core/").filter(|n| crate::netlink::sysctl::get(n).is_some()) {
-            let data = self.generate(&path, tid).unwrap_or_default();
-            return Ok(Arc::new(Sysctl { file: Generated { data }, name: name.to_string() }));
+        // A setting that can be set: the socket buffers' limits, the
+        // address space's randomness.
+        if let Some(which) = Setting::at(&path) {
+            return Ok(Arc::new(Sysctl { which }));
+        }
+        if path == "self/oom_score_adj" && self.source.oom_score_adj().is_some() {
+            return Ok(Arc::new(OomScoreAdj { source: Arc::clone(&self.source) }));
         }
         if let Some(data) = self.generate(&path, tid) {
             return Ok(Arc::new(Generated { data }));
@@ -714,7 +880,7 @@ impl FileSystem for ProcFs {
             }
             "self" => vec![
                 "maps", "cmdline", "environ", "auxv", "stat", "status", "statm", "comm", "exe", "cwd", "fd",
-                "fdinfo", "task", "mountinfo", "mounts", "attr",
+                "fdinfo", "task", "mountinfo", "mounts", "attr", "oom_score_adj",
             ],
             "self/fd" => {
                 let mut out = base_entries();
@@ -774,11 +940,11 @@ impl FileSystem for ProcFs {
         }
         if self.generate(&path, tid).is_some() {
             // The settings that can be set say so.
-            let settable = path.strip_prefix("sys/net/core/").is_some_and(|n| crate::netlink::sysctl::get(n).is_some());
+            let settable = Setting::at(&path);
             return Ok(Metadata {
                 file_type: FileType::Regular,
                 size: 0,
-                mode: if settable { 0o644 } else { 0o444 },
+                mode: settable.map_or(if path == "self/oom_score_adj" { 0o644 } else { 0o444 }, |s| s.mode()),
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
