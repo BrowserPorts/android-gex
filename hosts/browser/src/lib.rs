@@ -15715,6 +15715,13 @@ mod fault_code {
 /// when the process has no hook.
 #[must_use]
 fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
+    hook_fault_kind(pc, code, addr, 0, resumable)
+}
+
+/// [`hook_fault`] with an access violation's kind (Windows'
+/// ExceptionInformation[0]: 0 read, 1 write, 8 execute).
+#[must_use]
+fn hook_fault_kind(pc: u64, code: u32, addr: u64, kind: u32, resumable: bool) -> bool {
     if cgen::fault_hook() == 0 {
         return false;
     }
@@ -15722,10 +15729,10 @@ fn hook_fault(pc: u64, code: u32, addr: u64, resumable: bool) -> bool {
     let mut gm = guest();
     let c = my_ctx();
     let _ = gm.write_u64(c + ctx::PC as u64, pc);
-    if resumable && cgen::fault_in_place(c, code, addr, 0) {
+    if resumable && cgen::fault_in_place(c, code, addr, kind) {
         return true;
     }
-    cgen::fault_stage(code, addr, 0);
+    cgen::fault_stage(code, addr, kind);
     set_resume(pc);
     set_resume_ctx(c);
     trap();
@@ -15903,6 +15910,8 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             hook_fault(pc, fault_code::INT_OVERFLOW, 0, resumable)
         } else if raw == i::BRK_GENERAL_PROTECTION {
             hook_fault(pc, fault_code::ACCESS_VIOLATION, 0xffff_ffff, resumable)
+        } else if raw == i::BRK_FETCH_FAULT {
+            hook_fault_kind(pc, fault_code::ACCESS_VIOLATION, gex_abi::fetch_fault_addr(pc), 8, resumable)
         } else if raw != i::BRK_TRAP_PC && raw != i::BRK_BAD_SP && raw != i::BRK_X87_EXCEPTION {
             hook_fault(pc + 1, fault_code::BREAKPOINT, pc, resumable)
         } else {
@@ -15969,6 +15978,12 @@ pub extern "C" fn gex_breakpoint(_ctx: i32, pc: i64, raw: i32) {
             pc
         ));
         set_exit(128 + 8);
+        trap();
+    }
+    // An instruction running onto memory that is not executable: SIGSEGV
+    // at the first byte of it there, for the program's handler if it has one.
+    if raw == gex_abi::imports::BRK_FETCH_FAULT {
+        segv_at(pc as u64, gex_abi::fetch_fault_addr(pc as u64));
         trap();
     }
     // A general-protection fault (a privileged instruction in user mode):
@@ -16392,6 +16407,33 @@ pub(crate) static DIRS_HEALED: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// which are not a bug.
 pub(crate) static DIRS_HEALED_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `?jitdiag=1`: a block's guard found its bytes changed. Its first 32 bytes
+/// now, and whether they are the ones its last guard hit saw, at the 1st,
+/// 8th, 64th and 512th hit: bytes that are the same hit after hit were not
+/// rewritten since the last lift, and the translation, not the program, is
+/// what keeps disagreeing with them.
+fn guard_bytes_say(addr: u64, pc: u64) {
+    thread_local!(static SEEN: std::cell::RefCell<std::collections::HashMap<u64, (u32, Vec<u8>, u32)>> = Default::default());
+    let now = guest().read(addr, 32).map(|b| b.to_vec()).unwrap_or_default();
+    let said = SEEN.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(addr).or_insert((0, Vec::new(), 0));
+        e.0 += 1;
+        if e.1 == now {
+            e.2 += 1;
+        }
+        e.1 = now.clone();
+        matches!(e.0, 1 | 8 | 64 | 512).then(|| (e.0, e.2))
+    });
+    if let Some((n, same)) = said {
+        let hex: String = now.iter().map(|b| format!("{b:02x}")).collect();
+        warn_line(&format!(
+            "gex: pid {} guard hit {n} at {addr:#x} (block {pc:#x}): bytes now {hex}; {same} of the hits saw the bytes the one before did\n",
+            my_pid()
+        ));
+    }
+}
+
 /// For a block at `start` that failed its page check: its page and the next
 /// (an instruction across the boundary), wherever the page table numbers the
 /// page and the directory does not name that base, get the directory entry
@@ -16710,6 +16752,9 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // the page's block records. The old slots leak, which is harmless: they
         // are never reused and, once the directory is cleared, unreachable.
         let page = gex_abi::dispatch_page(addr as u64);
+        if jit_diag() {
+            guard_bytes_say(addr as u64, _pc as u64);
+        }
         with_jit_only(|j| {
             // The page in either mode: a WoW64 process's 32-bit blocks are
             // under the other mode's key alone (`gex_abi::ALT_PAGE`), so a
@@ -18558,9 +18603,15 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
 /// The whole process: a status set for this thread alone left the others
 /// running and its parent waiting.
 fn branch_fault(pc: u64) {
+    segv_at(pc, pc)
+}
+
+/// SIGSEGV at `pc` for an access at `addr`: the program's handler, or the
+/// process ends.
+fn segv_at(pc: u64, addr: u64) {
     let c = my_ctx();
     let mut gm = guest();
-    match sigs::fault(&mut gm, c, 11, pc, pc) {
+    match sigs::fault(&mut gm, c, 11, pc, addr) {
         gex_kernel::signal::Delivery::Resume(target) => {
             if let Some(run) = MY_RUN.with(|r| r.borrow().clone()) {
                 run.lock().unwrap_or_else(|e| e.into_inner()).pc = target;

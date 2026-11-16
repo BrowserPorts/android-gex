@@ -5249,6 +5249,39 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 return Err(StopExecution.into());
             }
+            // An instruction running onto memory that is not executable: an
+            // access violation, executing, at the first byte of it there
+            // (the fault hook's); else SIGSEGV with that address.
+            if imm == gex_abi::imports::BRK_FETCH_FAULT {
+                let pc = pc as u64;
+                let at = gex_abi::fetch_fault_addr(pc);
+                if deliver_guest_fault_kind(&mut caller, fault_code::ACCESS_VIOLATION, pc, at, 8)? {
+                    return Err(StopExecution.into());
+                }
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
+                let state = caller.data_mut();
+                let mut gm = GuestMem::new(data);
+                match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, at)) {
+                    gex_kernel::signal::Delivery::Resume(target) => {
+                        state.resume_cause = Some("SIGSEGV".into());
+                        state.resume_at = Some(target)
+                    }
+                    _ => {
+                        state.exit = Some(Exit::Signal {
+                            signal: signal::SIGSEGV,
+                            pc,
+                            detail: format!("instruction at 0x{pc:x} runs onto 0x{at:x}, which is not executable guest memory"),
+                            internal: false,
+                        })
+                    }
+                }
+                return Err(StopExecution.into());
+            }
             // An x87 exception the control word unmasks: not delivered, so
             // the process dies of SIGFPE, saying so.
             if imm == gex_abi::imports::BRK_X87_EXCEPTION {
