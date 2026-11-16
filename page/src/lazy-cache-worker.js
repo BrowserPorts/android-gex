@@ -569,14 +569,18 @@ function bundleIndex(url) {
   }
   return b;
 }
-/** `len` bytes at `from` of the file at `href` (`BUNDLE#OFFSET`). */
-async function bundleRead(href, from, len) {
+/** `len` bytes at `from` of the file at `href` (`BUNDLE#OFFSET`). `st.step`
+ *  says what it waits on now (`slowReads`). */
+async function bundleRead(href, from, len, st = {}) {
   const cut = href.lastIndexOf('#');
   const url = href.slice(0, cut), start = Number(href.slice(cut + 1)) + from;
+  st.step = 'the bundle\'s index';
   const b = await bundleIndex(url);
   const first = Math.floor(start / b.frame), last = Math.floor((start + len - 1) / b.frame);
   const out = new Uint8Array(len);
   for (let k = first, at = start; k <= last; k++) {
+    const key = `${url}#${k}`;
+    st.step = `frame ${k} (${fetching.has(key) ? 'its fetch in flight' : packed.has(key) || streamed.has(key) ? 'held, decoding' : 'from the cache or the network'})`;
     const f = await frameOf(url, b, k);
     const a = at - k * b.frame, n = Math.min(f.length - a, start + len - at);
     if (n <= 0) throw new Error(`${href} @${from}: short`);
@@ -623,6 +627,18 @@ async function start(m) {
   store_ = cache;
   self.postMessage({ kind: 'ready', ok: true });
   const busy = new Set();
+  // Reads taken and not answered: each said once, when it has waited 10 s,
+  // with what it waits on (a stalled read is a program stalled on a file,
+  // which otherwise says nothing at all).
+  const slowReads = new Set();
+  setInterval(() => {
+    const now = performance.now();
+    for (const st of slowReads) {
+      if (st.said || now - st.t0 < 10000) continue;
+      st.said = true;
+      console.warn(`[lazy-cache] a read of ${st.url} @${st.from} (${st.len} bytes) has waited ${Math.round((now - st.t0) / 1000)} s, on ${st.step}`);
+    }
+  }, 2000);
   const serve = async (i) => {
     const base = (HEAD + i * SLOT) / 4;
     // Taken: the reader waits for this answer now, not its own fetch.
@@ -635,11 +651,15 @@ async function start(m) {
     const from = new Float64Array(m.ctl, HEAD + i * SLOT + 24, 1)[0];
     const url = new TextDecoder().decode(raw.slice(HEAD + i * SLOT + 32, HEAD + i * SLOT + 32 + ul));
     let bytes = null;
+    const st = { url, from, len, t0: performance.now(), step: 'the network', said: false };
+    slowReads.add(st);
     try {
-      bytes = url.includes('#') && zstdUrl ? await bundleRead(url, from, len) : await read(cache, url, from, len);
+      bytes = url.includes('#') && zstdUrl ? await bundleRead(url, from, len, st) : await read(cache, url, from, len);
     } catch (e) {
       if (e !== heldError) console.warn(`[lazy-cache] ${e?.message ?? e}`);
     }
+    slowReads.delete(st);
+    if (st.said) console.warn(`[lazy-cache] the read of ${url} @${from} came after ${Math.round((performance.now() - st.t0) / 1000)} s`);
     // (A reader no longer gives up once its ask is taken; should one ever,
     // nothing is written into its buffer, which may be gone.)
     if (Atomics.compareExchange(ctl, base, TAKEN, WRITING) !== TAKEN) {
