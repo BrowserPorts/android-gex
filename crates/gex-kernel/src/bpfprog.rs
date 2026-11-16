@@ -146,6 +146,15 @@ impl Insn {
     pub fn decode(b: &[u8]) -> Insn {
         Insn { code: b[0], dst: b[1] & 0xf, src: b[1] >> 4, off: i16::from_le_bytes([b[2], b[3]]), imm: i32::from_le_bytes(b[4..8].try_into().unwrap()) }
     }
+
+    pub fn encode(&self) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        b[0] = self.code;
+        b[1] = self.dst | self.src << 4;
+        b[2..4].copy_from_slice(&self.off.to_le_bytes());
+        b[4..8].copy_from_slice(&self.imm.to_le_bytes());
+        b
+    }
 }
 
 /// What a 64-bit load (`BPF_LD | BPF_IMM | BPF_DW`) loads.
@@ -157,6 +166,15 @@ pub enum Imm64 {
     Map(Arc<Map>),
     /// The address of a map's value at an offset (`BPF_PSEUDO_MAP_VALUE`).
     MapValue(Arc<Map>, u32),
+}
+
+/// The BTF a program was loaded with, and its function and line records
+/// (`bpf_func_info`, 8 bytes each; `bpf_line_info`, 16), as kept.
+#[derive(Debug, Clone)]
+pub struct ProgBtf {
+    pub btf: Arc<crate::btf::Btf>,
+    pub func_info: Vec<u8>,
+    pub line_info: Vec<u8>,
 }
 
 /// A loaded program.
@@ -171,6 +189,39 @@ pub struct Prog {
     /// The 64-bit loads, by the index of their first instruction.
     pub imm64: std::collections::BTreeMap<usize, Imm64>,
     pub uid: u32,
+    /// The program compiled.
+    pub image: crate::bpfjit::Image,
+    /// `bpf_prog_calc_tag`'s, and each function's.
+    pub tag: [u8; 8],
+    pub func_tags: Vec<[u8; 8]>,
+    /// The maps it uses, in the order it first names them.
+    pub maps: Vec<Arc<Map>>,
+    pub btf: Option<ProgBtf>,
+    /// When it was loaded: the boot clock's nanoseconds.
+    pub load_time: u64,
+}
+
+/// `bpf_prog_calc_tag`: the first eight bytes of the SHA-256 of the
+/// instructions with every map's descriptor (and a map value's offset)
+/// taken out, which differ from one load to the next.
+fn calc_tag(insns: &[Insn]) -> [u8; 8] {
+    let mut h = gex_key::sha256::Sha256::new();
+    let mut was_ld_map = false;
+    for x in insns {
+        let mut x = *x;
+        if !was_ld_map && x.code == 0x18 && matches!(x.src, 1 | 2) {
+            was_ld_map = true;
+            x.imm = 0;
+        } else if was_ld_map && x.code == 0 && x.dst == 0 && x.src == 0 && x.off == 0 {
+            was_ld_map = false;
+            x.imm = 0;
+        } else {
+            was_ld_map = false;
+        }
+        h.update(&x.encode());
+    }
+    let d = h.finish();
+    d[..8].try_into().unwrap()
 }
 
 fn next_id() -> u32 {
@@ -542,7 +593,8 @@ impl Prog {
     /// Check and keep a program. `maps` gives the map a descriptor is:
     /// `Err(EBADF)` for one not open, `Err(EINVAL)` for one that is not a
     /// map.
-    pub fn load(ty: u32, expected_attach: u32, raw: &[u8], license: &str, name: [u8; 16], uid: u32, maps: &dyn Fn(i32) -> Result<Arc<Map>, Errno>) -> Result<Prog, Errno> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(ty: u32, expected_attach: u32, raw: &[u8], license: &str, name: [u8; 16], uid: u32, btf: Option<ProgBtf>, maps: &dyn Fn(i32) -> Result<Arc<Map>, Errno>) -> Result<Prog, Errno> {
         if ty == 0 || ty > prog_type::MAX {
             return Err(Errno::EINVAL);
         }
@@ -581,20 +633,197 @@ impl Prog {
                 i += 1;
             }
         }
-        Ok(Prog { id: next_id(), ty, expected_attach: expected, name, gpl, insns, imm64, uid })
+        let tag = calc_tag(&insns);
+        // Compiled, as the JIT that is always on would be; a program it
+        // cannot compile is not loaded.
+        let image = crate::bpfjit::compile(&insns, &imm64)?;
+        let func_tags = image
+            .funcs
+            .iter()
+            .enumerate()
+            .map(|(k, f)| {
+                let end = image.funcs.get(k + 1).map_or(insns.len(), |g| g.start);
+                calc_tag(&insns[f.start..end])
+            })
+            .collect();
+        let mut used: Vec<Arc<Map>> = Vec::new();
+        for v in imm64.values() {
+            if let Imm64::Map(m) | Imm64::MapValue(m, _) = v {
+                if !used.iter().any(|u| u.id() == m.id()) {
+                    used.push(Arc::clone(m));
+                }
+            }
+        }
+        let load_time = crate::syscalls::clock_ns(crate::syscalls::system_clock, 7);
+        Ok(Prog { id: next_id(), ty, expected_attach: expected, name, gpl, insns, imm64, uid, image, tag, func_tags, maps: used, btf, load_time })
     }
 
-    /// `struct bpf_prog_info`, as far as this kernel fills it.
-    pub fn info(&self) -> Vec<u8> {
+    /// The instructions as `xlated_prog_insns` gives them
+    /// (`bpf_insn_prepare_dump`): a map's descriptor replaced by its id (and
+    /// a value's offset kept), and a call's number hidden from a caller
+    /// that may not see kernel addresses. (Linux's are the instructions as
+    /// its verifier rewrote them, with a helper's address in a call; these
+    /// are the program's own.)
+    fn dump(&self, raw_ok: bool) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.insns.len() * 8);
+        let mut i = 0;
+        while i < self.insns.len() {
+            let mut x = self.insns[i];
+            if x.code == 0x85 && !raw_ok {
+                x.imm = 0;
+            }
+            if let Some(v) = self.imm64.get(&i) {
+                let mut y = self.insns[i + 1];
+                match v {
+                    Imm64::Map(m) => x.imm = m.id() as i32,
+                    Imm64::MapValue(m, off) => {
+                        x.imm = m.id() as i32;
+                        y.imm = *off as i32;
+                    }
+                    Imm64::Value(_) => {}
+                }
+                out.extend_from_slice(&x.encode());
+                out.extend_from_slice(&y.encode());
+                i += 2;
+                continue;
+            }
+            out.extend_from_slice(&x.encode());
+            i += 1;
+        }
+        out
+    }
+
+    /// `bpf_prog_get_info_by_fd`: the caller's `struct bpf_prog_info`
+    /// (`user`, as long as it gave) filled, and the arrays it points to that
+    /// it gave room in written. `capable`: `bpf_capable()`; `raw_ok`:
+    /// `bpf_dump_raw_ok()`, whether it may see kernel addresses and images.
+    pub fn info(&self, user: &[u8], m: &mut crate::GuestMem<'_>, capable: bool, raw_ok: bool) -> Result<Vec<u8>, Errno> {
         let mut b = vec![0u8; 228];
-        b[0..4].copy_from_slice(&self.ty.to_le_bytes());
-        b[4..8].copy_from_slice(&self.id.to_le_bytes());
-        // xlated_prog_len: the instructions as kept.
-        b[20..24].copy_from_slice(&((self.insns.len() * 8) as u32).to_le_bytes());
-        b[48..52].copy_from_slice(&self.uid.to_le_bytes());
-        let maps = self.imm64.values().filter(|v| !matches!(v, Imm64::Value(_))).count() as u32;
-        b[52..56].copy_from_slice(&maps.to_le_bytes());
+        let n = user.len().min(b.len());
+        b[..n].copy_from_slice(&user[..n]);
+        let r32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        let r64 = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let put32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let put64 = |b: &mut [u8], at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        put32(&mut b, 0, self.ty);
+        put32(&mut b, 4, self.id);
+        b[8..16].copy_from_slice(&self.tag);
+        put64(&mut b, 40, self.load_time);
+        put32(&mut b, 48, self.uid);
+        b[84] = (b[84] & !1) | self.gpl as u8;
         b[64..80].copy_from_slice(&self.name);
-        b
+        // The maps' ids.
+        let ulen = r32(&b, 52);
+        put32(&mut b, 52, self.maps.len() as u32);
+        for (k, map) in self.maps.iter().take(ulen as usize).enumerate() {
+            m.write_u32(r64(&b, 56) + 4 * k as u64, map.id())?;
+        }
+        // `set_info_rec_size`.
+        if (r32(&b, 144) != 0 || r32(&b, 132) != 0) && r32(&b, 132) != 8 {
+            return Err(Errno::EINVAL);
+        }
+        if (r32(&b, 148) != 0 || r32(&b, 172) != 0) && r32(&b, 172) != 16 {
+            return Err(Errno::EINVAL);
+        }
+        if (r32(&b, 168) != 0 || r32(&b, 176) != 0) && r32(&b, 176) != 8 {
+            return Err(Errno::EINVAL);
+        }
+        put32(&mut b, 132, 8);
+        put32(&mut b, 172, 16);
+        put32(&mut b, 176, 8);
+        // Run time and count, and recursion misses: nothing runs a program
+        // yet. What was checked: each operation once (a 64-bit load one),
+        // which is what the verifier counts of a program with no branches.
+        put64(&mut b, 192, 0);
+        put64(&mut b, 200, 0);
+        put64(&mut b, 208, 0);
+        put32(&mut b, 216, self.image.funcs.iter().map(|f| f.ops.len() as u32).sum());
+        if let Some(pb) = &self.btf {
+            put32(&mut b, 128, pb.btf.id);
+        }
+        if !capable {
+            for at in [16, 20, 104, 108, 144, 148, 168] {
+                put32(&mut b, at, 0);
+            }
+            return Ok(b);
+        }
+        // The instructions.
+        let ulen = r32(&b, 20);
+        put32(&mut b, 20, (self.insns.len() * 8) as u32);
+        if ulen != 0 {
+            let d = self.dump(raw_ok);
+            m.write(r64(&b, 32), &d[..d.len().min(ulen as usize)])?;
+        }
+        // The image, its functions' places and lengths.
+        let ulen = r32(&b, 16);
+        put32(&mut b, 16, self.image.len() as u32);
+        if !self.image.is_empty() && ulen != 0 {
+            if raw_ok {
+                let all: Vec<u8> = self.image.funcs.iter().flat_map(|f| f.image.iter().copied()).collect();
+                m.write(r64(&b, 24), &all[..all.len().min(ulen as usize)])?;
+            } else {
+                put64(&mut b, 24, 0);
+            }
+        }
+        let funcs = self.image.funcs.len();
+        let ulen = r32(&b, 104);
+        put32(&mut b, 104, funcs as u32);
+        if ulen != 0 {
+            if raw_ok {
+                for (k, f) in self.image.funcs.iter().take(ulen as usize).enumerate() {
+                    m.write_u64(r64(&b, 112) + 8 * k as u64, f.addr)?;
+                }
+            } else {
+                put64(&mut b, 112, 0);
+            }
+        }
+        let ulen = r32(&b, 108);
+        put32(&mut b, 108, funcs as u32);
+        if ulen != 0 {
+            if raw_ok {
+                for (k, f) in self.image.funcs.iter().take(ulen as usize).enumerate() {
+                    m.write_u32(r64(&b, 120) + 4 * k as u64, f.image.len() as u32)?;
+                }
+            } else {
+                put64(&mut b, 120, 0);
+            }
+        }
+        put32(&mut b, 220, 0);
+        put32(&mut b, 224, 0);
+        // Function and line records, and where each line was compiled to.
+        let (finfo, linfo) = self.btf.as_ref().map_or((&[][..], &[][..]), |pb| (&pb.func_info[..], &pb.line_info[..]));
+        let ulen = r32(&b, 144);
+        put32(&mut b, 144, (finfo.len() / 8) as u32);
+        if !finfo.is_empty() && ulen != 0 {
+            m.write(r64(&b, 136), &finfo[..finfo.len().min(ulen as usize * 8)])?;
+        }
+        let ulen = r32(&b, 148);
+        put32(&mut b, 148, (linfo.len() / 16) as u32);
+        if !linfo.is_empty() && ulen != 0 {
+            m.write(r64(&b, 152), &linfo[..linfo.len().min(ulen as usize * 16)])?;
+        }
+        let ulen = r32(&b, 168);
+        let lines = linfo.len() / 16;
+        put32(&mut b, 168, lines as u32);
+        if lines != 0 && ulen != 0 {
+            if raw_ok {
+                for k in 0..lines.min(ulen as usize) {
+                    let insn = u32::from_le_bytes(linfo[k * 16..k * 16 + 4].try_into().unwrap()) as usize;
+                    m.write_u64(r64(&b, 160) + 8 * k as u64, self.image.addr_of(insn).unwrap_or(0))?;
+                }
+            } else {
+                put64(&mut b, 160, 0);
+            }
+        }
+        // The tags: the program's, or each function's.
+        let ulen = r32(&b, 180);
+        put32(&mut b, 180, funcs as u32);
+        if ulen != 0 {
+            let tags: Vec<[u8; 8]> = if funcs > 1 { self.func_tags.clone() } else { vec![self.tag] };
+            for (k, t) in tags.iter().take(ulen as usize).enumerate() {
+                m.write(r64(&b, 184) + 8 * k as u64, t)?;
+            }
+        }
+        Ok(b)
     }
 }

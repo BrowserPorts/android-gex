@@ -524,13 +524,20 @@ pub mod mmap_rnd_bits {
 /// (`bpf_unpriv_handler`: `EPERM`); `net.core.bpf_jit_enable` only 1
 /// (`proc_dointvec_minmax_bpf_enable`); `net.core.bpf_jit_kallsyms` 0 or 1,
 /// starting at 1. Android's network BPF loader writes all three and stops
-/// the boot if it cannot. (Programs here are interpreted, not compiled:
-/// what the JIT setting says changes nothing a program sees.)
+/// the boot if it cannot. Programs are compiled at load into gex's own form
+/// ([`crate::bpfjit`]), so the JIT is on as the setting says.
+///
+/// And `kernel.kptr_restrict` (0 to 2, starting at 0), which says who may
+/// see kernel addresses, and with them a BPF program's image
+/// (`bpf_dump_raw_ok`). Android's init sets it to 2. (Linux asks
+/// `CAP_SYS_ADMIN` of a write to it; here who may write a setting is its
+/// file's mode, root's.)
 pub mod bpf_sysctl {
     use crate::errno::Errno;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static UNPRIV: AtomicU32 = AtomicU32::new(2);
+    static KPTR: AtomicU32 = AtomicU32::new(0);
     static KALLSYMS: AtomicU32 = AtomicU32::new(1);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -538,6 +545,18 @@ pub mod bpf_sysctl {
         UnprivDisabled,
         JitEnable,
         JitKallsyms,
+        KptrRestrict,
+    }
+
+    /// `kallsyms_show_value`: whether a caller with `CAP_SYSLOG` or
+    /// without may see kernel addresses. (Under setting 0 Linux shows them
+    /// to anyone when `perf_event_paranoid` is 1 or less; here it is 2, as
+    /// Linux starts it, and there is no perf to change it.)
+    pub fn addresses_shown(syslog: bool) -> bool {
+        match KPTR.load(Ordering::Relaxed) {
+            0 | 1 => syslog,
+            _ => false,
+        }
     }
 
     impl Which {
@@ -546,6 +565,7 @@ pub mod bpf_sysctl {
                 "sys/kernel/unprivileged_bpf_disabled" => Which::UnprivDisabled,
                 "sys/net/core/bpf_jit_enable" => Which::JitEnable,
                 "sys/net/core/bpf_jit_kallsyms" => Which::JitKallsyms,
+                "sys/kernel/kptr_restrict" => Which::KptrRestrict,
                 _ => return None,
             })
         }
@@ -555,6 +575,7 @@ pub mod bpf_sysctl {
                 Which::UnprivDisabled => UNPRIV.load(Ordering::Relaxed),
                 Which::JitEnable => 1,
                 Which::JitKallsyms => KALLSYMS.load(Ordering::Relaxed),
+                Which::KptrRestrict => KPTR.load(Ordering::Relaxed),
             }
         }
 
@@ -585,6 +606,12 @@ pub mod bpf_sysctl {
                         return Err(Errno::EINVAL);
                     }
                     KALLSYMS.store(value as u32, Ordering::Relaxed);
+                }
+                Which::KptrRestrict => {
+                    if !(0..=2).contains(&value) {
+                        return Err(Errno::EINVAL);
+                    }
+                    KPTR.store(value as u32, Ordering::Relaxed);
                 }
             }
             Ok(())
@@ -1070,7 +1097,7 @@ impl FileSystem for ProcFs {
             "sys/net" => vec!["core"],
             "sys/net/core" => vec!["bpf_jit_enable", "bpf_jit_kallsyms", "rmem_default", "rmem_max", "wmem_default", "wmem_max"],
             "sys/fs" => vec!["nr_open", "pipe-max-size"],
-            "sys/kernel" => vec!["osrelease", "pid_max", "random", "unprivileged_bpf_disabled"],
+            "sys/kernel" => vec!["kptr_restrict", "osrelease", "pid_max", "random", "unprivileged_bpf_disabled"],
             "sys/kernel/random" => vec!["boot_id", "entropy_avail", "poolsize", "uuid"],
             "sys/vm" => vec!["mmap_rnd_bits", "overcommit_memory"],
             "pressure" => vec!["cpu", "io", "memory"],

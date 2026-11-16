@@ -341,6 +341,10 @@ impl Map {
         Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(data) })
     }
 
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
     pub fn value_size(&self) -> u32 {
         self.value_size
     }
@@ -631,9 +635,15 @@ impl Map {
         }
     }
 
-    /// `struct bpf_map_info`, as far as this kernel fills it (88 bytes).
-    fn info(&self) -> Vec<u8> {
+    /// `struct bpf_map_info` (88 bytes): the caller's (`user`), with what
+    /// the kernel says of the map put in it.
+    fn info(&self, user: &[u8]) -> Vec<u8> {
         let mut b = vec![0u8; 88];
+        let n = user.len().min(b.len());
+        b[..n].copy_from_slice(&user[..n]);
+        // `btf_vmlinux_value_type_id` and `map_extra`: none here.
+        b[44..48].fill(0);
+        b[80..88].fill(0);
         let mut put = |at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
         put(0, self.ty);
         put(4, self.id);
@@ -766,6 +776,11 @@ pub struct Caller<'a> {
     pub capable: bool,
     /// `CAP_SYS_ADMIN`.
     pub admin: bool,
+    /// `CAP_NET_ADMIN`.
+    pub net_admin: bool,
+    /// `bpf_dump_raw_ok`: whether it may see kernel addresses (by
+    /// `kernel.kptr_restrict` and `CAP_SYSLOG`).
+    pub raw_ok: bool,
     pub uid: u32,
     pub gid: u32,
     pub umask: u32,
@@ -807,11 +822,6 @@ fn map_of(c: &Caller<'_>, fd: i32) -> Result<(Arc<Map>, bool, bool), Errno> {
 
 /// `bpf(cmd, attr, size)`.
 pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64) -> crate::errno::SysResult {
-    // Without CAP_BPF, nothing while kernel.unprivileged_bpf_disabled is
-    // set (`__sys_bpf`).
-    if !c.capable && crate::vfs::procfs::bpf_sysctl::Which::UnprivDisabled.get() != 0 {
-        return Err(Errno::EPERM);
-    }
     let size = size as usize;
     if size > crate::mem::PAGE_SIZE as usize {
         return Err(Errno::E2BIG);
@@ -839,7 +849,25 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
                 say_once("a map with an inner map, a device, kernel BTF or extra");
                 return Err(Errno::EINVAL);
             }
+            // Who may make it (`map_create`): no one without CAP_BPF while
+            // `kernel.unprivileged_bpf_disabled` is set, and some types
+            // only with CAP_BPF or CAP_NET_ADMIN at all. Asked after the
+            // type's own check of what it is asked for, where it has one
+            // (`map_alloc_check`), and before it is made.
+            let allowed = (c.capable || crate::vfs::procfs::bpf_sysctl::Which::UnprivDisabled.get() == 0)
+                && match ty {
+                    map_type::LRU_HASH | map_type::LPM_TRIE | map_type::SK_STORAGE => c.capable,
+                    map_type::DEVMAP_HASH => c.net_admin,
+                    _ => true,
+                };
+            let checked_first = !matches!(ty, map_type::LPM_TRIE | map_type::RINGBUF);
+            if !allowed && !checked_first {
+                return Err(Errno::EPERM);
+            }
             let mut map = Map::create(ty, key, value, max, flags, name)?;
+            if !allowed {
+                return Err(Errno::EPERM);
+            }
             // Its key's and value's types (`map_check_btf`): the value's
             // there and the value's size, the key's too where it is named.
             let (btf_fd, key_id, value_id) = (u32_at(48), u32_at(52), u32_at(56));
@@ -1061,9 +1089,12 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
         cmd::OBJ_GET_INFO_BY_FD => {
             zero_from(16)?;
             let file = c.fds.get(u32_at(0) as i32)?;
+            // The caller's struct as far as it gave it: the kernel fills it
+            // in, and what it does not fill stays the caller's.
+            let user = m.read(u64_at(8), (u32_at(4) as usize).min(256))?.to_vec();
             let info = match file.handle.bpf_object() {
-                Some(Object::Map(map)) => map.info(),
-                Some(Object::Prog(p)) => p.info(),
+                Some(Object::Map(map)) => map.info(&user),
+                Some(Object::Prog(p)) => p.info(&user, m, c.capable, c.raw_ok)?,
                 Some(Object::Btf(btf)) => {
                     // `struct bpf_btf_info`: the BTF itself copied out
                     // where the caller gave room (`btf`, `btf_size`).
@@ -1151,7 +1182,14 @@ fn prog_load(c: &Caller<'_>, m: &mut GuestMem<'_>, attr: u64, a: &[u8]) -> crate
     if flags & !0x1ff != 0 {
         return Err(Errno::EINVAL);
     }
+    // Without CAP_BPF: nothing while `kernel.unprivileged_bpf_disabled`
+    // is set; when it is not, Linux lets a socket filter or a cgroup skb
+    // program be loaded and holds it to the verifier's unprivileged rules,
+    // which are not here.
     if !c.capable {
+        if crate::vfs::procfs::bpf_sysctl::Which::UnprivDisabled.get() == 0 && matches!(ty, crate::bpfprog::prog_type::SOCKET_FILTER | crate::bpfprog::prog_type::CGROUP_SKB) {
+            say_once("a program loaded without CAP_BPF (the verifier's unprivileged rules)");
+        }
         return Err(Errno::EPERM);
     }
     let license = String::from_utf8_lossy(&m.read_cstr(license_at, 128)?).into_owned();
@@ -1177,11 +1215,15 @@ fn prog_load(c: &Caller<'_>, m: &mut GuestMem<'_>, attr: u64, a: &[u8]) -> crate
     let raw = m.read(insns, insn_cnt as usize * 8)?.to_vec();
     // Function and line information, which name the program's BTF.
     let (btf_fd, func_rec, func_at, func_cnt, line_rec, line_at, line_cnt) = (u32_at(72), u32_at(76), u64_at(80), u32_at(88), u32_at(92), u64_at(96), u32_at(104));
+    // Kept as the kernel keeps them (`bpf_func_info`'s 8 bytes a record,
+    // `bpf_line_info`'s 16), with the BTF they name.
+    let mut prog_btf = None;
     if func_cnt != 0 || line_cnt != 0 {
         let btf = match c.fds.get(btf_fd as i32)?.handle.bpf_object() {
             Some(Object::Btf(b)) => b,
             _ => return Err(Errno::EINVAL),
         };
+        let (mut func_info, mut line_info) = (Vec::new(), Vec::new());
         if func_cnt != 0 {
             // `check_btf_func`: records of at least 8 bytes, each an
             // instruction and a function's type, the first at 0, in order.
@@ -1196,6 +1238,7 @@ fn prog_load(c: &Caller<'_>, m: &mut GuestMem<'_>, attr: u64, a: &[u8]) -> crate
                     return Err(Errno::EINVAL);
                 }
                 last = Some(off);
+                func_info.extend_from_slice(&rec[..8]);
             }
         }
         if line_cnt != 0 {
@@ -1212,8 +1255,10 @@ fn prog_load(c: &Caller<'_>, m: &mut GuestMem<'_>, attr: u64, a: &[u8]) -> crate
                     return Err(Errno::EINVAL);
                 }
                 last = Some(off);
+                line_info.extend_from_slice(&rec[..16]);
             }
         }
+        prog_btf = Some(crate::bpfprog::ProgBtf { btf, func_info, line_info });
     }
     let maps = |fd: i32| -> Result<Arc<Map>, Errno> {
         match c.fds.get(fd).map_err(|_| Errno::EBADF)?.handle.bpf_object() {
@@ -1221,7 +1266,7 @@ fn prog_load(c: &Caller<'_>, m: &mut GuestMem<'_>, attr: u64, a: &[u8]) -> crate
             _ => Err(Errno::EINVAL),
         }
     };
-    let prog = crate::bpfprog::Prog::load(ty, expected, &raw, &license, name, c.uid, &maps);
+    let prog = crate::bpfprog::Prog::load(ty, expected, &raw, &license, name, c.uid, prog_btf, &maps);
     // The log, when asked for: the verifier's last line.
     if log_level != 0 {
         let text = match &prog {
@@ -1294,7 +1339,6 @@ fn lpm_match<'a>(t: &'a [(u32, Vec<u8>, Vec<u8>)], key: &[u8]) -> Option<&'a (u3
 /// The trie's post-order: a prefix after what is under it; between two
 /// that part, the one on the 0 side first.
 fn lpm_order(a: &&(u32, Vec<u8>, Vec<u8>), b: &&(u32, Vec<u8>, Vec<u8>)) -> std::cmp::Ordering {
-    use std::cmp::Ordering::*;
     let (pa, da, _) = a;
     let (pb, db, _) = b;
     let common = (0..(*pa).min(*pb)).find(|&i| bit_of(da, i) != bit_of(db, i));

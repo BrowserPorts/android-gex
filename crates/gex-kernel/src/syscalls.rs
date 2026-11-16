@@ -3701,6 +3701,8 @@ impl PathIo<'_> {
                     ns: self.ns,
                     capable: self.creds.capable(CAP_BPF) || self.creds.capable(CAP_SYS_ADMIN),
                     admin: self.creds.capable(CAP_SYS_ADMIN),
+                    net_admin: self.creds.capable(12),
+                    raw_ok: crate::vfs::procfs::bpf_sysctl::addresses_shown(self.creds.capable(34)),
                     uid: self.creds.uid(),
                     gid: self.creds.gid(),
                     umask: self.fs.umask(),
