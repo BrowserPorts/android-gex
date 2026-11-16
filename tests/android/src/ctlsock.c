@@ -18,7 +18,8 @@
 //   program run (this one, again) finds the descriptor open (F_GETFD),
 //   of the kind it was made (SO_TYPE), and bound where it was.
 // A datagram sent to the datagram socket is read with who sent it
-// (SCM_CREDENTIALS: the sender's process, user and group).
+// (SCM_CREDENTIALS: the sender's process, user and group), and so is one
+// written with write() on a connected socket, by whoever wrote it.
 // A stream and a seqpacket socket are listening when init says so
 // (SO_ACCEPTCONN), and a client that connects to the path is accepted.
 //
@@ -78,6 +79,22 @@ static void service(int fd, int type, const char *path, int listening) {
         struct ucred who;
         memcpy(&who, CMSG_DATA(c), sizeof who);
         if (who.pid != getpid() || who.uid != geteuid() || who.gid != getegid()) die("who sent the datagram", who.pid, who.uid);
+        // A plain write on a connected socket (liblog's writev to logdw)
+        // is from whoever writes: here a child that has become uid 1000.
+        if (connect(client, (struct sockaddr *)&to, sizeof to)) die("connect the datagram socket", errno, 0);
+        pid_t child = fork();
+        if (child == 0) {
+            if (setgid(1000) || setuid(1000) || write(client, "lg2", 3) != 3) _exit(1);
+            _exit(0);
+        }
+        int status = -1;
+        if (child < 0 || waitpid(child, &status, 0) != child || status != 0) die("the child's write", status, errno);
+        msg.msg_controllen = sizeof control.bytes;
+        if (recvmsg(fd, &msg, 0) != 3 || memcmp(buf, "lg2", 3)) die("the written datagram", errno, 0);
+        c = CMSG_FIRSTHDR(&msg);
+        if (!c || c->cmsg_type != SCM_CREDENTIALS) die("the written datagram's control message", msg.msg_controllen, 0);
+        memcpy(&who, CMSG_DATA(c), sizeof who);
+        if (who.pid != child || who.uid != 1000 || who.gid != 1000) die("who wrote the datagram", who.pid, who.uid);
         close(client);
     }
     if (listening) {

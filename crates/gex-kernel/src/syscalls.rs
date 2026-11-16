@@ -3161,9 +3161,15 @@ impl FdIo<'_> {
         let fds = self.fds;
         Some(match n {
             nr::READ => io_read(fds, m, a[0] as i32, a[1], a[2], self.shared),
-            nr::WRITE => io_write(fds, m, a[0] as i32, a[1], a[2], self.shared),
+            nr::WRITE => {
+                let _sender = unix::Sender::enter(self.cred());
+                io_write(fds, m, a[0] as i32, a[1], a[2], self.shared)
+            }
             nr::READV => io_readv(fds, m, a[0] as i32, a[1], a[2], self.compat, self.shared),
-            nr::WRITEV => io_writev(fds, m, a[0] as i32, a[1], a[2], self.compat, self.shared),
+            nr::WRITEV => {
+                let _sender = unix::Sender::enter(self.cred());
+                io_writev(fds, m, a[0] as i32, a[1], a[2], self.compat, self.shared)
+            }
             nr::PREAD64 => io_pread(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared),
             nr::PWRITE64 => io_pwrite(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared),
             nr::LSEEK => fds.get(a[0] as i32).and_then(|f| f.seek(a[1] as i64, a[2] as u32)),
@@ -13666,6 +13672,7 @@ impl Kernel {
     // -- I/O -----------------------------------------------------------------
 
     fn sys_write(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64) -> SysResult {
+        let _sender = unix::Sender::enter(self.fd_io().cred());
         io_write(&self.fds, m, fd, buf, len, Some(self.mem.shared_maps()))
     }
 
@@ -13717,6 +13724,7 @@ impl Kernel {
     }
 
     fn sys_writev(&mut self, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64) -> SysResult {
+        let _sender = unix::Sender::enter(self.fd_io().cred());
         io_writev(&self.fds, m, fd, iov, count, self.compat, Some(self.mem.shared_maps()))
     }
 

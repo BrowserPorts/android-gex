@@ -347,6 +347,36 @@ pub struct UnixSocket {
     seqpacket: AtomicBool,
 }
 
+thread_local! {
+    static SENDER: std::cell::Cell<Option<Cred>> = const { std::cell::Cell::new(None) };
+}
+
+/// Who writes, while a `write` or `writev` lasts: a datagram socket's
+/// write is a send that carries the writer's credentials (what
+/// `SCM_CREDENTIALS` gives a receiver with `SO_PASSCRED`), as Linux sends
+/// the current process's; a write is asked of a file with no word of who
+/// asks. Android's liblog writes every entry to logd's `logdw` so, and
+/// logd keeps the pid and uid it is given.
+pub struct Sender(Option<Cred>);
+
+impl Sender {
+    /// From now until the value is dropped, writes are `cred`'s.
+    pub fn enter(cred: Cred) -> Sender {
+        Sender(SENDER.with(|s| s.replace(Some(cred))))
+    }
+
+    /// Who writes now; `None` when it is the kernel or its host.
+    pub fn current() -> Option<Cred> {
+        SENDER.with(|s| s.get())
+    }
+}
+
+impl Drop for Sender {
+    fn drop(&mut self) {
+        SENDER.with(|s| s.set(self.0));
+    }
+}
+
 /// A process's credentials as `struct ucred` has them: pid, uid, gid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cred {
@@ -1221,8 +1251,9 @@ impl FileHandle for UnixDgram {
         self.recv_from(buf, false).map(|(n, _, _, _)| n as u64)
     }
 
-    /// `write` and `send` with no address: to the connected socket. The
-    /// syscalls that carry a name call [`UnixDgram::send_to`] themselves.
+    /// `write` and `send` with no address: to the connected socket, from
+    /// whoever writes ([`Sender`]). The syscalls that carry a name call
+    /// [`UnixDgram::send_to`] themselves.
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
         if buf.len() > DGRAM_BYTES {
             return Err(Errno::EMSGSIZE);
@@ -1231,7 +1262,7 @@ impl FileHandle for UnixDgram {
             Some((w, _)) => w.upgrade().ok_or(Errno::ECONNREFUSED)?,
             None => return Err(Errno::ENOTCONN),
         };
-        target.deliver(buf, self.name(), None)
+        target.deliver(buf, self.name(), Sender::current())
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
