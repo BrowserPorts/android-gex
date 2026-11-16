@@ -412,6 +412,9 @@ pub(crate) mod jit_stats {
     pub static RETIRED: AtomicU64 = AtomicU64::new(0);
     pub static SLOTS: AtomicU64 = AtomicU64::new(0);
     pub static GROWN: AtomicU64 = AtomicU64::new(0);
+    /// Empty dispatch slots a dispatch reached and that were given the
+    /// miss stub (`fill_empty_slot`).
+    pub static FILLED: AtomicU64 = AtomicU64::new(0);
     pub static WASM_BYTES: AtomicU64 = AtomicU64::new(0);
     /// Tier-1 miss translations: compiled-module cache hits and misses, and
     /// microseconds spent compiling (and loading) them.
@@ -6426,6 +6429,18 @@ fn catch_up_in_caller(caller: &mut Caller<'_, HostState>) -> Result<bool> {
     Ok(false)
 }
 
+/// [`catch_up_and_resume`] for a trap in a call-out: what has code on the
+/// page the dispatch was going to; else an empty slot, given the miss stub
+/// ([`fill_empty_slot`]); else everything published. Whether anything
+/// answered the trap.
+fn recover_dispatch_in_caller(caller: &mut Caller<'_, HostState>, ctx_addr: u64) -> Result<bool> {
+    let pc = caller.data().memory.clone().map_or(0, |m| read_u64(m.bytes(), (ctx_addr + ctx::PC as u64) as usize));
+    if replay_registry_taking(caller, Take::at(pc))? || fill_empty_slot(caller, ctx_addr)? {
+        return Ok(true);
+    }
+    catch_up_in_caller(caller)
+}
+
 fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
     replay_registry_taking(caller, Take::All)
 }
@@ -6563,7 +6578,13 @@ fn install_unit(
                 }
             }
             jit_stats::GROWN.fetch_add(want - have, std::sync::atomic::Ordering::Relaxed);
-            t.grow(cx.as_context_mut(), want - have, miss.clone())
+            // Empty slots, which cost nothing until written, where every
+            // slot once held the miss stub: a dispatch that reaches one is
+            // given the stub then ([`fill_empty_slot`]). Not for x86, whose
+            // code in a second mode is dispatched through a directory of
+            // its own.
+            let init = if gex_abi::X86 { miss.clone() } else { Ref::Func(None) };
+            t.grow(cx.as_context_mut(), want - have, init)
                 .with_context(|| format!("growing dispatch table {i}"))?;
         }
     }
@@ -7529,7 +7550,7 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
         }
         // Only a trap the catch-up answered is retried: with nothing replayed
         // the slot is not stale, and retrying would trap there forever.
-        if is_stale_table_trap(&e) && catch_up_in_caller(caller)? {
+        if is_stale_table_trap(&e) && recover_dispatch_in_caller(caller, ctx_addr)? {
             refresh_callouts(&mut *caller)?;
             pc = GuestMem::new(memory.bytes()).read_u64(ctx_addr + ctx::PC as u64).unwrap_or(pc);
             continue;
@@ -8024,21 +8045,71 @@ fn catch_up_and_resume(store: &mut Store<HostState>, ctx_addr: u64) -> Result<Op
         }
         None => return Ok(None),
     };
-    if !behind {
-        return Ok(None);
-    }
     let Some(memory) = store.data().memory.clone() else {
         return Ok(None);
     };
     // Where the transfer was going: both kinds write it into the context
     // before they take it.
     let pc = read_u64(memory.bytes(), (ctx_addr + ctx::PC as u64) as usize);
-    // What has code there; and if that is nothing, all there is, so that
-    // a trap nothing answers is reported and not taken again for ever.
-    if !replay_into(&mut *store, Take::at(pc))? && !replay_into(&mut *store, Take::All)? {
-        return Ok(None);
+    // What has code there; else, an empty slot, given the miss stub; else
+    // all there is, so that a trap nothing answers is reported and not
+    // taken again for ever.
+    let answered = (behind && replay_into(&mut *store, Take::at(pc))?)
+        || fill_empty_slot(&mut *store, ctx_addr)?
+        || (behind && replay_into(&mut *store, Take::All)?);
+    Ok((answered && pc != 0).then_some(pc))
+}
+
+/// A dispatch that reached a slot this thread's table has nothing in.
+///
+/// Dispatch tables grow with empty slots, which cost nothing until written
+/// (the engine reserves a dispatch table's maximum as zeroed memory and
+/// grows it by its length), where they once grew holding the miss stub in
+/// every slot. Slot numbers are handed out system-wide, so a thread's table
+/// reaches the highest slot any process has taken: with every slot
+/// written, each thread of each process held eight bytes for every slot
+/// the whole system had numbered, tens of megabytes a thread late in an
+/// Android boot. Now an empty slot a dispatch reaches is given the stub,
+/// and the dispatch made again translates where it was going, as the stub
+/// always did; a table too short for the slot is grown to the end of its
+/// page first. Whether the slot was empty (and is the stub's now).
+fn fill_empty_slot(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, ctx_addr: u64) -> Result<bool> {
+    if gex_abi::X86 {
+        return Ok(false);
     }
-    Ok((pc != 0).then_some(pc))
+    let (memory, tables) = {
+        let data = cx.as_context().data();
+        let Some(jit) = data.jit.as_ref() else { return Ok(false) };
+        // A wasm32 program's null call is its own null function pointer,
+        // not a dispatch: a fault.
+        if jit.shared.lock().unwrap_or_else(|e| e.into_inner()).wasm_program {
+            return Ok(false);
+        }
+        (data.memory.clone(), jit.tables.clone())
+    };
+    let Some(memory) = memory else { return Ok(false) };
+    // The dispatch's target, as the dispatcher recorded it (as for a
+    // watched slot: inline dispatch leaves only the PC).
+    let at = if !gex_emit::tier1::inline_dispatch() { ctx::LAST_TARGET } else { ctx::PC };
+    let target = read_u64(memory.bytes(), (ctx_addr + at as u64) as usize);
+    let Some(slot) = dispatch_slot_of(&memory, target, None) else { return Ok(false) };
+    // The miss span is the stub's from the start.
+    if slot.is_miss() {
+        return Ok(false);
+    }
+    let Some(t) = tables.get(slot.table).copied() else { return Ok(false) };
+    let size = t.size(cx.as_context_mut());
+    if slot.index >= size {
+        let end = (slot.index / gex_abi::SLOTS_PER_PAGE + 1) * gex_abi::SLOTS_PER_PAGE;
+        t.grow(cx.as_context_mut(), end - size, Ref::Func(None))
+            .with_context(|| format!("growing dispatch table {} to slot {}", slot.table, slot.index))?;
+    } else if !matches!(t.get(cx.as_context_mut(), slot.index), Some(Ref::Func(None))) {
+        return Ok(false);
+    }
+    let miss = tables[0].get(cx.as_context_mut(), 0).ok_or_else(|| anyhow!("dispatch table is empty"))?;
+    t.set(cx.as_context_mut(), slot.index, miss)?;
+    jit_stats::FILLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(true)
 }
 
 /// The signal Linux raises for the fault a trap in guest code stands for:
