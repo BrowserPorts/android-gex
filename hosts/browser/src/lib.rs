@@ -2963,6 +2963,103 @@ const PER_MISS_N: usize = 16;
 /// only the block that missed, so the blocks lifted are the blocks run.
 static LIFT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
 
+/// The hot-rewrite mode: a page whose byte guards (`Block::guard`) fire
+/// [`SMC_HOT_HITS`] times running, each within [`SMC_HOT_QUIET_NS`] of the
+/// one before (a JIT patching a constant into its code before each pass),
+/// has a miss there lift only the block that missed, not the blocks
+/// discovery reaches from it: each hit retires the page, and the next pass
+/// lifts again what it runs, one block or a few, where it lifted hundreds.
+/// Every block still checks its bytes on entry, as on any page written
+/// while executable. A page whose guards stay quiet that long leaves the
+/// mode at its next miss.
+const SMC_HOT_HITS: u32 = 8;
+const SMC_HOT_QUIET_NS: u64 = 2_000_000_000;
+
+/// Per page key: guard hits running, the last one's time (`now_ns`), and
+/// (`?jitdiag=1`) the nanoseconds and blocks its hot lifts took. See
+/// [`SMC_HOT_HITS`].
+static SMC_HOT: std::sync::Mutex<Option<std::collections::HashMap<u64, SmcHot>>> = std::sync::Mutex::new(None);
+
+#[derive(Default, Clone, Copy)]
+struct SmcHot {
+    hits: u32,
+    last: u64,
+    lifts: u64,
+    lift_ns: u64,
+    blocks: u64,
+}
+
+/// A guard on `page` fired.
+fn smc_hit(page: u64) {
+    let now = now_ns();
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    let h = m.get_or_insert_with(Default::default).entry(page).or_default();
+    let quiet = h.last != 0 && now.saturating_sub(h.last) > SMC_HOT_QUIET_NS;
+    let was = *h;
+    if quiet {
+        *h = SmcHot::default();
+    }
+    h.hits = h.hits.saturating_add(1);
+    h.last = now;
+    let h = *h;
+    drop(m);
+    if quiet && was.hits >= SMC_HOT_HITS {
+        smc_cooled(page, was.hits);
+    }
+    if jit_diag() && h.hits == SMC_HOT_HITS {
+        warn_line(&format!("gex: pid {} page {page:#x} is rewritten while it runs ({SMC_HOT_HITS} guard hits running): misses there lift only their block\n", my_pid()));
+    }
+    if jit_diag() && h.hits >= SMC_HOT_HITS && h.hits.is_power_of_two() && h.lifts > 0 {
+        warn_line(&format!(
+            "gex: pid {} page {page:#x}: {} guard hits running, {} hot lifts of {} blocks in {} us\n",
+            my_pid(),
+            h.hits,
+            h.lifts,
+            h.blocks,
+            h.lift_ns / 1000
+        ));
+    }
+}
+
+/// Whether a miss on `page` lifts only its block (the hot-rewrite mode); a
+/// page that has been quiet long enough leaves the mode here.
+fn smc_hot(page: u64) -> bool {
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = m.as_mut() else { return false };
+    let Some(h) = map.get(&page).copied() else { return false };
+    if h.hits < SMC_HOT_HITS {
+        return false;
+    }
+    if now_ns().saturating_sub(h.last) <= SMC_HOT_QUIET_NS {
+        return true;
+    }
+    map.remove(&page);
+    drop(m);
+    smc_cooled(page, h.hits);
+    false
+}
+
+/// `page` left the hot-rewrite mode, quiet after `hits` guard hits.
+fn smc_cooled(page: u64, hits: u32) {
+    if jit_diag() {
+        warn_line(&format!(
+            "gex: pid {} page {page:#x} quiet for {} ms after {hits} guard hits: misses there lift as before\n",
+            my_pid(),
+            SMC_HOT_QUIET_NS / 1_000_000
+        ));
+    }
+}
+
+/// `?jitdiag=1`: what a hot lift on `page` took.
+fn smc_lifted(page: u64, ns: u64, blocks: u64) {
+    let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = m.as_mut().and_then(|m| m.get_mut(&page)) {
+        h.lifts += 1;
+        h.lift_ns += ns;
+        h.blocks += blocks;
+    }
+}
+
 /// What the runtime translator did in this process, for `gex_xlate_stat`:
 /// 0 guest instructions lifted, 1 wasm bytes emitted, 2 translations (misses
 /// that lifted), 3 self-modifying-code page invalidations, 4 pages retired by
@@ -16752,6 +16849,7 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // the page's block records. The old slots leak, which is harmless: they
         // are never reused and, once the directory is cleared, unreachable.
         let page = gex_abi::dispatch_page(addr as u64);
+        smc_hit(gex_abi::page_key(addr as u64, thread_alt()));
         if jit_diag() {
             guard_bytes_say(addr as u64, _pc as u64);
         }
@@ -18244,6 +18342,11 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     // In the mode the thread runs in (a WoW64 thread's `ctx::CS`).
     let cs = if gex_abi::X86 { guest().read_u32(my_ctx() + ctx::CS as u64).unwrap_or(0) } else { 0 };
     let _mode = gex_xlate::cs_scope(cs);
+    // (or the block runs onto it: the block before a rewritten page fails
+    // its page check at each of the page's retires, and is lifted again)
+    let hot_page = gex_abi::page_key(pc, alt);
+    let hot = smc_hot(hot_page) || smc_hot(gex_abi::page_key(pc + gex_abi::DISPATCH_PAGE, alt));
+    let lift_t0 = if hot && jit_diag() { now_ns() } else { 0 };
     let (mut unit, stats) = gex_xlate::translate_runtime(
             // SAFETY: the translator takes the whole memory (`guest_whole`).
             unsafe { guest_whole() },
@@ -18254,7 +18357,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
-            LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed),
+            if hot { 1 } else { LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed) },
             // Must match the memory this shim was built against: a module the
             // translator emits is instantiated against the same memory, and an
             // import that disagrees about sharing does not link.
@@ -18264,6 +18367,9 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // The translator is the shim's deepest caller: recursive over the
         // control-flow graph of up to `LIFT_MAX` blocks.
         stack_tripwire("the end of a translation");
+        if lift_t0 != 0 {
+            smc_lifted(hot_page, now_ns().saturating_sub(lift_t0), stats.blocks as u64);
+        }
         note_kuser_folds(pc);
         if pwatched(gex_abi::dispatch_page(pc)) {
             let pg = gex_abi::dispatch_page(pc);
