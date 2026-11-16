@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 pub mod binderfs;
 pub mod bpffs;
+pub mod cgroupfs;
 pub mod devfs;
 pub mod devices;
 pub mod evdev;
@@ -588,6 +589,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// The BPF object a descriptor is (a map, from `bpf(2)`), for
     /// `BPF_OBJ_PIN` and the element calls; `None` for any other.
     fn bpf_object(&self) -> Option<crate::bpf::Object> {
+        None
+    }
+
+    /// The control group a cgroup2 directory is ([`crate::cgroup`]), for
+    /// `BPF_PROG_ATTACH` and its kin, which name one by an open directory.
+    fn cgroup(&self) -> Option<u64> {
         None
     }
 

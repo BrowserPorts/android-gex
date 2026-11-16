@@ -3173,7 +3173,10 @@ impl FdIo<'_> {
                 io_writev(fds, m, a[0] as i32, a[1], a[2], self.compat, self.shared)
             }
             nr::PREAD64 => io_pread(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared),
-            nr::PWRITE64 => io_pwrite(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared),
+            nr::PWRITE64 => {
+                let _sender = unix::Sender::enter(self.cred());
+                io_pwrite(fds, m, a[0] as i32, a[1], a[2], a[3], self.shared)
+            }
             nr::LSEEK => fds.get(a[0] as i32).and_then(|f| f.seek(a[1] as i64, a[2] as u32)),
             nr::CLOSE => {
                 self.closing_writes(m, a[0], a[0]);
@@ -5023,7 +5026,13 @@ impl PathIo<'_> {
             }
             // Empty, which is what most programs want of these: they probe
             // for a path, do not find it, and take the other branch.
-            "debugfs" | "cgroup" | "cgroup2" => {
+            // The one cgroup v2 hierarchy (crate::cgroup), every mount of
+            // it the same filesystem.
+            "cgroup2" => {
+                self.view.mount_unless_there(&target, || mounted(crate::vfs::cgroupfs::instance()));
+                Ok(0)
+            }
+            "debugfs" | "cgroup" => {
                 self.view.mount_unless_there(&target, || mounted(Arc::new(crate::vfs::TmpFs::new())));
                 Ok(0)
             }
@@ -11882,7 +11891,12 @@ impl Kernel {
             unimplemented: Vec::new(),
             next_ctx_slot: Arc::new(CtxSlots::new(1)),
             live_threads: Arc::new(std::sync::atomic::AtomicU32::new(1)),
-            procs: Arc::new(ProcTable::new()),
+            procs: {
+                // The cgroup hierarchy's processes are this table's.
+                let procs = Arc::new(ProcTable::new());
+                crate::cgroup::set_procs(&procs);
+                procs
+            },
             pipes: None,
             unix_remote: None,
             ptys: None,
@@ -13786,6 +13800,7 @@ impl Kernel {
     }
 
     fn sys_pwrite(&mut self, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, off: u64) -> SysResult {
+        let _sender = unix::Sender::enter(self.fd_io().cred());
         io_pwrite(&self.fds, m, fd, buf, len, off, Some(self.mem.shared_maps()))
     }
 

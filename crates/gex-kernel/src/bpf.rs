@@ -33,6 +33,9 @@ pub mod cmd {
     pub const MAP_GET_FD_BY_ID: u64 = 14;
     pub const OBJ_GET_INFO_BY_FD: u64 = 15;
     pub const BTF_LOAD: u64 = 18;
+    pub const PROG_ATTACH: u64 = 8;
+    pub const PROG_DETACH: u64 = 9;
+    pub const PROG_QUERY: u64 = 16;
 }
 
 /// Map types (`enum bpf_map_type`).
@@ -671,6 +674,16 @@ fn unsupported_flags(flags: u32) {
     }
 }
 
+/// Say `what` once, as it is: something done in part.
+pub(crate) fn note_once(what: &str) {
+    static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if !said.iter().any(|s| s == what) {
+        eprintln!("[gex] bpf: {what}");
+        said.push(what.to_string());
+    }
+}
+
 pub(crate) fn say_once(what: &str) {
     static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
@@ -806,6 +819,34 @@ fn install(c: &Caller<'_>, obj: Object, read: bool, write: bool) -> crate::errno
     let file = crate::file::OpenFile::new(handle, name.to_string(), flags, read, write);
     // Every descriptor bpf(2) makes closes at an exec (O_CLOEXEC).
     c.fds.insert(file, true)
+}
+
+/// The program type a cgroup attach type takes (`attach_type_to_prog_type`),
+/// for the cgroup hooks this kernel has; `None` for any other, said once
+/// where it is one Linux has.
+fn cgroup_prog_type(ty: u32) -> Option<u32> {
+    use crate::bpfprog::{attach::*, prog_type};
+    Some(match ty {
+        INET_INGRESS | INET_EGRESS => prog_type::CGROUP_SKB,
+        INET_SOCK_CREATE | INET_SOCK_RELEASE | INET4_POST_BIND | INET6_POST_BIND => prog_type::CGROUP_SOCK,
+        INET4_BIND | INET6_BIND | INET4_CONNECT | INET6_CONNECT | UDP4_SENDMSG | UDP6_SENDMSG | UDP4_RECVMSG | UDP6_RECVMSG | INET4_GETPEERNAME | INET6_GETPEERNAME | INET4_GETSOCKNAME | INET6_GETSOCKNAME | UNIX_CONNECT | UNIX_SENDMSG | UNIX_RECVMSG | UNIX_GETPEERNAME | UNIX_GETSOCKNAME => prog_type::CGROUP_SOCK_ADDR,
+        GETSOCKOPT | SETSOCKOPT => prog_type::CGROUP_SOCKOPT,
+        other => {
+            if other <= 60 {
+                say_once(&format!("attaching a program at attach type {other}"));
+            }
+            return None;
+        }
+    })
+}
+
+/// The program a descriptor is, of type `ty` (`bpf_prog_get_type`):
+/// `EBADF` for no descriptor, `EINVAL` for one that is not a program of it.
+fn prog_of(c: &Caller<'_>, fd: i32, ty: u32) -> Result<Arc<crate::bpfprog::Prog>, Errno> {
+    match c.fds.get(fd)?.handle.bpf_object() {
+        Some(Object::Prog(p)) if p.ty == ty => Ok(p),
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 /// The map a descriptor is, with whether it may be read and written.
@@ -1073,6 +1114,82 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             install(c, Object::Prog(p), true, true)
         }
         cmd::PROG_LOAD => prog_load(c, m, attr, &a),
+        cmd::PROG_ATTACH | cmd::PROG_DETACH => {
+            // ... expected_revision, the last field of both.
+            zero_from(32)?;
+            let (target, prog_fd, ty, flags, replace_fd, relative, revision) = (u32_at(0), u32_at(4), u32_at(8), u32_at(12), u32_at(16), u32_at(20), u64_at(24));
+            let ptype = cgroup_prog_type(ty).ok_or(Errno::EINVAL)?;
+            let group = |c: &Caller<'_>| -> Result<u64, Errno> { c.fds.get(target as i32)?.handle.cgroup().ok_or(Errno::EBADF) };
+            if cmd == cmd::PROG_DETACH {
+                let g = group(c)?;
+                let prog = prog_of(c, prog_fd as i32, ptype).ok();
+                return crate::cgroup::bpf_detach(g, ty, prog, revision).map(|_| 0);
+            }
+            use crate::cgroup::bpf_flag::*;
+            if flags & !(ALLOW_OVERRIDE | ALLOW_MULTI | REPLACE | PLACED) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if flags & PLACED != 0 || relative != 0 {
+                say_once("a cgroup program placed before or after another, or by a link");
+                return Err(Errno::EINVAL);
+            }
+            let prog = prog_of(c, prog_fd as i32, ptype)?;
+            // `bpf_prog_attach_check_attach_type`. (A cgroup skb program
+            // the verifier would hold to its expected type, one whose return
+            // may be 2 or 3, is not told apart here.)
+            match ptype {
+                crate::bpfprog::prog_type::CGROUP_SKB => {
+                    if !c.net_admin {
+                        return Err(Errno::EPERM);
+                    }
+                }
+                _ if prog.expected_attach != ty => return Err(Errno::EINVAL),
+                _ => {}
+            }
+            let g = group(c)?;
+            let replace = if flags & ALLOW_MULTI != 0 && flags & REPLACE != 0 { Some(prog_of(c, replace_fd as i32, ptype)?) } else { None };
+            crate::cgroup::bpf_attach(g, ty, prog, replace, flags, revision)?;
+            note_once("a program attached to a cgroup is kept and runs nowhere yet: there are no socket hooks");
+            Ok(0)
+        }
+        cmd::PROG_QUERY => {
+            if !(c.net_admin || c.admin) {
+                return Err(Errno::EPERM);
+            }
+            // ... revision, the last field.
+            zero_from(64)?;
+            let (target, ty, qflags, ids_at, cnt, flags_at) = (u32_at(0), u32_at(4), u32_at(8), u64_at(16), u32_at(24), u64_at(32));
+            const EFFECTIVE: u32 = 1;
+            if qflags & !EFFECTIVE != 0 {
+                return Err(Errno::EINVAL);
+            }
+            cgroup_prog_type(ty).ok_or(Errno::EINVAL)?;
+            let g = c.fds.get(target as i32)?.handle.cgroup().ok_or(Errno::EBADF)?;
+            let effective = qflags & EFFECTIVE != 0;
+            if effective && flags_at != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let (flags, progs, revision) = crate::cgroup::bpf_query(g, ty, effective)?;
+            m.write_u32(attr + 12, flags)?;
+            m.write_u32(attr + 24, progs.len() as u32)?;
+            if size >= 64 {
+                m.write_u64(attr + 56, revision)?;
+            }
+            if cnt == 0 || ids_at == 0 || progs.is_empty() {
+                return Ok(0);
+            }
+            let n = progs.len().min(cnt as usize);
+            for (k, p) in progs.iter().take(n).enumerate() {
+                m.write_u32(ids_at + 4 * k as u64, p.id)?;
+                if flags_at != 0 {
+                    m.write_u32(flags_at + 4 * k as u64, flags)?;
+                }
+            }
+            if (cnt as usize) < progs.len() {
+                return Err(Errno::ENOSPC);
+            }
+            Ok(0)
+        }
         cmd::MAP_GET_FD_BY_ID => {
             zero_from(12)?;
             if !c.admin {

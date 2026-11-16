@@ -730,6 +730,8 @@ impl ProcTable {
             crash: Vec::new(),
             crash_more: Vec::new(),
         });
+        drop(t);
+        crate::cgroup::fork(ppid, pid);
         pid
     }
 
@@ -769,6 +771,8 @@ impl ProcTable {
         let tid = t.next_pid;
         t.next_pid += 1;
         t.threads.insert(tid, pid);
+        drop(t);
+        crate::cgroup::thread_start(pid, tid);
         tid
     }
 
@@ -780,6 +784,8 @@ impl ProcTable {
         let mut t = self.lock();
         t.threads.remove(&tid);
         t.tasks.remove(&tid);
+        drop(t);
+        crate::cgroup::thread_end(tid);
     }
 
     /// The process task `id` is part of: `id` itself when it is a process
@@ -1031,6 +1037,7 @@ impl ProcTable {
     fn end(&self, pid: i32, status: i32, word: i32) {
         let virtual_init = self.virtual_init.load(Ordering::Acquire);
         let crashed;
+        let mut left_group = None;
         let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
@@ -1083,11 +1090,17 @@ impl ProcTable {
                 Some(p) => {
                     p.vm = None;
                     p.ended = true;
+                    // Out of its control group (`cgroup_exit`), its time
+                    // kept there; told once the table is let go.
+                    left_group = Some(p.usage.cpu_ns);
                     (Arc::clone(&p.child.status), Arc::clone(&p.child.done), ppid, p.queue.id(), orphans)
                 }
                 None => return,
             }
         };
+        if let Some(cpu_ns) = left_group {
+            crate::cgroup::exit(pid, cpu_ns);
+        }
         if crashed {
             self.crash_notify();
         }
@@ -1633,6 +1646,14 @@ impl ProcTable {
         self.halting
             .load(Ordering::Acquire)
             .then(|| self.halt_code.load(Ordering::Acquire))
+    }
+
+    /// The processor time `pid` has used, as it last said (nanoseconds).
+    pub fn cpu_ns_of(&self, pid: i32) -> u64 {
+        if self.remote.is_some() {
+            return 0;
+        }
+        self.lock().procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.usage.cpu_ns)
     }
 
     /// Whether `pid` names a live process, for `kill(pid, 0)`.

@@ -369,23 +369,37 @@ impl FileHandle for OomScoreAdj {
 /// (`EINVAL`). An armed trigger never goes off here. A file with none
 /// reports `POLLPRI` and `POLLERR` at once, as Linux's does. Android's
 /// lmkd arms three on memory and ends at once without the file.
+///
+/// And interrupts' (`irq`, as GKI is built with `IRQ_TIME_ACCOUNTING`):
+/// only "full", which is all a trigger on it may be (`EINVAL` for "some").
+/// A cgroup's pressure files are these too ([`crate::vfs::cgroupfs`]).
 #[derive(Debug, Default)]
-struct Pressure {
+pub(crate) struct Pressure {
     armed: std::sync::atomic::AtomicBool,
+    irq: bool,
 }
 
 impl Pressure {
     const NONE: &'static str = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+    const NONE_IRQ: &'static str = "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
 
-    /// Whether `path` (under `/proc`) is one of the three files.
+    pub(crate) fn new(irq: bool) -> Pressure {
+        Pressure { armed: Default::default(), irq }
+    }
+
+    fn text(irq: bool) -> &'static str {
+        if irq { Self::NONE_IRQ } else { Self::NONE }
+    }
+
+    /// Whether `path` (under `/proc`) is one of the four files.
     fn at(path: &str) -> bool {
-        matches!(path, "pressure/memory" | "pressure/cpu" | "pressure/io")
+        matches!(path, "pressure/memory" | "pressure/cpu" | "pressure/io" | "pressure/irq")
     }
 }
 
 impl FileHandle for Pressure {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
-        Generated { data: Pressure::NONE.as_bytes().to_vec() }.read_at(offset, buf)
+        Generated { data: Pressure::text(self.irq).as_bytes().to_vec() }.read_at(offset, buf)
     }
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
         use std::sync::atomic::Ordering::Relaxed;
@@ -401,7 +415,7 @@ impl FileHandle for Pressure {
         }
         // `sscanf(buf, "some %u %u")`: the word, then two numbers, each
         // after any space; what follows the second is not looked at.
-        let rest = text.strip_prefix("some").or_else(|| text.strip_prefix("full")).ok_or(Errno::EINVAL)?;
+        let rest = text.strip_prefix("some").filter(|_| !self.irq).or_else(|| text.strip_prefix("full")).ok_or(Errno::EINVAL)?;
         let mut numbers = [0u64; 2];
         let mut rest = rest;
         for n in numbers.iter_mut() {
@@ -840,6 +854,7 @@ impl ProcFs {
         Some(match rest {
             "stat" => stat_line(id, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid), threads, &usage).into_bytes(),
             "status" => status_text(id, e.pid, &comm, state, e.ppid, threads, &e.creds, &usage).into_bytes(),
+            "cgroup" => crate::cgroup::proc_file(e.pid),
             "statm" => statm_text(&e.usage).into_bytes(),
             "cmdline" => e.cmdline().to_vec(),
             "comm" => format!("{comm}\n").into_bytes(),
@@ -856,6 +871,7 @@ impl ProcFs {
         let task = || (tid != 0).then(|| s.others().into_iter().find(|e| e.pid == s.pid()).map(|e| e.task(tid)).unwrap_or_default());
         Some(match path {
             "self/maps" => s.maps().into_bytes(),
+            "self/cgroup" => crate::cgroup::proc_file(s.pid()),
             "self/cmdline" => s.cmdline(),
             "self/environ" => s.environ(),
             "self/auxv" => s.auxv(),
@@ -950,7 +966,7 @@ impl ProcFs {
             // glibc and musl both consult this before using large mappings.
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
             "sys/vm/mmap_rnd_bits" => format!("{}\n", mmap_rnd_bits::get()).into_bytes(),
-            p if Pressure::at(p) => Pressure::NONE.as_bytes().to_vec(),
+            p if Pressure::at(p) => Pressure::text(p == "pressure/irq").as_bytes().to_vec(),
             // The limit `F_SETPIPE_SZ` holds an unprivileged caller to.
             "sys/fs/nr_open" => format!("{}\n", crate::file::NR_OPEN).into_bytes(),
             "sys/fs/pipe-max-size" => format!("{}\n", crate::pipe::PIPE_MAX_SIZE).into_bytes(),
@@ -1007,7 +1023,7 @@ impl FileSystem for ProcFs {
             return Ok(Arc::new(Sysctl { which }));
         }
         if Pressure::at(&path) {
-            return Ok(Arc::new(Pressure::default()));
+            return Ok(Arc::new(Pressure::new(path == "pressure/irq")));
         }
         if path == "self/oom_score_adj" && self.source.oom_score_adj().is_some() {
             return Ok(Arc::new(OomScoreAdj { source: Arc::clone(&self.source) }));
@@ -1021,7 +1037,7 @@ impl FileSystem for ProcFs {
             }
             let mut out = base_entries();
             let names: &[&str] = match rest.as_str() {
-                "" => &["stat", "status", "statm", "cmdline", "comm", "environ", "maps", "task", "attr"],
+                "" => &["stat", "status", "statm", "cmdline", "comm", "environ", "maps", "task", "attr", "cgroup"],
                 "task" => {
                     for t in e.tasks() {
                         out.push(DirEntry { name: t.to_string(), file_type: FileType::Directory, ino: 1 });
@@ -1068,7 +1084,7 @@ impl FileSystem for ProcFs {
             }
             "self" => vec![
                 "maps", "cmdline", "environ", "auxv", "stat", "status", "statm", "comm", "exe", "cwd", "fd",
-                "fdinfo", "task", "mountinfo", "mounts", "attr", "oom_score_adj",
+                "fdinfo", "task", "mountinfo", "mounts", "attr", "oom_score_adj", "cgroup",
             ],
             "self/fd" => {
                 let mut out = base_entries();
@@ -1100,7 +1116,7 @@ impl FileSystem for ProcFs {
             "sys/kernel" => vec!["kptr_restrict", "osrelease", "pid_max", "random", "unprivileged_bpf_disabled"],
             "sys/kernel/random" => vec!["boot_id", "entropy_avail", "poolsize", "uuid"],
             "sys/vm" => vec!["mmap_rnd_bits", "overcommit_memory"],
-            "pressure" => vec!["cpu", "io", "memory"],
+            "pressure" => vec!["cpu", "io", "irq", "memory"],
             _ => return Err(Errno::ENOENT),
         };
         // `sys` holds directories, the directories under it files (and
