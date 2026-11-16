@@ -57,6 +57,7 @@ SPLIT = {}  # DLL -> the module of its own it is linked into, not the core (--sp
 STATIC = {}  # DLL -> the static libraries its IMPORTS name (libuuid.a), as paths (pelink's main)
 KEEP_EXPORTS = set()  # names the core exports if it defines them (--exports-of)
 STUB_IMPORTS = False  # a program's missing imports bound to stubs (--stub-imports)
+SYMBOLIC = False  # a --split module's own symbols bound locally (--symbolic)
 EXTRA = set()  # the --extra DLLs (pelink's main)
 
 
@@ -396,6 +397,20 @@ def main():
     # bound, as Wine's loader binds an import its DLL does not export, to a
     # stub that raises EXCEPTION_WINE_STUB when called; each is listed. The
     # core and the tree's DLLs stay checked (check_imports).
+    # --other NAME EXPORTS: a DLL that isn't linked here and isn't the tree's
+    # (a program's own DLL, gexcc-win's import library of it): its exports
+    # are what the program's imports of it bind to, as an i386 DLL's are
+    other = []
+    while sys.argv[1] == '--other':
+        other.append((sys.argv[2], sys.argv[3]))
+        del sys.argv[1:4]
+    # --symbolic (gexcc-win's DLL whose exports are its default-visibility
+    # symbols): the split module's own references to what it defines bound
+    # to it, not through the GOT
+    global SYMBOLIC
+    if sys.argv[1] == '--symbolic':
+        SYMBOLIC = True
+        del sys.argv[1]
     global STUB_IMPORTS
     if sys.argv[1] == '--stub-imports':
         STUB_IMPORTS = True
@@ -493,6 +508,8 @@ def main():
                         f.writelines(f'{n} func\n' for n in names)
                     others[mod[0]] = ex
     for mod, ro, ex, imports in extra:
+        others[mod] = ex
+    for mod, ex in other:
         others[mod] = ex
     link(dlls, out, os.path.join(build, 'libs', 'gexrt', 'libgexrt.a'), others)
 
@@ -1872,7 +1889,7 @@ static void *gexw_ntdll_proc(const char *name)
         cmd = ['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['--experimental-pic', '-shared', '--shared-memory',
                '--import-memory', '--max-memory=' + ('17179869184' if M64 else '4294967296'),
                '--unresolved-symbols=import-dynamic', '-o', out, '-Map=' + out + '.map',
-               f'@{rsp}'] + objs[g] + ([gexrt] if gexrt else [])
+               f'@{rsp}'] + (['-Bsymbolic'] if SYMBOLIC and g else []) + objs[g] + ([gexrt] if gexrt else [])
         # compiler-rt's builtins (__multi3 and the like), from the toolchain's
         # sysroot (toolchain/sysroot/build32.sh, build64.sh)
         sysroot = os.environ.get('GEX_WASM64_SYSROOT' if WINE64 else 'GEX_WASM_SYSROOT')

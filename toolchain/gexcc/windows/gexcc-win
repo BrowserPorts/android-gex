@@ -133,9 +133,47 @@ def compile_wmain(cmd, obj):
     return r
 
 
+def expand_rsp(args):
+    """@FILE arguments (a response file, one or more arguments a line,
+    shell-quoted) replaced by their contents, as gcc and clang read them."""
+    import shlex
+    out = []
+    for a in args:
+        if a.startswith('@') and os.path.isfile(a[1:]):
+            out += expand_rsp(shlex.split(open(a[1:]).read()))
+        else:
+            out.append(a)
+    return out
+
+
+IMPLIB_MEMBER = '__gexw_implib'
+
+
+def implib_of(path):
+    """The DLL name an import library gexcc-win wrote (-Wl,--out-implib)
+    names, or None for any other archive."""
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(4096)
+    except OSError:
+        return None
+    if not data.startswith(b'!<arch>\n'):
+        return None
+    pos = 8
+    while pos + 60 <= len(data):
+        name, size = data[pos:pos + 16].rstrip(b' '), int(data[pos + 48:pos + 58].strip() or 0)
+        body = data[pos + 60:pos + 60 + size]
+        if name.rstrip(b'/') == IMPLIB_MEMBER.encode():
+            return body.decode().split()[0]
+        if name not in (b'/', b'//', b'/SYM64/'):
+            return None
+        pos += 60 + size + (size & 1)
+    return None
+
+
 tool = os.path.basename(sys.argv[0])
 tool = tool[len('x86_64-w64-mingw32-'):] if tool.startswith('x86_64-w64-mingw32-') else tool
-args = sys.argv[1:]
+args = expand_rsp(sys.argv[1:])
 
 if tool in ('ar', 'ranlib', 'nm', 'strip', 'objcopy', 'objdump'):
     if tool == 'strip':
@@ -212,6 +250,7 @@ if any(a in ('-c', '-S', '-E', '-M', '-MM') for a in args) or not any(not a.star
 T = tools_dir()
 out = 'a.exe'; shared = False; objs = []; libs = []; libdirs = []; ress = []; srcs = []; defs = []
 subsys = None; extra_cflags = []; unicode = False; deflibs = True
+out_implib = None
 # -s (or GEXCC_WIN_STRIP=1): a release build, the module's name and debug sections
 # out; GEXCC_WIN_STRIP=0 keeps them whatever the build asks
 strip = os.environ.get('GEXCC_WIN_STRIP') == '1'
@@ -226,7 +265,14 @@ while i < len(args):
     elif a == '-municode': unicode = True
     elif a in ('-nostdlib', '-nodefaultlibs'): deflibs = False
     elif a.startswith('-Wl,'):
-        for p in a[4:].split(','):
+        ps = a[4:].split(',')
+        if ps[0] == '--out-implib' and len(ps) == 1 and i + 1 < len(args) and args[i + 1].startswith('-Wl,'):
+            out_implib = args[i + 1][4:]; i += 2; continue
+        if ps[0] == '--out-implib' and len(ps) > 1:
+            out_implib = ps[1]
+        elif ps[0].startswith('--out-implib='):
+            out_implib = ps[0].split('=', 1)[1]
+        for p in ps:
             if p in ('-s', '--strip-all'): strip = True
             if p.startswith('--subsystem'):
                 subsys = p.split('=', 1)[1] if '=' in p else None
@@ -273,6 +319,44 @@ try:
             continue
         else:
             dlls.append(l)
+    # import libraries of gexcc-win's own DLLs (-Wl,--out-implib), given as
+    # files or found by -l: the DLL's export list and signatures, for
+    # pelink to bind the program's calls to (--other), not archives
+    own = []
+    for lst in (objs, archives):
+        for a in list(lst):
+            n = a.endswith('.a') and implib_of(a)
+            if n:
+                lst.remove(a)
+                d = os.path.join(tmp, 'own-' + n)
+                if not os.path.isdir(d):
+                    os.makedirs(d)
+                    subprocess.check_call(['llvm-ar', 'x', '--output', d, os.path.abspath(a)])
+                    own.append((n, os.path.join(d, n + '.so.exports')))
+    # A DLL without a .def exports what its objects define with default
+    # visibility: the wasm target drops __declspec(dllexport), and code
+    # built for it marks its exports __attribute__((visibility("default")))
+    symbolic = False
+    if shared and not defs:
+        exp = []
+        for o in objs:
+            if o.endswith('.a'):
+                continue
+            for line in subprocess.run(['llvm-objdump', '-t', o], capture_output=True, text=True).stdout.splitlines():
+                w = line.split()
+                if len(w) >= 5 and w[1] == 'g' and w[-2] != '.hidden' and w[2] in ('F', 'O') and w[3] != '*UND*':
+                    exp.append((w[-1], w[2] == 'O'))
+        if exp:
+            dname = os.path.basename(out)
+            df = os.path.join(tmp, 'exports.def')
+            with open(df, 'w') as f:
+                f.write('LIBRARY %s\nEXPORTS\n' % (dname if '.' in dname else dname + '.dll'))
+                for n, data in sorted(set(exp)):
+                    f.write('  %s%s\n' % (n, ' DATA' if data else ''))
+            defs.append(df)
+            # (its own references to them bound locally, not through the GOT
+            # that default visibility makes them go through)
+            symbolic = True
     # MinGW's default libraries (its specs' *lib), after the program's: a
     # program built with MinGW names none of them (kernel32 is always
     # imported, below), and a name they define that another Wine DLL
@@ -320,12 +404,14 @@ try:
         if os.path.exists(implib(d)):
             x = os.path.basename(os.path.dirname(implib(d)))
             deps.append(x + ('.dll' if '.' not in x else ''))
+    deps += [n for n, _ in own]
+    other = [a for n, ex in own for a in ('--other', n, ex)]
     core = ['ntdll.dll', 'kernelbase.dll', 'kernel32.dll', 'msvcrt.dll', 'ucrtbase.dll']
     env = dict(os.environ, TMPDIR=tmp, PATH=os.environ['GEX_WASM64_SYSROOT'] + '/binaryen/bin:' + os.environ['PATH'])
     log = os.path.join(tmp, 'pelink.log')
     with open(log, 'w') as lf:
         r = subprocess.call([sys.executable, W + '/pelink.py', '--wasm64', '--split', name + '.wasm', name,
-                             '--extra', name, so + '.r.o', so + '.exports', ','.join(deps), '--stub-imports', B, S,
+                             '--extra', name, so + '.r.o', so + '.exports', ','.join(deps)] + other + (['--symbolic'] if symbolic else []) + ['--stub-imports', B, S,
                              os.path.join(tmp, 'core.wasm')] + core, env=env, stdout=lf, stderr=subprocess.STDOUT)
     if r:
         sys.stderr.write(open(log).read()[-4000:]); sys.exit(r)
@@ -362,6 +448,19 @@ try:
     if r: sys.exit(r)
     r = subprocess.call([sys.executable, here + '/peimports.py', skel, os.path.join(odir, name + '.wasm.undefined')],
                         stdout=subprocess.DEVNULL)
+    if r == 0 and shared and out_implib:
+        # the import library: the DLL's name, its export list and a module of
+        # only its signatures (gexw.sig64, for pelink's calls with a struct by
+        # value), as an archive programs link (-lNAME or the file)
+        d = os.path.join(tmp, 'implib')
+        os.makedirs(d)
+        with open(os.path.join(d, IMPLIB_MEMBER), 'w') as f:
+            f.write(name + '\n')
+        shutil.copy(so + '.exports', os.path.join(d, name + '.so.exports'))
+        subprocess.check_call(['llvm-objcopy', '--only-section=gexw.sig64', so, os.path.join(d, name + '.so')])
+        if os.path.exists(out_implib):
+            os.unlink(out_implib)
+        r = subprocess.call(['llvm-ar', 'rcS', os.path.abspath(out_implib), IMPLIB_MEMBER, name + '.so.exports', name + '.so'], cwd=d)
     sys.exit(r)
 finally:
     if not os.environ.get('GEXCC_WIN_KEEP'): shutil.rmtree(tmp, True)
