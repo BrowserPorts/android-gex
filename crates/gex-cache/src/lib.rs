@@ -457,12 +457,11 @@ pub fn load_or_compile(
     let meta_path = dir.join(format!("{key}.meta"));
     // Both halves must be present: a module without its metadata says nothing
     // about where its dispatch pages went.
-    if let (Ok(bytes), Ok(metadata)) = (std::fs::read(&path), std::fs::read(&meta_path)) {
-        // SAFETY: see the module comment. `deserialize` additionally rejects
-        // an artifact that does not match this engine, so a stale or truncated
-        // file produces an error rather than bad code -- which is why the
-        // failure path below simply rebuilds.
-        match unsafe { Module::deserialize(engine, &bytes) } {
+    if let (Some(found), Ok(metadata)) = (artifact(engine, &path), std::fs::read(&meta_path)) {
+        // An artifact that does not match this engine, or is stale or
+        // truncated, is an error here rather than bad code -- which is why
+        // the failure path below simply rebuilds.
+        match found {
             Ok(module) => {
                 refresh(&meta_path);
                 return Ok(Loaded {
@@ -474,9 +473,10 @@ pub fn load_or_compile(
             Err(_) => {
                 // Unusable: drop it so the next run does not pay to find out
                 // again. Failing to remove it is not worth reporting.
+                let size = std::fs::metadata(&path).map_or(0, |m| m.len());
                 let _ = std::fs::remove_file(&path);
                 let _ = std::fs::remove_file(&meta_path);
-                ledger_add(dir, -((bytes.len() + metadata.len()) as i64));
+                ledger_add(dir, -((size + metadata.len() as u64) as i64));
             }
         }
     }
@@ -503,6 +503,38 @@ pub fn load_or_compile(
 /// each one rewrote its metadata file (a new file renamed over the old), a
 /// busy disk's journal held every start for seconds.
 const REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The module whose artifact is the file at `path`; `None` when there is
+/// no such file.
+///
+/// The file is mapped, not read. Read, an artifact is a copy of its own in
+/// each process that loads it, and every guest process of a run loads
+/// libc's: a booting Android's dozen daemons held a dozen copies of the
+/// same machine code, none of which the host could take back. Mapped, the
+/// code is the file's pages: one copy however many load it, and the
+/// host's to drop and read again when memory is short.
+///
+/// An entry is never written in place ([`store`] writes beside it and
+/// renames; eviction unlinks), so what is mapped does not change under the
+/// code that runs it. A file that cannot be mapped is read instead, so
+/// that a host out of mappings is not taken for a bad entry.
+fn artifact(engine: &Engine, path: &Path) -> Option<Result<Module>> {
+    if !path.is_file() {
+        return None;
+    }
+    // SAFETY: see the module comment: the cache directory is the user's
+    // own, and `deserialize` rejects an artifact that is not this
+    // engine's.
+    if let Ok(m) = unsafe { Module::deserialize_file(engine, path) } {
+        return Some(Ok(m));
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    // SAFETY: as above.
+    Some(unsafe { Module::deserialize(engine, &bytes) }.map_err(anyhow::Error::from))
+}
 
 /// Mark a hit's entry as recently read for [`evict`]: its metadata file's
 /// mtime set to now, in place (its bytes untouched, so a concurrent reader
@@ -559,15 +591,12 @@ fn memo(engine: &Engine, len: usize, key: impl FnOnce() -> String, make: impl Fn
 }
 
 fn load_or_compile_at_uncached(engine: &Engine, path: &Path, wasm: &[u8]) -> Result<Module> {
-    if let Ok(bytes) = std::fs::read(path) {
-        // SAFETY: as for `load_or_compile`: written by `serialize` below, and
-        // `deserialize` rejects an artifact for another engine.
-        match unsafe { Module::deserialize(engine, &bytes) } {
-            Ok(m) => return Ok(m),
-            Err(_) => {
-                let _ = std::fs::remove_file(path);
-            }
+    match artifact(engine, path) {
+        Some(Ok(m)) => return Ok(m),
+        Some(Err(_)) => {
+            let _ = std::fs::remove_file(path);
         }
+        None => {}
     }
     let m = compile(engine, wasm).context("validating the module")?;
     if let (Some(bytes), Some(dir)) = (serialize(&m), path.parent()) {
@@ -670,12 +699,8 @@ pub fn compile(engine: &Engine, wasm: &[u8]) -> Result<Module> {
 
 fn compile_uncached(engine: &Engine, wasm: &[u8]) -> Result<Module> {
     if let Some(dir) = precompiled_dir() {
-        if let Ok(bytes) = std::fs::read(dir.join(content_name(wasm))) {
-            // SAFETY: written by `precompile` with this runtime's engine
-            // configuration; `deserialize` rejects any other engine's.
-            if let Ok(m) = unsafe { Module::deserialize(engine, &bytes) } {
-                return Ok(m);
-            }
+        if let Some(Ok(m)) = artifact(engine, &dir.join(content_name(wasm))) {
+            return Ok(m);
         }
     }
     compile_here(engine, wasm)
