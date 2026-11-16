@@ -629,7 +629,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     appendToUsed(M, {G});
   }
 
-  // ---- Class adapters (GEXW_ENTRY=classes; wasm64 only, for now) ----
+  // ---- Class adapters (wasm64's default; wasm32 has thunks still) ----
   //
   // In place of a thunk per function, one adapter per class: the function's
   // wasm type and the facts that type does not say (gex_kernel::ftab::facts:
@@ -648,9 +648,10 @@ struct GexIcall : PassInfoMixin<GexIcall> {
   static constexpr uint32_t FACT_SRET_SMALL = 1, FACT_SRET_BIG = 2, FACT_REFUSED = 1u << 31;
   static constexpr unsigned CTX_LAST_TARGET = 352;  // gex_abi ctx::LAST_TARGET
 
+  // (the default; GEXW_ENTRY=thunks keeps the thunk per function)
   static bool classesMode() {
     const char *e = getenv("GEXW_ENTRY");
-    return e && !strcmp(e, "classes");
+    return !e || strcmp(e, "thunks");
   }
 
   // F's class: the canonical type of F as wasm sees it (pointers as i64,

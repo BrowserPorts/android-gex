@@ -332,13 +332,13 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
  *   worst;
  * - comvt: Wine's own native functions through COM and C++ vtables and
  *   exports (fixtures/wow64/comvt.c; wow64/comvt.test.js runs it as i386).
- * `only` the names to run (all by default). `classes`: the DLL built with
- * the ICALL pass's class adapters (GEXW_ENTRY=classes) in place of its
- * entry thunks, and comvt left out (Wine's own DLLs are built as they are).
+ * `only` the names to run (all by default). `thunks`: the DLL built with
+ * the ICALL pass's entry thunks (GEXW_ENTRY=thunks) in place of its class
+ * adapters, and comvt left out (Wine's own DLLs are built as they are).
  */
-export async function guestNative(t, w, o = {}, pre = '', only = null, { classes = false } = {}) {
+export async function guestNative(t, w, o = {}, pre = '', only = null, { thunks = false } = {}) {
   const want = (n) => !only || only.includes(n);
-  if (want('comvt') && !classes) {
+  if (want('comvt') && !thunks) {
     let exe;
     try { exe = await w.mingw('comvt', { x64: true, out: 'comvt64.exe', libs: ['-lole32', '-luuid'] }); } catch (e) {
       return t.check(`${pre}comvt: build`, false, String(e.message));
@@ -349,8 +349,8 @@ export async function guestNative(t, w, o = {}, pre = '', only = null, { classes
   if (!progs.length) return;
   let dll;
   try {
-    dll = await w.gexccWin(join(F, 'convdll.c'), classes ? 'classes/convdll.dll' : 'convdll.dll', ['-O2', '-shared', join(F, 'convdll.def')],
-      { env: classes ? { GEXW_ENTRY: 'classes' } : {} });
+    dll = await w.gexccWin(join(F, 'convdll.c'), thunks ? 'thunks/convdll.dll' : 'convdll.dll', ['-O2', '-shared', join(F, 'convdll.def')],
+      { env: thunks ? { GEXW_ENTRY: 'thunks' } : {} });
   } catch (e) {
     if (e instanceof Skip) throw e;
     return t.check(`${pre}convdll: build`, false, String(e.message));
@@ -359,7 +359,7 @@ export async function guestNative(t, w, o = {}, pre = '', only = null, { classes
   // thunks' pairs are another)
   const mod = readFileSync(`${dll}.wasm`);
   const has = (n) => mod.includes(Buffer.from(n));
-  if (classes) t.check(`${pre}convdll: class adapters, no entry thunks`, has('__gexw_adapters') && !has('__gexe.'), `adapters ${has('__gexw_adapters')}, thunks ${has('__gexe.')}`);
+  t.check(`${pre}convdll: ${thunks ? 'entry thunks, no class adapters' : 'class adapters, no entry thunks'}`, thunks ? has('__gexe.') && !has('__gexw_adapters') : has('__gexw_adapters') && !has('__gexe.'), `adapters ${has('__gexw_adapters')}, thunks ${has('__gexe.')}`);
   const src = { convmatrix: 'convmain' };
   for (const n of progs) {
     let exe;

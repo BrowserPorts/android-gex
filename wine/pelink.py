@@ -1860,7 +1860,7 @@ static void *gexw_ntdll_proc(const char *name)
             f.write('--export-if-defined=__gexw_entries\n')
             f.write('--export-if-defined=__gexw_entries_decl\n')
             # the ICALL pass's class adapters' directory and facts (its
-            # GEXW_ENTRY=classes mode), whose bounds its objects define
+            # wasm64 default), whose bounds its objects define
             f.write('--export-if-defined=__gexw_adapters\n')
             f.write('--export-if-defined=__gexw_facts\n')
             # a module with thread-local data (a gexcc-win program's C++

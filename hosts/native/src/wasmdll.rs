@@ -333,7 +333,7 @@ fn apply_pending_one(wp: &Arc<WinePe>, shared: &Arc<Mutex<JitShared>>, memory: &
     }
 }
 
-/// The ICALL pass's class adapters (its `GEXW_ENTRY=classes` mode): guest
+/// The ICALL pass's class adapters (its wasm64 default): guest
 /// code calls any of the module's functions, its table index as an address,
 /// through the adapter of its class -- its wasm type and the facts its type
 /// does not say (`gex_kernel::ftab::facts`). `__gexw_adapters` bounds the
