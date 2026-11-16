@@ -30,6 +30,7 @@ pub mod cmd {
     pub const MAP_GET_NEXT_ID: u64 = 12;
     pub const MAP_GET_FD_BY_ID: u64 = 14;
     pub const OBJ_GET_INFO_BY_FD: u64 = 15;
+    pub const BTF_LOAD: u64 = 18;
 }
 
 /// Map types (`enum bpf_map_type`).
@@ -60,6 +61,7 @@ const MAX_KEY: u32 = 512;
 #[derive(Clone, Debug)]
 pub enum Object {
     Map(Arc<Map>),
+    Btf(Arc<crate::btf::Btf>),
 }
 
 /// A map.
@@ -72,6 +74,8 @@ pub struct Map {
     max_entries: u32,
     flags: u32,
     name: [u8; 16],
+    /// The BTF it was made with, and its key's and value's type ids.
+    btf: Option<(Arc<crate::btf::Btf>, u32, u32)>,
     data: Mutex<Data>,
 }
 
@@ -148,7 +152,7 @@ impl Map {
                 return Err(Errno::EINVAL);
             }
         };
-        Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, data: Mutex::new(data) })
+        Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(data) })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Data> {
@@ -267,6 +271,11 @@ impl Map {
         put(16, self.max_entries);
         put(20, self.flags);
         b[24..40].copy_from_slice(&self.name);
+        if let Some((btf, key, value)) = &self.btf {
+            b[64..68].copy_from_slice(&btf.id.to_le_bytes());
+            b[68..72].copy_from_slice(&key.to_le_bytes());
+            b[72..76].copy_from_slice(&value.to_le_bytes());
+        }
         b
     }
 }
@@ -329,6 +338,7 @@ pub struct Caller<'a> {
 fn install(c: &Caller<'_>, obj: Object, read: bool, write: bool) -> crate::errno::SysResult {
     let (handle, name): (Arc<dyn FileHandle>, &str) = match obj {
         Object::Map(map) => (Arc::new(MapFile { map, read, write }), "anon_inode:bpf-map"),
+        Object::Btf(btf) => (Arc::new(crate::btf::BtfFile(btf)), "anon_inode:btf"),
     };
     let flags = match (read, write) {
         (true, true) => crate::fs::oflags::O_RDWR,
@@ -348,7 +358,7 @@ fn map_of(c: &Caller<'_>, fd: i32) -> Result<(Arc<Map>, bool, bool), Errno> {
             let (r, w) = file.handle.bpf_access().unwrap_or((true, true));
             Ok((map, r, w))
         }
-        None => Err(Errno::EINVAL),
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -382,11 +392,49 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             let (ty, key, value, max, flags) = (u32_at(0), u32_at(4), u32_at(8), u32_at(12), u32_at(16));
             let mut name = [0u8; 16];
             name.copy_from_slice(&a[28..44]);
-            if u32_at(20) != 0 || u32_at(44) != 0 || u32_at(48) != 0 || u32_at(52) != 0 || u32_at(56) != 0 || u32_at(60) != 0 || u64_at(64) != 0 {
-                say_once("a map with an inner map, a device, BTF or extra");
+            if u32_at(20) != 0 || u32_at(44) != 0 || u32_at(60) != 0 || u64_at(64) != 0 {
+                say_once("a map with an inner map, a device, kernel BTF or extra");
                 return Err(Errno::EINVAL);
             }
-            let map = Arc::new(Map::create(ty, key, value, max, flags, name)?);
+            let mut map = Map::create(ty, key, value, max, flags, name)?;
+            // Its key's and value's types (`map_check_btf`): the value's
+            // there and the value's size, the key's too where it is named.
+            let (btf_fd, key_id, value_id) = (u32_at(48), u32_at(52), u32_at(56));
+            if key_id != 0 || value_id != 0 {
+                if btf_fd == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let btf = match c.fds.get(btf_fd as i32)?.handle.bpf_object() {
+                    Some(Object::Btf(b)) => b,
+                    _ => return Err(Errno::EINVAL),
+                };
+                if key_id != 0 && btf.size_of(key_id) != Ok(key) {
+                    return Err(Errno::EINVAL);
+                }
+                if value_id == 0 || btf.size_of(value_id) != Ok(value) {
+                    return Err(Errno::EINVAL);
+                }
+                // A key of no type only where the map says it may be
+                // (`map_check_btf`): an array of one element whose value is
+                // a datasec (global data); an array's key is otherwise a
+                // 32-bit int (`array_map_check_btf`). A hash names its key.
+                match ty {
+                    map_type::ARRAY if key_id == 0 => {
+                        if max != 1 || !btf.is_datasec(value_id) {
+                            return Err(Errno::EINVAL);
+                        }
+                    }
+                    map_type::ARRAY => {
+                        if !btf.is_i32(key_id) {
+                            return Err(Errno::EINVAL);
+                        }
+                    }
+                    _ if key_id == 0 => return Err(Errno::EINVAL),
+                    _ => {}
+                }
+                map.btf = Some((btf, key_id, value_id));
+            }
+            let map = Arc::new(map);
             register(&map);
             install(c, Object::Map(map), true, true)
         }
@@ -484,6 +532,24 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             let file = c.fds.get(u32_at(0) as i32)?;
             let info = match file.handle.bpf_object() {
                 Some(Object::Map(map)) => map.info(),
+                Some(Object::Btf(btf)) => {
+                    // `struct bpf_btf_info`: the BTF itself copied out
+                    // where the caller gave room (`btf`, `btf_size`).
+                    let mut i = vec![0u8; 32];
+                    if u32_at(4) as usize >= 16 {
+                        let to = m.read_u64(u64_at(8))?;
+                        let room = m.read_u32(u64_at(8) + 8)? as usize;
+                        if to != 0 {
+                            m.write(to, &btf.data[..room.min(btf.data.len())])?;
+                        }
+                    }
+                    i[8..12].copy_from_slice(&(btf.data.len() as u32).to_le_bytes());
+                    i[12..16].copy_from_slice(&btf.id.to_le_bytes());
+                    if u32_at(4) as usize >= 16 {
+                        i[0..8].copy_from_slice(&m.read_u64(u64_at(8))?.to_le_bytes());
+                    }
+                    i
+                }
                 None => return Err(Errno::EINVAL),
             };
             let want = u32_at(4) as usize;
@@ -496,8 +562,55 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             m.write_u32(attr + 4, n as u32)?;
             Ok(0)
         }
+        cmd::BTF_LOAD => {
+            zero_from(40)?;
+            if !c.capable {
+                return Err(Errno::EPERM);
+            }
+            let (data_at, log_buf, size, log_size, log_level, flags) = (u64_at(0), u64_at(8), u32_at(16), u32_at(20), u32_at(24), u32_at(32));
+            if flags != 0 {
+                return Err(Errno::EINVAL);
+            }
+            check_log(log_buf, log_size, log_level)?;
+            // `BTF_MAX_SIZE`.
+            if size > 16 << 20 {
+                return Err(Errno::E2BIG);
+            }
+            let data = m.read(data_at, size as usize)?.to_vec();
+            // The log, when asked for: what does not fit is cut, and the
+            // load fails for it (`ENOSPC`); its whole length is said.
+            let mut full = false;
+            if log_level != 0 {
+                let text = crate::btf::log_of(&data);
+                let room = log_size as usize - 1;
+                let n = text.len().min(room);
+                m.write(log_buf, &text.as_bytes()[..n])?;
+                m.write(log_buf + n as u64, &[0])?;
+                m.write_u32(attr + 28, text.len() as u32 + 1)?;
+                full = text.len() > room;
+            }
+            let btf = crate::btf::Btf::parse(data)?;
+            if full {
+                return Err(Errno::ENOSPC);
+            }
+            install(c, Object::Btf(Arc::new(btf)), true, true)
+        }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// A verifier log's attributes (`bpf_vlog_init`): a buffer and a level
+/// together or neither, a level of known bits, no more than `UINT_MAX >> 2`
+/// of room.
+fn check_log(buf: u64, size: u32, level: u32) -> Result<(), Errno> {
+    const LOG_MASK: u32 = 1 | 2 | 4 | 8 | 16;
+    if (buf != 0) != (size != 0) || (level != 0) != (buf != 0) || level & !LOG_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if size > u32::MAX >> 2 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 
 fn path_at(m: &GuestMem<'_>, at: u64) -> Result<String, Errno> {
