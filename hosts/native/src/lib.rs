@@ -5556,8 +5556,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 );
                 return Ok(());
             }
-            if op == gex_abi::cache_op::IC_INVALIDATE {
-                let addr = addr as u64;
+            if op == gex_abi::cache_op::IC_INVALIDATE || op == gex_abi::cache_op::GUARD_HIT {
+                // A guard names its block in `pc` (and its module in `addr`);
+                // the native host retires the page either way.
+                let addr = if op == gex_abi::cache_op::GUARD_HIT { pc as u64 } else { addr as u64 };
                 if std::env::var_os("GEX_TRACE_GUARD").is_some() {
                     eprintln!("[guard] {addr:#x} changed (block {:#x})", pc as u64);
                 }

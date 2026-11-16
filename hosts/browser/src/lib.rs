@@ -2983,17 +2983,27 @@ const SMC_HOT_RUN: usize = 8;
 /// [`SMC_HOT_HITS`].
 static SMC_HOT: std::sync::Mutex<Option<std::collections::HashMap<u64, SmcHot>>> = std::sync::Mutex::new(None);
 
+/// On a hot page, a block whose guard fires is retired alone (its slot
+/// moves to its new translation; the page's other blocks stay installed,
+/// each checking its own bytes). Every this many of those the page is
+/// retired whole all the same, so the modules holding the old copies of its
+/// blocks, which nothing dispatches to any more, can go.
+const SMC_HOT_PAGE_RETIRE: u32 = 256;
+
 #[derive(Default, Clone, Copy)]
 struct SmcHot {
     hits: u32,
+    /// Blocks retired alone since the page was last retired whole.
+    alone: u32,
     last: u64,
     lifts: u64,
     lift_ns: u64,
     blocks: u64,
 }
 
-/// A guard on `page` fired.
-fn smc_hit(page: u64) {
+/// A guard on `page` fired. Whether to retire only the block (the page
+/// is hot, and not due its whole retire: [`SMC_HOT_PAGE_RETIRE`]).
+fn smc_hit(page: u64) -> bool {
     let now = now_ns();
     let mut m = SMC_HOT.lock().unwrap_or_else(|e| e.into_inner());
     let h = m.get_or_insert_with(Default::default).entry(page).or_default();
@@ -3004,13 +3014,15 @@ fn smc_hit(page: u64) {
     }
     h.hits = h.hits.saturating_add(1);
     h.last = now;
+    let alone = h.hits > SMC_HOT_HITS && h.alone < SMC_HOT_PAGE_RETIRE;
+    h.alone = if alone { h.alone + 1 } else { 0 };
     let h = *h;
     drop(m);
     if quiet && was.hits >= SMC_HOT_HITS {
         smc_cooled(page, was.hits);
     }
     if jit_diag() && h.hits == SMC_HOT_HITS {
-        warn_line(&format!("gex: pid {} page {page:#x} is rewritten while it runs ({SMC_HOT_HITS} guard hits running): misses there lift only their block and the run after it\n", my_pid()));
+        warn_line(&format!("gex: pid {} page {page:#x} is rewritten while it runs ({SMC_HOT_HITS} guard hits running): a block whose bytes change is retired alone, and a miss there lifts only its block and the run after it\n", my_pid()));
     }
     if jit_diag() && h.hits >= SMC_HOT_HITS && h.hits.is_power_of_two() && h.lifts > 0 {
         warn_line(&format!(
@@ -3022,6 +3034,7 @@ fn smc_hit(page: u64) {
             h.lift_ns / 1000
         ));
     }
+    alone
 }
 
 /// Whether a miss on `page` lifts only its block (the hot-rewrite mode); a
@@ -16839,6 +16852,48 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         });
         return;
     }
+    if op == gex_abi::cache_op::GUARD_HIT {
+        // A block's self-modifying-code guard found its bytes changed: `pc`
+        // is the block, `addr` its module (dense base, id; as `PAGE_STALE`).
+        let start = _pc as u64;
+        let alt = thread_alt();
+        if jit_diag() {
+            guard_bytes_say(start, start);
+        }
+        // On a hot page, with dense numbering (a slot map word per block that
+        // every Worker reads), only this block: its translation again, into
+        // the slot. A Worker that has not instantiated the new module finds
+        // the miss stub at its index and catches up first (`dense::missing`);
+        // one that runs another block of the page meanwhile runs a block
+        // whose bytes did not change, or whose own guard sends it here.
+        // Otherwise (classic numbering, or a page not hot) the page, below.
+        if smc_hit(gex_abi::page_key(start, alt)) && dense::on() {
+            let again = with_jit_only(|j| {
+                // The slot already names a newer block than this module's
+                // (this copy was reached by a direct jump from a sibling of
+                // its own module, which keeps jumping to it): dispatch below
+                // goes there, or catches this Worker up to it.
+                let (base, _) = ((addr as u64 >> 32) as u32, addr as u64 & 0xffff_ffff);
+                let elsewhere = base != 0 && {
+                    let d = dense::index(start);
+                    d != 0 && j.module_dense.get(&base).is_some_and(|&n| d < base || d >= base + n)
+                };
+                if !elsewhere {
+                    let key = gex_abi::addr_key(start, alt);
+                    j.translated.remove(&key);
+                    j.provider.remove(&key);
+                }
+                !elsewhere
+            });
+            if again {
+                xlate_add(3, 1);
+                gex_dispatch_miss(_ctx, start as i64);
+            }
+            return;
+        }
+        gex_cache_op(_ctx, _pc, gex_abi::cache_op::IC_INVALIDATE, _pc);
+        return;
+    }
     if op == gex_abi::cache_op::IC_INVALIDATE {
         // Self-modifying / JIT-generated guest code (PCRE2's regex JIT does this)
         // wrote new machine code to a page it had already run, and is flushing
@@ -16852,10 +16907,6 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
         // the page's block records. The old slots leak, which is harmless: they
         // are never reused and, once the directory is cleared, unreachable.
         let page = gex_abi::dispatch_page(addr as u64);
-        smc_hit(gex_abi::page_key(addr as u64, thread_alt()));
-        if jit_diag() {
-            guard_bytes_say(addr as u64, _pc as u64);
-        }
         with_jit_only(|j| {
             // The page in either mode: a WoW64 process's 32-bit blocks are
             // under the other mode's key alone (`gex_abi::ALT_PAGE`), so a

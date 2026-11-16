@@ -1177,6 +1177,11 @@ pub mod cache_op {
     /// host lets tier-1 have the address: the miss that follows translates
     /// it and its block takes the slot.
     pub const FTAB_TIER1: i32 = 14;
+    /// Not a cache operation: the block at `pc` found its code bytes changed
+    /// since it was lifted (its self-modifying-code guard), and `addr` is its
+    /// module, as for [`PAGE_STALE`]. The host retires that block, or its
+    /// page, and the block then dispatches to `pc` again.
+    pub const GUARD_HIT: i32 = 15;
 }
 
 /// The lowest address a guest access may name: below it are the runtime's
