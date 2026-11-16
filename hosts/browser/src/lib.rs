@@ -599,6 +599,12 @@ extern "C" {
     /// Slots nobody else will be given, and the mark that keeps runtime
     /// allocation clear of what static recompilation already assigned.
     fn k_slot_alloc(count: u64) -> u64;
+    fn k_slot_alloc_for(count: u64, pid: i32) -> u64;
+    fn k_slot_get_held(page: u64, key: u64, pid: i32) -> u32;
+    fn k_mod_hold(id: u32, pid: i32) -> u32;
+    fn k_slot_limit(top: u64);
+    fn k_slot_top() -> u64;
+    fn k_slot_reclaimed() -> u64;
     fn k_slot_floor(floor: u64);
     /// How many slots the mark has left before it runs off the last dispatch
     /// table. Nothing gives slots back, so this only falls; see `k_slot_left`.
@@ -759,7 +765,39 @@ extern "C" {
 fn slot_space_top() -> u64 {
     let per_table =
         (gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE;
-    gex_abi::DISPATCH_TABLES as u64 * per_table
+    let full = gex_abi::DISPATCH_TABLES as u64 * per_table;
+    // SAFETY: scalar calls into the kernel.
+    if unsafe { k_present() } != 0 {
+        return unsafe { k_slot_top() }.min(full);
+    }
+    full
+}
+
+/// The last dispatch table's top, whatever a debug switch says.
+fn slot_space_full() -> u64 {
+    gex_abi::DISPATCH_TABLES as u64
+        * ((gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE)
+}
+
+/// `GEX_DEBUG_SLOT_SPACE=N` in a process's environment (a debug switch, for a
+/// test that must spend the runtime dispatch slot space quickly): the space
+/// is N slots above the statically recompiled ones, for every process from
+/// the first that says so.
+fn slot_space_switch() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Some(home) = crate::sigs::home() else { return };
+    DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+    let top = home
+        .envp()
+        .iter()
+        .find_map(|e| e.strip_prefix("GEX_DEBUG_SLOT_SPACE=").and_then(|v| v.parse::<u64>().ok()));
+    if let Some(top) = top {
+        // SAFETY: a scalar call into the kernel.
+        unsafe { k_slot_limit(top) };
+    }
 }
 
 /// A page table whose runtime allocations come from the system-wide counter.
@@ -829,8 +867,9 @@ fn shared_page_table(
     table.set_identity(std::sync::Arc::new(gex_xlate::Identity {
         adopt: Box::new(|page| {
             let (key, id) = snapshot_page_key(page)?;
-            // SAFETY: a lookup in the kernel's own memory, borrowing nothing here.
-            let base = unsafe { k_slot_get(page, key) };
+            // SAFETY: a lookup in the kernel's own memory, borrowing nothing
+            // here. Held: this process will use the base.
+            let base = unsafe { k_slot_get_held(page, key, crate::my_pid()) };
             if tracing() && base != 0 {
                 trace_line(&format!(
                     "[gex] page {page:#x} adopts base {base:#x} by identity {id:?} key {key:#x}\n"
@@ -852,17 +891,37 @@ fn shared_page_table(
     }));
     }
     unsafe { k_slot_floor(next_slot) };
+    slot_space_switch();
     table.set_refill(std::sync::Arc::new(gex_xlate::Refill(Box::new(|n| {
         // SAFETY: as above.
-        let base = unsafe { k_slot_alloc(n) };
-        // Each tenth of the runtime space (the upper half of the tables)
-        // spent is said once, by the allocation that crosses it (ranges are
-        // disjoint, so one in the whole system), so a run can be watched
-        // approaching the end.
+        slot_space_switch();
+        let base = unsafe { k_slot_alloc_for(n, crate::my_pid()) };
+        // Ranges of ended programs taken back to make room (the kernel's
+        // `reclaim`), said once each time.
         {
-            let runtime = slot_space_top() / 2;
-            let tenth = |s: u64| s.saturating_sub(runtime) * 10 / runtime;
-            if tenth(base + n) > tenth(base) {
+            // SAFETY: as above.
+            let now = unsafe { k_slot_reclaimed() };
+            if now != 0 {
+                warn_line(&format!(
+                    "[gex] dispatch slots: {} ranges of ended programs taken back ({} slots in all)\n",
+                    now >> 40,
+                    now & ((1u64 << 40) - 1),
+                ));
+            }
+        }
+        // Each tenth of the runtime space (the upper half of the tables)
+        // spent is said once, by the allocation from the mark that crosses
+        // it (ranges are disjoint, so one in the whole system), so a run can
+        // be watched approaching the end. A range given again is below the
+        // mark, and says nothing.
+        {
+            let start = (gex_abi::DISPATCH_TABLES as u64 / 2)
+                * ((gex_abi::DISPATCH_TABLE_MAX_SLOTS / gex_abi::SLOTS_PER_PAGE) * gex_abi::SLOTS_PER_PAGE);
+            let runtime = slot_space_top().saturating_sub(start).max(1);
+            let tenth = |s: u64| s.saturating_sub(start) * 10 / runtime;
+            // SAFETY: as above.
+            let from_mark = unsafe { k_slot_left() } == slot_space_full().saturating_sub(base + n);
+            if from_mark && tenth(base + n) > tenth(base) {
                 warn_line(&format!(
                     "[gex] dispatch slots: {}0% of the runtime space spent ({}k left)\n",
                     tenth(base + n).min(10),
@@ -884,8 +943,8 @@ fn shared_page_table(
                 warn_line(&format!(
                     "[gex] the runtime dispatch slot space is spent: slot {base} is past \
                      the top of table {} and nothing can be translated after this. \
-                     Slots are never given back, so a page's whole life shares \
-                     {} of them; this run has used them all.\n",
+                     Only an ended program's slots are given back, and this \
+                     run's live programs hold all {} of them.\n",
                     gex_abi::DISPATCH_TABLES - 1,
                     slot_space_top(),
                 ));
@@ -12699,7 +12758,8 @@ fn shared_slot(j: &Jit, page: u64, key: u64) -> Option<u32> {
     // SAFETY: a plain lookup in the kernel's own memory, taking no borrow of
     // anything this module owns.
     if unsafe { k_present() } != 0 {
-        let base = unsafe { k_slot_get(page, key) };
+        // Held: the caller uses the base.
+        let base = unsafe { k_slot_get_held(page, key, crate::my_pid()) };
         if base != 0 {
             return Some(base);
         }
@@ -13437,6 +13497,11 @@ fn shared_modules_of_object(
                 continue;
             }
             took += len as u64;
+            // Held before it is read: its slots cannot be taken back while
+            // this process may run it. Gone from the store: not installed.
+            if k_mod_hold(id, crate::my_pid()) == 0 {
+                continue;
+            }
             let mut wasm = vec![0u8; len];
             if k_mod_read(id, wasm.as_mut_ptr() as gex_kernel::PAddr, len as u32) as usize != len {
                 continue;
@@ -13617,6 +13682,10 @@ fn shared_module_at(
         }
         let len = k_mod_len(id) as usize;
         if len == 0 {
+            return None;
+        }
+        // Held before it is read, as above.
+        if k_mod_hold(id, crate::my_pid()) == 0 {
             return None;
         }
         let mut wasm = vec![0u8; len];
