@@ -6294,29 +6294,33 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             static RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
         const MAX_RETRIES: u32 = 16;
-        // Or the translation has no block that starts there at all. Seen
-        // only with many threads translating at once (Android's apexd,
-        // fifty reading archives; one run in several), which fits another
-        // thread publishing the block between this thread's miss and its
-        // translation's look at what is known, a known address not being
-        // made again; that is not established. Trying again begins by
-        // taking what others have published, and if the address is still
-        // not covered the report says what was made in its place.
+        // Or it was not published for another reason, seen only with many
+        // threads translating at once (Android's apexd, fifty reading
+        // archives; one run in several, always at a page's last
+        // instruction): once the translation had no block at the address,
+        // once it had one and the address's page had slots neither in the
+        // shared table nor in the translation's own. Neither is
+        // understood. Trying again begins by taking what others have
+        // published; if the address is still not covered after that many
+        // tries, the report says what was made and where the page stood.
         let made = translated_module.exported_blocks.iter().any(|(a, _)| *a == pc);
-        if (retired || !made) && RETRIES.with(|r| r.get()) < MAX_RETRIES {
+        if RETRIES.with(|r| r.get()) < MAX_RETRIES {
             jit_stats::STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             RETRIES.with(|r| r.set(r.get() + 1));
             let again = translate_and_install(caller, pc);
             RETRIES.with(|r| r.set(r.get() - 1));
             return again;
         }
-        // What was made instead, for whoever reads this: the instruction
-        // there and the blocks nearest it.
         let word = memory.bytes().get(pc as usize..pc as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
         let below = translated_module.exported_blocks.iter().map(|(a, _)| *a).filter(|a| *a < pc).max();
         let above = translated_module.exported_blocks.iter().map(|(a, _)| *a).filter(|a| *a > pc).min();
+        let (shared_base, own_base) = {
+            let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let page = gex_abi::page_key(pc, alt);
+            (sh.page_table.lookup(page), translated_module.page_table.lookup(page))
+        };
         bail!(
-            "translated blocks but none covered 0x{pc:x}{} (a block made there: {made}; the instruction: {word:x?}; {} blocks made, the nearest at {below:x?} and {above:x?})",
+            "translated blocks but none covered 0x{pc:x}{} (a block made there: {made}; the instruction: {word:x?}; {} blocks made, the nearest at {below:x?} and {above:x?}; its page's slots: shared {shared_base:?}, this translation's {own_base:?})",
             if retired { " (its page kept being retired)" } else { "" },
             translated_module.exported_blocks.len(),
         );
