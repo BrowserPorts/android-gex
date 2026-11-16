@@ -2,7 +2,8 @@
 // title files are in, before any read; without it (the default) not a byte of it comes before the first read,
 // which fetches its frame by Range. Each setting has its own page and its own copy of the bundle
 // (fixtures/images.mjs restBundle); a program reads its one lazy file 8 s after it starts, and the checks
-// are on the requests the page made.
+// are on the requests the page made. The single-thread build has no lazy files' owner, and restAhead does
+// nothing there: both of its phases are checked as restAhead false.
 import { start } from '../../page/src/app.js';
 
 export const meta = {
@@ -33,14 +34,18 @@ export default async function (t) {
       },
     }), 60000, `start (restAhead ${ahead})`);
     const name = `restAhead ${ahead}`;
-    if (!app.state.lazyCache?.on) {
+    // The single-thread build has no owner (it never starts one, so state.lazyCache is unset) and restAhead does
+    // nothing there: either setting reads a rest frame at its first read only, as restAhead false does here
+    const sp = app.state.lazyCache === undefined;
+    if (sp) say(`${name}: no lazy files' owner (the single-thread build): checked as restAhead false`);
+    else if (!app.state.lazyCache?.on) {
       check(`${name}: the lazy files' owner runs (shared memory, Cache Storage)`, false, JSON.stringify(app.state.lazyCache));
       app.kill();
       return ahead ? undefined : t.reload();
     }
     await until(() => /^up$/m.test(app.state.out), 'the program', 30000);
     const atUp = await t.hits(bin);
-    if (ahead) {
+    if (ahead && !sp) {
       // the download needs no read: it is under way before the program's read at 8 s
       await until(async () => (await t.hits(bin)) > 0, 'the rest bundle downloading ahead', 6000).catch(() => {});
       const before = await t.hits(bin), out = app.state.out;
@@ -58,7 +63,7 @@ export default async function (t) {
       .catch((e) => { throw new Error(`${e.message}: ${app.state.out.slice(-400)}`); });
     const out = app.state.out.replace(/\r/g, '');
     check(`${name}: the read answers with the file's size and bytes`, /^65536\naaa$/m.test(out), out.slice(-200));
-    if (!ahead) check(`${name}: ... fetched from the rest bundle by its read`, (await t.hits(bin)) > 0, `${await t.hits(bin)} request(s)`);
+    if (!ahead || sp) check(`${name}: ... fetched from the rest bundle by its read`, (await t.hits(bin)) > 0, `${await t.hits(bin)} request(s)`);
     say(`${name}: ${await t.hits(bin)} rest.bin request(s)`);
     app.kill();
     await timeout(app.exited, 20000, 'kill');

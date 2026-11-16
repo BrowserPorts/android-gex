@@ -108,6 +108,8 @@ const PIECES = {
  *   restAhead  true: the whole rest bundle downloaded in the background as soon as
  *              the title files are in, at low priority, a read's own fetch first;
  *              default false: a rest bundle's frames fetched at their first read only
+ *              (the shared-memory build's: the single-thread build has no lazy files'
+ *              owner, and reads every frame at its first read either way)
  *   baseUrl    where app.mjs's files are (default: beside app.mjs)
  *   launch     the build's launch file, relative to baseUrl
  *   build      the launch, already read (gex's test page; see `fromLaunch`)
