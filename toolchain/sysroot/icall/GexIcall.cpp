@@ -1033,9 +1033,11 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       FunctionType *CT = nullptr;
       uint32_t f = 0;
       if (!classOf32(F, conv, CT, f)) {
-        if (f & FACT_REFUSED) continue;
-        if (!F.isDeclaration())
-          if (Function *T = entryThunk(M, F, conv)) pairs.push_back({&F, T});
+        // (a function with no thunk either is said, so that no class of
+        // its wasm type serves it)
+        Function *T = f & FACT_REFUSED || F.isDeclaration() ? nullptr : entryThunk(M, F, conv);
+        if (T) pairs.push_back({&F, T});
+        else facts.push_back({&F, ConstantInt::get(I32, FACT_REFUSED)});
         continue;
       }
       if (f) facts.push_back({&F, ConstantInt::get(I32, f)});
