@@ -42,7 +42,9 @@ pub mod map_type {
     pub const PERCPU_ARRAY: u32 = 6;
     pub const LRU_HASH: u32 = 9;
     pub const LPM_TRIE: u32 = 11;
+    pub const SK_STORAGE: u32 = 24;
     pub const DEVMAP_HASH: u32 = 25;
+    pub const RINGBUF: u32 = 27;
 }
 
 /// Map creation flags (`BPF_F_*`).
@@ -55,6 +57,7 @@ pub mod map_flag {
     pub const ZERO_SEED: u32 = 1 << 6;
     pub const RDONLY_PROG: u32 = 1 << 7;
     pub const WRONLY_PROG: u32 = 1 << 8;
+    pub const CLONE: u32 = 1 << 9;
     pub const MMAPABLE: u32 = 1 << 10;
     /// `BPF_F_ACCESS_MASK`.
     pub const ACCESS: u32 = RDONLY | WRONLY | RDONLY_PROG | WRONLY_PROG;
@@ -124,6 +127,52 @@ enum Data {
     PercpuArray(Vec<u8>),
     /// Prefixes (bits of the key's data) and their values.
     Lpm(Vec<(u32, Vec<u8>, Vec<u8>)>),
+    /// A value for each socket that has one, by the socket (its address,
+    /// and the socket while it lasts).
+    SkStorage(std::collections::HashMap<usize, (std::sync::Weak<dyn FileHandle>, Vec<u8>)>),
+    /// A ring buffer ([`Ring`]).
+    Ringbuf(Ring),
+}
+
+const PAGE: u64 = 4096;
+
+/// A ring buffer as user space maps it (`struct bpf_ringbuf` from its
+/// consumer page): the consumer's page (its position first, the one page
+/// user space may write), the producer's (its position first), and the
+/// data, mapped twice over so a record that wraps reads straight on.
+#[derive(Debug)]
+pub struct Ring {
+    consumer: Vec<u8>,
+    producer: Vec<u8>,
+    data: Vec<u8>,
+    /// Counted at each change, for a mapping to know it is behind.
+    changes: u64,
+}
+
+impl Ring {
+    fn pos(page: &[u8]) -> u64 {
+        u64::from_le_bytes(page[..8].try_into().unwrap())
+    }
+
+    /// Whether there is a record not consumed (`ringbuf_avail_data_sz`).
+    fn pending(&self) -> bool {
+        Self::pos(&self.producer) != Self::pos(&self.consumer)
+    }
+
+    /// The mapped bytes at `offset`, from the consumer page on.
+    fn read(&self, offset: u64, buf: &mut [u8]) -> usize {
+        let size = self.data.len() as u64;
+        let end = (2 * PAGE + 2 * size).saturating_sub(offset).min(buf.len() as u64) as usize;
+        for (i, b) in buf[..end].iter_mut().enumerate() {
+            let at = offset + i as u64;
+            *b = match at / PAGE {
+                0 => self.consumer[at as usize],
+                1 => self.producer[(at - PAGE) as usize],
+                _ => self.data[((at - 2 * PAGE) % size) as usize],
+            };
+        }
+        end
+    }
 }
 
 fn next_map_id() -> u32 {
@@ -187,8 +236,21 @@ impl Map {
         if !named.clone().all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.') || name[15] != 0 {
             return Err(Errno::EINVAL);
         }
-        if value_size == 0 || max_entries == 0 || key_size > MAX_KEY {
+        // `ringbuf_map_alloc`: no key or value, a size of a power of two
+        // pages, and no flag but the node's.
+        if ty == map_type::RINGBUF {
+            if flags & !map_flag::NUMA_NODE != 0 || key_size != 0 || value_size != 0 || !max_entries.is_power_of_two() || max_entries as u64 % PAGE != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let ring = Ring { consumer: vec![0; PAGE as usize], producer: vec![0; PAGE as usize], data: vec![0; max_entries as usize], changes: 1 };
+            return Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(Data::Ringbuf(ring)) });
+        }
+        // (Socket storage has no number of entries: one a socket.)
+        if value_size == 0 || (max_entries == 0) != (ty == map_type::SK_STORAGE) || key_size > MAX_KEY {
             return Err(Errno::EINVAL);
+        }
+        if ty == map_type::SK_STORAGE && value_size > 0xffff - 64 {
+            return Err(Errno::E2BIG);
         }
         // A per-CPU value's size has a limit (`PCPU_MIN_UNIT_SIZE`).
         if ty == map_type::PERCPU_ARRAY && value_size > 32 << 10 {
@@ -252,6 +314,14 @@ impl Map {
                 }
                 Data::Lpm(Vec::new())
             }
+            map_type::SK_STORAGE => {
+                // `bpf_local_storage_map_alloc_check` (and the BTF its key
+                // and value need, which the caller checks after).
+                if flags & !(NO_PREALLOC | CLONE) != 0 || flags & NO_PREALLOC == 0 || key_size != 4 {
+                    return Err(Errno::EINVAL);
+                }
+                Data::SkStorage(std::collections::HashMap::new())
+            }
             map_type::DEVMAP_HASH => {
                 // `dev_map_alloc_check`: a key of four bytes, a value of an
                 // ifindex or an ifindex and a program.
@@ -295,6 +365,40 @@ impl Map {
         self.data.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// A socket's value (`bpf_fd_sk_storage_lookup_elem`).
+    fn sk_lookup(&self, sock: &Arc<dyn FileHandle>) -> Result<Vec<u8>, Errno> {
+        let Data::SkStorage(t) = &*self.lock() else { return Err(Errno::EINVAL) };
+        let at = Arc::as_ptr(sock) as *const () as usize;
+        t.get(&at).filter(|(w, _)| w.strong_count() > 0).map(|(_, v)| v.clone()).ok_or(Errno::ENOENT)
+    }
+
+    /// `bpf_local_storage_update` for a socket.
+    fn sk_update(&self, sock: &Arc<dyn FileHandle>, value: &[u8], flags: u64) -> Result<(), Errno> {
+        if flags & !F_LOCK > EXIST || flags & F_LOCK != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let Data::SkStorage(t) = &mut *self.lock() else { return Err(Errno::EINVAL) };
+        t.retain(|_, (w, _)| w.strong_count() > 0);
+        let at = Arc::as_ptr(sock) as *const () as usize;
+        match (t.contains_key(&at), flags) {
+            (true, NOEXIST) => Err(Errno::EEXIST),
+            (false, EXIST) => Err(Errno::ENOENT),
+            _ => {
+                t.insert(at, (Arc::downgrade(sock), value.to_vec()));
+                Ok(())
+            }
+        }
+    }
+
+    fn sk_delete(&self, sock: &Arc<dyn FileHandle>) -> Result<(), Errno> {
+        let Data::SkStorage(t) = &mut *self.lock() else { return Err(Errno::EINVAL) };
+        let at = Arc::as_ptr(sock) as *const () as usize;
+        match t.remove(&at) {
+            Some((w, _)) if w.strong_count() > 0 => Ok(()),
+            _ => Err(Errno::ENOENT),
+        }
+    }
+
     fn index(&self, key: &[u8]) -> u32 {
         u32::from_le_bytes(key[..4].try_into().unwrap())
     }
@@ -319,6 +423,8 @@ impl Map {
                 Ok(v[i as usize * each..(i as usize + 1) * each].to_vec())
             }
             Data::Lpm(t) => lpm_match(t, key).map(|(_, _, v)| v.clone()).ok_or(Errno::ENOENT),
+            Data::SkStorage(_) => Err(Errno::EINVAL),
+            Data::Ringbuf(_) => Err(crate::btf::ENOTSUPP),
         }
     }
 
@@ -345,6 +451,8 @@ impl Map {
                 v[i as usize * vs..(i as usize + 1) * vs].copy_from_slice(value);
                 Ok(())
             }
+            Data::SkStorage(_) => Err(Errno::EINVAL),
+            Data::Ringbuf(_) => Err(crate::btf::ENOTSUPP),
             Data::PercpuArray(v) => {
                 let i = self.index(key);
                 if i >= max {
@@ -451,7 +559,8 @@ impl Map {
 
     pub fn delete(&self, key: &[u8]) -> Result<(), Errno> {
         match &mut *self.lock() {
-            Data::Array(_) | Data::PercpuArray(_) => Err(Errno::EINVAL),
+            Data::Array(_) | Data::PercpuArray(_) | Data::SkStorage(_) => Err(Errno::EINVAL),
+            Data::Ringbuf(_) => Err(crate::btf::ENOTSUPP),
             Data::Lpm(t) => {
                 let (plen, data) = lpm_key(key);
                 let at = t.iter().position(|(p, d, _)| *p == plen && prefix_eq(d, &data, plen)).ok_or(Errno::ENOENT)?;
@@ -480,6 +589,8 @@ impl Map {
                 }
                 Ok(next.to_le_bytes().to_vec())
             }
+            // No walk of a socket storage (`notsupp_get_next_key`).
+            Data::SkStorage(_) | Data::Ringbuf(_) => Err(crate::btf::ENOTSUPP),
             Data::PercpuArray(_) => {
                 let next = match key.map(|k| self.index(k)) {
                     Some(i) if i < self.max_entries => i + 1,
@@ -580,6 +691,71 @@ impl FileHandle for MapFile {
     fn bpf_access(&self) -> Option<(bool, bool)> {
         Some((self.read, self.write))
     }
+
+    /// `bpf_map_mmap`: only a ring buffer maps (an array that could is
+    /// refused when made), shared, and of it only the consumer's page for
+    /// writing (`ringbuf_map_mmap_kern`), no further than its pages.
+    fn may_map(&self, offset: u64, len: u64, prot: u32, shared: bool) -> Result<(), Errno> {
+        let Data::Ringbuf(ring) = &*self.map.lock() else { return Err(crate::btf::ENOTSUPP) };
+        if !shared {
+            return Err(Errno::EINVAL);
+        }
+        if prot & crate::mem::prot::WRITE != 0 && (offset != 0 || len != PAGE) {
+            return Err(Errno::EPERM);
+        }
+        if offset.checked_add(len).is_none_or(|end| end > 2 * PAGE + 2 * ring.data.len() as u64) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+    /// A mapping made read-only stays so (`bpf_map_mmap`).
+    fn read_only_mapping_stays(&self) -> bool {
+        true
+    }
+    fn mapped_len(&self) -> Option<u64> {
+        match &*self.map.lock() {
+            Data::Ringbuf(ring) => Some(2 * PAGE + 2 * ring.data.len() as u64),
+            _ => None,
+        }
+    }
+    fn read_mapped(&self, offset: u64, buf: &mut [u8]) -> crate::errno::SysResult {
+        match &*self.map.lock() {
+            Data::Ringbuf(ring) => Ok(ring.read(offset, buf) as u64),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+    /// What a mapping writes back: the consumer's page, the one it may.
+    fn write_mapped(&self, offset: u64, buf: &[u8]) -> crate::errno::SysResult {
+        match &mut *self.map.lock() {
+            Data::Ringbuf(ring) if offset.checked_add(buf.len() as u64).is_some_and(|end| end <= PAGE) => {
+                ring.consumer[offset as usize..offset as usize + buf.len()].copy_from_slice(buf);
+                ring.changes += 1;
+                Ok(buf.len() as u64)
+            }
+            _ => Err(Errno::EINVAL),
+        }
+    }
+    fn changes(&self) -> u64 {
+        match &*self.map.lock() {
+            Data::Ringbuf(ring) => ring.changes,
+            _ => 0,
+        }
+    }
+    /// To `poll`, a ring buffer is readable while a record waits, and never
+    /// writable (`ringbuf_map_poll_kern`); any other map says only
+    /// `POLLERR`. (A `read` or `write` never waits: it is `EINVAL`.)
+    fn poll_in(&self) -> bool {
+        match &*self.map.lock() {
+            Data::Ringbuf(ring) => ring.pending(),
+            _ => false,
+        }
+    }
+    fn poll_out(&self) -> bool {
+        false
+    }
+    fn poll_err(&self) -> bool {
+        !matches!(&*self.map.lock(), Data::Ringbuf(_))
+    }
 }
 
 /// What a `bpf(2)` call needs of its caller.
@@ -667,6 +843,9 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             // Its key's and value's types (`map_check_btf`): the value's
             // there and the value's size, the key's too where it is named.
             let (btf_fd, key_id, value_id) = (u32_at(48), u32_at(52), u32_at(56));
+            if ty == map_type::SK_STORAGE && (key_id == 0 || value_id == 0) {
+                return Err(Errno::EINVAL);
+            }
             if key_id != 0 || value_id != 0 {
                 if btf_fd == 0 {
                     return Err(Errno::EINVAL);
@@ -696,6 +875,7 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
                             return Err(Errno::EINVAL);
                         }
                     }
+                    map_type::SK_STORAGE if !btf.is_i32(key_id) => return Err(Errno::EINVAL),
                     _ if key_id == 0 => return Err(Errno::EINVAL),
                     _ => {}
                 }
@@ -706,9 +886,67 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             install(c, Object::Map(map), true, true)
         }
         cmd::MAP_LOOKUP_ELEM | cmd::MAP_UPDATE_ELEM | cmd::MAP_DELETE_ELEM | cmd::MAP_GET_NEXT_KEY => {
-            zero_from(32)?;
+            // Past each command's last field (`CHECK_ATTR`): a delete's is
+            // the key, a walk's the next key, the others' the flags.
+            zero_from(match cmd {
+                cmd::MAP_DELETE_ELEM => 16,
+                cmd::MAP_GET_NEXT_KEY => 24,
+                _ => 32,
+            })?;
             let (map, r, w) = map_of(c, u32_at(0) as i32)?;
             let ks = map.key_size as usize;
+            // A ring buffer has no elements: it is read by mapping it
+            // (`ringbuf_map_lookup_elem` and its kin), after the checks
+            // the system call makes of any map.
+            if map.ty == map_type::RINGBUF {
+                let flags = u64_at(24);
+                let wants_read = matches!(cmd, cmd::MAP_LOOKUP_ELEM | cmd::MAP_GET_NEXT_KEY);
+                if cmd == cmd::MAP_LOOKUP_ELEM && flags & !F_LOCK != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                if if wants_read { !r } else { !w } {
+                    return Err(Errno::EPERM);
+                }
+                if matches!(cmd, cmd::MAP_LOOKUP_ELEM | cmd::MAP_UPDATE_ELEM) && flags & F_LOCK != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                // A key given to a map with none (`___bpf_copy_key`).
+                if u64_at(8) != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                return Err(crate::btf::ENOTSUPP);
+            }
+            // Socket storage: the key is a socket's descriptor.
+            if map.ty == map_type::SK_STORAGE && cmd != cmd::MAP_GET_NEXT_KEY {
+                let fd = m.read_u32(u64_at(8))? as i32;
+                let sock = c.fds.get(fd)?.handle.clone();
+                if sock.metadata()?.file_type != FileType::Socket {
+                    return Err(Errno::ENOTSOCK);
+                }
+                match cmd {
+                    cmd::MAP_LOOKUP_ELEM => {
+                        if !r {
+                            return Err(Errno::EPERM);
+                        }
+                        let v = map.sk_lookup(&sock)?;
+                        m.write(u64_at(16), &v)?;
+                    }
+                    cmd::MAP_UPDATE_ELEM => {
+                        if !w {
+                            return Err(Errno::EPERM);
+                        }
+                        let v = m.read(u64_at(16), map.value_size as usize)?.to_vec();
+                        map.sk_update(&sock, &v, u64_at(24))?;
+                    }
+                    _ => {
+                        if !w {
+                            return Err(Errno::EPERM);
+                        }
+                        map.sk_delete(&sock)?;
+                    }
+                }
+                return Ok(0);
+            }
             let key = if u64_at(8) == 0 && cmd == cmd::MAP_GET_NEXT_KEY { None } else { Some(m.read(u64_at(8), ks)?.to_vec()) };
             match cmd {
                 cmd::MAP_LOOKUP_ELEM => {

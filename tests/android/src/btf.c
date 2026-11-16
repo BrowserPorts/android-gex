@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -49,6 +50,20 @@ static const char expected[] =
     "hash with ids and no BTF: -22\n"
     "hash value a func: -22\n"
     "hash value the struct: made\n"
+    "sk storage made ahead: -22\n"
+    "sk storage of one entry: -22\n"
+    "sk storage keyed by a long: -22\n"
+    "sk storage: made\n"
+    "a socket's, none yet: -2\n"
+    "put: 0\n"
+    "get: 0 77\n"
+    "put NOEXIST: -17\n"
+    "a pipe's: -88\n"
+    "a descriptor not open: -9\n"
+    "walk: -524\n"
+    "delete: 0\n"
+    "delete again: -2\n"
+    "a new socket at its number: -2\n"
     "info: 0 size the blob's id given\n"
     "a log with no level: -22\n"
     "a log of 64 bytes: -28\n"
@@ -209,6 +224,40 @@ int main(void) {
     SAY("hash with ids and no BTF: %ld\n", map(0, 4, 8, 1, 11));
     SAY("hash value a func: %ld\n", map(fd, 4, 8, 1, 6));
     SAY("hash value the struct: %s\n", map(fd, 4, 8, 1, 3) >= 0 ? "made" : "refused");
+
+    // Socket storage: a value a socket, by the socket's descriptor.
+    {
+        union bpf_attr a;
+#define SK(flags, max, key_id) (memset(&a, 0, sizeof a), a.map_type = BPF_MAP_TYPE_SK_STORAGE, a.key_size = 4, a.value_size = 8, \
+                                a.max_entries = (max), a.map_flags = (flags), a.btf_fd = fd, a.btf_key_type_id = (key_id), a.btf_value_type_id = 11, \
+                                sys_bpf(BPF_MAP_CREATE, &a, sizeof a))
+        SAY("sk storage made ahead: %ld\n", SK(0, 0, 1));
+        SAY("sk storage of one entry: %ld\n", SK(BPF_F_NO_PREALLOC, 1, 1));
+        SAY("sk storage keyed by a long: %ld\n", SK(BPF_F_NO_PREALLOC, 0, 10));
+        long sk = SK(BPF_F_NO_PREALLOC, 0, 1);
+        SAY("sk storage: %s\n", sk >= 0 ? "made" : "refused");
+        int s1 = socket(AF_UNIX, SOCK_STREAM, 0);
+        uint64_t val = 77, got = 0;
+        union bpf_attr e;
+#define EL(cmd, k, v, f) (memset(&e, 0, sizeof e), e.map_fd = sk, e.key = (uintptr_t)(k), e.value = (uintptr_t)(v), e.flags = (f), sys_bpf(cmd, &e, sizeof e))
+        SAY("a socket's, none yet: %ld\n", EL(BPF_MAP_LOOKUP_ELEM, &s1, &got, 0));
+        SAY("put: %ld\n", EL(BPF_MAP_UPDATE_ELEM, &s1, &val, BPF_ANY));
+        SAY("get: %ld %llu\n", EL(BPF_MAP_LOOKUP_ELEM, &s1, &got, 0), (unsigned long long)got);
+        SAY("put NOEXIST: %ld\n", EL(BPF_MAP_UPDATE_ELEM, &s1, &val, BPF_NOEXIST));
+        int pp[2];
+        pipe(pp);
+        SAY("a pipe's: %ld\n", EL(BPF_MAP_LOOKUP_ELEM, &pp[0], &got, 0));
+        int bad = 9999;
+        SAY("a descriptor not open: %ld\n", EL(BPF_MAP_LOOKUP_ELEM, &bad, &got, 0));
+        int nk;
+        SAY("walk: %ld\n", (memset(&e, 0, sizeof e), e.map_fd = sk, e.key = 0, e.next_key = (uintptr_t)&nk, sys_bpf(BPF_MAP_GET_NEXT_KEY, &e, sizeof e)));
+        SAY("delete: %ld\n", EL(BPF_MAP_DELETE_ELEM, &s1, NULL, 0));
+        SAY("delete again: %ld\n", EL(BPF_MAP_DELETE_ELEM, &s1, NULL, 0));
+        EL(BPF_MAP_UPDATE_ELEM, &s1, &val, BPF_ANY);
+        close(s1);
+        int s2 = socket(AF_UNIX, SOCK_STREAM, 0);
+        SAY("a new socket at its number: %ld\n", EL(BPF_MAP_LOOKUP_ELEM, &s2, &got, 0));
+    }
 
     // Its description.
     struct bpf_btf_info bi;
