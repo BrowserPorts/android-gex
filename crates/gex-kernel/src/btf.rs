@@ -75,6 +75,21 @@ pub struct Btf {
     types: Vec<Option<Type>>,
 }
 
+thread_local! {
+    /// Where the last parse on this thread was, for the reason a refusal
+    /// gives in the log (the kernel's "[id] KIND name" lines).
+    static AT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn note_place(s: String) {
+    AT.with(|a| *a.borrow_mut() = s);
+}
+
+/// Why the last parse on this thread refused, as the log says it.
+pub fn last_reason() -> String {
+    AT.with(|a| a.borrow().clone())
+}
+
 fn next_id() -> u32 {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -84,10 +99,11 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
 
-/// `btf_name_valid_identifier`: a C identifier.
+/// `btf_name_valid_identifier`: a letter, `_` or `.`, then letters,
+/// digits, `_` and `.`, shorter than `KSYM_NAME_LEN` (512).
 fn identifier(s: &str) -> bool {
     let mut c = s.bytes();
-    matches!(c.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_') && c.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    s.len() < 512 && matches!(c.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_' || b == b'.') && c.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
 }
 
 /// `btf_name_valid_section`: printable, no space, not empty.
@@ -98,6 +114,7 @@ fn section_name(s: &str) -> bool {
 impl Btf {
     /// Parse and check `data` (`btf_parse`).
     pub fn parse(data: Vec<u8>) -> Result<Btf, Errno> {
+        note_place(String::from("header"));
         let n = data.len();
         if n < 8 {
             return Err(Errno::EINVAL);
@@ -182,6 +199,7 @@ impl Btf {
             let kind = (info >> 24) & 0x1f;
             let vlen = info & 0xffff;
             let kflag = info >> 31 != 0;
+            note_place(format!("[{}] kind {kind} vlen {vlen} kflag {} size/type {size_type}", types.len(), kflag as u8));
             if kind == 0 || kind > kind::MAX {
                 return Err(Errno::EINVAL);
             }
@@ -200,7 +218,7 @@ impl Btf {
                     need(enc & 0xf000_0000 == 0)?;
                     need(bits <= 128 && bits.div_ceil(8) <= sz && matches!(sz, 1 | 2 | 4 | 8 | 16) && offset + bits <= sz * 8)?;
                     need(matches!(encoding, 0 | 1 | 2 | 4))?;
-                    need(t.name.is_empty() || identifier(&t.name))?;
+                    // (An int's name is not held to anything: "unsigned int".)
                 }
                 kind::PTR | kind::VOLATILE | kind::CONST | kind::RESTRICT => {
                     need(vlen == 0 && !kflag && sz <= MAX_TYPE && t.name.is_empty())?;
@@ -303,7 +321,8 @@ impl Btf {
                     at += len;
                 }
                 kind::FLOAT => {
-                    need(vlen == 0 && !kflag && identifier(&t.name) && matches!(sz, 2 | 4 | 8 | 12 | 16))?;
+                    // (Nor a float's: "long double".)
+                    need(vlen == 0 && !kflag && matches!(sz, 2 | 4 | 8 | 12 | 16))?;
                 }
                 kind::DECL_TAG => {
                     need(vlen == 0 && !t.name.is_empty() && tb.len() - at >= 4)?;
@@ -334,6 +353,7 @@ impl Btf {
             }
         }
         for id in 1..n {
+            note_place(format!("[{id}] its references"));
             self.resolve(id)?;
             let t = self.types[id as usize].as_ref().unwrap();
             if let Some((elem, index, _)) = t.array {
@@ -428,7 +448,11 @@ pub fn log_of(data: &[u8]) -> String {
             data.len()
         ));
     }
-    if let Ok(btf) = Btf::parse(data.to_vec()) {
+    let parsed = Btf::parse(data.to_vec());
+    if parsed.is_err() {
+        out.push_str(&format!("{}: invalid\n", last_reason()));
+    }
+    if let Ok(btf) = parsed {
         const NAMES: [&str; 20] = ["UNKN", "INT", "PTR", "ARRAY", "STRUCT", "UNION", "ENUM", "FWD", "TYPEDEF", "VOLATILE", "CONST", "RESTRICT", "FUNC", "FUNC_PROTO", "VAR", "DATASEC", "FLOAT", "DECL_TAG", "TYPE_TAG", "ENUM64"];
         for (id, t) in btf.types.iter().enumerate().skip(1) {
             let t = t.as_ref().unwrap();
@@ -451,5 +475,21 @@ impl crate::vfs::FileHandle for BtfFile {
     }
     fn bpf_object(&self) -> Option<crate::bpf::Object> {
         Some(crate::bpf::Object::Btf(std::sync::Arc::clone(&self.0)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A BTF from a file (`GEX_BTF_FILE`): whether it parses, and if not
+    /// where. For finding why an object's BTF is refused.
+    #[test]
+    #[ignore]
+    fn a_btf_given() {
+        let path = std::env::var("GEX_BTF_FILE").expect("GEX_BTF_FILE");
+        let data = std::fs::read(path).unwrap();
+        match super::Btf::parse(data) {
+            Ok(b) => println!("parsed: {} types", b.count()),
+            Err(e) => panic!("refused {e:?} at {}", super::last_reason()),
+        }
     }
 }
