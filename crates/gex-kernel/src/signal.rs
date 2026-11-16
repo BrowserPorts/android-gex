@@ -1247,6 +1247,9 @@ pub fn setup_frame_fault(
 
 /// `si_code` for an address that is not aligned as its use needs.
 pub const BUS_ADRALN: u32 = 1;
+/// `BUS_ADRERR`: a nonexistent physical address, which is how a missing
+/// page of a `userfaultfd` range that asked for `SIGBUS` is reported.
+pub const BUS_ADRERR: u32 = 2;
 /// `si_code` for a fault at an address nothing is mapped at.
 pub const SEGV_MAPERR: u32 = 1;
 /// `si_code` for a fault at a page whose protection refuses the access.

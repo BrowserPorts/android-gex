@@ -94,6 +94,7 @@ pub mod nr {
     pub const TIMERFD_GETTIME: u64 = 87;
     pub const NANOSLEEP: u64 = 101;
     pub const CLOCK_SETTIME: u64 = 112;
+    pub const USERFAULTFD: u64 = 282;
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_GETRES: u64 = 114;
     pub const CLOCK_NANOSLEEP: u64 = 115;
@@ -5347,6 +5348,9 @@ impl MapIo<'_> {
         }
         if keep_old {
             m.zero_dirty(addr, old_len as usize)?;
+            // The source, emptied and kept (`MREMAP_DONTUNMAP`): its pages
+            // a `userfaultfd` registered are missing. (The map is held.)
+            mm.uffd_emptied(addr, addr + old_len);
         }
         Ok(dst)
     }
@@ -5498,6 +5502,8 @@ impl MapIo<'_> {
             for (lo, hi) in anon {
                 if hi > lo {
                     m.zero_dirty(lo, (hi - lo) as usize)?;
+                    // Emptied: a page a `userfaultfd` registered is missing.
+                    self.mem.lock().uffd_emptied(lo, hi);
                 }
             }
         }
@@ -8924,7 +8930,27 @@ fn arch_prctl(m: &mut GuestMem<'_>, ctx_addr: u64, code: u64, addr: u64) -> SysR
 }
 
 fn is_mapping(n: u64) -> bool {
-    matches!(n, nr::BRK | nr::MMAP | nr::MUNMAP | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC)
+    matches!(n, nr::BRK | nr::MMAP | nr::MUNMAP | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC | nr::USERFAULTFD)
+}
+
+/// `userfaultfd(flags)`: a descriptor for the caller's map
+/// ([`crate::uffd`]). Without `CAP_SYS_PTRACE` only one that takes the
+/// program's own faults (`UFFD_USER_MODE_ONLY`), as Linux has it with
+/// `vm.unprivileged_userfaultfd` at its default of 0; `EPERM` before the
+/// flags are looked at, then any flag but those and `O_CLOEXEC` and
+/// `O_NONBLOCK` is `EINVAL`.
+fn userfaultfd_call(io: &FdIo<'_>, mem: &crate::mem::Mm, flags: u64) -> SysResult {
+    const CAP_SYS_PTRACE: u64 = 19;
+    let user_only = flags & crate::uffd::USER_MODE_ONLY != 0;
+    if !user_only && !io.creds.capable(CAP_SYS_PTRACE) {
+        return Err(Errno::EPERM);
+    }
+    if flags & !(oflags::O_CLOEXEC | oflags::O_NONBLOCK | crate::uffd::USER_MODE_ONLY) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let handle = Arc::new(crate::uffd::Uffd::new(mem.shared()));
+    let file = OpenFile::new(handle, "anon_inode:[userfaultfd]".to_string(), (flags & oflags::O_NONBLOCK) | oflags::O_RDWR, true, true);
+    io.fds.insert(file, flags & oflags::O_CLOEXEC != 0)
 }
 
 /// SIGKILL and SIGSTOP, which no mask blocks.
@@ -9074,6 +9100,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::MREMAP => nr::MREMAP,
             x::MADVISE => nr::MADVISE,
             x::MSYNC => nr::MSYNC,
+            x::USERFAULTFD => nr::USERFAULTFD,
             x::OPEN | x::CREAT | x::OPENAT => nr::OPENAT,
             x::OPENAT2 => nr::OPENAT2,
             x::STAT | x::LSTAT | x::NEWFSTATAT => nr::NEWFSTATAT,
@@ -9147,7 +9174,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             | nr::RT_SIGPROCMASK | nr::PPOLL | nr::PSELECT6 | nr::EPOLL_PWAIT | nr::EPOLL_PWAIT2 | nr::FUTEX
             | nr::NANOSLEEP | nr::CLOCK_NANOSLEEP | nr::SENDMSG | nr::RECVMSG | nr::IOCTL | nr::CLOSE
             | nr::CLOSE_RANGE | nr::DUP | nr::DUP3 | nr::FCNTL | nr::FLOCK | nr::BRK | nr::MMAP | nr::MUNMAP
-            | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC => raw,
+            | nr::MPROTECT | nr::MREMAP | nr::MADVISE | nr::MSYNC | nr::USERFAULTFD => raw,
             n if is_path(n) => raw,
             // No `alarm` in this ABI.
             n if is_own_state(n) && n != nr::ALARM => raw,
@@ -9465,6 +9492,8 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
         // end as the full call's are.
         f.signals.process().collect(f.procs, f.pid, f.creds.ruid());
         r
+    } else if n == nr::USERFAULTFD {
+        userfaultfd_call(&f.io, f.map.mem, a[0])
     } else if is_mapping(n) {
         let Some(r) = f.map.call(m, n, a) else { unreachable!("free_class admitted a call MapIo does not make") };
         // A mapping the lowered memory had no room for.
@@ -13272,6 +13301,7 @@ impl Kernel {
             // a umask, but a program that sets one wants the old value back.
 
             // -- memory ------------------------------------------------------
+            nr::USERFAULTFD => userfaultfd_call(&self.fd_io(), &self.mem, a[0]),
             nr::BRK | nr::MMAP | nr::MUNMAP | nr::MSYNC | nr::MREMAP | nr::MPROTECT | nr::MADVISE => {
                 let Some(r) = self.map_io().call(m, n, a) else { unreachable!() };
                 r
@@ -13540,13 +13570,19 @@ impl Kernel {
     /// beside that address says: `SEGV_MAPERR` where nothing is mapped,
     /// `SEGV_ACCERR` where the protection refuses it (`do_page_fault`'s
     /// `bad_area`).
-    pub fn access_verdict(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, size: u32, write: bool) -> Option<(u64, signal::Fault)> {
+    pub fn access_verdict(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, size: u32, write: bool) -> Option<(u64, signal::Fault, u32)> {
         PERM_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.flush_perms(m);
         let need = if write { gex_abi::perm::WRITE } else { gex_abi::perm::READ };
         // The access's first byte, and the first of its last byte's page.
         let last = addr.wrapping_add(size as u64 - 1) & !(gex_abi::PERM_PAGE - 1);
         for at in [addr, last] {
+            // A missing page of a range a `userfaultfd` registered: SIGBUS
+            // at the address (`handle_userfault`'s `VM_FAULT_SIGBUS`, a
+            // translation fault), for the program's handler to fill it.
+            if self.mem.lock().uffd_missing(at) {
+                return Some((at, signal::Fault::data_abort(signal::BUS_ADRERR, write, false), signal::sig::SIGBUS));
+            }
             let bits = if at >= gex_abi::guest_floor() { self.mem.lock().vma_at(at).map(|v| gex_abi::perm::of_prot(v.prot)) } else { None };
             match bits {
                 Some(b) if b & need != 0 => {
@@ -13556,11 +13592,11 @@ impl Kernel {
                     let seen = if at < gex_abi::perm_limit() { m.read(gex_abi::perm_table() + page, 1).ok().map(|b| b[0]) } else { None };
                     if !seen.is_some_and(|s| s & need != 0) {
                         eprintln!("[gex:{}] the protection table has {seen:x?} for the page of {at:#x}, which the map allows a {} of (pc {pc:#x}): the access cannot be let through", self.pid, if write { "store" } else { "load" });
-                        return Some((at, signal::Fault::data_abort(signal::SEGV_ACCERR, write, true)));
+                        return Some((at, signal::Fault::data_abort(signal::SEGV_ACCERR, write, true), signal::sig::SIGSEGV));
                     }
                 }
-                Some(b) => return Some((at, signal::Fault::data_abort(signal::SEGV_ACCERR, write, b & gex_abi::perm::READ != 0))),
-                None => return Some((at, signal::Fault::data_abort(signal::SEGV_MAPERR, write, false))),
+                Some(b) => return Some((at, signal::Fault::data_abort(signal::SEGV_ACCERR, write, b & gex_abi::perm::READ != 0), signal::sig::SIGSEGV)),
+                None => return Some((at, signal::Fault::data_abort(signal::SEGV_MAPERR, write, false), signal::sig::SIGSEGV)),
             }
         }
         None
@@ -13571,7 +13607,7 @@ impl Kernel {
     pub fn access_fault(&mut self, m: &mut GuestMem<'_>, pc: u64, addr: u64, size: u32, write: bool) -> AccessFault {
         match self.access_verdict(m, pc, addr, size, write) {
             None => AccessFault::Retry,
-            Some((at, fault)) => AccessFault::Raised(self.raise_fault_as(m, signal::sig::SIGSEGV, Some(fault), pc, at)),
+            Some((at, fault, signo)) => AccessFault::Raised(self.raise_fault_as(m, signo, Some(fault), pc, at)),
         }
     }
 
@@ -15442,6 +15478,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::GETTIMEOFDAY => "gettimeofday",
         nr::SETTIMEOFDAY => "settimeofday",
         nr::CLOCK_SETTIME => "clock_settime",
+        nr::USERFAULTFD => "userfaultfd",
         nr::GETPID => "getpid",
         nr::GETPPID => "getppid",
         nr::SETSID => "setsid",

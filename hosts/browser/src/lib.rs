@@ -16495,11 +16495,11 @@ fn access_fault(ctx: i32, pc: u64, addr: u64, size: u32, write: bool) -> ! {
             let _ = gm.write_u64(c + ctx::PC as u64, pc);
             resume(pc)
         }
-        Some((at, fault)) => match sigs::fault_as(&mut gm, c, 11, Some(fault), pc, at) {
+        Some((at, fault, signo)) => match sigs::fault_as(&mut gm, c, signo, Some(fault), pc, at) {
             gex_kernel::signal::Delivery::Resume(target) => resume(target),
             _ => {
-                trace_line(&format!("gex: {} at {addr:#x} its page does not allow, at pc={pc:#x} (SIGSEGV)\n", if write { "a store" } else { "a load" }));
-                exit_here(-11, Some(pc));
+                trace_line(&format!("gex: {} at {addr:#x} its page does not allow, at pc={pc:#x} (signal {signo})\n", if write { "a store" } else { "a load" }));
+                exit_here(-(signo as i32), Some(pc));
             }
         },
     }

@@ -312,6 +312,7 @@ pub mod raw {
     pub const GETDENTS64: u64 = 217;
     pub const SET_TID_ADDRESS: u64 = 218;
     pub const CLOCK_SETTIME: u64 = 227;
+    pub const USERFAULTFD: u64 = 323;
     pub const CLOCK_GETTIME: u64 = 228;
     pub const CLOCK_GETRES: u64 = 229;
     pub const CLOCK_NANOSLEEP: u64 = 230;
@@ -589,6 +590,7 @@ pub fn translate(
         x::GETTIMEOFDAY => nr::GETTIMEOFDAY,
         x::SETTIMEOFDAY => nr::SETTIMEOFDAY,
         x::CLOCK_SETTIME => nr::CLOCK_SETTIME,
+        x::USERFAULTFD => nr::USERFAULTFD,
         x::GETRLIMIT => {
             *a = [0, a[0], 0, a[1], 0, 0];
             nr::PRLIMIT64

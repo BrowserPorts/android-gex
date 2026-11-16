@@ -407,18 +407,32 @@ impl Perms {
     /// of it, else 0, and 0 below everything a guest maps; its byte is those
     /// with what it and the next page both allow above (so the page before
     /// a change is written too).
-    fn writes(&mut self, vmas: &[Vma], generation: u64) -> Vec<(u64, Vec<u8>)> {
+    fn writes(&mut self, vmas: &[Vma], holes: &[(u64, u64)], generation: u64) -> Vec<(u64, Vec<u8>)> {
         use gex_abi::{perm, PERM_PAGE, PERM_PAGE_SHIFT};
         if self.at == Some(generation) {
             return Vec::new();
         }
         let known = self.at.replace(generation).is_some();
         let mut now: Vec<(u64, u64, u8)> = Vec::with_capacity(vmas.len());
+        let mut push = |s: u64, e: u64, bits: u8| match now.last_mut() {
+            Some(last) if last.1 == s && last.2 == bits => last.1 = e,
+            _ => now.push((s, e, bits)),
+        };
         for v in vmas {
             let bits = perm::of_prot(v.prot);
-            match now.last_mut() {
-                Some(last) if last.1 == v.start && last.2 == bits => last.1 = v.end,
-                _ => now.push((v.start, v.end, bits)),
+            // A missing page (`userfaultfd`) is mapped and allows nothing,
+            // so the program's touch is a fault the kernel answers.
+            let mut at = v.start;
+            for &(hs, he) in holes.iter().filter(|h| h.0 < v.end && h.1 > v.start) {
+                let (hs, he) = (hs.max(v.start), he.min(v.end));
+                if hs > at {
+                    push(at, hs, bits);
+                }
+                push(hs, he, perm::MAPPED);
+                at = he;
+            }
+            if at < v.end {
+                push(at, v.end, bits);
             }
         }
         let dirty = if known {
@@ -498,6 +512,10 @@ pub struct MemoryMap {
     /// The protection table's state ([`Perms`]), for a process whose
     /// accesses are checked; `None` for any other.
     perms: Option<Perms>,
+    /// What `userfaultfd` descriptors have registered, and which of those
+    /// pages are missing ([`crate::uffd`]): a missing page is in the
+    /// protection table as mapped with no access.
+    uffd: crate::uffd::UffdState,
     /// Where the program's stack began at `execve` (`mm->start_stack`),
     /// which `/proc/<pid>/stat` gives; 0 until a host says.
     start_stack: u64,
@@ -787,6 +805,7 @@ impl MemoryMap {
         MemoryMap {
             vmas: Vec::new(),
             perms: gex_abi::access_checks().then(Perms::default),
+            uffd: crate::uffd::UffdState::default(),
             start_stack: 0,
             view: ViewCell(std::sync::Arc::new(MapView::new(&[]))),
             generation: 0,
@@ -843,9 +862,57 @@ impl MemoryMap {
     /// for a map that keeps none, or that has not changed.
     pub fn take_perm_writes(&mut self) -> Vec<(u64, Vec<u8>)> {
         match &mut self.perms {
-            Some(p) => p.writes(&self.vmas, self.generation),
+            Some(p) => p.writes(&self.vmas, self.uffd.missing.all(), self.generation),
             None => Vec::new(),
         }
+    }
+
+    /// The map's `userfaultfd` state.
+    pub fn uffd(&self) -> &crate::uffd::UffdState {
+        &self.uffd
+    }
+
+    pub fn uffd_mut(&mut self) -> &mut crate::uffd::UffdState {
+        &mut self.uffd
+    }
+
+    /// The `userfaultfd` state changed what the protection table is to say.
+    pub fn uffd_changed(&mut self) {
+        self.generation += 1;
+        self.publish();
+    }
+
+    /// Whether the page of `at` is missing: registered with a
+    /// `userfaultfd` and nothing in it since it was emptied
+    /// ([`crate::uffd`]).
+    pub fn uffd_missing(&self, at: u64) -> bool {
+        self.uffd.missing.contains(at)
+    }
+
+    /// `[start, end)` was emptied (`MADV_DONTNEED`, the source of a
+    /// `MREMAP_DONTUNMAP`): its registered pages are missing now.
+    pub fn uffd_emptied(&mut self, start: u64, end: u64) {
+        if self.uffd.emptied(page_align_down(start), page_align_up(end)) {
+            self.uffd_changed();
+        }
+    }
+
+    /// The parts of `[start, end)` that are mapped, for `UFFDIO_REGISTER`
+    /// and `UFFDIO_UNREGISTER`: `EINVAL` when none is, or one is not an
+    /// anonymous private mapping (`vma_can_userfault`: missing mode takes
+    /// anonymous memory, shmem and hugetlbfs, and gex has the first).
+    pub fn anon_parts(&self, start: u64, end: u64) -> Result<Vec<(u64, u64)>, Errno> {
+        let mut parts = Vec::new();
+        for v in self.vmas.iter().filter(|v| v.start < end && v.end > start) {
+            if v.origin.is_some() || v.file_off.is_some() || v.shown.is_some() {
+                return Err(Errno::EINVAL);
+            }
+            parts.push((v.start.max(start), v.end.min(end)));
+        }
+        if parts.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        Ok(parts)
     }
 
     /// Whether this map keeps a protection table.
@@ -2040,6 +2107,8 @@ impl MemoryMap {
         }
         let len = page_align_up(len);
         let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+        // What was registered there is not, mapped again or not.
+        self.uffd.unmapped(addr, end);
         let mut out = Vec::with_capacity(self.vmas.len() + 1);
         for v in std::mem::take(&mut self.vmas) {
             if v.end <= addr || v.start >= end {
@@ -2316,7 +2385,8 @@ impl MemoryMap {
                 _ => return false,
             }
         }
-        true
+        // A missing page (`userfaultfd`) is the call's EFAULT.
+        self.uffd.missing.within(addr, end).is_empty()
     }
 
     /// Render the map the way `/proc/self/maps` does.

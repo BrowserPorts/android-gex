@@ -68,6 +68,7 @@ pub mod vfs;
 pub mod proclive;
 pub mod wait;
 pub mod unix;
+pub mod uffd;
 /// The x87's extended-precision arithmetic (its own crate, shared with the
 /// IR interpreter and the code generators).
 pub use gex_f80 as f80;
