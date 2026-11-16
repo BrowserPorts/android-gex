@@ -133,6 +133,7 @@ run() {
     ctty) check "$1" "ctty ok" 0 ;;
     apexns) check "$1" "apexns ok" 0 root ;;
     settod) check "$1" "settod ok" 0 root ;;
+    seqpacket) check "$1" "seqpacket ok" 0 ;;
     abortmsg)
         # What gexc says of the crash is the test: natively the message is
         # a crash dumper's to find.
@@ -166,7 +167,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket"
     for p in $all; do
         run "$p"
     done

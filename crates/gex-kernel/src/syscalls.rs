@@ -2710,17 +2710,24 @@ impl FdIo<'_> {
         }
         let mut received = Vec::new();
         let mut cut = false;
-        let total = if want == 0 {
+        // A record's whole length, when it is a record (SOCK_SEQPACKET).
+        let mut whole = None;
+        // A record is taken by any read, even one with no room for it.
+        let records = unix_sock.as_ref().is_some_and(|s| s.is_seqpacket());
+        let total = if want == 0 && !records {
             0
         } else {
             let mut tmp = vec![0u8; want];
             let n = match &unix_sock {
                 // The bytes and their descriptors in one step (`recv_with`).
                 Some(sock) => {
-                    let (n, fds, c) = sock.recv_msg(&mut tmp, room, peek)?;
-                    received = fds;
-                    cut = c;
-                    n
+                    let r = sock.recv_full(&mut tmp, room, peek)?;
+                    received = r.fds;
+                    cut = r.cut;
+                    if records {
+                        whole = Some(r.len);
+                    }
+                    r.n
                 }
                 None if peek => match self.socket_of(fd) {
                     Ok(sock) => sock.peek(&mut tmp)?,
@@ -2760,11 +2767,18 @@ impl FdIo<'_> {
         let written = creds + self.write_scm_rights(m, control + creds, controllen - creds, received)?;
         self.msg_wr(m, msg, 5, written)?;
         // msg_flags (int): MSG_CTRUNC when descriptors were closed for want
-        // of room.
+        // of room, MSG_TRUNC when a record was longer than the buffer (and
+        // then its whole length is the answer when the call asked with
+        // MSG_TRUNC, as unix_dgram_recvmsg gives it).
         const MSG_CTRUNC: u32 = 0x8;
-        let flags = if cut || (given && written == 0) { MSG_CTRUNC } else { 0 };
-        m.write_u32(msg + if self.compat { 24 } else { 48 }, flags)?;
-        Ok(total)
+        const MSG_TRUNC: u32 = 0x20;
+        let truncated = whole.is_some_and(|w| w > total);
+        let out_flags = if cut || (given && written == 0) { MSG_CTRUNC } else { 0 } | if truncated { MSG_TRUNC } else { 0 };
+        m.write_u32(msg + if self.compat { 24 } else { 48 }, out_flags)?;
+        Ok(match whole {
+            Some(w) if flags & MSG_TRUNC as u64 != 0 => w,
+            _ => total,
+        })
     }
 
     /// `recvmsg` on a netlink socket: one datagram scattered over the
@@ -6072,8 +6086,7 @@ impl NetIo<'_> {
                 return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
             }
             if kind != SOCK_STREAM && kind != 5 {
-                // SOCK_SEQPACKET is 5 and behaves closely enough to a stream
-                // for what uses it here.
+                // SOCK_SEQPACKET is 5: a connection of records.
                 return Err(Errno::EPROTONOSUPPORT);
             }
             let sock = Arc::new(unix::UnixSocket::new(true));
@@ -6178,6 +6191,11 @@ impl NetIo<'_> {
         }
         let (a, b) = unix::UnixSocket::pair();
         unix::UnixSocket::set_pair_cred(&a, &b, io.cred());
+        // SOCK_SEQPACKET: a pair of records.
+        if ty & 0xf == 5 {
+            a.set_seqpacket();
+            b.set_seqpacket();
+        }
         a.set_nonblocking(nonblock);
         b.set_nonblocking(nonblock);
         let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
@@ -6431,6 +6449,19 @@ fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, fl
         m.write(buf, &r.data)?;
         FdIo::write_sockaddr_nl(m, addr, addrlen, r.from, r.groups)?;
         return Ok(if flags & MSG_TRUNC != 0 { r.whole } else { r.data.len() } as u64);
+    }
+    // A unix connection: a peek leaves what it reads (a plain read took
+    // it), and a record's whole length is the answer to MSG_TRUNC. A unix
+    // peer has no name; descriptors that came are closed, as with no
+    // control buffer.
+    if let Ok(sock) = io.unix_of(fd) {
+        const MSG_TRUNC: u64 = 0x20;
+        let r = sock.recv_full(&mut tmp, 0, flags & Kernel::MSG_PEEK != 0)?;
+        m.write(buf, &tmp[..r.n as usize])?;
+        if addr != 0 {
+            Kernel::write_sockaddr_unnamed(m, addr, addrlen)?;
+        }
+        return Ok(if flags & MSG_TRUNC != 0 && sock.is_seqpacket() { r.len } else { r.n });
     }
     // The read and the sender address it set, as one (`recv_turn`).
     let inet = if addr != 0 { io.socket_of(fd).ok() } else { None };

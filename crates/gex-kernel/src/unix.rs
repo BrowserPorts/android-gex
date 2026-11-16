@@ -36,6 +36,27 @@ struct Stream {
     read: u64,
     /// Set when the writing end is gone, so a reader sees end-of-file.
     closed: bool,
+    /// A `SOCK_SEQPACKET` connection's records: where each one not yet read
+    /// ends, in the same count as `written` (a record of no bytes ends
+    /// where the one before it did).
+    bounds: VecDeque<u64>,
+}
+
+/// The largest record a `SOCK_SEQPACKET` socket sends: Linux's default
+/// send buffer (`net.core.wmem_default`, 212992) less the 32 bytes
+/// `unix_dgram_sendmsg` keeps back. Longer is `EMSGSIZE`.
+pub const SEQPACKET_MAX: usize = 212_992 - 32;
+
+/// What a read of a connection took: the bytes copied, the descriptors
+/// that came with them, whether some of those were closed for want of
+/// room (`MSG_CTRUNC`), and for a record the whole of its length, which is
+/// more than the bytes copied when it did not fit (`MSG_TRUNC`).
+#[derive(Debug)]
+pub struct Received {
+    pub n: u64,
+    pub fds: Vec<Arc<OpenFile>>,
+    pub cut: bool,
+    pub len: u64,
 }
 
 #[derive(Debug, Default)]
@@ -54,6 +75,9 @@ struct Pipe {
     /// [`Self::notify_writer`]): the ends' `FileHandle::wakes`.
     reader_wakes: AtomicU64,
     writer_wakes: AtomicU64,
+    /// The connection is `SOCK_SEQPACKET`: what is written is records, each
+    /// read whole or not at all (set before either end has written).
+    records: AtomicBool,
 }
 
 /// A guest wrote to (or closed) a host-serviced socket since the last
@@ -92,6 +116,29 @@ impl Pipe {
         if s.closed {
             return Err(Errno::EPIPE);
         }
+        if self.records() {
+            // A record whole or not at all (`unix_seqpacket_sendmsg`, which
+            // is the datagram path): one longer than the send buffer can
+            // never go; one there is no room for waits.
+            if buf.len() > SEQPACKET_MAX {
+                return Err(Errno::EMSGSIZE);
+            }
+            if s.bytes.len() + buf.len() > SOCK_BUF {
+                return Err(Errno::EAGAIN);
+            }
+            let at = s.written;
+            for fd in fds {
+                s.fds.push_back((at, at + buf.len() as u64, fd));
+            }
+            s.bytes.extend(buf);
+            s.written += buf.len() as u64;
+            let end = s.written;
+            s.bounds.push_back(end);
+            drop(s);
+            self.notify_reader();
+            self.note_host();
+            return Ok(buf.len() as u64);
+        }
         let room = SOCK_BUF.saturating_sub(s.bytes.len());
         // A send carrying descriptors and no room is not partially done: the
         // descriptors would be attached to a byte that was never written.
@@ -120,7 +167,51 @@ impl Pipe {
     /// read never holds two writes' descriptors. Of those, `max_fds` (the
     /// room the caller's control buffer has) are handed over and the rest
     /// closed; the third value says some were (`MSG_CTRUNC`).
-    fn recv(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>, bool), Errno> {
+    fn recv(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<Received, Errno> {
+        if self.records() {
+            return self.recv_record(buf, max_fds, peek);
+        }
+        let (n, fds, cut) = self.recv_bytes(buf, max_fds, peek)?;
+        Ok(Received { n, fds, cut, len: n })
+    }
+
+    /// One record, as a `SOCK_SEQPACKET` socket is read
+    /// (`unix_dgram_recvmsg`): never more than one, and what of it does not
+    /// fit is dropped with it, its length said ([`Received::len`]). End of
+    /// file once there are none and the writer is gone.
+    fn recv_record(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<Received, Errno> {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&end) = s.bounds.front() else {
+            return if s.closed { Ok(Received { n: 0, fds: Vec::new(), cut: false, len: 0 }) } else { Err(Errno::EAGAIN) };
+        };
+        let start = s.read;
+        let len = (end - start) as usize;
+        let n = buf.len().min(len);
+        for (i, slot) in buf[..n].iter_mut().enumerate() {
+            *slot = s.bytes[i];
+        }
+        if peek {
+            return Ok(Received { n: n as u64, fds: Vec::new(), cut: false, len: len as u64 });
+        }
+        s.bytes.drain(..len);
+        s.read = end;
+        s.bounds.pop_front();
+        let mut fds = Vec::new();
+        let mut cut = false;
+        while s.fds.front().is_some_and(|f| f.0 == start) {
+            let (_, _, file) = s.fds.pop_front().unwrap();
+            if fds.len() < max_fds {
+                fds.push(file);
+            } else {
+                cut = true;
+            }
+        }
+        drop(s);
+        self.notify_writer();
+        Ok(Received { n: n as u64, fds, cut, len: len as u64 })
+    }
+
+    fn recv_bytes(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>, bool), Errno> {
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.bytes.is_empty() {
             // Empty buffer means end-of-file or nothing yet: a stream socket
@@ -165,7 +256,13 @@ impl Pipe {
 
     fn readable(&self) -> bool {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        !s.bytes.is_empty() || s.closed
+        // (A record of no bytes is something to read.)
+        !s.bytes.is_empty() || !s.bounds.is_empty() || s.closed
+    }
+
+    /// Whether this direction carries records (`SOCK_SEQPACKET`).
+    fn records(&self) -> bool {
+        self.records.load(Ordering::Relaxed)
     }
 
     fn available(&self) -> u64 {
@@ -281,11 +378,15 @@ impl UnixSocket {
         }
     }
 
-    /// The socket was made `SOCK_SEQPACKET`: what `SO_TYPE` says of it.
-    /// (Its messages are not kept apart yet: it carries bytes as a stream
-    /// socket does.)
+    /// The socket was made `SOCK_SEQPACKET`: what `SO_TYPE` says of it,
+    /// and, once connected, its connection carries records, each sent
+    /// whole and read whole or not at all.
     pub fn set_seqpacket(&self) {
         self.seqpacket.store(true, Ordering::Relaxed);
+        if let Role::Connected { rx, tx, .. } = &*self.role.lock().unwrap() {
+            rx.records.store(true, Ordering::Relaxed);
+            tx.records.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn is_seqpacket(&self) -> bool {
@@ -491,7 +592,16 @@ impl UnixSocket {
     ///
     /// Returns the far end, which the listener will hand to `accept`.
     fn connect_to(&self, listener: &UnixSocket, path: &str) -> SysResult {
+        // A name is a socket of one type (`unix_find_other`): an abstract
+        // name of another type is not found, a path's is EPROTOTYPE.
+        if self.is_seqpacket() != listener.is_seqpacket() {
+            return Err(if path.starts_with('\0') { Errno::ECONNREFUSED } else { Errno::EPROTOTYPE });
+        }
         let (mine, theirs) = UnixSocket::pair();
+        if self.is_seqpacket() {
+            // Both pipes are the pair's: marking the far end marks them.
+            theirs.set_seqpacket();
+        }
         {
             let role = listener.role.lock().unwrap();
             let Role::Listening { backlog, .. } = &*role else {
@@ -567,11 +677,11 @@ impl UnixSocket {
         let Role::Connected { rx, .. } = &*role else {
             return Err(Errno::ENOTCONN);
         };
-        let (n, fds, _) = rx.recv(buf, max_fds, peek)?;
-        if !fds.is_empty() {
-            self.pending_recv.lock().unwrap().extend(fds);
+        let r = rx.recv(buf, max_fds, peek)?;
+        if !r.fds.is_empty() {
+            self.pending_recv.lock().unwrap().extend(r.fds);
         }
-        Ok(n)
+        Ok(r.n)
     }
 
     /// Read, and hand back the descriptors that came with the bytes, in one
@@ -586,6 +696,12 @@ impl UnixSocket {
     /// [`Self::recv_with`], also saying whether descriptors that did not
     /// fit in `max_fds` were closed (`recvmsg`'s `MSG_CTRUNC`).
     pub fn recv_msg(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<(u64, Vec<Arc<OpenFile>>, bool), Errno> {
+        self.recv_full(buf, max_fds, peek).map(|r| (r.n, r.fds, r.cut))
+    }
+
+    /// [`Self::recv_msg`], with a record's whole length ([`Received`]):
+    /// what `recvmsg` and `recvfrom` need for `MSG_TRUNC`.
+    pub fn recv_full(&self, buf: &mut [u8], max_fds: usize, peek: bool) -> Result<Received, Errno> {
         let role = self.role.lock().unwrap();
         let Role::Connected { rx, .. } = &*role else {
             return Err(Errno::ENOTCONN);
