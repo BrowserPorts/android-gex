@@ -448,6 +448,9 @@ enum Setting {
     NetCore(String),
     /// `vm.mmap_rnd_bits`.
     MmapRndBits,
+    /// `kernel.unprivileged_bpf_disabled`, `net.core.bpf_jit_enable`,
+    /// `net.core.bpf_jit_kallsyms` ([`bpf_sysctl`]).
+    Bpf(bpf_sysctl::Which),
 }
 
 impl Setting {
@@ -455,6 +458,9 @@ impl Setting {
     fn at(path: &str) -> Option<Setting> {
         if path == "sys/vm/mmap_rnd_bits" {
             return Some(Setting::MmapRndBits);
+        }
+        if let Some(w) = bpf_sysctl::Which::at(path) {
+            return Some(Setting::Bpf(w));
         }
         let name = path.strip_prefix("sys/net/core/")?;
         crate::netlink::sysctl::get(name).map(|_| Setting::NetCore(name.to_string()))
@@ -465,6 +471,7 @@ impl Setting {
         let value = match self {
             Setting::NetCore(name) => crate::netlink::sysctl::get(name).unwrap_or(0),
             Setting::MmapRndBits => mmap_rnd_bits::get(),
+            Setting::Bpf(w) => w.get(),
         };
         format!("{value}\n").into_bytes()
     }
@@ -475,6 +482,7 @@ impl Setting {
         match self {
             Setting::NetCore(_) => 0o644,
             Setting::MmapRndBits => 0o600,
+            Setting::Bpf(w) => w.mode(),
         }
     }
 }
@@ -506,6 +514,81 @@ pub mod mmap_rnd_bits {
         SAID.call_once(|| eprintln!("[gex] vm.mmap_rnd_bits is kept and not applied: mappings are not placed at random"));
         BITS.store(value as u32, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+/// The settings for BPF, as Linux has them built with
+/// `CONFIG_BPF_JIT_ALWAYS_ON` and `CONFIG_BPF_UNPRIV_DEFAULT_OFF` (GKI's
+/// configuration, and the oracle's): `kernel.unprivileged_bpf_disabled`
+/// 0 to 2, starting at 2, and once 1 never anything else
+/// (`bpf_unpriv_handler`: `EPERM`); `net.core.bpf_jit_enable` only 1
+/// (`proc_dointvec_minmax_bpf_enable`); `net.core.bpf_jit_kallsyms` 0 or 1,
+/// starting at 1. Android's network BPF loader writes all three and stops
+/// the boot if it cannot. (Programs here are interpreted, not compiled:
+/// what the JIT setting says changes nothing a program sees.)
+pub mod bpf_sysctl {
+    use crate::errno::Errno;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static UNPRIV: AtomicU32 = AtomicU32::new(2);
+    static KALLSYMS: AtomicU32 = AtomicU32::new(1);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Which {
+        UnprivDisabled,
+        JitEnable,
+        JitKallsyms,
+    }
+
+    impl Which {
+        pub fn at(path: &str) -> Option<Which> {
+            Some(match path {
+                "sys/kernel/unprivileged_bpf_disabled" => Which::UnprivDisabled,
+                "sys/net/core/bpf_jit_enable" => Which::JitEnable,
+                "sys/net/core/bpf_jit_kallsyms" => Which::JitKallsyms,
+                _ => return None,
+            })
+        }
+
+        pub fn get(self) -> u32 {
+            match self {
+                Which::UnprivDisabled => UNPRIV.load(Ordering::Relaxed),
+                Which::JitEnable => 1,
+                Which::JitKallsyms => KALLSYMS.load(Ordering::Relaxed),
+            }
+        }
+
+        /// As Linux 7.0's files show them: the JIT's own settings root's
+        /// alone, the others anyone's to read.
+        pub fn mode(self) -> u32 {
+            match self {
+                Which::JitKallsyms => 0o600,
+                _ => 0o644,
+            }
+        }
+
+        pub fn set(self, value: i64) -> Result<(), Errno> {
+            match self {
+                Which::UnprivDisabled => {
+                    if !(0..=2).contains(&value) {
+                        return Err(Errno::EINVAL);
+                    }
+                    if UNPRIV.load(Ordering::Relaxed) == 1 && value != 1 {
+                        return Err(Errno::EPERM);
+                    }
+                    UNPRIV.store(value as u32, Ordering::Relaxed);
+                }
+                Which::JitEnable if value != 1 => return Err(Errno::EINVAL),
+                Which::JitEnable => {}
+                Which::JitKallsyms => {
+                    if !(0..=1).contains(&value) {
+                        return Err(Errno::EINVAL);
+                    }
+                    KALLSYMS.store(value as u32, Ordering::Relaxed);
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -549,6 +632,7 @@ impl FileHandle for Sysctl {
         match &self.which {
             Setting::NetCore(name) => crate::netlink::sysctl::set(name, u32::try_from(value).map_err(|_| Errno::EINVAL)?)?,
             Setting::MmapRndBits => mmap_rnd_bits::set(value)?,
+            Setting::Bpf(w) => w.set(value)?,
         }
         Ok(taken as u64)
     }
@@ -984,9 +1068,9 @@ impl FileSystem for ProcFs {
             }
             "sys" => vec!["fs", "kernel", "net", "vm"],
             "sys/net" => vec!["core"],
-            "sys/net/core" => vec!["rmem_default", "rmem_max", "wmem_default", "wmem_max"],
+            "sys/net/core" => vec!["bpf_jit_enable", "bpf_jit_kallsyms", "rmem_default", "rmem_max", "wmem_default", "wmem_max"],
             "sys/fs" => vec!["nr_open", "pipe-max-size"],
-            "sys/kernel" => vec!["osrelease", "pid_max", "random"],
+            "sys/kernel" => vec!["osrelease", "pid_max", "random", "unprivileged_bpf_disabled"],
             "sys/kernel/random" => vec!["boot_id", "entropy_avail", "poolsize", "uuid"],
             "sys/vm" => vec!["mmap_rnd_bits", "overcommit_memory"],
             "pressure" => vec!["cpu", "io", "memory"],
