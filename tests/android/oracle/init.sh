@@ -31,7 +31,8 @@ GEXC=${GEXC:-$HERE/../../../target/big64/release/gexc}
 export GEX_FIXED_RANDOM="${GEX_FIXED_RANDOM:-1}"
 # Room for what an image's programs come to: the cache keeps 4 GiB unless
 # told, and a boot's translations and a comparison's push one another out.
-export GEX_CACHE_MAX_BYTES="${GEX_CACHE_MAX_BYTES:-34359738368}"
+# 12 GiB holds both.
+export GEX_CACHE_MAX_BYTES="${GEX_CACHE_MAX_BYTES:-12884901888}"
 if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
     export GEX_CACHE_BUILD="$name"
 fi
