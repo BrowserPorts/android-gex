@@ -61,6 +61,9 @@ impl Errno {
     /// "Structure needs cleaning": a filesystem's `EFSCORRUPTED`.
     pub const EUCLEAN: Errno = Errno(117);
     pub const ENOBUFS: Errno = Errno(105);
+    /// An operation called off: a `timerfd` read after the clock it is
+    /// armed against was set (`TFD_TIMER_CANCEL_ON_SET`).
+    pub const ECANCELED: Errno = Errno(125);
     pub const ENETUNREACH: Errno = Errno(101);
     pub const ENOTSOCK: Errno = Errno(88);
     pub const EMSGSIZE: Errno = Errno(90);

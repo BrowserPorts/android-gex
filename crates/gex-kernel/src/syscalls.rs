@@ -93,6 +93,7 @@ pub mod nr {
     pub const TIMERFD_SETTIME: u64 = 86;
     pub const TIMERFD_GETTIME: u64 = 87;
     pub const NANOSLEEP: u64 = 101;
+    pub const CLOCK_SETTIME: u64 = 112;
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_GETRES: u64 = 114;
     pub const CLOCK_NANOSLEEP: u64 = 115;
@@ -156,6 +157,7 @@ pub mod nr {
     pub const UNAME: u64 = 160;
     pub const GETRUSAGE: u64 = 165;
     pub const GETTIMEOFDAY: u64 = 169;
+    pub const SETTIMEOFDAY: u64 = 170;
     pub const GETPID: u64 = 172;
     pub const GETPPID: u64 = 173;
     pub const GETUID: u64 = 174;
@@ -1319,9 +1321,41 @@ pub fn set_guest_clock(scale: f64, wall_shift: i64) {
 }
 
 /// The wall clock as the guest reads it: see [`set_guest_clock`].
+/// Nanoseconds the wall clock has been set ahead (or, negative, back) by
+/// `settimeofday` and `clock_settime(CLOCK_REALTIME)`: the guest's system
+/// clock, which every process of a kernel shares (in the page, each
+/// process is a kernel: a set is that process's).
+static WALL_SET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The kernel's time zone (`sys_tz`): `tz_minuteswest` in the low half,
+/// `tz_dsttime` in the high, as `settimeofday` last set it. Nothing reads
+/// it but `gettimeofday`, as on Linux, where the clock is UTC.
+static SYS_TZ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The latest wall clock `settimeofday` takes, in seconds
+/// (`TIME_SETTOD_SEC_MAX`: `KTIME_SEC_MAX` less thirty years of uptime).
+const TIME_SETTOD_SEC_MAX: i64 = 9_223_372_036 - 30 * 365 * 24 * 3600;
+
+const CAP_SYS_TIME: u64 = 25;
+const CLOCK_REALTIME: u64 = 0;
+const CLOCK_REALTIME_ALARM: u64 = 8;
+
+/// `sys_tz` written as a `struct timezone` (two ints, the same in every
+/// ABI).
+fn write_tz(m: &mut GuestMem<'_>, at: u64) -> Result<(), Errno> {
+    let tz = SYS_TZ.load(std::sync::atomic::Ordering::Relaxed);
+    m.write_u32(at, tz as u32)?;
+    m.write_u32(at + 4, (tz >> 32) as u32)
+}
+
 fn guest_wall((secs, nanos): (u64, u32)) -> (u64, u32) {
     let shift = WALL_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
-    (secs.wrapping_sub(shift as u64), nanos)
+    let set = WALL_SET.load(std::sync::atomic::Ordering::Relaxed);
+    if set == 0 {
+        return (secs.wrapping_sub(shift as u64), nanos);
+    }
+    let ns = ((secs as i128 - shift as i128) * 1_000_000_000 + nanos as i128 + set as i128).max(0);
+    ((ns / 1_000_000_000) as u64, (ns % 1_000_000_000) as u32)
 }
 
 /// A monotonic clock reading made from a wall clock reading: seconds since
@@ -1482,7 +1516,7 @@ pub fn clock_call(
         // (buffer, 32-bit timespec)
         Res(u64, bool),
         // (buffer, 32-bit timeval)
-        Tod(u64, bool),
+        Tod(u64, u64, bool),
         // (who, buffer)
         Rusage(u64, u64),
         // (buffer): `times`, in the ABI's `clock_t`.
@@ -1498,7 +1532,7 @@ pub fn clock_call(
             x::CLOCK_GETTIME64 => Call::Clock(a0, a1, false),
             x::CLOCK_GETRES => Call::Res(a1, true),
             x::CLOCK_GETRES_TIME64 => Call::Res(a1, false),
-            x::GETTIMEOFDAY => Call::Tod(a0, true),
+            x::GETTIMEOFDAY => Call::Tod(a0, a1, true),
             x::GETRUSAGE => Call::Rusage(a0, a1),
             x::TIMES => Call::Times(a0),
             x::TIME => Call::Time(a0),
@@ -1511,7 +1545,7 @@ pub fn clock_call(
         match raw {
             228 => Call::Clock(a0, a1, false),
             229 => Call::Res(a1, false),
-            96 => Call::Tod(a0, false),
+            96 => Call::Tod(a0, a1, false),
             98 => Call::Rusage(a0, a1),
             100 => Call::Times(a0),
             201 => Call::Time(a0),
@@ -1522,7 +1556,7 @@ pub fn clock_call(
         match raw {
             nr::CLOCK_GETTIME => Call::Clock(a0, a1, false),
             nr::CLOCK_GETRES => Call::Res(a1, false),
-            nr::GETTIMEOFDAY => Call::Tod(a0, false),
+            nr::GETTIMEOFDAY => Call::Tod(a0, a1, false),
             nr::GETRUSAGE => Call::Rusage(a0, a1),
             nr::TIMES => Call::Times(a0),
             nr::SCHED_YIELD => Call::Yield,
@@ -1560,13 +1594,12 @@ pub fn clock_call(
             buf != 0 && pair(m, buf, secs, nanos as u64, w32).is_ok()
         }
         Call::Res(buf, w32) => buf == 0 || pair(m, buf, 0, 1, w32).is_ok(),
-        Call::Tod(buf, w32) => {
-            if buf == 0 {
-                true
-            } else {
+        Call::Tod(buf, tz, w32) => {
+            let tv_ok = buf == 0 || {
                 let (secs, nanos) = guest_wall(clock());
                 pair(m, buf, secs, (nanos / 1000) as u64, w32).is_ok()
-            }
+            };
+            tv_ok && (tz == 0 || write_tz(m, tz).is_ok())
         }
         Call::Rusage(who, buf) => match rusage_ns(who, cpu, &children, || cpu_of(true)) {
             Err(e) => {
@@ -1682,6 +1715,9 @@ impl FdIo<'_> {
         let mut timer = crate::timerfd::TimerFd::new(clock);
         if is_monotonic_clock(clockid) {
             timer = timer.monotonic(monotonic_from);
+        } else if matches!(clockid, CLOCK_REALTIME | CLOCK_REALTIME_ALARM) {
+            // The guest's wall clock, which `settimeofday` may have set.
+            timer = timer.wall(guest_wall);
         }
         let handle = Arc::new(timer);
         let cloexec = flags & oflags::O_CLOEXEC != 0;
@@ -1708,17 +1744,18 @@ impl FdIo<'_> {
         new: u64,
         old: u64,
     ) -> SysResult {
-        let read_ns = |m: &GuestMem<'_>, at: u64| -> Result<u64, Errno> {
-            let secs = m.read_u64(at)?;
-            let nanos = m.read_u64(at + 8)?;
-            Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
-        };
-        let interval = read_ns(m, new)?;
-        let value = read_ns(m, new + 16)?;
+        // Each timespec read whole first (EFAULT), then the flags and the
+        // values checked (`do_timerfd_settime`: EINVAL before EBADF).
+        let read = |m: &GuestMem<'_>, at: u64| -> Result<(i64, i64), Errno> { Ok((m.read_u64(at)? as i64, m.read_u64(at + 8)? as i64)) };
+        let interval = read(m, new)?;
+        let value = read(m, new + 16)?;
+        let valid = |(secs, nanos): (i64, i64)| secs >= 0 && (0..1_000_000_000).contains(&nanos);
+        if flags & !crate::timerfd::TFD_SETTIME_FLAGS != 0 || !valid(interval) || !valid(value) {
+            return Err(Errno::EINVAL);
+        }
+        let ns = |(secs, nanos): (i64, i64)| (secs as u64).saturating_mul(1_000_000_000).saturating_add(nanos as u64);
         let handle = self.fds.get(fd)?.handle.clone();
-        let (rem, prev_int) = handle
-            .timerfd_set(value, interval, flags & crate::timerfd::TFD_TIMER_ABSTIME != 0)
-            .ok_or(Errno::EINVAL)?;
+        let (rem, prev_int) = handle.timerfd_set(ns(value), ns(interval), flags).ok_or(Errno::EINVAL)??;
         if old != 0 {
             m.write_u64(old, prev_int / 1_000_000_000)?;
             m.write_u64(old + 8, prev_int % 1_000_000_000)?;
@@ -8053,12 +8090,16 @@ pub fn thread_own_call(
 
 /// `get[e]gid`, the `set*id` family, `getres[ug]id`, `setsid`, `getsid`,
 /// `getpgid` (and i386's and x86-64's `getpgrp`, translated to it) and
-/// `setpgid`. They need the process's [`Creds`] and the process
-/// table, which locks itself. Canonical.
+/// `setpgid`; and the clock's setters, `settimeofday` and
+/// `clock_settime`, which ask the [`Creds`] for `CAP_SYS_TIME`. They need
+/// the process's [`Creds`] and the process table, which locks itself.
+/// Canonical.
 pub fn is_cred(n: u64) -> bool {
     matches!(
         n,
-        nr::GETUID
+        nr::SETTIMEOFDAY
+            | nr::CLOCK_SETTIME
+            | nr::GETUID
             | nr::GETEUID
             | nr::GETGID
             | nr::GETEGID
@@ -8093,7 +8134,90 @@ pub fn is_cred(n: u64) -> bool {
 /// root, and the capability sets follow a uid change as Linux's do
 /// ([`Creds::after_uid_change`]): what peer credentials, `getuid` and
 /// `geteuid` report is what Linux's would. All ones means "leave alone".
-pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+/// `settimeofday(tv, tz)`: the time zone, and the wall clock set, by
+/// `do_sys_settimeofday64`'s rules: a `tv_usec` out of range or a time
+/// before the epoch or past `TIME_SETTOD_SEC_MAX` is EINVAL, before
+/// anything else; without `CAP_SYS_TIME`, EPERM; a zone more than
+/// fifteen hours from Greenwich, EINVAL. (Linux warps the clock at the
+/// first zone set when the hardware clock keeps local time; this one
+/// keeps UTC.)
+fn settimeofday_call(creds: &Creds, clock: ClockFn, m: &mut GuestMem<'_>, tv: u64, tz: u64) -> SysResult {
+    let ts = if tv != 0 {
+        let secs = m.read_u64(tv)? as i64;
+        let usecs = m.read_u64(tv + 8)? as i64;
+        if !(0..=1_000_000).contains(&usecs) {
+            return Err(Errno::EINVAL);
+        }
+        Some((secs, usecs * 1000))
+    } else {
+        None
+    };
+    let zone = if tz != 0 { Some((m.read_u32(tz)? as i32, m.read_u32(tz + 4)? as i32)) } else { None };
+    set_time_of_day(creds, clock, ts, zone)
+}
+
+/// `do_sys_settimeofday64`.
+fn set_time_of_day(creds: &Creds, clock: ClockFn, ts: Option<(i64, i64)>, zone: Option<(i32, i32)>) -> SysResult {
+    if let Some((secs, nanos)) = ts {
+        if secs < 0 || !(0..1_000_000_000).contains(&nanos) || secs >= TIME_SETTOD_SEC_MAX {
+            return Err(Errno::EINVAL);
+        }
+    }
+    if !creds.capable(CAP_SYS_TIME) {
+        return Err(Errno::EPERM);
+    }
+    if let Some((west, dst)) = zone {
+        if !(-15 * 60..=15 * 60).contains(&west) {
+            return Err(Errno::EINVAL);
+        }
+        SYS_TZ.store(west as u32 as u64 | (dst as u32 as u64) << 32, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some((secs, nanos)) = ts {
+        // What the wall clock reads with nothing set, and the
+        // difference from what is asked kept.
+        let (s0, n0) = clock();
+        let shift = WALL_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
+        let unset = (s0 as i128 - shift as i128) * 1_000_000_000 + n0 as i128;
+        let want = secs as i128 * 1_000_000_000 + nanos as i128;
+        let diff = (want - unset).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        WALL_SET.store(diff, std::sync::atomic::Ordering::Relaxed);
+        crate::timerfd::clock_was_set();
+    }
+    Ok(0)
+}
+
+/// `clock_settime(clk, tp)`: the wall clock alone can be set (as
+/// `settimeofday` sets it); any other clock has no setter, EINVAL, before
+/// the time is read (Linux 7.0: the process's and thread's CPU clocks
+/// too).
+fn clock_settime_call(creds: &Creds, clock: ClockFn, m: &mut GuestMem<'_>, clk: u64, tp: u64) -> SysResult {
+    match clk as i32 {
+        0 => {}
+        // Another process's or thread's CPU clock
+        // (`MAKE_PROCESS_CPUCLOCK`), or a clock descriptor: whether
+        // Linux gives EINVAL or EPERM takes looking the process up.
+        c if c < 0 => {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("[gex] clock_settime: another process's CPU clock or a clock descriptor is not implemented -> EINVAL ({c})");
+            }
+            return Err(Errno::EINVAL);
+        }
+        _ => return Err(Errno::EINVAL),
+    }
+    let secs = m.read_u64(tp)? as i64;
+    let nanos = m.read_u64(tp + 8)? as i64;
+    set_time_of_day(creds, clock, Some((secs, nanos)), None)
+}
+
+pub fn cred_call(creds: &Creds, procs: &ProcTable, pid: i32, clock: ClockFn, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    // The clock's setters, which take CAP_SYS_TIME and change nothing
+    // `/proc/<pid>/status` shows.
+    match n {
+        nr::SETTIMEOFDAY => return settimeofday_call(creds, clock, m, a[0], a[1]),
+        nr::CLOCK_SETTIME => return clock_settime_call(creds, clock, m, a[0], a[1]),
+        _ => {}
+    }
     let r = cred_change(creds, procs, pid, m, n, a);
     // A change the other processes' `/proc/<pid>/status` shows.
     if r.is_ok() && !matches!(n, nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID | nr::GETRESUID | nr::GETRESGID | nr::CAPGET | nr::SETFSUID | nr::SETFSGID | nr::SETSID | nr::GETSID | nr::GETPGID | nr::SETPGID) {
@@ -9342,7 +9466,7 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
         }
         r
     } else if is_cred(n) {
-        cred_call(f.creds, f.procs, f.pid, m, n, a)
+        cred_call(f.creds, f.procs, f.pid, f.futex.clock, m, n, a)
     } else if is_mount(n) {
         f.path.mount_call(m, n, a)
     } else if is_thread_clone(n) {
@@ -13116,7 +13240,7 @@ impl Kernel {
             nr::GETPID => Ok(self.pid as u64),
             nr::GETTID => Ok(self.tid as u64),
             // -- credentials, sessions and process groups --------------------
-            n if is_cred(n) => cred_call(&self.creds, &self.procs, self.pid, m, n, a),
+            n if is_cred(n) => cred_call(&self.creds, &self.procs, self.pid, self.clock, m, n, a),
 
             // -- mounts ------------------------------------------------------
             n if is_mount(n) => self.path_io().mount_call(m, n, a),
@@ -13139,7 +13263,7 @@ impl Kernel {
             }
             nr::CLOCK_GETTIME => self.sys_clock_gettime(m, a[0], a[1]),
             nr::CLOCK_GETRES => self.sys_clock_getres(m, a[1]),
-            nr::GETTIMEOFDAY => self.sys_gettimeofday(m, a[0]),
+            nr::GETTIMEOFDAY => self.sys_gettimeofday(m, a[0], a[1]),
             nr::NANOSLEEP => self.sys_nanosleep(m, a[0]),
             nr::CLOCK_NANOSLEEP => self.sys_nanosleep(m, a[2]),
             nr::GETRANDOM => self.sys_getrandom(m, a[0], a[1]),
@@ -14871,13 +14995,15 @@ impl Kernel {
         Ok(0)
     }
 
-    fn sys_gettimeofday(&mut self, m: &mut GuestMem<'_>, buf: u64) -> SysResult {
-        if buf == 0 {
-            return Ok(0);
+    fn sys_gettimeofday(&mut self, m: &mut GuestMem<'_>, buf: u64, tz: u64) -> SysResult {
+        if buf != 0 {
+            let (secs, nanos) = guest_wall((self.clock)());
+            m.write_u64(buf, secs)?;
+            m.write_u64(buf + 8, (nanos / 1000) as u64)?;
         }
-        let (secs, nanos) = guest_wall((self.clock)());
-        m.write_u64(buf, secs)?;
-        m.write_u64(buf + 8, (nanos / 1000) as u64)?;
+        if tz != 0 {
+            write_tz(m, tz)?;
+        }
         Ok(0)
     }
 
@@ -14889,7 +15015,8 @@ impl Kernel {
     /// CLOCK_REALTIME deadline the guest names is on this clock.
     fn guest_now_nanos(&mut self) -> u128 {
         let shift = WALL_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
-        (self.now_nanos() as i128 - shift as i128 * 1_000_000_000).max(0) as u128
+        let set = WALL_SET.load(std::sync::atomic::Ordering::Relaxed);
+        (self.now_nanos() as i128 - shift as i128 * 1_000_000_000 + set as i128).max(0) as u128
     }
 
     /// How much time this process has used, in nanoseconds: wall clock since
@@ -15265,6 +15392,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::UNAME => "uname",
         nr::GETRUSAGE => "getrusage",
         nr::GETTIMEOFDAY => "gettimeofday",
+        nr::SETTIMEOFDAY => "settimeofday",
+        nr::CLOCK_SETTIME => "clock_settime",
         nr::GETPID => "getpid",
         nr::GETPPID => "getppid",
         nr::SETSID => "setsid",
@@ -16982,7 +17111,7 @@ mod tests {
         let run = |c: &Creds, n: u64, a: [u64; 3]| {
             let mut buf = [0u8; 64];
             let mut m = GuestMem::new(&mut buf);
-            cred_call(c, &ProcTable::new(), 1, &mut m, n, [a[0], a[1], a[2], 0, 0, 0]).unwrap();
+            cred_call(c, &ProcTable::new(), 1, system_clock, &mut m, n, [a[0], a[1], a[2], 0, 0, 0]).unwrap();
         };
         let keep = u32::MAX as u64;
         run(&c, nr::SETRESUID, [keep, 997, keep]);

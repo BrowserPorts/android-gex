@@ -769,8 +769,8 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// Arm or disarm a `timerfd`, returning the previous `(remaining, interval)`
     /// in nanoseconds. `None` means this handle is not a timerfd, which the
     /// `timerfd_settime` syscall reports as `EINVAL`.
-    fn timerfd_set(&self, value_ns: u64, interval_ns: u64, abstime: bool) -> Option<(u64, u64)> {
-        let _ = (value_ns, interval_ns, abstime);
+    fn timerfd_set(&self, value_ns: u64, interval_ns: u64, flags: u64) -> Option<Result<(u64, u64), Errno>> {
+        let _ = (value_ns, interval_ns, flags);
         None
     }
 

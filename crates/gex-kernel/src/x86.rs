@@ -256,6 +256,7 @@ pub mod raw {
     pub const LCHOWN: u64 = 94;
     pub const UMASK: u64 = 95;
     pub const GETTIMEOFDAY: u64 = 96;
+    pub const SETTIMEOFDAY: u64 = 164;
     pub const GETRLIMIT: u64 = 97;
     pub const GETRUSAGE: u64 = 98;
     pub const SYSINFO: u64 = 99;
@@ -310,6 +311,7 @@ pub mod raw {
     pub const EPOLL_CREATE: u64 = 213;
     pub const GETDENTS64: u64 = 217;
     pub const SET_TID_ADDRESS: u64 = 218;
+    pub const CLOCK_SETTIME: u64 = 227;
     pub const CLOCK_GETTIME: u64 = 228;
     pub const CLOCK_GETRES: u64 = 229;
     pub const CLOCK_NANOSLEEP: u64 = 230;
@@ -585,6 +587,8 @@ pub fn translate(
         }
         x::UMASK => nr::UMASK,
         x::GETTIMEOFDAY => nr::GETTIMEOFDAY,
+        x::SETTIMEOFDAY => nr::SETTIMEOFDAY,
+        x::CLOCK_SETTIME => nr::CLOCK_SETTIME,
         x::GETRLIMIT => {
             *a = [0, a[0], 0, a[1], 0, 0];
             nr::PRLIMIT64
