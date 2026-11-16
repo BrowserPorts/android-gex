@@ -452,7 +452,8 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
     pairs.dedup_by_key(|&mut (a, _)| a);
 
     // Data exports: the skeleton's export address table pointed at the
-    // module's data (32-bit RVAs wrap to any address).
+    // module's data. In a 32-bit memory a 32-bit RVA wraps to any address;
+    // in a 64-bit one it reaches only the 4 GiB above the image.
     let edir = pe.dirs.first().map(|d| d.0).unwrap_or(0);
     if edir != 0 && !data_list.is_empty() {
         let mut gm = crate::guest();
@@ -464,7 +465,7 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             };
             let at = wp.data + *off as u64;
             let target = at.wrapping_sub(base);
-            if target > u32::MAX as u64 {
+            if gex_abi::mem64() && target > u32::MAX as u64 {
                 crate::warn_line(&format!("gex-pe: {path}: data export {link} at {at:#x} is out of its 32-bit RVA's reach from the image at {base:#x}\n"));
             }
             let _ = gm.write_u32(base + functions + 4 * *i as u64, target as u32);
