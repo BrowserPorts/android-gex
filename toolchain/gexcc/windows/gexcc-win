@@ -135,12 +135,15 @@ def compile_wmain(cmd, obj):
 
 def expand_rsp(args):
     """@FILE arguments (a response file, one or more arguments a line,
-    shell-quoted) replaced by their contents, as gcc and clang read them."""
+    shell-quoted) replaced by their contents, as gcc and clang read them;
+    and the linker's, -Wl,@FILE, whose lines are the link's inputs."""
     import shlex
     out = []
     for a in args:
         if a.startswith('@') and os.path.isfile(a[1:]):
             out += expand_rsp(shlex.split(open(a[1:]).read()))
+        elif a.startswith('-Wl,@') and os.path.isfile(a[5:]):
+            out += expand_rsp(shlex.split(open(a[5:]).read()))
         else:
             out.append(a)
     return out
