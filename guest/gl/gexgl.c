@@ -4172,6 +4172,7 @@ static void context_create(void) {
     host_deferred = 1;
 }
 
+static void context_host_made(void);
 static void host_realize(void) {
     if (host_context_made || !host_deferred || !ring) return;
     host_context_made = 1;
@@ -4209,6 +4210,7 @@ static void host_realize(void) {
             }
         }
     }
+    context_host_made();
 }
 
 /* eglGetError's answer: the last failure's code, EGL_SUCCESS once read. A
@@ -4696,6 +4698,154 @@ unsigned eglDestroySurface(void *dpy, void *surface) {
     return EGL_TRUE;
 }
 
+/* Contexts. The host keeps one for each of a process's EGL contexts, all
+ * in one share group (op::CONTEXT_CURRENT): objects are the group's, state is
+ * each context's own. Two contexts used to be one host context under two
+ * names, so what one set -- its framebuffer, viewport, bound texture, enables
+ * -- was set in the other: a Qt Quick panel, drawn in a context of its own and
+ * composited from the window's, came out black.
+ *
+ * What this library keeps a copy of that is context state goes with the
+ * context too: it is swapped into the globals when the context becomes the
+ * one commands are for. The first context is the host's context 0, made by
+ * CONTEXT_CREATE as before; a process that has only ever one context never
+ * sends CONTEXT_CURRENT at all. */
+#define GEXGL_MAX_CONTEXTS 16
+struct gexgl_context_state {
+    __typeof__(shadow) shadow;
+    struct gexgl_pixel_store pack_store, unpack_store;
+    struct buffer_target_state buffer_targets[16];
+    void *vertex_attrib_pointers[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
+    struct vertex_attrib_state vertex_attribs[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
+    int vertex_attrib_client_count;
+    struct ff_array_state ff_arrays[GEXGL_FF_ARRAYS];
+    int ff_client_count;
+    unsigned client_active_texture;
+    struct pv_vao pv_default;
+    struct pv_vao *pv_cur; /* NULL for its own pv_default */
+    struct pv_binding pv_bindings[PV_BINDINGS];
+    int pv_bindings_unknown;
+};
+static struct gexgl_egl_context {
+    int used;
+    int live; /* not destroyed (context 0 stays used while the host has it) */
+    int fresh; /* the host has not made it yet */
+    struct gexgl_context_state saved;
+} egl_contexts[GEXGL_MAX_CONTEXTS];
+/* Whose state is in the globals and current on the host. */
+static unsigned egl_wire_context;
+static struct gexgl_context_state egl_context_template;
+static int egl_context_template_taken;
+static struct gexgl_context_state egl_context_template_copy;
+
+#define SWAP_FIELD(a, b) do { __typeof__(a) t_; memcpy(&t_, &(a), sizeof t_); \
+    memcpy(&(a), &(b), sizeof t_); memcpy(&(b), &t_, sizeof t_); } while (0)
+
+static void context_state_swap(struct gexgl_context_state *c) {
+    struct pv_vao *cur = pv_cur == &pv_default ? NULL : pv_cur;
+    SWAP_FIELD(shadow, c->shadow);
+    SWAP_FIELD(pack_store, c->pack_store);
+    SWAP_FIELD(unpack_store, c->unpack_store);
+    SWAP_FIELD(buffer_targets, c->buffer_targets);
+    SWAP_FIELD(vertex_attrib_pointers, c->vertex_attrib_pointers);
+    SWAP_FIELD(vertex_attribs, c->vertex_attribs);
+    SWAP_FIELD(vertex_attrib_client_count, c->vertex_attrib_client_count);
+    SWAP_FIELD(ff_arrays, c->ff_arrays);
+    SWAP_FIELD(ff_client_count, c->ff_client_count);
+    SWAP_FIELD(client_active_texture, c->client_active_texture);
+    SWAP_FIELD(pv_default, c->pv_default);
+    SWAP_FIELD(pv_bindings, c->pv_bindings);
+    SWAP_FIELD(pv_bindings_unknown, c->pv_bindings_unknown);
+    pv_cur = c->pv_cur ? c->pv_cur : &pv_default;
+    c->pv_cur = cur;
+}
+
+static unsigned egl_context_index(void *ctx) {
+    if (ctx == (void *)3) return 0;
+    const uintptr_t v = (uintptr_t)ctx;
+    if (v >= 0x1000 && v < 0x1000 + GEXGL_MAX_CONTEXTS * 16 && (v & 15) == 3)
+        return (unsigned)((v - 0x1000) >> 4);
+    return GEXGL_MAX_CONTEXTS; /* not one of ours (GLX's, or none) */
+}
+static void *egl_context_handle(unsigned i) {
+    return i == 0 ? (void *)3 : (void *)(uintptr_t)(0x1000 + i * 16 + 3);
+}
+
+static void context_wire_say(unsigned i) {
+    uint32_t *a = begin(GEXGL_CONTEXT_CURRENT, 5, 0);
+    if (!a) return;
+    a[0] = i;
+    a[1] = egl_api == 0x30A2u ? 1u : 0u;
+    a[2] = (uint32_t)egl_context_major;
+    a[3] = (uint32_t)egl_context_minor;
+    a[4] = (uint32_t)egl_context_profile;
+}
+
+/* Commands from here on are context i's. */
+static void context_switch(unsigned i) {
+    if (i >= GEXGL_MAX_CONTEXTS || i == egl_wire_context || !egl_contexts[i].used) return;
+    fbq_forget();
+    fbq_known = 0;
+    context_state_swap(&egl_contexts[egl_wire_context].saved);
+    egl_wire_context = i;
+    context_state_swap(&egl_contexts[i].saved);
+    if (!host_context_made) return; /* said once the host has context 0 */
+    context_wire_say(i);
+    if (egl_contexts[i].fresh) {
+        egl_contexts[i].fresh = 0;
+        shadow_context_made();
+    }
+}
+
+/* Context 0 has just been made on the host: the one commands are for, if it
+ * is another, is made now too. */
+static void context_host_made(void) {
+    for (unsigned i = 0; i < GEXGL_MAX_CONTEXTS; i++) egl_contexts[i].fresh = i != 0;
+    if (egl_wire_context != 0 && egl_contexts[egl_wire_context].used) {
+        context_wire_say(egl_wire_context);
+        egl_contexts[egl_wire_context].fresh = 0;
+    }
+}
+
+/* A new EGL context: its slot, with the state a new context has. */
+static void *context_slot_new(void) {
+    if (!egl_context_template_taken) {
+        /* Before any context drew: the globals are a new context's. */
+        egl_context_template_taken = 1;
+        context_state_swap(&egl_context_template);
+        egl_context_template_copy = egl_context_template;
+        context_state_swap(&egl_context_template);
+        egl_context_template = egl_context_template_copy;
+        egl_context_template.pv_cur = NULL;
+    }
+    int any = 0;
+    for (unsigned i = 0; i < GEXGL_MAX_CONTEXTS; i++) any |= egl_contexts[i].used;
+    if (!any) {
+        /* The only one: context 0, whose state is in the globals already. */
+        egl_contexts[0] = (struct gexgl_egl_context){ .used = 1, .live = 1 };
+        egl_wire_context = 0;
+        return egl_context_handle(0);
+    }
+    for (unsigned i = 1; i < GEXGL_MAX_CONTEXTS; i++) {
+        if (egl_contexts[i].used) continue;
+        egl_contexts[i] = (struct gexgl_egl_context){ .used = 1, .live = 1, .fresh = 1,
+                                                       .saved = egl_context_template };
+        return egl_context_handle(i);
+    }
+    /* Past the table: the last one, shared, as every context once was. */
+    return egl_context_handle(GEXGL_MAX_CONTEXTS - 1);
+}
+
+/* Every context gone and the host's with them. */
+static void context_slots_reset(void) {
+    if (egl_wire_context != 0 && egl_contexts[egl_wire_context].used) {
+        context_state_swap(&egl_contexts[egl_wire_context].saved);
+        context_state_swap(&egl_contexts[0].saved);
+    }
+    for (unsigned i = 0; i < GEXGL_MAX_CONTEXTS; i++) egl_contexts[i].used = 0;
+    egl_wire_context = 0;
+}
+
 void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
     (void)dpy; (void)config; (void)share;
     /* EGL's defaults: version 1.0, which for desktop GL means a context of
@@ -4719,7 +4869,7 @@ void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
         }
     }
     context_create();
-    return (void *)3;
+    return context_slot_new();
 }
 
 /* Really destroy it, so the next context is created rather than latched.
@@ -4733,13 +4883,29 @@ void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
  * Only the last one: an application that keeps two contexts and destroys one
  * is not asking for the other's to go. */
 unsigned eglDestroyContext(void *dpy, void *ctx) {
-    (void)dpy; (void)ctx;
+    (void)dpy;
+    const unsigned i = egl_context_index(ctx);
+    const int ours = i < GEXGL_MAX_CONTEXTS && egl_contexts[i].used && egl_contexts[i].live;
     if (!host_context_made || egl_contexts_live > 1) {
         if (egl_contexts_live) egl_contexts_live--;
+        if (ours && i != 0) {
+            /* Its host context and its own objects go; context 0 stays, the
+               share group's. */
+            if (i == egl_wire_context) context_switch(0);
+            if (host_context_made && !egl_contexts[i].fresh) CMD1(GEXGL_CONTEXT_DROP, i);
+            egl_contexts[i].used = 0;
+            if (egl_current_context == ctx) egl_current_context = NULL;
+        } else if (ours) {
+            egl_contexts[0].live = 0;
+        }
         /* The last of them gone before any drew: the host never made one. */
-        if (!egl_contexts_live) host_deferred = 0;
+        if (!egl_contexts_live) {
+            host_deferred = 0;
+            context_slots_reset();
+        }
         return EGL_TRUE;
     }
+    context_slots_reset();
     egl_contexts_live = 0;
     host_context_made = 0;
     egl_current_context = NULL;
@@ -4763,6 +4929,8 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
        alive after its last eglDestroyContext (SDL's throwaway GLX context
        then stood in for the one it really wanted). */
     if (ctx && !host_context_made && !host_deferred) context_create();
+    /* Its own state from here, and on the host its own context. */
+    if (ctx) context_switch(egl_context_index(ctx));
     /* Drawing into a surface: the host's context is needed now. */
     if (ctx && draw) host_realize();
     egl_current_display = ctx ? dpy : NULL;
