@@ -1,0 +1,18 @@
+# The oracle's own addition to init's configuration, for init.sh's boot:
+# bound at /init.ranchu.rc, which the image's init.rc imports
+# (/init.${ro.hardware}.rc) and the image does not have, so nothing of the
+# image's is replaced.
+#
+# What Android logs goes to logd, which nobody reads in a boot without a
+# screen or adb. gex_logcat copies it into the kernel log as it comes,
+# which gexc prints with init's own lines ("[kmsg] ..."): the reasons
+# odrefresh, odsign and the services after them give for what they do.
+
+on post-fs
+    start gex_logcat
+
+service gex_logcat /system/bin/logcat -b main,system,crash -v brief -f /dev/kmsg
+    user logd
+    group log
+    disabled
+    seclabel u:r:logpersist:s0
