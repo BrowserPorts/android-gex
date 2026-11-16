@@ -602,6 +602,7 @@ impl ProcFs {
             p if p.strip_prefix("sys/net/core/").is_some_and(|n| crate::netlink::sysctl::get(n).is_some()) => format!("{}\n", crate::netlink::sysctl::get(&p["sys/net/core/".len()..]).unwrap()).into_bytes(),
             // glibc and musl both consult this before using large mappings.
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
+            "sys/vm/mmap_rnd_bits" => format!("{}\n", mmap_rnd_bits::get()).into_bytes(),
             // The limit `F_SETPIPE_SZ` holds an unprivileged caller to.
             "sys/fs/nr_open" => format!("{}\n", crate::file::NR_OPEN).into_bytes(),
             "sys/fs/pipe-max-size" => format!("{}\n", crate::pipe::PIPE_MAX_SIZE).into_bytes(),
@@ -744,7 +745,7 @@ impl FileSystem for ProcFs {
             "sys/fs" => vec!["nr_open", "pipe-max-size"],
             "sys/kernel" => vec!["osrelease", "pid_max", "random"],
             "sys/kernel/random" => vec!["boot_id", "entropy_avail", "poolsize", "uuid"],
-            "sys/vm" => vec!["overcommit_memory"],
+            "sys/vm" => vec!["mmap_rnd_bits", "overcommit_memory"],
             _ => return Err(Errno::ENOENT),
         };
         // `sys` holds directories, the directories under it files (and
