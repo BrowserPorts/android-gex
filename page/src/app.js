@@ -123,6 +123,9 @@ const PIECES = {
  *              asked for with `debug: { glcapture: BYTES }`, once it is that
  *              long: for the page to save. Without it the recording is POSTed
  *              to /__gex_capture.
+ *   onNotice({ pid, name, text })
+ *              why a running program cannot work as it should (the System's
+ *              `notice` event): once per program and text
  *   onStoreBusy({ name, signal })
  *              the OPFS store is open in another tab or window of the site
  *              (one page holds a store at a time): the page offers its user
@@ -968,6 +971,9 @@ async function begin(opts, base, at, state, meter, lets) {
       if (opts.onGlCapture) globalThis.__gexGlCaptureSink = opts.onGlCapture;
       if (opts.onCrash) {
         s.system.addEventListener('crash', ({ pid, name, reason, code, signal }) => opts.onCrash({ pid, name, reason, code, signal }));
+      }
+      if (opts.onNotice) {
+        s.system.addEventListener('notice', ({ pid, name, text }) => opts.onNotice({ pid, name, text }));
       }
     },
     // `hostx: 'rootful'` (or the build's default): one X screen, fullscreen,

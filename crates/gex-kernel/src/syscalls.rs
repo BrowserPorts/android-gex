@@ -7255,6 +7255,13 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
                 procs.set_crash(io.pid, &note);
                 Ok(0)
             }
+            // Why the process cannot work as it should, while it runs (a
+            // need no memory gex has can meet): a notice, once.
+            crate::proc::PR_GEX_NOTICE => {
+                let text = m.read(a[1], (a[2] as usize).min(512))?.to_vec();
+                procs.notice(io.pid, &String::from_utf8_lossy(&text));
+                Ok(0)
+            }
             // A reservation the lowered memory had no room for, as 64-bit
             // Wine says it (it never asks for a mapping it found no gap for).
             crate::proc::PR_GEX_SHORT => {

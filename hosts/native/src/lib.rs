@@ -3111,6 +3111,11 @@ fn report_first_end(spawn: &SpawnContext, pid: i32, exit: &Exit) {
 /// A crash's one line on the host's console.
 fn crash_line(c: &gex_kernel::proc::Crash) {
     let name = if c.name.is_empty() { String::new() } else { format!(" ({})", c.name) };
+    if c.notice {
+        // a running program's notice: said by default, as gex's few are
+        eprintln!("gex: pid {}{name}: {}", c.pid, c.reason);
+        return;
+    }
     eprintln!("[gex] pid {}{name} crashed: {}", c.pid, c.reason);
 }
 
