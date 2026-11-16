@@ -105,6 +105,9 @@ const PIECES = {
  *              image is decoded; the image is fetched at start, beside the bundle.
  *   glLazy     start Mesa at the first GL request instead of at boot (a 32-bit Wine
  *              build's default)
+ *   restAhead  true: the whole rest bundle downloaded in the background as soon as
+ *              the title files are in, at low priority, a read's own fetch first;
+ *              default false: a rest bundle's frames fetched at their first read only
  *   baseUrl    where app.mjs's files are (default: beside app.mjs)
  *   launch     the build's launch file, relative to baseUrl
  *   build      the launch, already read (gex's test page; see `fromLaunch`)
@@ -855,11 +858,13 @@ async function begin(opts, base, at, state, meter, lets) {
       if (ready.ok) {
         lc.on = true;
         lazyCache = { ctl };
-        // The rest bundles downloaded in the background as soon as the title files are in (the pieces, the
-        // streamed archive), not after the start-up: the program does not wait for them, and the reads after
-        // find their frames in the owner's store (none while the page is hidden).
+        // With `restAhead`, the rest bundles downloaded in the background as soon as the title files are in
+        // (the pieces, the streamed archive), not after the start-up: the program does not wait for them, and
+        // the reads after find their frames in the owner's store (none while the page is hidden). Without it a
+        // rest bundle is read on demand only, a frame at its first read. The `restahead` switch ('1' or '0')
+        // overrides the option.
         const restBundles = [...new Set(lazy.map(([, , url]) => String(url)).filter((u) => u.includes('#')).map((u) => u.slice(0, u.lastIndexOf('#'))))];
-        if (restBundles.length && sw.restahead !== '0') {
+        if (restBundles.length && (sw.restahead !== undefined ? sw.restahead !== '0' : opts.restAhead === true)) {
           const paused = () => w.postMessage({ kind: 'ahead', paused: document.visibilityState === 'hidden' });
           Promise.allSettled([pieceBufs, streamed?.done]).then(() => {
             w.postMessage({ kind: 'ahead', bundles: restBundles, paused: document.visibilityState === 'hidden' });
