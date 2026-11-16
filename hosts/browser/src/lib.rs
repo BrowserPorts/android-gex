@@ -2974,6 +2974,9 @@ static LIFT_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 /// mode at its next miss.
 const SMC_HOT_HITS: u32 = 8;
 const SMC_HOT_QUIET_NS: u64 = 2_000_000_000;
+/// The most blocks one miss on a hot page lifts: the block that missed and
+/// the straight-line run after it on its page (`translate_runtime_run`).
+const SMC_HOT_RUN: usize = 8;
 
 /// Per page key: guard hits running, the last one's time (`now_ns`), and
 /// (`?jitdiag=1`) the nanoseconds and blocks its hot lifts took. See
@@ -3007,7 +3010,7 @@ fn smc_hit(page: u64) {
         smc_cooled(page, was.hits);
     }
     if jit_diag() && h.hits == SMC_HOT_HITS {
-        warn_line(&format!("gex: pid {} page {page:#x} is rewritten while it runs ({SMC_HOT_HITS} guard hits running): misses there lift only their block\n", my_pid()));
+        warn_line(&format!("gex: pid {} page {page:#x} is rewritten while it runs ({SMC_HOT_HITS} guard hits running): misses there lift only their block and the run after it\n", my_pid()));
     }
     if jit_diag() && h.hits >= SMC_HOT_HITS && h.hits.is_power_of_two() && h.lifts > 0 {
         warn_line(&format!(
@@ -18347,7 +18350,11 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
     let hot_page = gex_abi::page_key(pc, alt);
     let hot = smc_hot(hot_page) || smc_hot(gex_abi::page_key(pc + gex_abi::DISPATCH_PAGE, alt));
     let lift_t0 = if hot && jit_diag() { now_ns() } else { 0 };
-    let (mut unit, stats) = gex_xlate::translate_runtime(
+    // Hot: the block and its straight-line run on the page, in one module
+    // (`SMC_HOT_RUN`); else what discovery reaches.
+    let lift: fn(&[u8], u64, &(dyn Fn(u64) -> bool + Sync), &(dyn Fn(u64) -> bool + Sync), _, _, usize, bool, &_) -> _ =
+        if hot { gex_xlate::translate_runtime_run } else { gex_xlate::translate_runtime };
+    let (mut unit, stats) = lift(
             // SAFETY: the translator takes the whole memory (`guest_whole`).
             unsafe { guest_whole() },
             pc,
@@ -18357,7 +18364,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             Default::default(),
             // A cap keeps one miss from translating a whole library at once;
             // the next miss picks up where this stopped.
-            if hot { 1 } else { LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed) },
+            if hot { SMC_HOT_RUN } else { LIFT_MAX.load(std::sync::atomic::Ordering::Relaxed) },
             // Must match the memory this shim was built against: a module the
             // translator emits is instantiated against the same memory, and an
             // import that disagrees about sharing does not link.
