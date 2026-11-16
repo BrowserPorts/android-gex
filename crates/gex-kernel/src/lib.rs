@@ -73,6 +73,8 @@ pub mod bpf;
 pub mod btf;
 pub mod bpfprog;
 pub mod bpfjit;
+pub mod bpfrun;
+pub mod bpfskb;
 pub mod cgroup;
 /// The x87's extended-precision arithmetic (its own crate, shared with the
 /// IR interpreter and the code generators).

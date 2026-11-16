@@ -36,6 +36,7 @@ pub mod cmd {
     pub const PROG_ATTACH: u64 = 8;
     pub const PROG_DETACH: u64 = 9;
     pub const PROG_QUERY: u64 = 16;
+    pub const PROG_TEST_RUN: u64 = 10;
 }
 
 /// Map types (`enum bpf_map_type`).
@@ -206,6 +207,17 @@ fn register_prog(p: &Arc<crate::bpfprog::Prog>) {
 fn prog_after(after: u32) -> Option<Arc<crate::bpfprog::Prog>> {
     let progs = PROGS.lock().unwrap_or_else(|e| e.into_inner());
     progs.range(after.saturating_add(1)..).find_map(|(_, m)| m.upgrade())
+}
+
+/// Where a value a program found is in its map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueAt {
+    /// An array's element.
+    Index(u32),
+    /// A hash's, by its key.
+    Key(Vec<u8>),
+    /// A trie's, by its prefix.
+    Prefix(u32, Vec<u8>),
 }
 
 /// A program's descriptor.
@@ -404,6 +416,60 @@ impl Map {
             Some((w, _)) if w.strong_count() > 0 => Ok(()),
             _ => Err(Errno::ENOENT),
         }
+    }
+
+    /// `map_lookup_elem` from a program: where the value it found is, for
+    /// the program to read and write in place; `None` for none. An LRU
+    /// hash's lookup is a use of the element. (A program has the value
+    /// of the processor it runs on: here, always the first.)
+    pub fn find(&self, key: &[u8]) -> Option<ValueAt> {
+        let max = self.max_entries;
+        match &mut *self.lock() {
+            Data::Array(_) | Data::PercpuArray(_) => {
+                let i = self.index(key);
+                (i < max).then_some(ValueAt::Index(i))
+            }
+            Data::Hash(h) => {
+                let o = *h.at.get(key)?;
+                if self.ty == map_type::LRU_HASH {
+                    let (k, v) = h.order.remove(&o).unwrap();
+                    let n = h.next;
+                    h.next += 1;
+                    h.order.insert(n, (k, v));
+                    h.at.insert(key.to_vec(), n);
+                }
+                Some(ValueAt::Key(key.to_vec()))
+            }
+            Data::Lpm(t) => lpm_match(t, key).map(|(p, d, _)| ValueAt::Prefix(*p, d.clone())),
+            Data::SkStorage(_) | Data::Ringbuf(_) => None,
+        }
+    }
+
+    /// The value at `at`, given to `f` to read or write in place; `None`
+    /// when it is no longer there (deleted since it was found).
+    pub fn with_value<R>(&self, at: &ValueAt, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
+        let vs = self.value_size as usize;
+        match (&mut *self.lock(), at) {
+            (Data::Array(v), ValueAt::Index(i)) => Some(f(&mut v[*i as usize * vs..(*i as usize + 1) * vs])),
+            (Data::PercpuArray(v), ValueAt::Index(i)) => {
+                let each = self.user_value_size();
+                Some(f(&mut v[*i as usize * each..*i as usize * each + vs]))
+            }
+            (Data::Hash(h), ValueAt::Key(k)) => {
+                let o = *h.at.get(k)?;
+                Some(f(&mut h.order.get_mut(&o)?.1))
+            }
+            (Data::Lpm(t), ValueAt::Prefix(p, d)) => t.iter_mut().find(|(q, e, _)| q == p && e == d).map(|(_, _, v)| f(v)),
+            _ => None,
+        }
+    }
+
+    pub fn key_size(&self) -> u32 {
+        self.key_size
+    }
+
+    pub fn ty(&self) -> u32 {
+        self.ty
     }
 
     fn index(&self, key: &[u8]) -> u32 {
@@ -821,6 +887,14 @@ fn install(c: &Caller<'_>, obj: Object, read: bool, write: bool) -> crate::errno
     c.fds.insert(file, true)
 }
 
+/// The most a test run's packet may be (`bpf_test_init` at 6.18): a page
+/// less the headroom an skb keeps (`NET_SKB_PAD`, 64 on arm64, whose
+/// `NET_IP_ALIGN` is 0) and the room for its shared information at the
+/// end (`SKB_DATA_ALIGN(sizeof(struct skb_shared_info))`: 360 bytes with
+/// GKI's Android reserves and 17 fragments, 384 aligned). (Linux 7.0 takes
+/// far more.)
+const TEST_MAX_DATA: u32 = 4096 - 64 - 384;
+
 /// The program type a cgroup attach type takes (`attach_type_to_prog_type`),
 /// for the cgroup hooks this kernel has; `None` for any other, said once
 /// where it is one Linux has.
@@ -1150,6 +1224,88 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             let replace = if flags & ALLOW_MULTI != 0 && flags & REPLACE != 0 { Some(prog_of(c, replace_fd as i32, ptype)?) } else { None };
             crate::cgroup::bpf_attach(g, ty, prog, replace, flags, revision)?;
             note_once("a program attached to a cgroup is kept and runs nowhere yet: there are no socket hooks");
+            Ok(0)
+        }
+        cmd::PROG_TEST_RUN => {
+            // ... batch_size, the last field.
+            zero_from(76)?;
+            let (prog_fd, size_in, room, data_in, data_out, repeat) = (u32_at(0), u32_at(8), u32_at(12), u64_at(16), u64_at(24), u32_at(32));
+            let (ctx_size_in, ctx_size_out, ctx_in, ctx_out, flags, cpu, batch) = (u32_at(40), u32_at(44), u64_at(48), u64_at(56), u32_at(64), u32_at(68), u32_at(72));
+            if (ctx_size_in != 0) != (ctx_in != 0) || (ctx_size_out != 0) != (ctx_out != 0) {
+                return Err(Errno::EINVAL);
+            }
+            let prog = match c.fds.get(prog_fd as i32)?.handle.bpf_object() {
+                Some(Object::Prog(p)) => p,
+                _ => return Err(Errno::EINVAL),
+            };
+            use crate::bpfprog::prog_type::*;
+            if !matches!(prog.ty, SOCKET_FILTER | SCHED_CLS | SCHED_ACT | CGROUP_SKB) {
+                say_once(&format!("a test run of a program of type {}", prog.ty));
+                return Err(crate::btf::ENOTSUPP);
+            }
+            // `bpf_prog_test_run_skb`: BPF_F_TEST_SKB_CHECKSUM_COMPLETE the
+            // only flag; a packet in a page with the room an skb keeps.
+            if flags & !1 != 0 || cpu != 0 || batch != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if flags != 0 {
+                say_once("a test run with BPF_F_TEST_SKB_CHECKSUM_COMPLETE");
+                return Err(Errno::EINVAL);
+            }
+            if size_in < 14 {
+                return Err(Errno::EINVAL);
+            }
+            if size_in > TEST_MAX_DATA {
+                return Err(Errno::EINVAL);
+            }
+            const CTX: usize = crate::bpfskb::off::SIZE as usize;
+            let mut ctx = vec![0u8; CTX];
+            let given = if ctx_in != 0 || ctx_out != 0 {
+                if ctx_in != 0 {
+                    let n = ctx_size_in as usize;
+                    if n > CTX && m.read(ctx_in + CTX as u64, n - CTX)?.iter().any(|b| *b != 0) {
+                        return Err(Errno::E2BIG);
+                    }
+                    ctx[..n.min(CTX)].copy_from_slice(m.read(ctx_in, n.min(CTX))?);
+                }
+                true
+            } else {
+                false
+            };
+            let packet = m.read(data_in, size_in as usize)?.to_vec();
+            let mut skb = crate::bpfskb::for_test(prog.ty, &packet, given.then_some(&ctx[..]))?;
+            let start = crate::syscalls::clock_ns(crate::syscalls::system_clock, 1);
+            let mut retval = 0u32;
+            for _ in 0..repeat.max(1) {
+                retval = crate::bpfrun::run(&prog, &mut skb).map_err(|_| Errno::EINVAL)? as u32;
+            }
+            let took = crate::syscalls::clock_ns(crate::syscalls::system_clock, 1).saturating_sub(start);
+            let out = skb.after_test(&mut ctx);
+            // `bpf_test_finish`.
+            let size = out.len() as u32;
+            let mut r = Ok(0);
+            let copy = if room != 0 && size > room {
+                r = Err(Errno::ENOSPC);
+                room
+            } else {
+                size
+            };
+            if data_out != 0 {
+                m.write(data_out, &out[..copy as usize])?;
+            }
+            m.write_u32(attr + 12, size)?;
+            m.write_u32(attr + 4, retval)?;
+            m.write_u32(attr + 36, (took / repeat.max(1) as u64) as u32)?;
+            r?;
+            // `bpf_ctx_finish`.
+            if given && ctx_out != 0 {
+                let n = CTX.min(ctx_size_out as usize);
+                m.write(ctx_out, &ctx[..n])?;
+                m.write_u32(attr + 44, CTX as u32)?;
+                if (ctx_size_out as usize) < CTX {
+                    return Err(Errno::ENOSPC);
+                }
+            }
             Ok(0)
         }
         cmd::PROG_QUERY => {
