@@ -955,10 +955,14 @@ fn raw_ns(clock: ClockFn) -> u64 {
 
 /// The Windows program Wine's loader (`path`) was started on by hand
 /// (`wine C:\\app.exe`, not by CreateProcess, which says it in
-/// WINEGEX_IMAGE): its first argument (`argv[1]`), a DOS path, found
-/// through the prefix's dosdevices. `None` for any other program.
+/// WINEGEX_IMAGE): its first argument (`argv[1]`), a DOS path found
+/// through the prefix's dosdevices, or a Unix path as it is. `None` for any other program.
 pub fn wine_program(path: &str, argv: &[String], envp: &[String]) -> Option<String> {
     let wine = path.rsplit('/').next().is_some_and(|n| n == "wine" || n == "wine.m64");
+    // (or a Unix path, which Wine's loader takes as it is)
+    if let Some(a) = argv.get(1).filter(|a| wine && a.starts_with('/') && a.len() > 4 && a[a.len() - 4..].eq_ignore_ascii_case(".exe")) {
+        return Some(a.clone());
+    }
     let a = argv.get(1).filter(|a| wine && a.len() > 3 && a.as_bytes()[1] == b':' && a.as_bytes()[2] == b'\\')?;
     let pfx = envp.iter().find_map(|e| e.strip_prefix("WINEPREFIX="))?;
     Some(format!("{pfx}/dosdevices/{}:/{}", a[..1].to_ascii_lowercase(), a[3..].replace('\\', "/")))

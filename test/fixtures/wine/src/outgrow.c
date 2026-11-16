@@ -22,6 +22,10 @@
  *                      cannot go on without it does (OpenBLAS's buffers);
  *                      gex ends it at the second ask. Says "outgrow retry
  *                      gave up" and exits 0 if it was never ended
+ *   outgrow late M     runs `outgrow M` once, then waits (10 min at most)
+ *                      for a run that got the 3.5 GiB, which may be one
+ *                      gex had started again, and says "outgrow late done"
+ *                      (or "outgrow late timed out")
  *   outgrow twice M    runs `outgrow M` twice, one after the other
  *                      (CreateProcess each), and says how each ended
  *   outgrow each M X.. the same for each program X (a copy of this one),
@@ -63,10 +67,24 @@ static DWORD WINAPI thread(void *arg) {
     return 0;
 }
 
+/* "outgrow big", and the event a `late` run waits on, if there is one */
+static void big_said(void *p) {
+    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, "outgrow-big");
+    printf("outgrow big %s\n", (ULONG_PTR)p >= ((ULONG_PTR)1 << 32) ? "high" : "low");
+    fflush(stdout);
+    if (ev) SetEvent(ev);
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc > 1 ? argv[1] : "crash";
     void *p;
 
+    if (argc > 2 && !strcmp(argv[1], "late")) {
+        HANDLE ev = CreateEventA(NULL, TRUE, FALSE, "outgrow-big");
+        once(NULL, argv[2]);
+        printf("outgrow late %s\n", WaitForSingleObject(ev, 600000) ? "timed out" : "done");
+        return 0;
+    }
     if (argc > 2 && !strcmp(argv[1], "twice")) {
         once(NULL, argv[2]);
         once(NULL, argv[2]);
@@ -109,7 +127,7 @@ int main(int argc, char **argv) {
         fflush(stdout);
         for (i = 0; i < 100000; i++) {
             if ((p = VirtualAlloc(NULL, BIG, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))) {
-                printf("outgrow big %s\n", (ULONG_PTR)p >= ((ULONG_PTR)1 << 32) ? "high" : "low");
+                big_said(p);
                 return 0;
             }
         }
@@ -118,7 +136,7 @@ int main(int argc, char **argv) {
     }
     p = VirtualAlloc(NULL, BIG, MEM_RESERVE, PAGE_NOACCESS);
     if (p) {
-        printf("outgrow big %s\n", (ULONG_PTR)p >= ((ULONG_PTR)1 << 32) ? "high" : "low");
+        big_said(p);
         return 0;
     }
     if (!strcmp(mode, "crash")) {

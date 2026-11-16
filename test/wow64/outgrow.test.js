@@ -13,9 +13,9 @@
 // so the record must be made before anything can see the first gone:
 // on the page, a run of copies started that way, each found recorded.
 // One whose thread gex has no memory of its own for (outgrow thread)
-// outgrows it the same way, and so does one that asks for the same
-// refused block again and again (outgrow retry): gex ends it at the
-// second ask. One built as a native wasm32 module, with no
+// outgrows it the same way. One that asks for the same refused block
+// again and again (outgrow retry) is recorded at the second ask and
+// started again at once by Wine, in a 64-bit memory, with no crash. One built as a native wasm32 module, with no
 // memory64 build, is never moved: it ends saying so, as does a 32-bit
 // program (its Wine core has none).
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
@@ -28,6 +28,7 @@ export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1500 };
 
 const SRC = fileURLToPath(new URL('../fixtures/wine/src/outgrow.c', import.meta.url));
 const SAID = /outgrow\.exe needs 64-bit memory \(a reservation of 0xe0000000 bytes did not fit\); it gets it from its next start/;
+const RESTARTED = /outgrow\.exe needs 64-bit memory \(a reservation of 0xe0000000 bytes did not fit\); started again in one/;
 const NOTICE = /needs 64-bit memory; it will get it the next time it starts/;
 const NO64 = /outgrow\.exe ran out of memory \(2 GiB\); \S*outgrow\.exe\.wasm has no 64-bit memory build/;
 const I386_NO64 = /outgrow\.exe ran out of memory \(2 GiB\); \S*i386-windows\/winepe\.wasm has no 64-bit memory build/;
@@ -98,13 +99,15 @@ export default async function (t) {
   t.eq('page: and its next start, in a 64-bit memory, runs the thread', run.slice(2).join('\n'), 'outgrow filling\noutgrow thread ran\noutgrow child exit 00000000', w.detail(pr));
   t.check("page: gex says its own memory for it could not grow", /outgrow\.exe needs 64-bit memory \(gex's own memory for it could not grow by 0x[0-9a-f]+ bytes\); it gets it from its next start/.test(pr.out), w.detail(pr));
   // the same refused block asked for again and again, as OpenBLAS's
-  // allocator does: gex ends the first start at the second ask, and the
-  // next start has a 64-bit memory
-  const pq = await w.page(['/t/outgrow.exe', 'twice', 'retry'], { files: { '/t/outgrow.exe': exe }, name: 'page-retry', timeout: 600000 });
+  // allocator does: gex records it at the second ask, and Wine starts it
+  // again at once, in a 64-bit memory, where the block fits; the first
+  // start's end is no crash (its parent sees it exit 0)
+  const pq = await w.page(['/t/outgrow.exe', 'late', 'retry'], { files: { '/t/outgrow.exe': exe }, name: 'page-retry', timeout: 900000 });
   const rq = lines(pq.out).split('\n');
-  t.check('page: one asking again for the same refused block is ended', rq[0] === 'outgrow retrying' && /^outgrow child exit (?!00000000)/.test(rq[1] ?? ''), w.detail(pq));
-  t.eq('page: and its next start has a 64-bit memory', rq.slice(2).join('\n'), 'outgrow retrying\noutgrow big high\noutgrow child exit 00000000', w.detail(pq));
-  t.check('page: gex says it needs 64-bit memory', SAID.test(pq.out), w.detail(pq));
+  t.eq('page: one asking again for the same refused block is started again in a 64-bit memory', [...rq].sort().join('\n'),
+    ['outgrow big high', 'outgrow child exit 00000000', 'outgrow late done', 'outgrow retrying', 'outgrow retrying'].join('\n'), w.detail(pq));
+  t.check('page: gex says it was started again, with no crash notice',
+    RESTARTED.test(pq.out) && !NOTICE.test(pq.out) && !/ended by gex/.test(pq.out + (pq.err ?? '')), w.detail(pq));
   // a 32-bit program (PE32, the WoW64 process's i386 side, whose Wine core
   // has no memory64 build) that runs out of gex's own memory cannot move
   // either: it ends saying so, and its next start is lowered again, never
