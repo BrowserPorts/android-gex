@@ -74,6 +74,14 @@ pub trait Context {
     fn socket_cookie(&mut self) -> u64 {
         0
     }
+    /// `bpf_get_current_uid_gid`: the calling task's real group and user.
+    fn current_uid_gid(&mut self) -> u64 {
+        0
+    }
+    /// The socket the context is (or is of), for its storage.
+    fn socket(&mut self) -> Option<Arc<dyn crate::vfs::FileHandle>> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -235,8 +243,34 @@ impl Machine<'_, '_> {
                     }
                 }
             }
+            15 => self.ctx.current_uid_gid(),
             46 => self.ctx.socket_cookie(),
             47 => self.ctx.socket_uid(),
+            // sk_storage_get(map, sk, value, flags), sk_storage_delete(map,
+            // sk): the context's socket's value, made when asked
+            // (BPF_SK_STORAGE_GET_F_CREATE), from `value` or zeros.
+            107 | 108 => {
+                let m = self.map_arg(op, r[1])?;
+                let sock = (r[2] == addr(CTX, 0)).then(|| self.ctx.socket()).flatten();
+                let Some(sock) = sock else { return Ok(0) };
+                if id == 108 {
+                    return Ok(match m.sk_delete_of(&sock) {
+                        Ok(()) => 0,
+                        Err(e) => err(e),
+                    });
+                }
+                if r[4] & !1 != 0 {
+                    return Ok(0);
+                }
+                let init = if r[3] != 0 && r[4] & 1 != 0 { Some(self.bytes(op, r[3], m.value_size() as usize)?) } else { None };
+                match m.sk_get(&sock, init.as_deref(), r[4] & 1 != 0) {
+                    Some(at) => {
+                        self.regions.push(Region::Value(m, at));
+                        addr(self.regions.len() - 1, 0)
+                    }
+                    None => 0,
+                }
+            }
             other => return Err(Fault::Helper(other)),
         })
     }

@@ -84,6 +84,8 @@ pub struct Skb {
     pub local_port: u32,
     pub socket_uid: u64,
     pub socket_cookie: u64,
+    /// The calling task's real group and user.
+    pub uid_gid: u64,
 }
 
 impl Skb {
@@ -228,6 +230,10 @@ impl Context for Skb {
 
     fn socket_cookie(&mut self) -> u64 {
         self.socket_cookie
+    }
+
+    fn current_uid_gid(&mut self) -> u64 {
+        self.uid_gid
     }
 }
 

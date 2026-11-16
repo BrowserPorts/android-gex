@@ -605,6 +605,9 @@ pub enum Kind {
 #[derive(Debug)]
 pub struct Socket {
     pub kind: Kind,
+    /// Its mark, priority and interface (`SO_MARK` and its kin, and what a
+    /// BPF program at its making set).
+    pub opts: Mutex<crate::bpfsock::SockOpts>,
     net: Arc<dyn NetStack>,
     resolver: Arc<Resolver>,
     transport: Mutex<Option<Arc<dyn Transport>>>,
@@ -669,6 +672,7 @@ impl Socket {
     pub fn new(kind: Kind, net: Arc<dyn NetStack>, resolver: Arc<Resolver>, ports: Arc<Ports>, remote: Option<crate::unix::Remote>) -> Socket {
         Socket {
             kind,
+            opts: Mutex::new(Default::default()),
             net,
             resolver,
             transport: Mutex::new(None),

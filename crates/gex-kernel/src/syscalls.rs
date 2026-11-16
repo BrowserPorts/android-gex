@@ -3708,6 +3708,7 @@ impl PathIo<'_> {
                     raw_ok: crate::vfs::procfs::bpf_sysctl::addresses_shown(self.creds.capable(34)),
                     uid: self.creds.uid(),
                     gid: self.creds.gid(),
+                    real_uid_gid: (self.creds.rgid() as u64) << 32 | self.creds.ruid() as u64,
                     umask: self.fs.umask(),
                 };
                 crate::bpf::call(&caller, m, a[0], a[1], a[2])
@@ -6034,6 +6035,28 @@ impl NetIo<'_> {
                 const SOL_SOCKET: u64 = 1;
                 const SO_PASSCRED: u64 = 16;
                 io.fds.get(fd)?;
+                // An internet socket's mark (CAP_NET_RAW or CAP_NET_ADMIN)
+                // and priority (above 6, the same): kept.
+                if let (SOL_SOCKET, 36 | 12, Ok(sock)) = (a[1], a[2], io.socket_of(fd)) {
+                    if a[4] < 4 {
+                        return Err(Errno::EINVAL);
+                    }
+                    let v = m.read_u32(a[3])?;
+                    let net = io.creds.capable(13) || io.creds.capable(12);
+                    let mut o = sock.opts.lock().unwrap_or_else(|e| e.into_inner());
+                    if a[2] == 36 {
+                        if !net {
+                            return Err(Errno::EPERM);
+                        }
+                        o.mark = v;
+                    } else {
+                        if v > 6 && !net {
+                            return Err(Errno::EPERM);
+                        }
+                        o.priority = v;
+                    }
+                    return Ok(0);
+                }
                 if a[1] == SOL_SOCKET && a[2] == SO_PASSCRED && a[3] != 0 && a[4] >= 4 {
                     let on = m.read_u32(a[3])? != 0;
                     if let Ok(s) = io.unix_of(fd) {
@@ -6202,6 +6225,13 @@ impl NetIo<'_> {
         sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
         let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
         let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
+        // The group's programs for a socket made (`inet_create`'s
+        // BPF_CGROUP_RUN_PROG_INET_SOCK): they may refuse it, or mark it.
+        let (sock_ty, proto) = match kind {
+            net::Kind::Tcp => (SOCK_STREAM as u32, 6),
+            net::Kind::Udp => (SOCK_DGRAM as u32, 17),
+        };
+        crate::bpfsock::created(&handle, &sock.opts, io.pid, io.creds.ruid(), io.creds.rgid(), AF_INET as u32, sock_ty, proto)?;
         let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
         io.fds.insert(file, ty & SOCK_CLOEXEC != 0)
     }
@@ -6741,6 +6771,39 @@ fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u6
         if let Some(r) = netlink_getsockopt(m, &sock, level, name, val, optlen) {
             return r;
         }
+    }
+    // SO_COOKIE: the socket's cookie (a u64; EINVAL for less room).
+    const SO_COOKIE: u64 = 57;
+    if level == SOL_SOCKET && name == SO_COOKIE {
+        let room = if optlen != 0 { m.read_u32(optlen)? } else { 8 };
+        if room < 8 {
+            return Err(Errno::EINVAL);
+        }
+        let c = crate::bpfsock::cookie_of(&io.fds.get(fd)?.handle);
+        if val != 0 {
+            m.write_u64(val, c)?;
+        }
+        if optlen != 0 {
+            m.write_u32(optlen, 8)?;
+        }
+        return Ok(0);
+    }
+    // An internet socket's mark, priority and interface, as set.
+    if let (SOL_SOCKET, 36 | 12 | 62, Ok(sock)) = (level, name, io.socket_of(fd)) {
+        let o = *sock.opts.lock().unwrap_or_else(|e| e.into_inner());
+        let v = match name {
+            36 => o.mark,
+            12 => o.priority,
+            _ => o.bound_dev_if,
+        };
+        let room = if optlen != 0 { (m.read_u32(optlen)? as usize).min(4) } else { 4 };
+        if val != 0 {
+            m.write(val, &v.to_le_bytes()[..room])?;
+        }
+        if optlen != 0 {
+            m.write_u32(optlen, room as u32)?;
+        }
+        return Ok(0);
     }
     // SO_PEERCRED: the far end's `struct ucred` (pid, uid, gid; 12 bytes on
     // every ABI), as it was when the two were joined. Every byte is written:

@@ -218,6 +218,8 @@ pub enum ValueAt {
     Key(Vec<u8>),
     /// A trie's, by its prefix.
     Prefix(u32, Vec<u8>),
+    /// A socket's, by the socket.
+    Sock(usize),
 }
 
 /// A program's descriptor.
@@ -460,8 +462,31 @@ impl Map {
                 Some(f(&mut h.order.get_mut(&o)?.1))
             }
             (Data::Lpm(t), ValueAt::Prefix(p, d)) => t.iter_mut().find(|(q, e, _)| q == p && e == d).map(|(_, _, v)| f(v)),
+            (Data::SkStorage(t), ValueAt::Sock(at)) => t.get_mut(at).filter(|(w, _)| w.strong_count() > 0).map(|(_, v)| f(v)),
             _ => None,
         }
+    }
+
+    /// `bpf_sk_storage_get` from a program: the socket's value, made
+    /// (from `init`, or zeros) when `create` and it has none.
+    pub fn sk_get(&self, sock: &Arc<dyn FileHandle>, init: Option<&[u8]>, create: bool) -> Option<ValueAt> {
+        let vs = self.value_size as usize;
+        let Data::SkStorage(t) = &mut *self.lock() else { return None };
+        let at = Arc::as_ptr(sock) as *const () as usize;
+        let there = t.get(&at).is_some_and(|(w, _)| w.strong_count() > 0);
+        if !there {
+            if !create {
+                return None;
+            }
+            t.retain(|_, (w, _)| w.strong_count() > 0);
+            t.insert(at, (Arc::downgrade(sock), init.map_or_else(|| vec![0; vs], <[u8]>::to_vec)));
+        }
+        Some(ValueAt::Sock(at))
+    }
+
+    /// `bpf_sk_storage_delete`.
+    pub fn sk_delete_of(&self, sock: &Arc<dyn FileHandle>) -> Result<(), Errno> {
+        self.sk_delete(sock)
     }
 
     pub fn key_size(&self) -> u32 {
@@ -862,6 +887,8 @@ pub struct Caller<'a> {
     pub raw_ok: bool,
     pub uid: u32,
     pub gid: u32,
+    /// The real group and user, as `bpf_get_current_uid_gid` gives them.
+    pub real_uid_gid: u64,
     pub umask: u32,
 }
 
@@ -1223,7 +1250,11 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             let g = group(c)?;
             let replace = if flags & ALLOW_MULTI != 0 && flags & REPLACE != 0 { Some(prog_of(c, replace_fd as i32, ptype)?) } else { None };
             crate::cgroup::bpf_attach(g, ty, prog, replace, flags, revision)?;
-            note_once("a program attached to a cgroup is kept and runs nowhere yet: there are no socket hooks");
+            // Run where a socket is made (crate::bpfsock); the other hooks
+            // are not here yet.
+            if ty != crate::bpfprog::attach::INET_SOCK_CREATE {
+                note_once(&format!("a program attached to a cgroup at attach type {ty} is kept and runs nowhere yet"));
+            }
             Ok(0)
         }
         cmd::PROG_TEST_RUN => {
@@ -1274,6 +1305,7 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             };
             let packet = m.read(data_in, size_in as usize)?.to_vec();
             let mut skb = crate::bpfskb::for_test(prog.ty, &packet, given.then_some(&ctx[..]))?;
+            skb.uid_gid = c.real_uid_gid;
             let start = crate::syscalls::clock_ns(crate::syscalls::system_clock, 1);
             let mut retval = 0u32;
             for _ in 0..repeat.max(1) {
