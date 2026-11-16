@@ -8,7 +8,8 @@
 // The mounts and nodes are first_stage_init.cpp's, in its order: a tmpfs
 // on /dev with pts, socket and dm-user in it, sysfs on /sys (which
 // ueventd makes /dev from: without it its cold boot finds no device),
-// the kernel log, the random devices, ptmx and null by number, and tmpfs
+// the kernel log (and the one anyone may write, as a debuggable build
+// makes it), the random devices, ptmx and null by number, and tmpfs
 // on /mnt, /debug_ramdisk and /second_stage_resources; and /metadata,
 // which first stage mounts from the fstab, a fresh tmpfs. Left out, and
 // said: devpts on /dev/pts, where the kernel cannot mount one; proc and
@@ -39,6 +40,10 @@ int main(int argc, char **argv) {
     if (mount("devpts", "/dev/pts", "devpts", 0, NULL)) printf("firststage: no devpts on /dev/pts: errno %d\n", errno);
     CHECK(mount("sysfs", "/sys", "sysfs", 0, NULL));
     CHECK(mknod("/dev/kmsg", S_IFCHR | 0600, makedev(1, 11)));
+    // A debuggable build's first stage (WORLD_WRITABLE_KMSG, which the
+    // image's userdebug init is built with) makes a kernel log anyone may
+    // write: what init gives a service's output with stdio_to_kmsg.
+    CHECK(mknod("/dev/kmsg_debug", S_IFCHR | 0622, makedev(1, 11)));
     CHECK(mknod("/dev/random", S_IFCHR | 0666, makedev(1, 8)));
     CHECK(mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9)));
     CHECK(mknod("/dev/ptmx", S_IFCHR | 0666, makedev(5, 2)));

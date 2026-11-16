@@ -51,9 +51,12 @@ FIRST=$HERE/../bin/firststage
 [ -x "$FIRST" ] || { echo "init.sh: no $FIRST (tests/android/build.sh)" >&2; exit 1; }
 CONFIG=$(mktemp)
 ERR=$(mktemp)
+# Android's log (init.gex.rc's logcat), kept: LOGDIR, or a new directory.
+LOGDIR=${LOGDIR:-$(mktemp -d)}
+echo "init.sh: Android's log goes to $LOGDIR/logcat.txt" >&2
 printf 'androidboot.selinux = "permissive"\nandroidboot.hardware = "ranchu"\n' >"$CONFIG"
 (cd "$ROOT" && gexc timeout "${TIMEOUT:-150}" "$GEXC" run --argv0 /firststage --uid 0 --mem64 --selinuxfs --bootconfig "$CONFIG" \
-    --bind "$FIRST=/firststage" --bind "$HERE/fstab.gex=/vendor/etc/fstab.ranchu" --bind "$HERE/init.gex.rc=/init.ranchu.rc" --sysroot "$ROOT" "$FIRST" "$@" 2>"$ERR")
+    --bind "$FIRST=/firststage" --bind "$HERE/fstab.gex=/vendor/etc/fstab.ranchu" --bind "$HERE/init.gex.rc=/init.ranchu.rc" --bind "$LOGDIR=/gexlog" --sysroot "$ROOT" "$FIRST" "$@" 2>"$ERR")
 echo "init.sh: gexc exited $? (124: still running at the time limit)"
 grep -a '^\[kmsg\]' "$ERR" | sed 's/^\[kmsg\] //'
 echo "init.sh: and gexc said:"

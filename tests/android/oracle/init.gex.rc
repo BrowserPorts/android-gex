@@ -4,15 +4,20 @@
 # image's is replaced.
 #
 # What Android logs goes to logd, which nobody reads in a boot without a
-# screen or adb. gex_logcat copies it into the kernel log as it comes,
-# which gexc prints with init's own lines ("[kmsg] ..."): the reasons
-# odrefresh, odsign and the services after them give for what they do.
+# screen or adb. gex_logcat copies it, as it comes, to /gexlog/logcat.txt:
+# a directory of the host's that init.sh binds there, so the log is the
+# host's to read during the boot and after it (the reasons odrefresh,
+# odsign and the services after them give for what they do). Not to the
+# kernel log: a write there is one record of at most 1024 bytes, and an
+# entry can be longer. logcat's own complaints go to the kernel log
+# (stdio_to_kmsg).
 
 on post-fs
     start gex_logcat
 
-service gex_logcat /system/bin/logcat -b main,system,crash -v brief -f /dev/kmsg
+service gex_logcat /system/bin/logcat -b main,system,crash -v threadtime -f /gexlog/logcat.txt -r 1048576
     user logd
     group log
     disabled
+    stdio_to_kmsg
     seclabel u:r:logpersist:s0
