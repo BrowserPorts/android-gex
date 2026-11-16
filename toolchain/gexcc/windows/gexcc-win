@@ -235,7 +235,10 @@ if cxx:
             '-DWIDL_EXPLICIT_AGGREGATE_RETURNS'] + base
 # (__forceinline as MinGW's _mingw.h has it)
 base += ['-isystem', S + '/include/msvcrt', '-idirafter', here + '/include', '-fdeclspec',
-         '-D__forceinline=__inline__ __attribute__((__always_inline__))']
+         '-D__forceinline=__inline__ __attribute__((__always_inline__))',
+         # (dllexport and dllimport as the GexLLP64 plugin's attributes: default
+         # visibility, what the wasm target exports and imports by)
+         '-Ddllexport=__gexw_dllexport', '-Ddllimport=__gexw_dllimport']
 # compile-only modes
 if any(a in ('-c', '-S', '-E', '-M', '-MM') for a in args) or not any(not a.startswith('-') for a in args):
     if cxx and '-fno-exceptions' not in args:
@@ -339,8 +342,8 @@ try:
                     subprocess.check_call(['llvm-ar', 'x', '--output', d, os.path.abspath(a)])
                     own.append((n, os.path.join(d, n + '.so.exports')))
     # A DLL without a .def exports what its objects define with default
-    # visibility: the wasm target drops __declspec(dllexport), and code
-    # built for it marks its exports __attribute__((visibility("default")))
+    # visibility: what it marks dllexport or dllimport (the GexLLP64
+    # plugin's attributes) or visibility("default")
     symbolic = False
     if shared and not defs:
         exp = []
