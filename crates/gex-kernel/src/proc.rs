@@ -1037,7 +1037,7 @@ impl ProcTable {
     fn end(&self, pid: i32, status: i32, word: i32) {
         let virtual_init = self.virtual_init.load(Ordering::Acquire);
         let crashed;
-        let mut left_group = None;
+        let left_group: Option<u64>;
         let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
