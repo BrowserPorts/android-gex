@@ -1209,6 +1209,20 @@ int create_backend_context(unsigned api, unsigned major, unsigned minor,
      * without it st drops every draw before the driver is called. */
     attribs.profile = api != 1 ? API_OPENGLES2
                     : profile == 1 || major * 10 + minor < 32 ? API_OPENGL_COMPAT : API_OPENGL_CORE;
+    /* Three of Mesa's driconf options, by their driconf names, from the
+     * environment the page gives Mesa (`?mesaenv=`): the GL_VENDOR and
+     * GL_RENDERER a game is told, and ETC textures handed to the GPU as BC
+     * ones. A DRI frontend reads them from driconf; this one has none, so
+     * they are read here. st keeps the two strings for the context's life,
+     * so they are copied and never freed. */
+    const char *vendor = getenv("force_gl_vendor");
+    const char *renderer = getenv("force_gl_renderer");
+    const char *etc = getenv("transcode_etc");
+    if (vendor && *vendor)
+        attribs.options.force_gl_vendor = strdup(vendor);
+    if (renderer && *renderer)
+        attribs.options.force_gl_renderer = strdup(renderer);
+    attribs.options.transcode_etc = etc && (!strcmp(etc, "true") || !strcmp(etc, "1"));
 
     fprintf(stderr, "gex-wgpu: context requested api=%u %u.%u\n",
             api, major, minor);

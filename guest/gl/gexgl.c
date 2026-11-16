@@ -4782,6 +4782,20 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
 static int egl_swap_interval = 1;
 static uint32_t egl_swaps_issued;
 
+/* GEXGL_SWAP_INTERVAL: the player's pacing over the application's, as a
+   driver's vsync setting overrides a game's: 0 unpaced, 1 paced. Unset (or
+   anything else), the application's eglSwapInterval decides. Read at the
+   first swap: -2 until then, -1 for no override. */
+static int egl_swap_override = -2;
+
+static int swap_interval_now(void) {
+    if (egl_swap_override == -2) {
+        const char *e = getenv("GEXGL_SWAP_INTERVAL");
+        egl_swap_override = e && (e[0] == '0' || e[0] == '1') && !e[1] ? e[0] - '0' : -1;
+    }
+    return egl_swap_override >= 0 ? egl_swap_override : egl_swap_interval;
+}
+
 unsigned eglSwapBuffers(void *dpy, void *surface) {
     (void)dpy;
     /* The surface named here, not the one that happens to be current: a
@@ -4801,9 +4815,10 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     CMD0(GEXGL_PRESENT);
     gexgl_wl_follow_size(s);
     gexgl_x11_follow_size(s);
+    const int interval = swap_interval_now();
     /* Nothing is paced on the reply at swap interval 0 (Unity with vsync
        off), so the frame goes without waiting for it. */
-    if (egl_swap_interval == 0) {
+    if (interval == 0) {
         flush_async();
         ++egl_swaps_issued;
         return EGL_TRUE;
@@ -4845,14 +4860,14 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
      * `shown == 0` means either a decoder that does not report, or a page
      * with no display loop at all. Neither is a reason to slow the guest
      * down, and the second used to be the gears demo. */
-    if (egl_swap_interval > 0 && shown > 0 && egl_swaps_issued > shown) {
+    if (interval > 0 && shown > 0 && egl_swaps_issued > shown) {
         const uint32_t ahead = egl_swaps_issued - shown;
         /* One frame in flight is normal and must not be paced against: the
            page displays a frame after the swap that produced it, so `ahead`
            sits at 1 for a well-behaved application and briefly at 2 whenever
            the display loop misses a beat. Pacing at 1 cost SuperTuxKart a
            fifth of its frame rate -- 60 down to 48.8 -- for nothing. */
-        const uint32_t slack = (uint32_t)egl_swap_interval + in_flight;
+        const uint32_t slack = (uint32_t)interval + in_flight;
         if (ahead > slack) {
             unsigned long micros = (unsigned long)(ahead - slack) * 16667UL;
             /* Capped so a page that stops displaying entirely -- a hidden
