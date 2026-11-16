@@ -413,7 +413,9 @@ pub const PR_GEX_CRASH: u64 = 0x4745_0002;
 /// `prctl` option gex adds: a reservation of `arg2` bytes with no address
 /// could not be placed in the calling process's lowered memory (64-bit
 /// Wine's `map_view`, which looks for room itself and never asks the
-/// kernel for a mapping it has no gap for). `Kernel::note_short`.
+/// kernel for a mapping it has no gap for). `Kernel::note_short`. With
+/// `arg3` 1 the caller can start its program again itself, and 1 back says
+/// to, in place of its end (`outgrow_restart`).
 pub const PR_GEX_SHORT: u64 = 0x4745_0003;
 
 /// `prctl` option gex adds: why the calling process cannot work as it

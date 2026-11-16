@@ -941,6 +941,9 @@ struct Outgrow {
     /// process, so it is never recorded for one.
     core_m64: Option<bool>,
     no64: Option<String>,
+    /// It was recorded for a 64-bit memory and starts itself again in one
+    /// ([`outgrow_restart`]): its end is no crash.
+    restarted: bool,
 }
 
 static OUTGROW: crate::sync::Mutex<Vec<Outgrow>> = crate::sync::Mutex::new(Vec::new());
@@ -998,6 +1001,32 @@ pub fn note_short(pid: i32, len: u64, compat: bool, wasm32: bool) -> bool {
         (host.debug)(&format!("pid {pid}: a reservation of {len:#x} bytes did not fit its 32-bit memory\n"));
     }
     end
+}
+
+/// Process `pid`, which [`note_short`] is ending, can start itself again
+/// (64-bit Wine's `PR_GEX_SHORT` with a third argument of 1: it starts its
+/// own program again, with its command line, environment and directory,
+/// and then exits): record its program for a 64-bit memory now, before
+/// that start looks, and say whether it should. False, and it is ended
+/// as before, when it cannot move (a module with no memory64 build, a host
+/// with no 64-bit memory, no program known, or the record failed).
+fn outgrow_restart(pid: i32) -> bool {
+    let Some(host) = OUTGROW_HOST.get() else { return false };
+    if !(host.reachable)() {
+        return false;
+    }
+    let mut all = OUTGROW.lock();
+    let Some(o) = all.iter_mut().find(|o| o.pid == pid) else { return false };
+    if o.core_m64 == Some(true) && o.no64.is_some() {
+        return false;
+    }
+    let Some(p) = o.image.clone() else { return false };
+    let set = o.ns.get().xattr(&p, true, crate::vfs::XattrOp::Set { name: "user.gex.mem64", value: b"1", flags: 0 });
+    if set.is_err() {
+        return false;
+    }
+    o.restarted = true;
+    true
 }
 
 /// Whether a [`crate::proc::PR_GEX_SHORT`] process `pid` just made says to
@@ -1081,6 +1110,14 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
         all.swap_remove(i)
     };
     let Some((len, at)) = rec.short else { return };
+    if rec.restarted {
+        (host.say)(&format!(
+            "{} needs 64-bit memory (a reservation of {:#x} bytes did not fit); started again in one\n",
+            rec.image.as_deref().unwrap_or(""),
+            rec.last.max(len)
+        ));
+        return;
+    }
     let sig = (status & 0x7f) as u32;
     let abnormal = rec.ended
         || rec.runtime
@@ -7267,13 +7304,20 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
             }
             // A reservation the lowered memory had no room for, as 64-bit
             // Wine says it (it never asks for a mapping it found no gap for).
+            // With a third argument of 1, the caller can start itself again
+            // in a 64-bit memory: 1 says to ([`outgrow_restart`]), instead
+            // of its end.
             crate::proc::PR_GEX_SHORT => {
-                if note_short(io.pid, a[1], io.compat, false) {
+                if !note_short(io.pid, a[1], io.compat, false) {
+                    Ok(0)
+                } else if a[2] == 1 && outgrow_restart(io.pid) {
+                    Ok(1)
+                } else {
                     if let Some(o) = OUTGROW.lock().iter_mut().find(|o| o.pid == io.pid) {
                         o.end = true;
                     }
+                    Ok(0)
                 }
-                Ok(0)
             }
             _ => Ok(0),
         },
@@ -10182,13 +10226,13 @@ impl Kernel {
             || image.as_deref().and_then(|p| self.read_head(p, 4096)).is_some_and(|h| pe_is_32bit(&h));
         let mut all = OUTGROW.lock();
         match all.iter_mut().find(|o| o.pid == self.pid) {
-            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false, core_m64: None, no64: None },
+            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false, core_m64: None, no64: None, restarted: false },
             Some(o) => {
                 if o.image.is_none() {
                     o.image = image;
                 }
             }
-            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false, core_m64: None, no64: None }),
+            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false, core_m64: None, no64: None, restarted: false }),
         }
     }
 
