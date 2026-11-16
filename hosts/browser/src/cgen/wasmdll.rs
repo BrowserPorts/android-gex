@@ -778,19 +778,26 @@ fn install_module(
         // its calls load the DLL first, and then are bound, through `Late`
         // slots, when Wine loads it)
         let delayed = |d: &str| sh.exports.iter().any(|(e, _)| e.strip_prefix("gexw-delay!") == Some(d));
+        // (one whose data it imports, GOT.mem's DLL!name: installed now even
+        // if Wine maps it later, its data's address being needed now)
+        let mut data_deps = std::collections::BTreeSet::new();
         for (m, n, _, _) in &sh.imports {
-            if let (true, Some((d, _))) = (m == "env" || m == "GOT.func", n.split_once('!')) {
-                if delayed(d) {
+            if let (true, Some((d, _))) = (m == "env" || m == "GOT.func" || m == "GOT.mem", n.split_once('!')) {
+                if delayed(d) && m != "GOT.mem" {
                     continue;
                 }
                 if let Some(f) = sh.modules.get(d) {
                     deps.insert(f.clone(), d.to_string());
+                    if m == "GOT.mem" {
+                        data_deps.insert(f.clone());
+                    }
                 }
             }
         }
         busy.push(name.to_string());
         for (f, d) in deps {
-            if g.mods.iter().any(|w| w.ptr64 == is64 && w.name == f) || busy.contains(&f) || later.contains(&d.to_ascii_lowercase()) {
+            let wait = later.contains(&d.to_ascii_lowercase()) && !data_deps.contains(&f);
+            if g.mods.iter().any(|w| w.ptr64 == is64 && w.name == f) || busy.contains(&f) || wait {
                 continue;
             }
             let Ok(m) = read_module(dir, &f) else { continue };
@@ -853,6 +860,7 @@ fn install_module(
         Late(u32),
         Own(u32),
         Abs(u32),
+        Addr(u64),
     }
     let mut len = names.len() as u32;
     let mut binds: Vec<(usize, B)> = Vec::new();
@@ -879,6 +887,13 @@ fn install_module(
                         lates.push((off, n.clone(), provider));
                         B::Own(off)
                     }
+                }
+            } else if m == "GOT.mem" && n.contains('!') {
+                // another module's data export (a program's DLL's): its
+                // address, that module's data plus the export's offset
+                match g.mods.iter().filter(|w| w.ptr64 == is64).find_map(|w| w.data_exports.get(n).map(|&off| w.data + off as u64)) {
+                    Some(a) => B::Addr(a),
+                    None => return Err(format!("{name}: GOT.mem.{n}: no installed module exports it")),
                 }
             } else if m == "env" && core.is_some_and(|c| g.mods[c].exports.contains(n)) {
                 B::Export(g.mods[core.unwrap()].number)
@@ -998,6 +1013,13 @@ fn install_module(
             }
             B::Own(off) => g64(base + off),
             B::Abs(v) => g64(v),
+            B::Addr(a) => {
+                let (w, mutable) = global.unwrap_or((true, true));
+                if !w && a > u32::MAX as u64 {
+                    return Err(format!("{name}: {m}.{n}: its module's data is above 4 GiB, out of a 32-bit global's reach"));
+                }
+                format!("G\t{m}\t{n}\t{a}\t{}\t{}\n", mutable as u8, if w { 64 } else { 32 })
+            }
         };
     }
     for (n, off) in canon_new {

@@ -58,6 +58,7 @@ STATIC = {}  # DLL -> the static libraries its IMPORTS name (libuuid.a), as path
 KEEP_EXPORTS = set()  # names the core exports if it defines them (--exports-of)
 STUB_IMPORTS = False  # a program's missing imports bound to stubs (--stub-imports)
 SYMBOLIC = False  # a --split module's own symbols bound locally (--symbolic)
+OTHER_DATA = {}  # data name -> the --other DLL that exports it (pelink's main)
 EXTRA = set()  # the --extra DLLs (pelink's main)
 
 
@@ -511,6 +512,10 @@ def main():
         others[mod] = ex
     for mod, ex in other:
         others[mod] = ex
+        for line in open(ex):
+            w = line.split()
+            if len(w) >= 2 and w[1] == 'data' and not w[0].startswith('__gexw'):
+                OTHER_DATA.setdefault(w[0], mod)
     link(dlls, out, os.path.join(build, 'libs', 'gexrt', 'libgexrt.a'), others)
 
 
@@ -1469,6 +1474,11 @@ def link(dlls, out, gexrt, others=None):
                 sym = guest_sym(mod, f'{gdll}.{gname}' + ('' if name == gname else f'={name}'), have)
                 guest_binds.append((f'gexw-guest!{sym}', have, gdll, gname, grp(mod), mod))
                 f.write(f'{name} gexw-guest {sym}\n')
+            # an --other DLL's data: its GOT.mem import named DLL!name, which
+            # gex binds to that DLL's data
+            if mod in EXTRA:
+                for name, owner in sorted(OTHER_DATA.items()):
+                    f.write(f'{name} {owner}\n')
         bound = os.path.join(tmp, mod + '.o')
         subprocess.check_call([sys.executable, os.path.join(here, 'pesym.py'), 'imports', local, bound, mod, mapfile])
         # The ICALL pass's stdcall annotations are for the compiler only;
@@ -2022,7 +2032,8 @@ static void *gexw_ntdll_proc(const char *name)
         # a module calls into before it
         if SPLIT:
             core_file = os.path.basename(out) if not g else os.path.basename(main_out)
-            mods = '\n'.join(f'{d} {SPLIT.get(d) or core_file}' for d in sorted({m for m, _, _, _ in dlls}))
+            mods = '\n'.join([f'{d} {SPLIT.get(d) or core_file}' for d in sorted({m for m, _, _, _ in dlls})] +
+                             [f'{d} {d}.wasm' for d in sorted(set(OTHER_DATA.values()))])
             payload = enc_name('gexw.modules') + mods.encode() + b'\n'
             with open(out, 'ab') as f:
                 f.write(bytes([0]) + enc_leb(len(payload)) + payload)
@@ -2030,7 +2041,8 @@ static void *gexw_ntdll_proc(const char *name)
             name_imports(out)
         undefined = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
         names = sorted(set(re.findall(r'<- env\.(\S+)', undefined)) - {'memory', '__indirect_function_table',
-                       '__stack_pointer', '__memory_base', '__table_base'})
+                       '__stack_pointer', '__memory_base', '__table_base'}
+                       | {n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if n.split('!')[0] in OTHER_DATA.values()})
         open(out + '.undefined', 'w').write('\n'.join(names) + '\n')
         print(f'{out}: {sum(grp(d[0]) == g for d in dlls)} DLLs, {os.path.getsize(out) >> 20} MiB, {len(names)} undefined '
               f'(listed in {out}.undefined)')

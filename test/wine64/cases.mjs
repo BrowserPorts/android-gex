@@ -273,6 +273,20 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     await one('bigdata', src, ['-O1'], { want: /bigdata: ends 1 module 1 1/ });
   }
   await one('hostdatacc', join(W, 'hostdata.c'), ['-O2']);
+  if (want('owndll')) {
+    // a program linked against its own DLL's import library (the DLL
+    // without a .def: its default-visibility symbols are its exports):
+    // calls, a struct by value, the DLL's data written and read on both sides
+    let dll, exe;
+    try {
+      dll = await w.gexccWin(join(F, 'owndll.c'), 'owndll.dll', ['-O2', '-shared', `-Wl,--out-implib,${join(w.work, 'libowndll.a')}`]);
+      exe = await w.gexccWin(join(F, 'ownmain.c'), 'ownmain.exe', ['-O2', `-L${w.work}`, '-lowndll']);
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}owndll: build`, false, String(e.message));
+    }
+    await w.nt({ want: allOk, ...o, name: `${pre}owndll`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
+  }
   if (want('modcase')) {
     // installed under other case than its link (an installer naming the
     // files ModCase.exe and ModCase.exe.wasm): its .wasmref still names

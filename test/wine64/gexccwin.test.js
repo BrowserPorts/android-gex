@@ -34,6 +34,9 @@
 //   relocations applies within the engines' function size limit (pelink
 //   splits it);
 // - hostdatacc: hostdata.c's statics, gex's memory outside every image;
+// - owndll: a program linked against its own DLL's import library, the
+//   DLL's exports its default-visibility symbols: calls, a struct by value,
+//   the DLL's int and struct written and read on both sides;
 // - wmain0, wmain3: wmain(void) and wmain(argc, argv, envp);
 // - xthr: a just-loaded DLL's function called by a thread with no system
 //   call since; xhoist: a call loop's hoisted ICALL bound while another
