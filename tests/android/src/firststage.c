@@ -9,7 +9,8 @@
 // on /dev with pts, socket and dm-user in it, sysfs on /sys (which
 // ueventd makes /dev from: without it its cold boot finds no device),
 // the kernel log, the random devices, ptmx and null by number, and tmpfs
-// on /mnt, /debug_ramdisk and /second_stage_resources. Left out, and
+// on /mnt, /debug_ramdisk and /second_stage_resources; and /metadata,
+// which first stage mounts from the fstab, a fresh tmpfs. Left out, and
 // said: devpts on /dev/pts, where the kernel cannot mount one; proc and
 // selinuxfs, which whoever runs this has mounted already.
 //
@@ -54,6 +55,13 @@ int main(int argc, char **argv) {
     CHECK(mkdir("/mnt/product", 0755));
     CHECK(mount("tmpfs", "/debug_ramdisk", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV, "mode=0755,uid=0,gid=0"));
     CHECK(mount("tmpfs", "/second_stage_resources", "tmpfs", MS_NOEXEC | MS_NOSUID | MS_NODEV, "mode=0755,uid=0,gid=0"));
+    // /metadata, which first stage mounts from its fstab before anything
+    // after it runs: second stage decides from it whether this is a first
+    // boot (no /metadata/apex), and with that whether to keep one mount
+    // namespace or two. The image's is a partition; here /data is a fresh
+    // tmpfs each boot, and /metadata is one too: a first boot after a
+    // factory reset, which wipes both, every time.
+    CHECK(mount("tmpfs", "/metadata", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755,uid=0,gid=0"));
 
     char *args[16] = {"/system/bin/init", "selinux_setup", NULL};
     for (int i = 1; i < argc && i < 14; i++) {
