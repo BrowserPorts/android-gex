@@ -355,6 +355,79 @@ impl FileHandle for OomScoreAdj {
     }
 }
 
+/// `/proc/pressure/<resource>`: pressure-stall information, how much of
+/// the time tasks waited for memory, a processor or I/O (`kernel/sched/
+/// psi.c`). **Here the answer is always none**: this kernel keeps no task
+/// waiting for memory it would have to reclaim, schedules nothing itself
+/// (a guest thread is a host thread), and measures no I/O wait, so the
+/// averages and the total read 0 and stay there.
+///
+/// A write arms a trigger on the open file, "some" or "full", a stall in
+/// microseconds and the window it is counted over, for `poll` to report
+/// with `POLLPRI` when that much stall is seen: one a file (`EBUSY`), a
+/// window of at most ten seconds and a stall of no more than the window
+/// (`EINVAL`). An armed trigger never goes off here. A file with none
+/// reports `POLLPRI` and `POLLERR` at once, as Linux's does. Android's
+/// lmkd arms three on memory and ends at once without the file.
+#[derive(Debug, Default)]
+struct Pressure {
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl Pressure {
+    const NONE: &'static str = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+
+    /// Whether `path` (under `/proc`) is one of the three files.
+    fn at(path: &str) -> bool {
+        matches!(path, "pressure/memory" | "pressure/cpu" | "pressure/io")
+    }
+}
+
+impl FileHandle for Pressure {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        Generated { data: Pressure::NONE.as_bytes().to_vec() }.read_at(offset, buf)
+    }
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        use std::sync::atomic::Ordering::Relaxed;
+        if buf.is_empty() {
+            return Err(Errno::EINVAL);
+        }
+        // At most 32 bytes are looked at, and the last of them is taken
+        // for the text's end whatever it is (`psi_write`).
+        let text = &buf[..buf.len().min(32)];
+        let text = String::from_utf8_lossy(&text[..text.len() - 1]).into_owned();
+        if self.armed.load(Relaxed) {
+            return Err(Errno::EBUSY);
+        }
+        // `sscanf(buf, "some %u %u")`: the word, then two numbers, each
+        // after any space; what follows the second is not looked at.
+        let rest = text.strip_prefix("some").or_else(|| text.strip_prefix("full")).ok_or(Errno::EINVAL)?;
+        let mut numbers = [0u64; 2];
+        let mut rest = rest;
+        for n in numbers.iter_mut() {
+            rest = rest.trim_start();
+            let digits = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            *n = rest[..digits].parse::<u32>().map_err(|_| Errno::EINVAL)? as u64;
+            rest = &rest[digits..];
+        }
+        let [threshold_us, window_us] = numbers;
+        const WINDOW_MAX_US: u64 = 10_000_000;
+        if window_us == 0 || window_us > WINDOW_MAX_US || threshold_us == 0 || threshold_us > window_us {
+            return Err(Errno::EINVAL);
+        }
+        self.armed.store(true, Relaxed);
+        Ok(buf.len() as u64)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { mode: 0o666, ..Generated { data: Vec::new() }.metadata()? })
+    }
+    /// With no trigger, `POLLPRI` (and `POLLERR`) at once; with one, when
+    /// it goes off, which is never.
+    fn poll_pri(&self) -> bool {
+        !self.armed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// A setting under `/proc/sys` that can be set: its value as it was at
 /// the open to read, and a write of a number to set it
 /// (`proc_dointvec_minmax`; `EINVAL` for what is not a number and for a
@@ -766,6 +839,7 @@ impl ProcFs {
             // glibc and musl both consult this before using large mappings.
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
             "sys/vm/mmap_rnd_bits" => format!("{}\n", mmap_rnd_bits::get()).into_bytes(),
+            p if Pressure::at(p) => Pressure::NONE.as_bytes().to_vec(),
             // The limit `F_SETPIPE_SZ` holds an unprivileged caller to.
             "sys/fs/nr_open" => format!("{}\n", crate::file::NR_OPEN).into_bytes(),
             "sys/fs/pipe-max-size" => format!("{}\n", crate::pipe::PIPE_MAX_SIZE).into_bytes(),
@@ -821,6 +895,9 @@ impl FileSystem for ProcFs {
         if let Some(which) = Setting::at(&path) {
             return Ok(Arc::new(Sysctl { which }));
         }
+        if Pressure::at(&path) {
+            return Ok(Arc::new(Pressure::default()));
+        }
         if path == "self/oom_score_adj" && self.source.oom_score_adj().is_some() {
             return Ok(Arc::new(OomScoreAdj { source: Arc::clone(&self.source) }));
         }
@@ -868,10 +945,10 @@ impl FileSystem for ProcFs {
                 for pid in pids {
                     out.push(DirEntry { name: pid.to_string(), file_type: FileType::Directory, ino: 1 });
                 }
-                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "mounts", "sys", "cmdline", "filesystems"].into_iter().chain(BOOTCONFIG.get().map(|_| "bootconfig")) {
+                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "mounts", "sys", "pressure", "cmdline", "filesystems"].into_iter().chain(BOOTCONFIG.get().map(|_| "bootconfig")) {
                     let file_type = match name {
                         "self" => FileType::Symlink,
-                        "sys" => FileType::Directory,
+                        "sys" | "pressure" => FileType::Directory,
                         _ => FileType::Regular,
                     };
                     out.push(DirEntry { name: name.to_string(), file_type, ino: 1 });
@@ -912,6 +989,7 @@ impl FileSystem for ProcFs {
             "sys/kernel" => vec!["osrelease", "pid_max", "random"],
             "sys/kernel/random" => vec!["boot_id", "entropy_avail", "poolsize", "uuid"],
             "sys/vm" => vec!["mmap_rnd_bits", "overcommit_memory"],
+            "pressure" => vec!["cpu", "io", "memory"],
             _ => return Err(Errno::ENOENT),
         };
         // `sys` holds directories, the directories under it files (and
@@ -944,7 +1022,7 @@ impl FileSystem for ProcFs {
             return Ok(Metadata {
                 file_type: FileType::Regular,
                 size: 0,
-                mode: settable.map_or(if path == "self/oom_score_adj" { 0o644 } else { 0o444 }, |s| s.mode()),
+                mode: settable.map_or(if path == "self/oom_score_adj" { 0o644 } else if Pressure::at(&path) { 0o666 } else { 0o444 }, |s| s.mode()),
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
@@ -971,7 +1049,7 @@ impl FileSystem for ProcFs {
             };
         }
         match path.as_str() {
-            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/fs" | "sys/kernel" | "sys/kernel/random" | "sys/net" | "sys/net/core" | "sys/vm" => Ok(Metadata::dir()),
+            "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/fs" | "sys/kernel" | "sys/kernel/random" | "sys/net" | "sys/net/core" | "sys/vm" | "pressure" => Ok(Metadata::dir()),
             "self/ns" if self.source.mount_ns_id().is_some() => Ok(Metadata { mode: 0o511, ..Metadata::dir() }),
             "self/exe" | "self/cwd" | "self/ns/mnt" => Ok(Metadata {
                 file_type: FileType::Symlink,
