@@ -280,6 +280,22 @@ impl OpenFile {
         self.handle.read_at(offset, buf)
     }
 
+    /// [`Self::pread`] as a mapping reads the file.
+    pub fn pread_mapped(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        if !self.readable {
+            return Err(Errno::EBADF);
+        }
+        self.handle.read_mapped(offset, buf)
+    }
+
+    /// [`Self::pwrite`] as a shared mapping writes it back.
+    pub fn pwrite_mapped(&self, offset: u64, buf: &[u8]) -> SysResult {
+        if !self.writable {
+            return Err(Errno::EBADF);
+        }
+        self.handle.write_mapped(offset, buf)
+    }
+
     pub fn pwrite(&self, offset: u64, buf: &[u8]) -> SysResult {
         if !self.writable {
             return Err(Errno::EBADF);

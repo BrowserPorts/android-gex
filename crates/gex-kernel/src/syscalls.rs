@@ -5271,6 +5271,17 @@ impl MapIo<'_> {
         // Under `PR_SET_MDWE` the mappings up to the first that may not
         // have the protection get it, and the call is `EACCES`, as the
         // kernel's walk leaves them (mm/mprotect.c).
+        // A mapping that may never be writable stops the walk the same way
+        // (`mprotect_fixup`'s `VM_MAY*` check).
+        let denied = self.mem.lock().denied_write_gain(a[0], a[1], a[2] as u32);
+        if let Some(at) = denied {
+            if at > a[0] && a[0].is_multiple_of(crate::mem::PAGE_SIZE) {
+                let mut before = a;
+                before[1] = at - a[0];
+                self.mprotect(m, before)?;
+            }
+            return Err(Errno::EACCES);
+        }
         if self.deny_write_exec {
             let denied = self.mem.lock().denied_exec_gain(a[0], a[1], a[2] as u32);
             if let Some(at) = denied {
@@ -5558,7 +5569,7 @@ impl MapIo<'_> {
             let len_aligned = crate::mem::page_align_up(len);
             let file = self.fds.get(fd)?;
             let name = file.path.clone();
-            file.handle.may_map(offset, len_aligned, prot_bits)?;
+            file.handle.may_map(offset, len_aligned, prot_bits, flags & crate::mem::flags::SHARED != 0)?;
             if file.handle.maps_own_memory() {
                 let start = self.mem.lock().mmap(addr, len, prot_bits, flags | mflags::ANONYMOUS, &name)?;
                 file.handle.mapped(start, len);
@@ -5672,7 +5683,7 @@ impl MapIo<'_> {
             // stand (`SharedMaps::recall`).
             let shared = flags & crate::mem::flags::SHARED != 0;
             let before = if shared && len_aligned >= RECALL_MIN { file.handle.changes() } else { 0 };
-            let n = file.pread(offset, m.read_mut(start, len as usize)?)? as usize;
+            let n = file.pread_mapped(offset, m.read_mut(start, len as usize)?)? as usize;
             m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
             // A shared mapping is written back at `msync` and `munmap` (where
             // a program that never calls `msync` expects its changes to land).
@@ -5688,6 +5699,12 @@ impl MapIo<'_> {
                 });
             }
             if shared {
+                // Never writable: a file not open for writing (`do_mmap`
+                // clears `VM_MAYWRITE`), or one that keeps a mapping made
+                // read-only so.
+                if !file.writable || (prot_bits & crate::mem::prot::WRITE == 0 && file.handle.read_only_mapping_stays()) {
+                    self.mem.lock().set_never_write(start, start + len_aligned);
+                }
                 let path_of_map = file.path.clone();
                 let changes = if before != 0 && file.handle.changes() == before { before } else { 0 };
                 let kept = if changes != 0 { self.mem.lock().log.shared_maps.recall(&file, offset, len_aligned, changes) } else { None };
@@ -10269,7 +10286,8 @@ fn write_back_own(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result
     // end of the file is not the file's (Linux never extends it).
     let known = map.changes.load(std::sync::atomic::Ordering::Acquire);
     let (size, at_start) = match map.file.handle.metadata_changes() {
-        Ok((md, c)) => (md.size, if known != 0 { c } else { 0 }),
+        // (Or what a mapping of it holds, where its size does not say.)
+        Ok((md, c)) => (map.file.handle.mapped_len().unwrap_or(md.size), if known != 0 { c } else { 0 }),
         Err(_) => (u64::MAX, 0),
     };
     let to = to.min(map.start + size.saturating_sub(map.offset));
@@ -10309,7 +10327,7 @@ fn write_back_own(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result
             (true, None) => run = Some(ps),
             (false, Some(rs)) => {
                 let at = map.offset + (rs - map.start);
-                map.file.pwrite(at, m.read(rs, (ps.min(to) - rs) as usize)?)?;
+                map.file.pwrite_mapped(at, m.read(rs, (ps.min(to) - rs) as usize)?)?;
                 writes += 1;
                 run = None;
             }
@@ -10374,7 +10392,7 @@ fn refresh(m: &mut GuestMem<'_>, map: &SharedMap, force: bool, seen: Option<u64>
         buf[..in_map].fill(0);
         let mut got = 0;
         while got < in_file {
-            match map.file.handle.read_at(map.offset + page * P + got as u64, &mut buf[got..in_file])? {
+            match map.file.handle.read_mapped(map.offset + page * P + got as u64, &mut buf[got..in_file])? {
                 0 => break,
                 n => got += n as usize,
             }
@@ -10959,7 +10977,7 @@ fn poll_revents_level(p: &PollFd) -> u16 {
     // Whether a write would block is asked of the handle every time, not
     // frozen: a parked poll outlives the state it was built from, and a
     // stored "not writable" never moved once the reader drained the buffer.
-    if p.events & POLLOUT != 0 && p.writable && h.poll_writable() {
+    if p.events & POLLOUT != 0 && p.writable && h.poll_out() {
         r |= POLLOUT;
     }
     // Never masked by `events`, as on Linux.
@@ -10979,6 +10997,9 @@ fn poll_revents_level(p: &PollFd) -> u16 {
     const POLLERR: u16 = 0x008;
     if p.events & POLLPRI != 0 && h.poll_pri() {
         r |= POLLPRI | POLLERR;
+    }
+    if h.poll_err() {
+        r |= POLLERR;
     }
     r
 }

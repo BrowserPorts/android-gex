@@ -559,9 +559,13 @@ impl FileHandle for File {
     fn mapped_len(&self) -> Option<u64> {
         (self.path == "status").then_some(STATUS_LEN as u64)
     }
+    /// And it is never made writable after (`sel_mmap_handle_status`).
+    fn read_only_mapping_stays(&self) -> bool {
+        true
+    }
     /// Only `status` has a mapping: its one page, from its start, and not
     /// for writing (`sel_mmap_handle_status`).
-    fn may_map(&self, offset: u64, len: u64, prot: u32) -> Result<(), Errno> {
+    fn may_map(&self, offset: u64, len: u64, prot: u32, _shared: bool) -> Result<(), Errno> {
         if self.path != "status" {
             return Err(Errno::ENODEV);
         }
@@ -841,8 +845,8 @@ mod tests {
         // counted as changed when it changes. Nothing else maps.
         let status = open("status");
         let (r, w) = (crate::mem::prot::READ, crate::mem::prot::WRITE);
-        assert_eq!((status.may_map(0, 4096, r), status.may_map(4096, 4096, r), status.may_map(0, 8192, r), status.may_map(0, 4096, r | w)), (Ok(()), Err(Errno::EIO), Err(Errno::EIO), Err(Errno::EPERM)));
-        assert_eq!((enforce.may_map(0, 4096, r), enforce.changes(), status.mapped_len()), (Err(Errno::ENODEV), 0, Some(20)));
+        assert_eq!((status.may_map(0, 4096, r, true), status.may_map(4096, 4096, r, true), status.may_map(0, 8192, r, true), status.may_map(0, 4096, r | w, true)), (Ok(()), Err(Errno::EIO), Err(Errno::EIO), Err(Errno::EPERM)));
+        assert_eq!((enforce.may_map(0, 4096, r, true), enforce.changes(), status.mapped_len()), (Err(Errno::ENODEV), 0, Some(20)));
         let was = status.changes();
         assert_eq!(enforce.write_at(0, b"1"), Ok(1));
         assert_eq!(status.changes(), was, "enforce as it was is no change");

@@ -512,6 +512,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         self.poll_readable()
     }
 
+    /// What `poll` says as `POLLOUT`: [`Self::poll_writable`], unless a
+    /// write that never waits is still not something `poll` reports (a BPF
+    /// map's, which is `EINVAL`).
+    fn poll_out(&self) -> bool {
+        self.poll_writable()
+    }
+
     /// Whether the other end has hung up: a pipe with no writers left, a
     /// stream socket shut down in both directions (its peer closed).
     /// `poll` and `epoll` report `POLLHUP` for it whether or not it was
@@ -546,6 +553,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// is never masked): what `/proc/self/mountinfo` says after a mount
     /// changed.
     fn poll_pri(&self) -> bool {
+        false
+    }
+
+    /// An error to report (`POLLERR`, never masked) and nothing else: a
+    /// BPF map that has no readiness of its own (`bpf_map_poll`).
+    fn poll_err(&self) -> bool {
         false
     }
 
@@ -746,12 +759,31 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     }
 
     /// Whether the file may be mapped so: `len` bytes (whole pages) from
-    /// `offset` with protection `prot`. A file that is a page of the
-    /// kernel's lets only that page be mapped, and not for writing; one
-    /// with no mapping at all is `ENODEV`.
-    fn may_map(&self, offset: u64, len: u64, prot: u32) -> Result<(), Errno> {
-        let _ = (offset, len, prot);
+    /// `offset` with protection `prot`, shared or private. A file that is
+    /// a page of the kernel's lets only that page be mapped, and not for
+    /// writing; one with no mapping at all is `ENODEV`.
+    fn may_map(&self, offset: u64, len: u64, prot: u32, shared: bool) -> Result<(), Errno> {
+        let _ = (offset, len, prot, shared);
         Ok(())
+    }
+
+    /// Whether a mapping made without writing may be made writable later.
+    /// No for a file whose mapping the kernel keeps read-only once it is
+    /// (`VM_MAYWRITE` cleared at the mapping: a BPF map, selinuxfs's
+    /// status page).
+    fn read_only_mapping_stays(&self) -> bool {
+        false
+    }
+
+    /// What a mapping of the file holds at `offset`, where that is not
+    /// what `read` gives (a BPF ring buffer, which `read` refuses).
+    fn read_mapped(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        self.read_at(offset, buf)
+    }
+
+    /// What a shared mapping writes back, where that is not a `write`.
+    fn write_mapped(&self, offset: u64, buf: &[u8]) -> SysResult {
+        self.write_at(offset, buf)
     }
 
     /// How much of the file a mapping holds, for a file whose size does

@@ -141,6 +141,10 @@ pub struct Vma {
     /// `[image]`), with `file_off` its offset there
     /// ([`MemoryMap::show_file`]).
     pub shown: Option<std::sync::Arc<str>>,
+    /// May never be made writable (Linux's `VM_MAYWRITE` clear): a shared
+    /// mapping of a file not open for writing, or one its file keeps
+    /// read-only (a BPF map's, selinuxfs's status page).
+    pub never_write: bool,
 }
 
 impl Vma {
@@ -163,6 +167,7 @@ impl Vma {
                 _ => false,
             }
             && self.patched == next.patched
+            && self.never_write == next.never_write
             && continues(&self.origin, &next.origin)
             && continues(&self.code, &next.code)
     }
@@ -187,6 +192,7 @@ impl Vma {
             anon_name: self.anon_name.clone(),
             file_off: self.file_off.map(|o| o + (start - self.start)),
             shown: self.shown.clone(),
+            never_write: self.never_write,
         }
     }
 }
@@ -1552,6 +1558,7 @@ impl MemoryMap {
             anon_name: None,
             file_off: None,
             shown: None,
+            never_write: false,
         });
         self.vmas.sort_by_key(|v| v.start);
     }
@@ -1628,6 +1635,7 @@ impl MemoryMap {
             anon_name: None,
             file_off: None,
             shown: None,
+            never_write: false,
         });
         // Sorted already but for the one just pushed: move it into place.
         let at = self.vmas[..self.vmas.len() - 1].partition_point(|v| v.start < aligned);
@@ -2355,6 +2363,23 @@ impl MemoryMap {
     /// may not be given under `PR_SET_MDWE` (`map_deny_write_exec`): any,
     /// when `new` is writable and executable; one that is not executable
     /// now, when `new` is executable.
+    /// Where `mprotect` to `new` first meets a mapping that may never be
+    /// writable, when `new` asks for writing.
+    pub fn denied_write_gain(&self, addr: u64, len: u64, new: u32) -> Option<u64> {
+        if new & prot::WRITE == 0 {
+            return None;
+        }
+        let end = addr.saturating_add(page_align_up(len));
+        self.vmas.iter().find(|v| v.end > addr && v.start < end && v.never_write).map(|v| v.start.max(addr))
+    }
+
+    /// Mark `[start, end)` as never to be made writable.
+    pub fn set_never_write(&mut self, start: u64, end: u64) {
+        for v in self.vmas.iter_mut().filter(|v| v.start >= start && v.end <= end) {
+            v.never_write = true;
+        }
+    }
+
     pub fn denied_exec_gain(&self, addr: u64, len: u64, new: u32) -> Option<u64> {
         if new & prot::EXEC == 0 {
             return None;
