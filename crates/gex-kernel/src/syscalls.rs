@@ -7299,7 +7299,16 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
             // need no memory gex has can meet): a notice, once.
             crate::proc::PR_GEX_NOTICE => {
                 let text = m.read(a[1], (a[2] as usize).min(512))?.to_vec();
-                procs.notice(io.pid, &String::from_utf8_lossy(&text));
+                let text = String::from_utf8_lossy(&text);
+                procs.notice(io.pid, &text);
+                // said where it is made by a host that does not say it
+                // from the table (the page's shim: its console, which has
+                // no reader of the table but the page's own)
+                if !crate::proc::crash_hook_set() {
+                    if let Some(h) = OUTGROW_HOST.get() {
+                        (h.say)(&format!("pid {}: {}\n", io.pid, text.trim_end()));
+                    }
+                }
                 Ok(0)
             }
             // A reservation the lowered memory had no room for, as 64-bit

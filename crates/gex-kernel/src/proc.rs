@@ -537,6 +537,11 @@ pub fn set_crash_hook(f: fn(&Crash)) {
     let _ = CRASH_HOOK.set(f);
 }
 
+/// Whether this host reports crashes and notices itself ([`set_crash_hook`]).
+pub fn crash_hook_set() -> bool {
+    CRASH_HOOK.get().is_some()
+}
+
 struct Table {
     /// The next task id, a process's or a thread's: one numbering, as
     /// Linux's pids and tids are one, so an id names exactly one task.
