@@ -808,6 +808,10 @@ impl FileHandle for UnixSocket {
         true
     }
 
+    fn keeps_records(&self) -> bool {
+        self.is_seqpacket()
+    }
+
     fn poll_readable(&self) -> bool {
         match &*self.role.lock().unwrap() {
             // A listener is "readable" when a connection is waiting.

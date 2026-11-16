@@ -10497,6 +10497,15 @@ fn io_writev(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64,
             return file.write_here(&bytes);
         }
     }
+    // A record socket's writev is one record, however long (logd's
+    // entries reach 5 KiB).
+    if file.handle.keeps_records() {
+        let mut bytes = Vec::new();
+        for &(base, len) in &vecs {
+            bytes.extend_from_slice(m.read(base, len as usize)?);
+        }
+        return file.write_here(&bytes);
+    }
     // One position for the whole call, as Linux holds `f_pos_lock`.
     let _pos = file.pos_lock();
     let mut total = 0u64;

@@ -9,6 +9,7 @@
 // - a peek leaves the record; a read with no room takes it all the same;
 // - a record longer than the send buffer allows is EMSGSIZE, the longest
 //   that fits goes whole;
+// - a writev is one record, however long;
 // - descriptors go with their record;
 // - a listener's connections are records too; a stream socket connecting
 //   to it is refused (an abstract name) or EPROTOTYPE (a path);
@@ -22,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -94,6 +96,11 @@ int main(void) {
     expect("one byte too long", snd(sv[0], large, big + 1), -EMSGSIZE);
     expect("the longest", snd(sv[0], large, big), (long)big);
     expect("read the longest", rd(sv[1], large, big + 1, 0), (long)big);
+
+    // A writev is one record, however long.
+    struct iovec two[2] = {{large, 1000}, {large + 1000, 5000}};
+    expect("writev of 6000 in two", writev(sv[0], two, 2), 6000);
+    expect("read it as one", rd(sv[1], large, big, 0), 6000);
 
     // Descriptors with their record.
     int pfd[2];

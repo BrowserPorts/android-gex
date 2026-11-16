@@ -459,6 +459,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn is_stream(&self) -> bool {
         false
     }
+    /// True when each write is a record of its own (a `SOCK_SEQPACKET`
+    /// socket): a `writev` is one write of all its vectors, whatever its
+    /// length, as Linux's one `sendmsg` is one record.
+    fn keeps_records(&self) -> bool {
+        false
+    }
     /// `lseek` on a handle that keeps its own offset (a standard stream
     /// redirected from a host file: the offset is the host descriptor's).
     /// `None`: the open-file description's offset, or `ESPIPE` for a stream.
