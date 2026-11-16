@@ -95,6 +95,7 @@ pub mod nr {
     pub const NANOSLEEP: u64 = 101;
     pub const CLOCK_SETTIME: u64 = 112;
     pub const USERFAULTFD: u64 = 282;
+    pub const BPF: u64 = 280;
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_GETRES: u64 = 114;
     pub const CLOCK_NANOSLEEP: u64 = 115;
@@ -3692,6 +3693,19 @@ impl PathIo<'_> {
             nr::FACCESSAT | nr::FACCESSAT2 => self.faccessat(m, a[0] as i32, a[1], a[2] as u32),
             nr::READLINKAT => self.readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.getcwd(m, a[0], a[1]),
+            nr::BPF => {
+                const CAP_SYS_ADMIN: u64 = 21;
+                const CAP_BPF: u64 = 39;
+                let caller = crate::bpf::Caller {
+                    fds: self.map.fds,
+                    ns: self.ns,
+                    capable: self.creds.capable(CAP_BPF) || self.creds.capable(CAP_SYS_ADMIN),
+                    uid: self.creds.uid(),
+                    gid: self.creds.gid(),
+                    umask: self.fs.umask(),
+                };
+                crate::bpf::call(&caller, m, a[0], a[1], a[2])
+            }
             nr::MKDIRAT => self.sys_mkdirat(m, a[0] as i32, a[1], a[2] as u32),
             nr::MKNODAT => self.sys_mknodat(m, a[0] as i32, a[1], a[2] as u32, a[3]),
             nr::CHDIR => self.sys_chdir(m, a[0]),
@@ -4970,6 +4984,15 @@ impl PathIo<'_> {
                     return Err(Errno::EINVAL);
                 }
                 self.view.mount(&target, mounted(Arc::new(crate::vfs::SelinuxFs::of_kernel())));
+                Ok(0)
+            }
+            // bpffs: each mount is one of its own, empty.
+            "bpf" => {
+                if a[4] != 0 && !m.read_cstr(a[4], 4096)?.is_empty() {
+                    crate::bpf::say_once("bpffs mount options");
+                    return Err(Errno::EINVAL);
+                }
+                self.view.mount(&target, mounted(Arc::new(crate::vfs::BpfFs::new())));
                 Ok(0)
             }
             // binderfs: every mount has binder devices of its own.
@@ -6963,7 +6986,8 @@ fn is_poll(n: u64) -> bool {
 fn is_path(n: u64) -> bool {
     matches!(
         n,
-        nr::OPENAT
+        nr::BPF
+            | nr::OPENAT
             | nr::OPENAT2
             | nr::GETDENTS64
             | nr::FSTAT
@@ -9109,6 +9133,7 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::MADVISE => nr::MADVISE,
             x::MSYNC => nr::MSYNC,
             x::USERFAULTFD => nr::USERFAULTFD,
+            x::BPF => nr::BPF,
             x::OPEN | x::CREAT | x::OPENAT => nr::OPENAT,
             x::OPENAT2 => nr::OPENAT2,
             x::STAT | x::LSTAT | x::NEWFSTATAT => nr::NEWFSTATAT,
@@ -15487,6 +15512,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::SETTIMEOFDAY => "settimeofday",
         nr::CLOCK_SETTIME => "clock_settime",
         nr::USERFAULTFD => "userfaultfd",
+        nr::BPF => "bpf",
         nr::GETPID => "getpid",
         nr::GETPPID => "getppid",
         nr::SETSID => "setsid",

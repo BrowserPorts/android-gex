@@ -148,6 +148,9 @@ impl Mount {
 }
 
 impl FileSystem for Mount {
+    fn bpf(&self) -> Option<&super::bpffs::BpfFs> {
+        self.fs.bpf()
+    }
     fn fs_type(&self) -> &'static str {
         self.fs.fs_type()
     }

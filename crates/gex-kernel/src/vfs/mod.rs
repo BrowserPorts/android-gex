@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod binderfs;
+pub mod bpffs;
 pub mod devfs;
 pub mod devices;
 pub mod evdev;
@@ -32,6 +33,7 @@ pub mod sysfs;
 pub mod tmpfs;
 
 pub use binderfs::BinderFs;
+pub use bpffs::BpfFs;
 pub use devfs::DevFs;
 #[cfg(unix)]
 pub use hostfs::HostFs;
@@ -570,6 +572,18 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// This handle as a unix socket, when it is one: the syscalls that need
     /// the concrete type (descriptor passing, `listen`, `accept`) recover it
     /// from the handle, whichever process made it.
+    /// The BPF object a descriptor is (a map, from `bpf(2)`), for
+    /// `BPF_OBJ_PIN` and the element calls; `None` for any other.
+    fn bpf_object(&self) -> Option<crate::bpf::Object> {
+        None
+    }
+
+    /// For a BPF object's descriptor: whether it may be read and written
+    /// (`BPF_OBJ_GET` with `BPF_F_RDONLY` or `BPF_F_WRONLY`).
+    fn bpf_access(&self) -> Option<(bool, bool)> {
+        None
+    }
+
     fn as_unix_socket(self: Arc<Self>) -> Option<Arc<crate::unix::UnixSocket>> {
         None
     }
@@ -964,6 +978,12 @@ impl Moved {
 
 /// A mounted filesystem.
 pub trait FileSystem: Send + Sync {
+    /// This filesystem as a bpffs, which `BPF_OBJ_PIN` puts objects in;
+    /// `None` for any other kind.
+    fn bpf(&self) -> Option<&bpffs::BpfFs> {
+        None
+    }
+
     /// Its type as `/proc/self/mountinfo` names it. tmpfs unless it says
     /// otherwise, as `statfs` answers for every one.
     fn fs_type(&self) -> &'static str {
@@ -2446,6 +2466,31 @@ impl Namespace {
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<(), Errno> {
         let (fs, rel) = self.resolve(path)?;
         fs.mkdir(&rel, mode)
+    }
+
+    /// `BPF_OBJ_PIN` at `path` (its last name not followed): `EPERM`
+    /// where that is not in a bpffs (`bpf_obj_do_pin`).
+    pub fn bpf_pin(&self, path: &str, obj: crate::bpf::Object, mode: u32, uid: u32, gid: u32) -> Result<(), Errno> {
+        let (fs, rel) = self.resolve(path)?;
+        let bpf = fs.bpf().ok_or(Errno::EPERM)?;
+        bpf.pin(rel.trim_matches('/'), obj, mode, uid, gid)
+    }
+
+    /// `BPF_OBJ_GET` of `path` (its last name followed): the object pinned
+    /// there; `EACCES` for anything else that is there.
+    pub fn bpf_get(&self, path: &str) -> Result<crate::bpf::Object, Errno> {
+        let abs = normalize(path, &self.cwd);
+        let (fs, rel) = match self.resolve_walked(&abs, true)? {
+            Some(found) => found,
+            None => self.resolve(&abs)?,
+        };
+        match fs.bpf() {
+            Some(bpf) => bpf.get(rel.trim_matches('/')),
+            None => {
+                fs.metadata(&rel)?;
+                Err(Errno::EACCES)
+            }
+        }
     }
 
     pub fn rmdir(&self, path: &str) -> Result<(), Errno> {
