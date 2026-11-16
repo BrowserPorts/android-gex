@@ -391,6 +391,11 @@ impl Btf {
         self.types.len() as u32
     }
 
+    /// Whether type `id` is a function (`btf_type_is_func`).
+    pub fn is_func(&self, id: u32) -> bool {
+        matches!(self.types.get(id as usize), Some(Some(t)) if t.kind == kind::FUNC)
+    }
+
     /// Whether type `id` is a datasec (`btf_type_is_datasec`).
     pub fn is_datasec(&self, id: u32) -> bool {
         matches!(self.types.get(id as usize), Some(Some(t)) if t.kind == kind::DATASEC)

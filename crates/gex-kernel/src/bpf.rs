@@ -24,6 +24,8 @@ pub mod cmd {
     pub const MAP_UPDATE_ELEM: u64 = 2;
     pub const MAP_DELETE_ELEM: u64 = 3;
     pub const MAP_GET_NEXT_KEY: u64 = 4;
+    pub const PROG_LOAD: u64 = 5;
+    pub const PROG_GET_FD_BY_ID: u64 = 13;
     pub const OBJ_PIN: u64 = 6;
     pub const OBJ_GET: u64 = 7;
     pub const PROG_GET_NEXT_ID: u64 = 11;
@@ -62,6 +64,7 @@ const MAX_KEY: u32 = 512;
 pub enum Object {
     Map(Arc<Map>),
     Btf(Arc<crate::btf::Btf>),
+    Prog(Arc<crate::bpfprog::Prog>),
 }
 
 /// A map.
@@ -113,6 +116,36 @@ fn register(map: &Arc<Map>) {
     maps.insert(map.id, Arc::downgrade(map));
 }
 
+/// Every program there is, by id.
+static PROGS: Mutex<BTreeMap<u32, std::sync::Weak<crate::bpfprog::Prog>>> = Mutex::new(BTreeMap::new());
+
+fn register_prog(p: &Arc<crate::bpfprog::Prog>) {
+    let mut progs = PROGS.lock().unwrap_or_else(|e| e.into_inner());
+    progs.retain(|_, m| m.strong_count() > 0);
+    progs.insert(p.id, Arc::downgrade(p));
+}
+
+fn prog_after(after: u32) -> Option<Arc<crate::bpfprog::Prog>> {
+    let progs = PROGS.lock().unwrap_or_else(|e| e.into_inner());
+    progs.range(after.saturating_add(1)..).find_map(|(_, m)| m.upgrade())
+}
+
+/// A program's descriptor.
+#[derive(Debug)]
+pub struct ProgFile(pub Arc<crate::bpfprog::Prog>);
+
+impl FileHandle for ProgFile {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> crate::errno::SysResult {
+        Err(Errno::EINVAL)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o600, ino: self.0.id as u64, mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None })
+    }
+    fn bpf_object(&self) -> Option<Object> {
+        Some(Object::Prog(Arc::clone(&self.0)))
+    }
+}
+
 /// The live map with the least id above `after`.
 fn map_after(after: u32) -> Option<Arc<Map>> {
     let maps = MAPS.lock().unwrap_or_else(|e| e.into_inner());
@@ -153,6 +186,16 @@ impl Map {
             }
         };
         Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(data) })
+    }
+
+    pub fn value_size(&self) -> u32 {
+        self.value_size
+    }
+
+    /// Whether a program may take the address of its value directly
+    /// (`array_map_direct_value_addr`: an array of one element's).
+    pub fn direct_value(&self) -> bool {
+        self.ty == map_type::ARRAY && self.max_entries == 1
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Data> {
@@ -339,6 +382,7 @@ fn install(c: &Caller<'_>, obj: Object, read: bool, write: bool) -> crate::errno
     let (handle, name): (Arc<dyn FileHandle>, &str) = match obj {
         Object::Map(map) => (Arc::new(MapFile { map, read, write }), "anon_inode:bpf-map"),
         Object::Btf(btf) => (Arc::new(crate::btf::BtfFile(btf)), "anon_inode:btf"),
+        Object::Prog(p) => (Arc::new(ProgFile(p)), "anon_inode:bpf-prog"),
     };
     let flags = match (read, write) {
         (true, true) => crate::fs::oflags::O_RDWR,
@@ -506,14 +550,26 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
                 return Err(Errno::EPERM);
             }
             let next = match cmd {
-                // No program is loaded here yet.
-                cmd::PROG_GET_NEXT_ID => None,
+                cmd::PROG_GET_NEXT_ID => prog_after(u32_at(0)).map(|p| p.id),
                 _ => map_after(u32_at(0)).map(|m| m.id),
             };
             let next = next.ok_or(Errno::ENOENT)?;
             m.write_u32(attr + 4, next)?;
             Ok(0)
         }
+        cmd::PROG_GET_FD_BY_ID => {
+            zero_from(12)?;
+            if !c.admin {
+                return Err(Errno::EPERM);
+            }
+            if u32_at(8) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let id = u32_at(0);
+            let p = prog_after(id.wrapping_sub(1)).filter(|p| p.id == id).ok_or(Errno::ENOENT)?;
+            install(c, Object::Prog(p), true, true)
+        }
+        cmd::PROG_LOAD => prog_load(c, m, attr, &a),
         cmd::MAP_GET_FD_BY_ID => {
             zero_from(12)?;
             if !c.admin {
@@ -532,6 +588,7 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             let file = c.fds.get(u32_at(0) as i32)?;
             let info = match file.handle.bpf_object() {
                 Some(Object::Map(map)) => map.info(),
+                Some(Object::Prog(p)) => p.info(),
                 Some(Object::Btf(btf)) => {
                     // `struct bpf_btf_info`: the BTF itself copied out
                     // where the caller gave room (`btf`, `btf_size`).
@@ -597,6 +654,117 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
         }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// `BPF_PROG_LOAD` (`bpf_prog_load`), its checks in its order: the fields
+/// it does not read zero, its flags, the license, the instruction count,
+/// the type and what it expects to be attached to, the name, function and
+/// line information against the BTF; then the program
+/// ([`crate::bpfprog::Prog::load`]); then the log.
+fn prog_load(c: &Caller<'_>, m: &mut GuestMem<'_>, attr: u64, a: &[u8]) -> crate::errno::SysResult {
+    let u32_at = |at: usize| u32::from_le_bytes(a[at..at + 4].try_into().unwrap());
+    let u64_at = |at: usize| u64::from_le_bytes(a[at..at + 8].try_into().unwrap());
+    if a[148..].iter().any(|b| *b != 0) {
+        return Err(Errno::EINVAL);
+    }
+    let (ty, insn_cnt, insns, license_at) = (u32_at(0), u32_at(4), u64_at(8), u64_at(16));
+    let (log_level, log_size, log_buf) = (u32_at(24), u32_at(28), u64_at(32));
+    let flags = u32_at(44);
+    // BPF_F_STRICT_ALIGNMENT, ANY_ALIGNMENT, TEST_RND_HI32,
+    // TEST_STATE_FREQ, SLEEPABLE, XDP_HAS_FRAGS, XDP_DEV_BOUND_ONLY,
+    // TEST_REG_INVARIANTS, TOKEN_FD.
+    if flags & !0x1ff != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if !c.capable {
+        return Err(Errno::EPERM);
+    }
+    let license = String::from_utf8_lossy(&m.read_cstr(license_at, 128)?).into_owned();
+    if insn_cnt == 0 || insn_cnt > crate::bpfprog::MAX_INSNS {
+        return Err(Errno::E2BIG);
+    }
+    if u32_at(64) != 0 {
+        say_once("a program offloaded to a device");
+        return Err(Errno::EINVAL);
+    }
+    if u32_at(108) != 0 || u32_at(112) != 0 || u32_at(116) != 0 || u64_at(120) != 0 || u64_at(128) != 0 {
+        say_once("a program attached by BTF id, with CO-RE relocations, or with an fd_array");
+        return Err(Errno::EINVAL);
+    }
+    let expected = u32_at(68);
+    crate::bpfprog::check_attach(ty, expected).map_err(|e| if ty == 0 || ty > crate::bpfprog::prog_type::MAX { Errno::EINVAL } else { e })?;
+    let mut name = [0u8; 16];
+    name.copy_from_slice(&a[48..64]);
+    if !name.iter().take_while(|b| **b != 0).all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.') || name[15] != 0 {
+        return Err(Errno::EINVAL);
+    }
+    check_log(log_buf, log_size, log_level)?;
+    let raw = m.read(insns, insn_cnt as usize * 8)?.to_vec();
+    // Function and line information, which name the program's BTF.
+    let (btf_fd, func_rec, func_at, func_cnt, line_rec, line_at, line_cnt) = (u32_at(72), u32_at(76), u64_at(80), u32_at(88), u32_at(92), u64_at(96), u32_at(104));
+    if func_cnt != 0 || line_cnt != 0 {
+        let btf = match c.fds.get(btf_fd as i32)?.handle.bpf_object() {
+            Some(Object::Btf(b)) => b,
+            _ => return Err(Errno::EINVAL),
+        };
+        if func_cnt != 0 {
+            // `check_btf_func`: records of at least 8 bytes, each an
+            // instruction and a function's type, the first at 0, in order.
+            if !(8..=252).contains(&func_rec) || func_rec % 4 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let mut last = None;
+            for k in 0..func_cnt as u64 {
+                let rec = m.read(func_at + k * func_rec as u64, func_rec as usize)?.to_vec();
+                let (off, tid) = (u32::from_le_bytes(rec[0..4].try_into().unwrap()), u32::from_le_bytes(rec[4..8].try_into().unwrap()));
+                if (k == 0 && off != 0) || last.is_some_and(|l| off <= l) || off >= insn_cnt || !btf.is_func(tid) || rec[8..].iter().any(|b| *b != 0) {
+                    return Err(Errno::EINVAL);
+                }
+                last = Some(off);
+            }
+        }
+        if line_cnt != 0 {
+            // `check_btf_line`: records of at least 16 bytes, in order,
+            // within the program, their names in the BTF's strings.
+            if !(16..=252).contains(&line_rec) || line_rec % 4 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let mut last = None;
+            for k in 0..line_cnt as u64 {
+                let rec = m.read(line_at + k * line_rec as u64, line_rec as usize)?.to_vec();
+                let off = u32::from_le_bytes(rec[0..4].try_into().unwrap());
+                if (k == 0 && off != 0) || last.is_some_and(|l| off < l) || off >= insn_cnt || rec[16..].iter().any(|b| *b != 0) {
+                    return Err(Errno::EINVAL);
+                }
+                last = Some(off);
+            }
+        }
+    }
+    let maps = |fd: i32| -> Result<Arc<Map>, Errno> {
+        match c.fds.get(fd).map_err(|_| Errno::EBADF)?.handle.bpf_object() {
+            Some(Object::Map(m)) => Ok(m),
+            _ => Err(Errno::EINVAL),
+        }
+    };
+    let prog = crate::bpfprog::Prog::load(ty, expected, &raw, &license, name, c.uid, &maps);
+    // The log, when asked for: the verifier's last line.
+    if log_level != 0 {
+        let text = match &prog {
+            Ok(_) => format!("processed {insn_cnt} insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0\n"),
+            Err(_) => String::from("program refused\n"),
+        };
+        let room = log_size as usize - 1;
+        let n = text.len().min(room);
+        m.write(log_buf, &text.as_bytes()[..n])?;
+        m.write(log_buf + n as u64, &[0])?;
+        m.write_u32(attr + 140, text.len() as u32 + 1)?;
+        if text.len() > room && prog.is_ok() {
+            return Err(Errno::ENOSPC);
+        }
+    }
+    let prog = Arc::new(prog?);
+    register_prog(&prog);
+    install(c, Object::Prog(prog), true, true)
 }
 
 /// A verifier log's attributes (`bpf_vlog_init`): a buffer and a level
