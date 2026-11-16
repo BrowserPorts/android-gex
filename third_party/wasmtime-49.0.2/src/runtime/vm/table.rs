@@ -190,6 +190,10 @@ pub struct DynamicFuncTable {
     maximum: Option<usize>,
     /// Whether elements of this table are initialized lazily.
     lazy_init: bool,
+    /// Whether the capacity past the length is zeroed memory nothing has
+    /// written (gex: [`Table::new_dynamic`] reserves a large table's whole
+    /// maximum that way), so growing within it is setting the length.
+    zeroed_spare: bool,
 }
 
 pub struct DynamicGcRefTable {
@@ -291,6 +295,26 @@ pub(crate) fn wasm_to_table_type(ty: WasmRefType) -> TableElementType {
 ///
 /// Should only ever be called with a `T` that is a table element type and where
 /// `Option<T>`'s `None` variant is represented with zero.
+/// gex: the smallest and largest reservation in bytes a funcref table's
+/// maximum is taken as: from 32 MiB, which glibc's allocator always maps
+/// (its threshold's ceiling), so the zeroed pages are the kernel's and
+/// untouched; to 1 GiB, past which a table declares a maximum it will not
+/// reach.
+const RESERVE_MIN: usize = 32 << 20;
+const RESERVE_MAX: usize = 1 << 30;
+
+/// gex: `len` null elements in zeroed memory with room for `cap`, the rest
+/// zeroed too ([`DynamicFuncTable::zeroed_spare`]).
+unsafe fn alloc_reserved_table_elements<T>(len: usize, cap: usize) -> Result<TryVec<Option<T>>> {
+    debug_assert!(len < cap);
+    let layout = Layout::array::<Option<T>>(cap)?;
+    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return Err(OutOfMemory::new(layout.size()).into());
+    }
+    Ok(unsafe { TryVec::<Option<T>>::from_raw_parts(ptr.cast(), len, cap) })
+}
+
 unsafe fn alloc_dynamic_table_elements<T>(len: usize) -> Result<TryVec<Option<T>>> {
     debug_assert!(
         unsafe {
@@ -335,11 +359,29 @@ impl Table {
     ) -> Result<Self> {
         let (minimum, maximum) = Self::limit_new(ty, limiter).await?;
         match wasm_to_table_type(ty.ref_type) {
-            TableElementType::Func => Ok(Self::from(DynamicFuncTable {
-                elements: unsafe { alloc_dynamic_table_elements(minimum)? },
-                maximum,
-                lazy_init: tunables.table_lazy_init,
-            })),
+            TableElementType::Func => {
+                // gex: a funcref table whose maximum is large (a dispatch
+                // table of ten million slots) has its whole maximum reserved
+                // at once as zeroed memory, which the host maps and leaves
+                // untouched, and grows by setting its length: a slot costs
+                // memory only once written. Grown by copying, each growth
+                // wrote every slot, so a table cost all of its length
+                // whether or not anything was ever put in it.
+                let elem = mem::size_of::<FuncTableElem>();
+                let reserve = maximum.filter(|&m| {
+                    m > minimum && (RESERVE_MIN..=RESERVE_MAX).contains(&m.saturating_mul(elem))
+                });
+                let (elements, zeroed_spare) = match reserve {
+                    Some(m) => (unsafe { alloc_reserved_table_elements(minimum, m)? }, true),
+                    None => (unsafe { alloc_dynamic_table_elements(minimum)? }, false),
+                };
+                Ok(Self::from(DynamicFuncTable {
+                    elements,
+                    maximum,
+                    lazy_init: tunables.table_lazy_init,
+                    zeroed_spare,
+                }))
+            }
             TableElementType::GcRef => Ok(Self::from(DynamicGcRefTable {
                 elements: unsafe { alloc_dynamic_table_elements(minimum)? },
                 maximum,
@@ -697,8 +739,17 @@ impl Table {
             // loading the base address. However, in that case the above checks
             // that delta is non-zero and the new size doesn't exceed the
             // maximum mean we can't get here.
-            Table::Dynamic(DynamicTable::Func(DynamicFuncTable { elements, .. })) => {
-                elements.resize_with(new_size, || None)?;
+            Table::Dynamic(DynamicTable::Func(DynamicFuncTable { elements, zeroed_spare, .. })) => {
+                if *zeroed_spare && new_size <= elements.capacity() {
+                    // Zeroed and never written past the length: those are
+                    // null elements already, and the length is all there
+                    // is to change.
+                    let (ptr, _, cap) = mem::take(elements).into_raw_parts();
+                    *elements = unsafe { TryVec::from_raw_parts(ptr, new_size, cap) };
+                } else {
+                    elements.resize_with(new_size, || None)?;
+                    *zeroed_spare = false;
+                }
             }
             Table::Dynamic(DynamicTable::GcRef(DynamicGcRefTable { elements, .. })) => {
                 elements.resize_with(new_size, || None)?;

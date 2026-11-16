@@ -357,7 +357,13 @@ impl Table {
         // fail, hence the unwrap. Note that this is required for the safety of
         // this operation because this table's type may be non-nullable elements
         // which means this must happen after growth.
-        self._fill(store, start, init, delta).unwrap();
+        // gex: a funcref table's new elements are null already (uninitialized,
+        // which reads as null: past what the module's segments cover, lazy
+        // initialization finds nothing), so growing with null writes none of
+        // them, and a large table's unwritten slots cost nothing.
+        if !matches!(init, Ref::Func(None)) {
+            self._fill(store, start, init, delta).unwrap();
+        }
         Ok(start)
     }
 
