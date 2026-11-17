@@ -9,8 +9,9 @@
 # WINE_SRC    its source tree (headers, nls)
 # GEX_WASM64_SYSROOT  the wasm64 sysroot wcc64 compiles with
 #                     (toolchain/sysroot/build64.sh)
-# MINGW_HEADERS       optional: mingw-w64's mingw-w64-headers directory; programs
-#                     then compile against its headers, not Wine's
+# MINGW_W64           optional: a mingw-w64 source tree; programs then compile
+#                     against its headers, not Wine's, and link the parts of
+#                     its runtime those headers expect (the UCRT stdio wrappers)
 # Then C++: toolchain/gexcc/windows/build-cxx.sh PREFIX LLVM_SRC.
 # Out: PREFIX/bin/x86_64-w64-mingw32-{gcc,g++,cc,c++,windres,ar,ranlib,nm,
 # strip,objcopy,objdump}, PREFIX/lib/gexcc-win (the runtime every program
@@ -27,8 +28,9 @@ done
 L=$PREFIX/lib/gexcc-win
 mkdir -p "$PREFIX/bin" "$L" "$PREFIX/share/gexcc-win"
 printf 'WINE_BUILD=%s\nWINE_SRC=%s\nSYSROOT64=%s\nCXX=%s\n' "$WB" "$WS" "$(realpath "$GEX_WASM64_SYSROOT")" "$PREFIX/cxx" > "$L/config"
-if [ -n "${MINGW_HEADERS:-}" ]; then
-  python3 "$HERE/mingw-headers.py" "$(realpath "$MINGW_HEADERS")" "$L/include-mingw"
+if [ -n "${MINGW_W64:-}" ]; then
+  MW=$(realpath "$MINGW_W64")
+  python3 "$HERE/mingw-headers.py" "$MW/mingw-w64-headers" "$L/include-mingw"
   echo "MINGW_INCLUDE=$L/include-mingw" >> "$L/config"
 fi
 for t in gcc g++ cc c++ windres ar ranlib nm strip objcopy objdump; do
@@ -51,6 +53,22 @@ for k in main wmain dll; do GEX_WASM_NO_ICALL=1 "$CC" -O2 -DONLY_$k -c "$HERE/rt
 for k in 0 3; do "$CC" -O2 -DONLY_$k -c "$HERE/rt/wmain.c" -o "$L/wmain$k.o"; done
 rm -f "$L/libgexcc-win.a"
 llvm-ar rcs "$L/libgexcc-win.a" "$T/cpp_exception.o" "$T/wchar.o" "$T/dirent.o" "$T/math.o" "$T/ssp.o" "$T/time.o" "$T/comsupp.o"
+# with mingw-w64's headers: their stdio.h's printf and scanf families with
+# the UCRT are mingw-w64's small wrappers over ucrtbase's __stdio_common_*
+if [ -n "${MINGW_W64:-}" ]; then
+  for f in "$MW"/mingw-w64-crt/stdio/ucrt_*.c; do
+    "$CC" -O2 -c "$f" -o "$T/$(basename "$f" .c).o"
+  done
+  # and the old names (open for _open ...) its import libraries alias
+  python3 "$HERE/oldnames.py" "$MW/mingw-w64-crt" "$L/include-mingw" "$HERE/include-mingw-pre" "$T/oldnames.c"
+  "$CC" -O2 -c "$T/oldnames.c" -o "$T/oldnames.o"
+  # and what MinGW's libws2_32.a has beside the imports: the wspiapi
+  # getaddrinfo fallbacks, gai_strerror, the in6addr helpers
+  for f in "$MW"/mingw-w64-crt/libsrc/wspiapi/*.c "$MW"/mingw-w64-crt/libsrc/ws2tcpip/*.c; do
+    "$CC" -O2 -c "$f" -o "$T/ws2_$(basename "$f" .c).o"
+  done
+  llvm-ar rs "$L/libgexcc-win.a" "$T"/ucrt_*.o "$T/oldnames.o" "$T"/ws2_*.o
+fi
 # setjmp/longjmp, a copy of the program's own (a program has no core beside
 # it to share the tag with): libgexrt's
 (cd "$T" && llvm-ar x "$WB/libs/gexrt/libgexrt.a" wasm32_sjlj.o) && mv "$T/wasm32_sjlj.o" "$L/"
