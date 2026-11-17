@@ -88,13 +88,15 @@ if [ -n "${GEX_SNAPSHOT:-}" ]; then
   llvm-ar crs "$OUT/sysroot/lib/libgex-snap.a" $sobjs
 fi
 
-# Linux UAPI headers (Wine's Unix side includes linux/*.h). asm/ is the
-# host's x86 set taken down its i386 branches: gex-kernel serves the i386
-# ABI. swab.h keeps its generic C (its i386 branch is inline asm).
+# Linux UAPI headers (Wine's Unix side includes linux/*.h), the pinned ones
+# (toolchain/linux-headers.sh). asm/ is the x86 set taken down its i386
+# branches: gex-kernel serves the i386 ABI. swab.h keeps its generic C (its
+# i386 branch is inline asm).
 SR="$OUT/sysroot/include"
+LH=$("$HERE/../linux-headers.sh")
 rm -rf "$SR/linux" "$SR/asm-generic" "$SR/asm"
-cp -r /usr/include/linux /usr/include/asm-generic "$SR/"
-cp -rL /usr/include/asm "$SR/asm"
+cp -rL "$LH/linux" "$LH/asm-generic" "$SR/"
+cp -rL "$LH/x86_64-linux-gnu/asm" "$SR/asm"
 for h in $(grep -l __i386__ "$SR"/asm/*.h); do
   case $h in */swab.h) continue ;; esac
   sed -i -e 's/defined(__i386__)/(defined(__i386__) || defined(__wasm32__))/g' \
@@ -103,39 +105,41 @@ for h in $(grep -l __i386__ "$SR"/asm/*.h); do
 done
 
 cd "$OUT/crt-build"
+# against this sysroot's musl and clang's own headers, as build64.sh's (with
+# no sysroot, clang's Linux driver searches the build machine's /usr/include)
+CRT_CFLAGS="$WASM_CFLAGS -nostdinc -isystem $SR -isystem $(clang -print-resource-dir)/include"
 # objects of other flags are built again (a build directory copied from one
 # made without gexcc's -fvisibility=default kept its hidden builtins, and
 # libc.so then exported none of them)
-if [ "$(cat .gex-flags 2>/dev/null)" != "$CRT $WASM_CFLAGS" ]; then
+if [ "$(cat .gex-flags 2>/dev/null)" != "$CRT $CRT_CFLAGS" ]; then
   rm -f ./*.o
-  printf '%s' "$CRT $WASM_CFLAGS" > .gex-flags
+  printf '%s' "$CRT $CRT_CFLAGS" > .gex-flags
 fi
-objs=
+objs= todo=
 for f in "$CRT"/*.c; do
   b=$(basename "$f" .c)
   case $b in
     apple_versioning|clear_cache|enable_execute_stack|trampoline_setup|emutls|\
     gcc_personality_v0|os_version_check|atomic*|*xf*|*xc3|*bf2|crtbegin|crtend) continue ;;
   esac
-  [ "$b.o" -nt "$f" ] || clang $WASM_CFLAGS -Wno-everything -c "$f" -o "$b.o" &
+  [ "$b.o" -nt "$f" ] || todo="$todo $f"
   objs="$objs $b.o"
-  [ $(jobs -p | wc -l) -ge "$JOBS" ] && wait -n 2>/dev/null || true
 done
-wait
+# JOBS compiles at a time (sh has no `wait -n`)
+[ -z "$todo" ] || printf '%s\n' $todo | xargs -P "$JOBS" -I{} sh -c 'clang $1 -Wno-everything -c "$2" -o "$(basename "$2" .c).o"' sh "$CRT_CFLAGS" {}
 rm -f "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a"
 llvm-ar crs "$OUT/sysroot/lib/libclang_rt.builtins-wasm32.a" $objs
 # The ICALL pass (wcc applies it to Wine's PE-side code, -D_WIN32).
 "$HERE/icall/build.sh" "$OUT/sysroot/lib"
 # binaryen, for wcc's asyncify of programs that fork (wasm-opt >= 117 for
-# exception handling): GEX_BINARYEN names an existing install.
-BINARYEN_VERSION=133
+# exception handling): GEX_BINARYEN names an existing install, linked;
+# else the pinned build for this host (toolchain/binaryen.sh), copied in.
 if [ -n "${GEX_BINARYEN:-}" ]; then
   ln -sfn "$(realpath "$GEX_BINARYEN")" "$OUT/sysroot/binaryen"
 elif [ ! -x "$OUT/sysroot/binaryen/bin/wasm-opt" ]; then
-  t=binaryen-version_$BINARYEN_VERSION
-  curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$t-x86_64-linux.tar.gz" | tar xz -C "$OUT"
+  b=$("$HERE/../binaryen.sh")
   rm -rf "$OUT/sysroot/binaryen"
-  mv "$OUT/$t" "$OUT/sysroot/binaryen"
+  cp -a "$b" "$OUT/sysroot/binaryen"
 fi
 if [ -n "${GEX_SNAPSHOT:-}" ]; then touch "$OUT/sysroot/lib/gex-snapshot"; else rm -f "$OUT/sysroot/lib/gex-snapshot"; fi
 echo "sysroot: $OUT/sysroot"

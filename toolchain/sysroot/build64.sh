@@ -57,11 +57,13 @@ if [ -f lib/libc.a ] && [ -n "$(find "$MUSL/arch" "$MUSL/include" "$MUSL/src/int
 fi
 make -s -j"$JOBS" install-headers install-libs >/dev/null
 
-# Linux UAPI headers: the host's x86 set, whose non-i386 branches are x86-64's.
+# Linux UAPI headers, the pinned ones (toolchain/linux-headers.sh): x86's
+# set, whose non-i386 branches are x86-64's.
 SR="$OUT/sysroot/include"
+LH=$("$HERE/../linux-headers.sh")
 rm -rf "$SR/linux" "$SR/asm-generic" "$SR/asm"
-cp -r /usr/include/linux /usr/include/asm-generic "$SR/"
-cp -rL /usr/include/asm "$SR/asm"
+cp -rL "$LH/linux" "$LH/asm-generic" "$SR/"
+cp -rL "$LH/x86_64-linux-gnu/asm" "$SR/asm"
 
 # libgex: the wasm32 runtime's setjmp and dlopen (data-model neutral C) and
 # the x86-64 signal-frame runner.
@@ -87,40 +89,27 @@ if [ -n "${GEX_SNAPSHOT:-}" ]; then
 fi
 
 cd "$OUT/crt-build"
-objs=
+objs= todo=
 for f in "$CRT"/*.c; do
   b=$(basename "$f" .c)
   case $b in
     apple_versioning|clear_cache|enable_execute_stack|trampoline_setup|emutls|\
     gcc_personality_v0|os_version_check|atomic*|*xf*|*xc3|*bf2|crtbegin|crtend) continue ;;
   esac
-  [ "$b.o" -nt "$f" ] || clang $WASM64_CFLAGS -nostdinc -isystem "$SR" -isystem "$(clang -print-resource-dir)/include" -Wno-everything -c "$f" -o "$b.o" &
+  [ "$b.o" -nt "$f" ] || todo="$todo $f"
   objs="$objs $b.o"
-  [ $(jobs -p | wc -l) -ge "$JOBS" ] && wait -n 2>/dev/null || true
 done
-wait
+# JOBS compiles at a time (sh has no `wait -n`)
+[ -z "$todo" ] || printf '%s\n' $todo | xargs -P "$JOBS" -I{} sh -c 'clang $1 -Wno-everything -c "$2" -o "$(basename "$2" .c).o"' \
+  sh "$WASM64_CFLAGS -nostdinc -isystem $SR -isystem $(clang -print-resource-dir)/include" {}
 rm -f "$OUT/sysroot/lib/libclang_rt.builtins-wasm64.a"
 llvm-ar crs "$OUT/sysroot/lib/libclang_rt.builtins-wasm64.a" $objs
 
-# binaryen 133 (--memory64-lowering of whole programs, exception handling)
-BINARYEN_VERSION=133
-if [ -n "${GEX_BINARYEN:-}" ]; then
-  ln -sfn "$(realpath "$GEX_BINARYEN")" "$OUT/sysroot/binaryen"
-else
-  # fetched once per host into the cache, linked from every sysroot
-  cache=${XDG_CACHE_HOME:-$HOME/.cache}/gex/binaryen-$BINARYEN_VERSION
-  if [ ! -x "$cache/bin/wasm-opt" ]; then
-    t=binaryen-version_$BINARYEN_VERSION
-    mkdir -p "$(dirname "$cache")"
-    tmp=$(mktemp -d "$(dirname "$cache")/.binaryen.XXXXXX")
-    curl -sSfL "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$t-x86_64-linux.tar.gz" | tar xz -C "$tmp"
-    rm -rf "$cache"
-    mv "$tmp/$t" "$cache"
-    rm -rf "$tmp"
-  fi
-  rm -rf "$OUT/sysroot/binaryen"
-  ln -sfn "$cache" "$OUT/sysroot/binaryen"
-fi
+# binaryen (--memory64-lowering of whole programs, exception handling): the
+# pinned build for this host, or GEX_BINARYEN (toolchain/binaryen.sh), fetched
+# once into the cache and linked from every sysroot
+rm -rf "$OUT/sysroot/binaryen"
+ln -sfn "$("$HERE/../binaryen.sh")" "$OUT/sysroot/binaryen"
 # Wine's PE side (wcc64 -D_WIN32): the LLP64 plugin, its llp64.h, and the
 # ICALL pass (its Win64 mode)
 "$HERE/llp64/build.sh" "$OUT/sysroot/lib"
