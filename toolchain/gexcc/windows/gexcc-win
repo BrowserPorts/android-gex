@@ -472,6 +472,11 @@ try:
     if cxx:
         archives += [CXX + '/lib/libc++.a', CXX + '/lib/libc++abi.a', CXX + '/lib/libunwind.a']
     archives.append(LIB + '/libgexcc-win.a')
+    # (the compiler's own runtime, libgcc's part for MinGW: 128-bit
+    # arithmetic and the rest the back end calls)
+    rtb = conf['SYSROOT64'] + '/lib/libclang_rt.builtins-wasm64.a'
+    if os.path.exists(rtb):
+        archives.append(rtb)
     name = os.path.basename(out)
     if '.' not in name:
         name += '.dll' if shared else '.exe'
