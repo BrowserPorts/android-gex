@@ -2320,7 +2320,8 @@ export class Gex {
           // The shim's own per-library line, said once per session instead
           // (the host's `loaded` line, from `noteStatus`).
           // Said to the host, which says it the first time in the session.
-          const dll = /^gex-pe: native wasm32 module for (\S+): /.exec(text);
+          // (The path may hold spaces: C:\Program Files.)
+          const dll = /^gex-pe: native wasm32 module for (.+): \d+ entries$/.exec(text);
           if (dll) {
             this.#env.noteStatus?.({ kind: 'module', path: dll[1] });
             if (!logOn('debug')) return;
