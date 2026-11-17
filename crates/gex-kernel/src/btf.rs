@@ -520,6 +520,83 @@ impl crate::vfs::FileHandle for BtfFile {
 
 #[cfg(test)]
 mod tests {
+    /// A BTF blob: types as (name, info, size or type, extra words), with
+    /// the string section made from the names.
+    fn blob(types: &[(&str, u32, u32, Vec<(&str, u32, u32)>, Vec<u32>)]) -> Vec<u8> {
+        let mut strs = vec![0u8];
+        let mut name = |n: &str| -> u32 {
+            if n.is_empty() {
+                return 0;
+            }
+            let at = strs.len() as u32;
+            strs.extend_from_slice(n.as_bytes());
+            strs.push(0);
+            at
+        };
+        let mut t = Vec::new();
+        for (n, info, size, members, extra) in types {
+            let off = name(n);
+            for w in [off, *info, *size] {
+                t.extend_from_slice(&w.to_le_bytes());
+            }
+            for (mn, ty, bits) in members {
+                let mo = name(mn);
+                for w in [mo, *ty, *bits] {
+                    t.extend_from_slice(&w.to_le_bytes());
+                }
+            }
+            for w in extra {
+                t.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xeb9fu16.to_le_bytes());
+        out.extend_from_slice(&[1, 0]);
+        for w in [24u32, 0, t.len() as u32, t.len() as u32, strs.len() as u32] {
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out.extend_from_slice(&t);
+        out.extend_from_slice(&strs);
+        out
+    }
+
+    const INT: u32 = 1 << 24;
+    const PTR: u32 = 2 << 24;
+    const ARRAY: u32 = 3 << 24;
+    const STRUCT: u32 = 4 << 24;
+    const TYPE_TAG: u32 = 18 << 24;
+
+    /// The fields a map's value may hold that the kernel manages, as
+    /// `btf_parse_fields` finds them: in the struct, in a struct or array
+    /// within it, or a pointer tagged `kptr`; not a plain pointer, and not
+    /// the lock's own type taken as the value.
+    #[test]
+    fn special_fields_are_found_where_the_kernel_looks() {
+        let b = super::Btf::parse(blob(&[
+            ("int", INT | 0, 4, vec![], vec![(1 << 24) | 32]),                       // 1
+            ("bpf_spin_lock", STRUCT | 1, 4, vec![("val", 1, 0)], vec![]),            // 2
+            ("value", STRUCT | 2, 8, vec![("lock", 2, 0), ("n", 1, 32)], vec![]),     // 3
+            ("plain", STRUCT | 1, 4, vec![("n", 1, 0)], vec![]),                      // 4
+            ("outer", STRUCT | 1, 8, vec![("v", 3, 0)], vec![]),                      // 5
+            ("", ARRAY, 0, vec![], vec![2, 1, 2]),                                    // 6: bpf_spin_lock[2]
+            ("arr", STRUCT | 1, 8, vec![("locks", 6, 0)], vec![]),                    // 7
+            ("kptr", TYPE_TAG, 4, vec![], vec![]),                                    // 8 -> plain
+            ("", PTR, 8, vec![], vec![]),                                             // 9 -> 8
+            ("withkptr", STRUCT | 1, 8, vec![("p", 9, 0)], vec![]),                   // 10
+            ("", PTR, 4, vec![], vec![]),                                             // 11 -> plain
+            ("withptr", STRUCT | 1, 8, vec![("p", 11, 0)], vec![]),                   // 12
+        ]))
+        .unwrap_or_else(|e| panic!("{e:?} at {}", super::last_reason()));
+        assert!(!b.has_special_fields(1), "an int");
+        assert!(!b.has_special_fields(2), "the lock itself, as the value");
+        assert!(b.has_special_fields(3), "a lock in the struct");
+        assert!(!b.has_special_fields(4), "a struct with none");
+        assert!(b.has_special_fields(5), "a lock in a struct within it");
+        assert!(b.has_special_fields(7), "locks in an array within it");
+        assert!(b.has_special_fields(10), "a pointer tagged kptr");
+        assert!(!b.has_special_fields(12), "a plain pointer");
+    }
+
     /// A BTF from a file (`GEX_BTF_FILE`): whether it parses, and if not
     /// where. For finding why an object's BTF is refused.
     #[test]
