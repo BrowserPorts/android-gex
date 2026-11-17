@@ -29,7 +29,7 @@ export const OPTIONS = [
   ['fcacheStats',    'GEX_FCACHE_STATS',     'fcachestats',   'GEX_FCACHE_STATS',      'flag',   'extra', false],
   // Every process's time in syscalls, by call, on its exit (the shim's
   // `gex_sys_times`): what a slow run spent writing files against the rest.
-  ['sysTime',        'GEX_SYS_TIME',         'systime',       'GEX_SYS_TIME',          'flag',   'extra', false],
+  ['sysTime',        'GEX_SYS_TIME',         'systime',       'GEX_SYS_TIME',          'flag',   'extra', true],
   // Label process and thread Worker exits, without the debug option's
   // mirroring of every guest write.
   ['exitTrace',      'GEX_EXIT_TRACE',       'exittrace',     null,                    'flag',   'extra', false],

@@ -3444,6 +3444,18 @@ pub extern "C" fn k_fs_truncate(handle: i32, len: u64) -> i32 {
     as_unit(h.truncate(len))
 }
 
+/// `?systime=1`: count from now on (`on` 1), or read
+/// (`gex_kernel::vfs::tmpfs::ADVISE_STATS[i]`, `on` 2: laid-wait ns, laid waits, fadvise calls).
+#[no_mangle]
+pub extern "C" fn k_advise_stat(on: u32, i: u32) -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    if on == 1 {
+        gex_kernel::vfs::tmpfs::ADVISE_TIMED.store(true, Relaxed);
+        return 0;
+    }
+    gex_kernel::vfs::tmpfs::ADVISE_STATS.get(i as usize).map_or(0, |s| s.load(Relaxed))
+}
+
 /// `posix_fadvise` of an open file (`FileHandle::advise`): a lazy file fetches
 /// what is asked now, in the caller's Worker.
 #[no_mangle]
@@ -4093,7 +4105,9 @@ fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
     }
     // Traced ([`k_fs_pending_trace`]): in 10 ms slices, each wait kept.
     let traced = PENDING_TRACE.load(core::sync::atomic::Ordering::Relaxed);
-    let (slice, per_sec) = if traced { (10_000_000i64, 100u32) } else { (1_000_000_000, 1) };
+    // (`?systime=1`: timed in 10 ms slices too, into ADVISE_STATS)
+    let timed = gex_kernel::vfs::tmpfs::ADVISE_TIMED.load(core::sync::atomic::Ordering::Relaxed);
+    let (slice, per_sec) = if traced || timed { (10_000_000i64, 100u32) } else { (1_000_000_000, 1) };
     let start = traced.then(|| (rootfs().pending_path(ino), FILLED.load(core::sync::atomic::Ordering::Relaxed)));
     let mut n = 0u32;
     while word.load(Acquire) == gex_kernel::vfs::tmpfs::PENDING {
@@ -4104,6 +4118,11 @@ fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
         if n == 30 * per_sec {
             PENDING_LONG.store(ino, core::sync::atomic::Ordering::Relaxed);
         }
+    }
+    if timed && n > 0 {
+        let st = &gex_kernel::vfs::tmpfs::ADVISE_STATS;
+        st[0].fetch_add(n as u64 * 10_000_000, core::sync::atomic::Ordering::Relaxed);
+        st[1].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
     if let Some((path, at)) = start {
         let path = path.unwrap_or_else(|| format!("inode {ino}"));

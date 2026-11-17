@@ -370,16 +370,36 @@ export function kernelThread(k, top) {
 
 /** `lazy_fetch(url, urlLen, offset, dst, len)` against the kernel memory `memory`. */
 export function lazyFetch(memory) {
+  const read = lazyRead(memory);
+  // `?systime=1`: this Worker's lazy reads, by how they were served (lazyStats)
+  return (url, urlLen, offset, dst, len) => {
+    if (!globalThis.GEX_SYS_TIME) return read(url, urlLen, offset, dst, len);
+    const t0 = performance.now();
+    readKind = 'xhr';
+    const n = read(url, urlLen, offset, dst, len);
+    const s = (lazyStats[readKind] ??= [0, 0, 0]);
+    s[0]++; s[1] += performance.now() - t0; s[2] += Math.max(0, n);
+    return n;
+  };
+}
+/** `?systime=1`: this Worker's lazy reads so far, by kind (fill, bundle,
+ *  cache, xhr): [reads, ms, bytes]. */
+export const lazyStats = {};
+let readKind = 'xhr';
+function lazyRead(memory) {
   return (url, urlLen, offset, dst, len) => {
     url >>>= 0; urlLen >>>= 0; dst >>>= 0; len >>>= 0;
     const from = Number(offset);
     const href = new TextDecoder().decode(new Uint8Array(memory.buffer, url, urlLen).slice());
     if (fill) {
+      readKind = 'fill';
       const n = fromFill(href, from, memory, dst, len);
       if (n >= 0) return n;
+      readKind = 'xhr';
     }
     const done = noteFetch(href, len);
     if (href.includes('#')) {
+      readKind = 'bundle';
       // The owner's decoder, when the page has one; this Worker's own if not.
       const c = cachedRead(absolute(href), from, dst, len);
       if (c === len) {
@@ -394,6 +414,7 @@ export function lazyFetch(memory) {
     // The page's cache of lazy files, when it keeps one (lazy-cache.mjs):
     // its answer, or its failure (it tried the server already).
     const c = cachedRead(absolute(href), from, dst, len);
+    if (c === len) readKind = 'cache';
     if (c === len || c === OWNER_FAILED) {
       done(c === len ? len : 0);
       return c === len ? len : -1;

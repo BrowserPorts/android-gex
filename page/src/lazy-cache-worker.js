@@ -547,24 +547,37 @@ async function ahead(urls) {
 
 // One fetch a frame however many readers want it: they share its promise
 // (`decoded`) while it is in flight.
+// `?systime=1` (start's `sysTime`): what the owner's reads cost, said every 10 s while reads come.
+const sys = { on: false, reads: 0, ms: 0, frames: 0, hit: 0, packed: 0, stored: 0, net: 0, netMs: 0, decodeMs: 0, said: 0 };
 function frameOf(url, b, k) {
   const key = `${url}#${k}`;
   let f = decoded.get(key);
+  if (sys.on) sys.frames++;
   if (f) {
     // (moved to the end: most recently used; its size stays counted)
+    if (sys.on) sys.hit++;
     decoded.delete(key);
   } else {
     if (failed.held(key)) return Promise.reject(heldError);
     const kept = packedFrame(key) ?? streamed.get(key);
+    if (sys.on && kept) sys.packed++;
     const z = kept ? Promise.resolve(kept) : stored(url, b, k).then((have) => {
       if (have) {
+        if (sys.on) sys.stored++;
         kept_(have.length);
         keepPacked(key, have);
         return have;
       }
-      return fetchFrame(url, b, k, false);
+      const t = performance.now();
+      if (sys.on) sys.net++;
+      return fetchFrame(url, b, k, false).then((v) => { if (sys.on) sys.netMs += performance.now() - t; return v; });
     });
-    f = Promise.all([z, decoder()]).then(([zb, d]) => d.decode(zb, k === b.frames.length - 1 ? 0 : b.frame));
+    f = Promise.all([z, decoder()]).then(([zb, d]) => {
+      const t = performance.now();
+      const v = d.decode(zb, k === b.frames.length - 1 ? 0 : b.frame);
+      if (sys.on) sys.decodeMs += performance.now() - t;
+      return v;
+    });
     f.then((v) => {
       // (still kept: counted, and the budget kept)
       if (decoded.get(key) !== f || decodedBytes.has(key)) return;
@@ -654,6 +667,13 @@ async function start(m) {
   // with what it waits on (a stalled read is a program stalled on a file,
   // which otherwise says nothing at all).
   const slowReads = new Set();
+  sys.on = !!m.sysTime;
+  if (sys.on) setInterval(() => {
+    if (sys.reads === sys.said) return;
+    sys.said = sys.reads;
+    const f = (x) => x.toFixed(0);
+    console.log(`[lazy-cache] systime: ${sys.reads} reads served in ${f(sys.ms)} ms; frames ${sys.frames} (decoded kept ${sys.hit}, packed ${sys.packed}, page cache ${sys.stored}, network ${sys.net} in ${f(sys.netMs)} ms); decoding ${f(sys.decodeMs)} ms`);
+  }, 10000);
   setInterval(() => {
     const now = performance.now();
     for (const st of slowReads) {
@@ -676,12 +696,14 @@ async function start(m) {
     let bytes = null;
     const st = { url, from, len, t0: performance.now(), step: 'the network', said: false };
     slowReads.add(st);
+    const t0 = performance.now();
     try {
       bytes = url.includes('#') && zstdUrl ? await bundleRead(url, from, len, st) : await read(cache, url, from, len);
     } catch (e) {
       if (e !== heldError) console.warn(`[lazy-cache] ${e?.message ?? e}`);
     }
     slowReads.delete(st);
+    if (sys.on) { sys.reads++; sys.ms += performance.now() - t0; }
     if (st.said) console.warn(`[lazy-cache] the read of ${url} @${from} came after ${Math.round((performance.now() - st.t0) / 1000)} s`);
     // (A reader no longer gives up once its ask is taken; should one ever,
     // nothing is written into its buffer, which may be gone.)

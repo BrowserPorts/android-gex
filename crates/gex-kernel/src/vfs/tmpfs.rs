@@ -315,6 +315,12 @@ pub fn set_pending_hooks(h: PendingHooks) {
     let _ = PENDING_HOOKS.set(h);
 }
 
+/// `?systime=1`, every process's together: nanoseconds waited for files the
+/// bundle had not laid yet (any read's, timed by the host's `pending_wait`),
+/// those waits, and `posix_fadvise` calls. Kept only while [`ADVISE_TIMED`].
+pub static ADVISE_STATS: [core::sync::atomic::AtomicU64; 3] = [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+pub static ADVISE_TIMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 fn pending_wait(word: &core::sync::atomic::AtomicU32, ino: u64) -> bool {
     match PENDING_HOOKS.get() {
         Some(h) => (h.wait)(word, ino),
@@ -1836,6 +1842,9 @@ impl FileHandle for TmpHandle {
 
     fn advise(&self, offset: u64, len: u64, advice: u32) -> Result<(), Errno> {
         let Some(file) = &self.file else { return Ok(()) };
+        if ADVISE_TIMED.load(Ordering::Relaxed) {
+            ADVISE_STATS[2].fetch_add(1, Ordering::Relaxed);
+        }
         // The advice that fetches: a range wanted, an image mapped.
         if advice == super::FADV_WILLNEED || advice == super::FADV_GEX_IMAGE {
             file.mark_read();
