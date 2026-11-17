@@ -1589,12 +1589,32 @@ void glGetAttachedShaders(unsigned program, int max_count, int *count,
     if (count) *count = (int)n;
 }
 
+/* A reply longer than the caller's buffer can hold by GL's rules: said
+   once a query, and cut to what fits (written whole, it went past the
+   buffer into whatever the caller's heap put after it). */
+static void reply_too_long(const char *what, size_t got, size_t fits) {
+    static const char *said[8];
+    for (int i = 0; i < 8; i++) {
+        if (said[i] == what) return;
+        if (!said[i]) { said[i] = what; break; }
+    }
+    fprintf(stderr, "gexgl: %s: the host answered %zu bytes where the caller's buffer holds %zu; only those are written\n",
+            what, got, fits);
+}
+
 static void get_uniform(uint32_t opcode, unsigned program, int location,
                         void *out) {
     CMD2(opcode, program, location);
     flush();
     uint32_t bytes = 0;
     const uint8_t *values = reply_blob(&bytes);
+    /* One uniform's value: at most a dmat4's 128 bytes (GL sizes the
+       caller's buffer by the uniform's type, which only the host knows; a
+       longer reply is not one value, and is not written past it). */
+    if (bytes > 128) {
+        reply_too_long("glGetUniform*v", bytes, 128);
+        bytes = 128;
+    }
     if (out && values && bytes) memcpy(out, values, bytes);
 }
 void glGetUniformfv(unsigned program, int location, float *out) {
@@ -1717,20 +1737,37 @@ void glGetActiveUniformBlockName(unsigned program, unsigned index, int max,
 
 /* However many integers the query yields; the host knows the count from the
    pname, so the reply carries it. */
-static void reply_ints(int *params) {
+/* The integers a query yields, at most `max` of them: what the caller's
+   array holds by GL's rules (its own count, or one), however many the host
+   sent. */
+static void reply_ints(const char *what, int *params, size_t max) {
     uint32_t n = 0;
     const uint8_t *p = reply_blob(&n);
+    n -= n % 4;
+    if (n / 4 > max) {
+        reply_too_long(what, n, max * 4);
+        n = (uint32_t)(max * 4);
+    }
     if (params && p && n)
-        memcpy(params, p, n - (n % 4));
+        memcpy(params, p, n);
 }
 
 void glGetActiveUniformBlockiv(unsigned program, unsigned index,
                                unsigned pname, int *params) {
+    /* One integer, but for the active uniforms' indices: as many as the
+       block's active uniforms, which the caller asked for to size its array
+       (asked here first, so its reply is not this one's). */
+    size_t max = 1;
+    if (pname == 0x8A43u) { /* GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES */
+        int count = 0;
+        glGetActiveUniformBlockiv(program, index, 0x8A42u, &count); /* GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS */
+        max = count > 0 ? (size_t)count : 0;
+    }
     uint32_t *p = begin(GEXGL_GET_ACTIVE_UNIFORM_BLOCKIV, 3, 0);
     if (!p) return;
     p[0] = program; p[1] = index; p[2] = pname;
     flush();
-    reply_ints(params);
+    reply_ints("glGetActiveUniformBlockiv", params, max);
 }
 
 void glGetActiveUniformsiv(unsigned program, int count,
@@ -1745,7 +1782,7 @@ void glGetActiveUniformsiv(unsigned program, int count,
     p[0] = program; p[1] = pname;
     put_blob(p + 2, indices, len);
     flush();
-    reply_ints(params);
+    reply_ints("glGetActiveUniformsiv", params, (size_t)count);
 }
 
 void glGetUniformIndices(unsigned program, int count,
@@ -1773,8 +1810,14 @@ void glGetUniformIndices(unsigned program, int count,
     flush();
     uint32_t n = 0;
     const uint8_t *r = reply_blob(&n);
+    n -= n % 4;
+    /* one index a name */
+    if (n / 4 > (uint32_t)count) {
+        reply_too_long("glGetUniformIndices", n, (size_t)count * 4);
+        n = (uint32_t)count * 4;
+    }
     if (indices && r && n)
-        memcpy(indices, r, n - (n % 4));
+        memcpy(indices, r, n);
 }
 
 /* Answered from the guest's own state: the host never saw a guest pointer, so
