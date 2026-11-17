@@ -935,8 +935,10 @@ fn install_module(
     // first (no code of theirs runs until Wine loads their DLLs): its
     // imports then bind to their functions directly, and a function
     // address is the defining module's own. Only a cycle's far side is
-    // left to `Late` slots.
-    if core.is_some() {
+    // left to `Late` slots. (A program installed without a core beside
+    // it, its own DLLs beside it: theirs too, a GOT.mem import of their
+    // data has no `Late` binding.)
+    if core.is_some() || file.file_name().is_some_and(|n| n != CORE_MODULE) {
         thread_local! {
             static BUSY: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
         }
