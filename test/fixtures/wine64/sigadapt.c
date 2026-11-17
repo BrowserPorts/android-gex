@@ -10,6 +10,9 @@ int sig_narrow(long long);          /* defined (int) */
 void sig_val(void);                 /* defined returning int */
 int sig_novalue(void);              /* defined void: 0 */
 long long sig_widen(int);           /* defined (long long) */
+void *sig_extra_addr(void);         /* &sig_extra where its type is known */
+/* an address taken through the mismatched declaration: the function's own */
+int (*sig_extra_ptr)(int, int) = sig_extra;
 
 int main(void)
 {
@@ -21,6 +24,7 @@ int main(void)
     if (sig_counter != 1) bad |= 8;
     if (sig_novalue() != 0 || sig_counter != 11) bad |= 16;
     if (sig_widen(-1) != 0xffffffffLL) bad |= 32;
+    if ((void *)sig_extra_ptr != sig_extra_addr()) bad |= 64;
     printf(bad ? "sigadapt: failed %d\n" : "sigadapt: ok\n", bad);
     return bad;
 }

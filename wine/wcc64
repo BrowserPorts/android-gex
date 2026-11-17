@@ -132,6 +132,13 @@ def ld(cmd, name, relocatable=False):
     target ABI's slot semantics make the call work (sigadapt.py: a K&R
     definition called with arguments, an int of the other width); the rest
     still fail. GEX_WCC_VERBOSE=1 lists each adapter."""
+    path = cmd[cmd.index('-o') + 1]
+    if relocatable:
+        # (a list from an earlier build must not excuse this one's .so)
+        try:
+            os.unlink(path + '.adapted')
+        except OSError:
+            pass
     p = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
     if p.returncode:
         sys.stderr.write(p.stderr)
@@ -141,7 +148,6 @@ def ld(cmd, name, relocatable=False):
     # is not judged.
     # The C runtime calls main or wmain with every argument it has; a
     # program's own main may take fewer, as C allows.
-    path = cmd[cmd.index('-o') + 1]
     out = os.path.basename(path)
     bad = [m for m in re.findall(r'function signature mismatch: (\S+)', p.stderr) if m not in ('main', 'wmain')]
     err = p.stderr

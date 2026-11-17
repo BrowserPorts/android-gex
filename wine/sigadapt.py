@@ -18,7 +18,13 @@ non-number types, a caller typed `() -> void` against a callee with
 parameters (clang's placeholder for a vtable slot whose type it could not
 convert; its real type is unknown), the shape of a struct returned through
 an sret pointer against a value (one side void with one more leading i64
-parameter), and a name with no definition in the object.
+parameter), and a name with no definition in the object. Not seen at all: a
+small struct by value (1, 2, 4 or 8 bytes) is in a register on x64 but a
+pointer in wasm's C ABI, and against a scalar of the same width the two
+slots look alike; wasm's types can't show it.
+
+An address taken through the mismatched declaration stays the function's
+own (only calls go through the adapter).
 
 adapt(path) rewrites the object in place: each adapter is a new function at
 the end of the code section, the stub's symbol now names it, and the stub
@@ -306,26 +312,38 @@ def adapt(path, names=None):
             out += enc_name(nm)
     subs[sti[0]][1] = bytes(out)
     secs[by['linking']][2] = enc_u(ver) + b''.join(bytes([st]) + enc_u(len(sb)) + sb for st, sb in subs)
-    # reloc.CODE: shifted by the count's growth, the adapters' calls added
+    # The relocations: reloc.CODE shifted by the count's growth and the
+    # adapters' calls added; in every section, an address taken through the
+    # mismatched declaration (any relocation but a call) names the
+    # definition again, not the adapter: the function itself, its own entry
+    # thunk and facts, equal to a pointer taken where its type is known
+    retarget = {k: dsym for k, dsym, _, _ in made}
     code_index = by[10]
-    rk = [k for k, s in enumerate(secs) if s[0] == 0 and s[1] and s[1].startswith('reloc.')
-          and uleb(s[2], 0)[0] == code_index]
-    if rk:
-        p = secs[rk[0]][2]
+    have_code = False
+    for s in secs:
+        if not (s[0] == 0 and s[1] and s[1].startswith('reloc.')):
+            continue
+        p = s[2]
         si, i = uleb(p, 0); n, i = uleb(p, i)
+        code = si == code_index
         ents = bytearray()
         for _ in range(n):
             ty = p[i]; i += 1
             off, i = uleb(p, i); ix, i = uleb(p, i)
-            e = bytes([ty]) + enc_u(off + delta) + enc_u(ix)
+            if ty != R_FUNCTION_INDEX_LEB and ix in retarget:
+                ix = retarget[ix]
+            e = bytes([ty]) + enc_u(off + (delta if code else 0)) + enc_u(ix)
             if ty in ADDEND:
                 ad, i = sleb(p, i); e += enc_s(ad)
             ents += e
-        for o, s in relocs_new:
-            ents += bytes([R_FUNCTION_INDEX_LEB]) + enc_u(o) + enc_u(s)
-        secs[rk[0]][2] = enc_u(si) + enc_u(n + len(relocs_new)) + bytes(ents)
-    else:
-        ents = b''.join(bytes([R_FUNCTION_INDEX_LEB]) + enc_u(o) + enc_u(s) for o, s in relocs_new)
+        if code:
+            have_code = True
+            for o, sy in relocs_new:
+                ents += bytes([R_FUNCTION_INDEX_LEB]) + enc_u(o) + enc_u(sy)
+            n += len(relocs_new)
+        s[2] = enc_u(si) + enc_u(n) + bytes(ents)
+    if not have_code:
+        ents = b''.join(bytes([R_FUNCTION_INDEX_LEB]) + enc_u(o) + enc_u(sy) for o, sy in relocs_new)
         secs.append([0, 'reloc.CODE', enc_u(code_index) + enc_u(len(relocs_new)) + ents])
     open(path, 'wb').write(write(b, secs))
     return result

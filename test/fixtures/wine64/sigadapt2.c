@@ -6,3 +6,4 @@ int sig_narrow(int x) { return x; }
 int sig_val(void) { sig_counter++; return 3; }
 void sig_novalue(void) { sig_counter += 10; }
 long long sig_widen(long long x) { return x; }
+void *sig_extra_addr(void) { return (void *)sig_extra; }
