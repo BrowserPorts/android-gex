@@ -93,7 +93,22 @@ import { Gex, Env, utf8, narrate, hostNowNs, vforkTrace } from './gex.mjs';
 import { UsdClock } from './usd-clock.mjs';
 import { single, registerWorkerMain, sched } from './single.mjs';
 import { SP_CODE } from './mode.mjs';
-import { logNamed, setLog } from './log.mjs';
+import { logNamed, logOn, setLog } from './log.mjs';
+
+/** The MiB of `memory` in 64 KiB pages not all zero: what a browser holds
+ *  resident for it, near enough (a page written and zeroed again is the only
+ *  miss). */
+function touchedMib(memory) {
+  const words = new Uint32Array(memory.buffer);
+  let pages = 0;
+  for (let p = 0; p < words.length; p += 16384) {
+    const end = Math.min(p + 16384, words.length);
+    for (let i = p; i < end; i++) {
+      if (words[i]) { pages++; break; }
+    }
+  }
+  return Math.round(pages / 16);
+}
 // GEX_WATCH_DIR=<page>: narrate every write to that page's directory entry.
 if (typeof process !== 'undefined' && process.env?.GEX_WATCH_DIR) {
   Gex.watchDir = Number(process.env.GEX_WATCH_DIR);
@@ -1553,6 +1568,11 @@ async function handle(msg) {
       // What this process's memory grew to -- the question is whether a forked
       // child pays the same again.
       memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)),
+      // And what of it holds anything: its pages not all zero, MiB, which is
+      // what the browser keeps resident for it (a memory's size is not: a
+      // memory64 is 8 GiB from its first instruction). Only where the exit
+      // line is said: a pass over the whole memory.
+      touchedMib: logOn('debug') || logNamed('touched') || globalThis.process?.env?.GEX_DEBUG_EXIT ? touchedMib(gex.memory) : undefined,
       // Dispatch slots the page has left, in thousands. A budget nothing
       // refills: when it runs out, the next module names a table that does not
       // exist and the engine refuses it. Per process, because the question is
@@ -1567,6 +1587,9 @@ async function handle(msg) {
       // A posix_spawn child that ran in its parent's Worker until this exec.
       vforkMs: msg.child?.vforkMs,
       // (and the largest single claim of the four)
+      // The guest's accessible mappings (VmRSS), MiB: its share of `arena`'s
+      // total in either memory flavour.
+      guestMib: gex.shim.exports.gex_guest_mapped_mib ? Number(gex.shim.exports.gex_guest_mapped_mib()) : undefined,
       arena: gex.shim.exports.gex_arena_spent_mib
         ? [0, 1, 2, 3].map((i) => Number(gex.shim.exports.gex_arena_spent_mib(i)))
         : null,

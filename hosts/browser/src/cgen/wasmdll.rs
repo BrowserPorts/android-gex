@@ -1482,8 +1482,9 @@ pub extern "C" fn gex_cgen_pmod_wasm_ptr(number: u32) -> u32 {
 /// (checked at offset 0: dpkg's rename gives a new inode).
 #[no_mangle]
 pub extern "C" fn gex_cgen_pmod_read(number: u32, offset: u64, at: u32, len: u32) -> i32 {
-    let found = lock(&WINE_PE).mods.iter().find(|w| w.number == number).map(|w| (w.file.clone(), w.id, w.len));
-    let Some((path, id, size)) = found.or_else(|| super::wasmprog::file_of(number)) else { return -1 };
+    let found = lock(&WINE_PE).mods.iter().find(|w| w.number == number).map(|w| (w.file.clone(), w.id, w.len, 0));
+    // (`start`: where the module starts in the file, past a program's headers)
+    let Some((path, id, size, start)) = found.or_else(|| super::wasmprog::file_of(number)) else { return -1 };
     if offset == 0 && super::wasmprog::file_identity(&path) != id {
         crate::warn_line(&format!("gex: {path}: changed since it was loaded\n"));
         return -2;
@@ -1492,7 +1493,7 @@ pub extern "C" fn gex_cgen_pmod_read(number: u32, offset: u64, at: u32, len: u32
     // SAFETY: `at` is JS's window of `len` bytes in this module's memory
     // (`gex_alloc`), which nothing else holds while it reads.
     let out = unsafe { std::slice::from_raw_parts_mut(at as usize as *mut u8, want) };
-    crate::sigs::proc_home().read_file_at(&path, offset, out).map_or(-1, |n| n as i32)
+    crate::sigs::proc_home().read_file_at(&path, start + offset, out).map_or(-1, |n| n as i32)
 }
 
 /// Whether provider module `number` is Wine's PE module of the process's

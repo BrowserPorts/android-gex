@@ -4384,6 +4384,10 @@ fn place_image(
     id: Identity,
 ) -> Result<()> {
     let image = &program.exe;
+    // A native wasm32 program's module rides in its image (wasm-elf.py), but
+    // nothing in the guest reads it there: the host takes it from the
+    // program (`wasmprog::install`). Not placed, its pages are never touched.
+    let module = gex_cgen::image::program_flags::module(image).map(|(at, len)| (at as usize, (at + len) as usize));
     // Segments first: the executable's, then the interpreter's.
     for seg in program.segments() {
         let data = memory.bytes();
@@ -4397,8 +4401,16 @@ fn place_image(
             );
         }
         gex_kernel::big_op("segment", end - start);
-        data[start..end].fill(0);
-        data[start..start + seg.bytes.len()].copy_from_slice(&seg.bytes);
+        let filled = start + seg.bytes.len();
+        let (ma, mb) = module.filter(|&(a, b)| a >= start && b <= filled).unwrap_or((filled, filled));
+        data[start..ma].fill(0);
+        data[mb..end].fill(0);
+        data[start..ma].copy_from_slice(&seg.bytes[..ma - start]);
+        data[mb..start + seg.bytes.len()].copy_from_slice(&seg.bytes[mb - start..]);
+        // (zeroes already where nothing wrote: a page is touched only to clear it)
+        if data[ma..mb].iter().any(|&b| b != 0) {
+            data[ma..mb].fill(0);
+        }
 
         let mut p = 0;
         if seg.readable {

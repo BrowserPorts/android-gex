@@ -77,7 +77,12 @@ export async function exitStats(t) {
     pid: /pid (\d+(?::\d+)*): lived/.exec(l)[1],
     cmd: /\{([^}]*)\}/.exec(l)?.[1] ?? '',
     slotsLeftK: Number(/(\d+)k dispatch slots left/.exec(l)?.[1] ?? NaN),
-    memoryMib: Number(/memory (\d+) MiB/.exec(l)?.[1] ?? NaN),
+    memoryMib: Number(/memory (?:size )?(\d+) MiB/.exec(l)?.[1] ?? NaN),
+    // What of it the process used: the guest's mappings, the runtime's heap,
+    // Worker stacks.
+    inUseMib: Number(/in use (\d+) MiB/.exec(l)?.[1] ?? NaN),
+    // Its pages that hold anything, what the browser keeps resident.
+    residentMib: Number(/resident (\d+) MiB/.exec(l)?.[1] ?? NaN),
     kernelMib: Number(/kernel (\d+) MiB/.exec(l)?.[1] ?? NaN),
     tables: /tables blocks (\d+) ftab (\d+)/.exec(l)?.slice(1).map(Number) ?? null,
     // name=blocks@first..last

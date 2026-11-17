@@ -423,7 +423,7 @@ fn publish(p: &mut DyProc, from: usize, bytes: Vec<Bytes>, relocate: bool, keep:
         // built for wasm64 and lowered, as its program (64-bit Wine's loader
         // and its side module): i64 bases (is_lowered, from the import's type)
         let lowered = m.info.imports.iter().any(|imp| imp.module == "env" && imp.name == "__memory_base" && imp.wide);
-        lock(&PROGS).push(Prog { number, len: size, wasm, relocate, relocating: false, key, path: m.path.clone(), lowered, from_file, gone });
+        lock(&PROGS).push(Prog { number, len: size, wasm, relocate, relocating: false, key, path: m.path.clone(), lowered, from_file, gone, off: 0 });
         let (_, ok) = ftab(|f| f.publish_at(m.table_base, len.max(1), PROVIDER | number, Tier::Unit, &pairs));
         if !ok {
             return Err(format!("{}: table range {}+{} is taken", m.path, m.table_base, len));
@@ -725,7 +725,7 @@ fn adopt_inherited(p: &mut DyProc, mods: &str, inh: &str, wasm: &[u8], entry: u6
             }
         };
         let len = if wasm.is_empty() { m.len } else { wasm.len() as u32 };
-        lock(&PROGS).push(Prog { number: m.number, len, wasm, relocate: false, relocating: false, key, path: path.clone(), lowered: m.lowered, from_file: i != 0, gone });
+        lock(&PROGS).push(Prog { number: m.number, len, wasm, relocate: false, relocating: false, key, path: path.clone(), lowered: m.lowered, from_file: i != 0, gone, off: 0 });
         let (_, ok) = ftab(|f| f.publish_at(table_base, m.slots.max(1), PROVIDER | m.number, Tier::Unit, &pairs));
         if !ok {
             return Err(format!("{}: table range {}+{} is taken", path, table_base, m.slots));

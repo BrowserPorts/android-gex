@@ -59,7 +59,7 @@ import { makeGlChannel } from './gl-bridge.mjs';
  *  gave it and its largest single claim (`gex_arena_spent_mib`), and its
  *  command line. */
 function arenaSaid(m) {
-  return (m.arena ? `, arena heap ${m.arena[1]} MiB, largest claim ${m.arena[3] ?? '?'} MiB` : '') + (m.cmdline ? ` {${m.cmdline}}` : '');
+  return (m.touchedMib !== undefined ? `, resident ${m.touchedMib} MiB` : '') + (m.guestMib !== undefined ? `, guest maps ${m.guestMib} MiB` : '') + (m.arena ? `, arena heap ${m.arena[1]} MiB, largest claim ${m.arena[3] ?? '?'} MiB` : '') + (m.cmdline ? ` {${m.cmdline}}` : '');
 }
 
 function pageHostsFromEnv(v) {

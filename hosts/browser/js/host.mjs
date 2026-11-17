@@ -2243,10 +2243,15 @@ export class ProcessHost {
               (m.slotsLeftK >= 0 ? `, ${m.slotsLeftK}k dispatch slots left` : '') +
               // What this process's memory grew to. One memory per process, so
               // this times the number live at once is what the tab costs.
-              (m.memoryMib !== undefined ? `, memory ${m.memoryMib} MiB` : '') +
+              // Its size, not what is used: a memory64 is 8 GiB from the start.
+              (m.memoryMib !== undefined ? `, memory size ${m.memoryMib} MiB` : '') +
+              // Its pages that hold anything: what the browser keeps resident.
+              (m.touchedMib !== undefined ? `, resident ${m.touchedMib} MiB` : '') +
               // And what that memory went on, which is the only way to tell a
-              // guest that really maps a lot from a runtime spending it.
-              (m.arena ? ` (maps ${m.arena[0]}, heap ${m.arena[1]}, stacks ${m.arena[2]})` : '') +
+              // guest that really maps a lot from a runtime spending it: the
+              // guest's accessible mappings (its VmRSS, in either memory
+              // flavour), the runtime's heap, Worker stacks.
+              (m.arena ? `, in use ${(m.guestMib ?? m.arena[0]) + m.arena[1] + m.arena[2]} MiB (maps ${m.guestMib ?? m.arena[0]}, heap ${m.arena[1]}, stacks ${m.arena[2]})` : '') +
               // Dense modules this Worker left for a miss, and those a miss took.
               (m.fill?.denseLeft ? `, dense modules ${m.fill.denseWanted} wanted of ${m.fill.denseLeft} left (${m.fill.denseAsks} asks, ${m.fill.denseFillMs.toFixed(1)} ms, worst ${m.fill.denseFillWorst.toFixed(2)} ms)` : '') +
               (m.fill ? `, tables blocks ${m.fill.blocksLen} ftab ${m.fill.ftabLen}` : '') +

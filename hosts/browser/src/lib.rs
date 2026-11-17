@@ -12393,14 +12393,30 @@ fn do_exec(h: &mut Host, path: &str, argv: &[String], envp: &[String]) -> u64 {
     let mut data = guest();
     // The new image goes where its own headers say, which for a static
     // executable is the same place the old one was.
+    // A native wasm32 program's module rides in its image (wasm-elf.py), and
+    // nothing in the guest reads it there: it is read from the file where it
+    // is needed (`wasmprog::publish`, JS), so it is not placed. Placed, it was
+    // a copy in every process's memory (8 MiB of each Wine process's).
+    let module = program.as_ref().and_then(|p| {
+        let segs: Vec<(u64, u64, u64)> = p.exe.segments.iter().zip(&ranges).map(|(s, &(o, l))| (s.vaddr, o, l)).collect();
+        let exe = p.direct.as_deref().unwrap_or(path);
+        cgen::wasmprog::module_in_file(p.exe.entry, &segs, &|o, b| h.kernel.read_file_at(exe, o, b)).map(|(at, len, _)| (at, at + len))
+    });
     for ((seg, from), &(off, len)) in program.iter().flat_map(|p| p.placements()).zip(&ranges) {
         let len = len as usize;
         if !fresh && data.zero_dirty(seg.vaddr, seg.mem_size as usize).is_err() {
             return 0;
         }
-        // From the file into place: the one copy.
+        // From the file into place: the one copy -- around the module, if it
+        // is in this segment.
         let Ok(dst) = data.read_mut(seg.vaddr, len) else { return 0 };
-        if h.kernel.read_file_at(from.unwrap_or(path), off, dst) != Some(len) {
+        let (ma, mb) = module
+            .filter(|&(a, b)| a >= seg.vaddr && b <= seg.vaddr + len as u64)
+            .map_or((len, len), |(a, b)| ((a - seg.vaddr) as usize, (b - seg.vaddr) as usize));
+        let file = from.unwrap_or(path);
+        if h.kernel.read_file_at(file, off, &mut dst[..ma]) != Some(ma)
+            || h.kernel.read_file_at(file, off + mb as u64, &mut dst[mb..]) != Some(len - mb)
+        {
             return 0;
         }
         let mut prot = 0;
@@ -20702,6 +20718,16 @@ pub extern "C" fn gex_shared_seed(ptr: u32, count: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn gex_slots_per_table() -> u32 {
     gex_xlate::PageTable::SLOTS_PER_TABLE as u32
+}
+
+/// The guest's accessible mappings, in MiB (its VmRSS): what its share of
+/// the memory is, in a wasm32 memory and a memory64 alike (where its mappings
+/// take no arena, so [`gex_arena_spent_mib`]'s maps stay 0). A memory's size
+/// is not it: a memory64 is 8 GiB from its first instruction, almost none of
+/// it touched.
+#[no_mangle]
+pub extern "C" fn gex_guest_mapped_mib() -> u32 {
+    (crate::sigs::proc_home().mm().lock().vm_counters().1 >> 20) as u32
 }
 
 /// What this process's address space went on, in MiB: 0 guest mappings, 1 the
