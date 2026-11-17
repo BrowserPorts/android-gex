@@ -17,10 +17,13 @@
 # says so as such devices do: ro.hw_timeout_multiplier scales the time
 # Android's daemons give each other (android::base::HwTimeoutMultiplier).
 # netd gives its iptables-restore 50 polls of 100 ms times it to answer, and
-# the first one of a boot loads and translates every iptables extension.
-# Set before anything reads it; the image's build properties do not set it.
+# the first one of a boot loads and translates every iptables extension
+# while the zygote and dozens of services start and translate beside it
+# (at 10, boots b62 and b71 still ran out of time; alone it answers in 7 s
+# of the guest's time, cold). Set before anything reads it; the image's
+# build properties do not set it.
 on early-init
-    setprop ro.hw_timeout_multiplier 10
+    setprop ro.hw_timeout_multiplier 30
 
 on post-fs
     start gex_logcat
