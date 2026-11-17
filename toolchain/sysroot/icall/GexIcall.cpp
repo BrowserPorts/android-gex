@@ -368,6 +368,11 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       const User *Us = U.getUser();
       if (auto *CB = dyn_cast<CallBase>(Us))
         if (CB->isCallee(&U)) continue;
+      // (a function's personality, as wasm EH's __gxx_wasm_personality_v0,
+      // is no address anything holds: the back end drops it, and libc++abi
+      // defines no such symbol, so a record naming it failed every link of
+      // a C++ program with exceptions)
+      if (isa<Function>(Us)) continue;
       if (auto *GV = dyn_cast<GlobalVariable>(Us))
         if (GV->getSection() == "llvm.metadata") continue;
       if (auto *CE = dyn_cast<Constant>(Us)) {
