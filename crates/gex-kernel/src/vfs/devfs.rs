@@ -81,14 +81,11 @@ impl FileHandle for DevHandle {
                 Ok(buf.len() as u64)
             }
             // A terminal read has to come from the host's stdin, which the
-            // kernel wires up separately; through the VFS it looks empty
-            // (end of file). On Linux a reader would wait; here, for now,
-            // it does not: with init's console shell waiting, servicemanager's
-            // readiness never reached the processes waiting for it (boot
-            // b68), which looks like a shared property area going stale
-            // while init is idle, which the shell's endless restarts were
-            // keeping busy. Until that is found the shell is left to end.
-            Device::Tty => Ok(0),
+            // kernel wires up separately. Through the VFS nothing is ever
+            // typed: a reader waits, as it would at a terminal nobody types
+            // at (it was end of file, and init's console shell, which init
+            // starts again whenever it ends, ended at once, over and over).
+            Device::Tty => Err(Errno::EAGAIN),
         }
     }
 
@@ -124,7 +121,24 @@ impl FileHandle for DevHandle {
         self.device == Device::Tty
     }
 
+    /// Nothing is ever there to read at a terminal here (`read_at`):
+    /// readable said otherwise, a parked read found nothing and was tried
+    /// again at once, for ever.
+    fn poll_readable(&self) -> bool {
+        self.device != Device::Tty
+    }
 
+    /// A terminal read waits here: a queue nothing notifies, since nothing
+    /// is ever typed (without one a parked read was tried again and again,
+    /// a CPU's worth of it, and the console shell's starved init's other
+    /// services).
+    fn wait_queue(&self) -> u32 {
+        static NOBODY_TYPES: std::sync::OnceLock<crate::wait::Queue> = std::sync::OnceLock::new();
+        match self.device {
+            Device::Tty => NOBODY_TYPES.get_or_init(crate::wait::Queue::new).id(),
+            _ => 0,
+        }
+    }
 }
 
 /// The `/dev` filesystem.
