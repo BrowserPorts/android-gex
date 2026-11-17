@@ -124,6 +124,7 @@ pub const HELPERS: &[(i32, &str, bool)] = &[
     (132, "ringbuf_submit", false),
     (133, "ringbuf_discard", false),
     (143, "store_hdr_opt", false),
+    (160, "ktime_get_coarse_ns", false),
     (144, "reserve_hdr_opt", false),
     (164, "for_each_map_elem", false),
     (186, "get_retval", false),

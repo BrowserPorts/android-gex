@@ -264,6 +264,12 @@ impl Machine<'_, '_> {
             // the boot clock (the same here: nothing is suspended).
             5 => crate::syscalls::clock_ns(crate::syscalls::system_clock, 1),
             125 => crate::syscalls::clock_ns(crate::syscalls::system_clock, 7),
+            // ktime_get_coarse_ns: CLOCK_MONOTONIC_COARSE, which here is
+            // the monotonic clock unrounded to a tick, as `clock_gettime`
+            // gives it (socket filters, skb, classifier, sock and sock_addr
+            // programs may call it: `bpf_sk_base_func_proto`,
+            // `sock_filter_func_proto`).
+            160 => crate::syscalls::clock_ns(crate::syscalls::system_clock, 6),
             // get_smp_processor_id.
             8 => 0,
             // skb_load_bytes(skb, offset, to, len): -EFAULT and the
@@ -636,6 +642,26 @@ mod tests {
         assert_eq!(ret(1, &[i(0xb7, 0, 0, 0, -100), i(0xb7, 1, 0, 0, 7), i(0x3f, 0, 1, 1, 0), exit]), 0xffff_fff2);
         assert_eq!(ret(1, &[i(0xb7, 0, 0, 0, -100), i(0xb7, 1, 0, 0, 7), i(0x9f, 0, 1, 1, 0), exit]), 0xffff_fffe);
         assert_eq!(ret(1, &[i(0xb7, 1, 0, 0, 0x80), i(0xbf, 0, 1, 8, 0), exit]), 0xffff_ff80);
+    }
+
+    /// `ktime_get_coarse_ns` from a socket filter: the monotonic clock,
+    /// not zero, and not going back between two calls.
+    #[test]
+    fn the_coarse_clock() {
+        let exit = i(0x95, 0, 0, 0, 0);
+        let prog = [
+            i(0x85, 0, 0, 0, 160),
+            i(0xbf, 6, 0, 0, 0),
+            i(0x15, 6, 0, 5, 0),
+            i(0x85, 0, 0, 0, 160),
+            i(0x3d, 0, 6, 1, 0),
+            i(0x05, 0, 0, 2, 0),
+            i(0xb7, 0, 0, 0, 1),
+            exit,
+            i(0xb7, 0, 0, 0, 0),
+            exit,
+        ];
+        assert_eq!(ret(prog_type::SOCKET_FILTER, &prog), 1);
     }
 
     #[test]
