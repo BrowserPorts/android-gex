@@ -511,6 +511,40 @@ try:
     # (in link-line order: a name two of them export binds to the first, as
     # GNU ld takes it from the first import library that defines it)
     own = [(n, ex) for _, n, ex in sorted(own)]
+    # A .def that exports a name twice: the first entry is taken, as MSVC's
+    # link and GNU ld take it (winebuild refuses the second). An export the
+    # objects define as data is data, DATA or not, as link finds it (winebuild
+    # would make it a function)
+    data = None
+    if defs:
+        data = set()
+        r = subprocess.run(['llvm-nm', '--defined-only', '--extern-only'] + [o for o in objs if o.endswith(('.o', '.obj', '.a'))],
+                           capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            w = line.split()
+            if len(w) == 3 and w[1] in 'DBRVdbr':
+                data.add(w[2])
+    for k, d in enumerate(defs):
+        seen, lines, dup, sect = set(), [], False, ''
+        for line in open(d, errors='surrogateescape'):
+            w = line.split(';', 1)[0].split()
+            if w and w[0].upper() in ('EXPORTS', 'IMPORTS', 'LIBRARY', 'NAME', 'SECTIONS', 'HEAPSIZE', 'STACKSIZE', 'VERSION', 'DESCRIPTION'):
+                sect = w[0].upper()
+                w = w[1:]
+            if sect == 'EXPORTS' and w:
+                n = w[0].split('=', 1)[0]
+                if n in seen:
+                    dup = True
+                    continue
+                seen.add(n)
+                if n in data and 'DATA' not in (x.upper() for x in w[1:]):
+                    line = line.rstrip('\n').split(';', 1)[0].rstrip() + ' DATA\n'
+                    dup = True
+            lines.append(line)
+        if dup:
+            defs[k] = os.path.join(tmp, '%d-%s' % (k, os.path.basename(d)))
+            with open(defs[k], 'w', errors='surrogateescape') as f:
+                f.writelines(lines)
     # A DLL without a .def exports what its objects define with default
     # visibility: what it marks dllexport or dllimport (the GexLLP64
     # plugin's attributes) or visibility("default")
