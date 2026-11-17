@@ -396,8 +396,16 @@ if cxx:
     # C runtime's, the -D__builtin_lround=lround below and the rest)
     # (not when only preprocessing: what a program preprocesses, such as
     # JavaScript sources, would carry the header's lines)
+    # (after the program's own -include files: the header pulls in C++
+    # headers, and a program's wrappers of them, as Firefox's stl_wrappers
+    # reaching mfbt/Types.h, would otherwise run before the program's
+    # config header, mozilla-config.h's WIN32, and MOZ_EXPORT come out empty)
     pre = '-E' in args
-    base = ([] if pre else ['-include', 'math.h' if conf.get('MINGW_INCLUDE') else here + '/include/gexcc-win-cxx.h']) + ['-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER',
+    if not pre:
+        last = max([i + (2 if a == '-include' else 1) for i, a in enumerate(args)
+                    if a.startswith('-include') and not a.startswith('-include-')], default=0)
+        args[last:last] = ['-include', 'math.h' if conf.get('MINGW_INCLUDE') else here + '/include/gexcc-win-cxx.h']
+    base = ['-nostdinc++', '-isystem', CXX + '/include/c++/v1', '-D_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER',
             '-DWIDL_EXPLICIT_AGGREGATE_RETURNS'] + base
 # (__forceinline as MinGW's _mingw.h has it)
 base += [*crt_dirs, '-idirafter', here + '/include', '-fdeclspec',
