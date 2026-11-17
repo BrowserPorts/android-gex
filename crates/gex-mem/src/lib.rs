@@ -59,6 +59,8 @@ impl GuestMemory {
     }
 }
 
+pub mod alloc_tag;
+
 /// Give the host back what its allocator keeps of memory the program has
 /// freed (glibc's `malloc_trim`; nothing on a host with another
 /// allocator). Here with the other thing the host cannot say safely: glibc
@@ -166,6 +168,11 @@ pub fn heap_stats_every() {
                     m.hblkhd >> 20,
                     m.hblks
                 );
+                let live = alloc_tag::live();
+                if live.iter().any(|&b| b != 0) {
+                    let parts: Vec<String> = alloc_tag::NAMES.iter().zip(live).map(|(n, b)| format!("{n} {}", b >> 20)).collect();
+                    eprintln!("gex: heap by tag at {}s (MiB): {}", start.elapsed().as_secs(), parts.join(", "));
+                }
             });
         });
     }

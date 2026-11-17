@@ -915,6 +915,7 @@ dependencies = [
  "gex-ir",
  "gex-kernel",
  "gex-ld",
+ "gex-mem",
  "gex-native",
  "gex-split",
  "gex-units",

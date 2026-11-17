@@ -21,6 +21,7 @@ gex-xlate = { workspace = true, features = ["parallel", "cgen", "fjit"] }
 gex-emit.workspace = true
 gex-native = { workspace = true, features = ["translate"] }
 gex-kernel.workspace = true
+gex-mem.workspace = true
 gex-eject = { workspace = true, features = ["build"] }
 gex-cache = { workspace = true, features = ["compile"] }
 anyhow = "1"
@@ -30,3 +31,7 @@ anyhow = "1"
 x86 = ["gex-abi/x86", "gex-xlate/x86", "gex-native/x86", "gex-eject/x86"]
 # A gexc whose 64-bit guest memory is 64 GiB. See `gex-abi`'s `big64`.
 big64 = ["gex-abi/big64"]
+# A diagnostic allocator: live heap bytes by what allocated them
+# (`gex_mem::alloc_tag`), said with GEX_HEAP_STATS. Every block costs a
+# header.
+alloc-tags = []

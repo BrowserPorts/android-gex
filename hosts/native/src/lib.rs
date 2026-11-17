@@ -974,6 +974,36 @@ fn new_engine() -> Result<Engine> {
     Engine::new(&config).context("creating the wasm engine")
 }
 
+/// `GEX_JIT_STATS=<seconds>`: every so many seconds, the run's translation
+/// counts so far, one line on standard error: what was published, installed
+/// into a store (once per store that takes it), compiled or found in the
+/// cache, and slots given the miss stub. For seeing what grows with threads.
+fn jit_stats_every() {
+    let Some(secs) = std::env::var("GEX_JIT_STATS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else {
+        return;
+    };
+    let start = std::time::Instant::now();
+    let _ = std::thread::Builder::new().name("gex-jit-stats".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        use jit_stats::*;
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "gex: jit at {}s: {} published ({} blocks, {} MiB of wasm), {} installs, {} cache hits, {} misses, {} filled, {} stale, {} retired; tmpfs {} MiB",
+            start.elapsed().as_secs(),
+            PUBLISHED.load(Relaxed),
+            BLOCKS.load(Relaxed),
+            WASM_BYTES.load(Relaxed) >> 20,
+            INSTALLS.load(Relaxed),
+            CACHE_HITS.load(Relaxed),
+            CACHE_MISSES.load(Relaxed),
+            FILLED.load(Relaxed),
+            STALE.load(Relaxed),
+            RETIRED.load(Relaxed),
+            gex_kernel::vfs::tmpfs::TMPFS_BYTES.load(Relaxed) >> 20,
+        );
+    });
+}
+
 /// `GEX_FIXED_RANDOM=<seed>`: what `getrandom` and `/dev/urandom` give is a
 /// function of the seed and of which program asks, the same in every run
 /// (`gex_kernel::entropy`). For a run whose programs place their own code
@@ -986,6 +1016,7 @@ fn fixed_random() {
         gex_mem::raise_open_files();
         gex_mem::tune_heap();
         gex_mem::heap_stats_every();
+        jit_stats_every();
         if let Ok(seed) = std::env::var("GEX_FIXED_RANDOM") {
             match seed.parse::<u64>() {
                 Ok(seed) => gex_kernel::entropy::fix(seed),
@@ -1012,6 +1043,7 @@ fn run_program_with(
     inherited: Option<Inherited>,
 ) -> Result<(Exit, Stats)> {
     let fresh_process = inherited.is_none();
+    let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::THREAD);
     gex_kernel::syscalls::set_thread_runners(gex_kernel::syscalls::ThreadRunners { take: take_runner, give: give_runner });
     fixed_random();
     dense::start();
@@ -2408,6 +2440,7 @@ fn run_thread_loop(
     ctx_addr: u64,
     entry: u64,
 ) -> Result<Stopped> {
+    let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::RUN);
     let enter = instance
         .get_func(&mut *store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
@@ -2829,6 +2862,7 @@ fn publish_vm(k: &Kernel, memory: &gex_mem::GuestMemory) {
 }
 
 fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest, inside: bool) -> Result<()> {
+    let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::FORK);
     let pid = req.pid;
     if let Some(aot) = store.as_context().data().spawn.as_ref().and_then(|s| s.opts.aot.clone()) {
         if aot.single_process {
@@ -3210,6 +3244,7 @@ fn crash_line(c: &gex_kernel::proc::Crash) {
 
 /// Run a child process to completion in this host thread.
 fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> Result<Exit> {
+    let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::THREAD);
     let mut store = Store::new(
         &cx.engine,
         HostState {
@@ -3598,6 +3633,7 @@ fn exec_program(
 /// Run one spawned thread to its end. `Some` when its end is the process's
 /// (`exit_group`, a fatal signal), not just its own.
 fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option<Exit>> {
+    let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::THREAD);
     // Without the kernel lock at the end, which a process ending may hold.
     let slots = Arc::clone(&cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).next_ctx_slot);
     let mut store = Store::new(
@@ -3789,6 +3825,7 @@ impl Take {
 /// pages a thread runs keeps a thread that runs little small, where every
 /// thread of Android's apexd had all 1,500 modules of the process.
 fn replay_into(mut cx: impl wasmtime::AsContextMut<Data = HostState>, take: Take) -> Result<bool> {
+    let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::REPLAY);
     let (pending, deferred) = {
         let mut store = cx.as_context_mut();
         let Some(jit) = store.data_mut().jit.as_mut() else {
@@ -4976,7 +5013,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let outcome = state.with_kernel(|k| {
                 // Cheap when nothing changed; an exec changes the image.
                 k.publish_proc(&proc_state);
-                let o = k.syscall(&mut gm, pc as u64);
+                let o = {
+                    let _t = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::KERNEL);
+                    k.syscall(&mut gm, pc as u64)
+                };
                 sys_nr = k.syscall_nr;
                 o
             });
@@ -6075,6 +6115,7 @@ pub(crate) fn ensure_alt_dir_in(state: &mut HostState, shared: &Arc<Mutex<JitSha
 /// table, so freshly translated code shares state with everything already
 /// running and can branch into it through the table.
 fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
+    let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::TRANSLATE);
     // No translator in this build: nothing is ever translated.
     if cfg!(not(feature = "translate")) {
         return Ok(false);
@@ -6268,6 +6309,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         Some((dir, build)) => {
             let key = gex_cache::key(&build, [translated_module.wasm.as_slice()]);
             let wasm = translated_module.wasm.clone();
+            let _load = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::LOAD);
             let l = gex_cache::load_or_compile(&engine, &dir, &key, move || Ok((wasm, Vec::new())))
                 .map_err(keep_bad)
                 .context("compiling runtime-translated wasm")?;
@@ -6556,6 +6598,7 @@ fn install_unit(
     mut cx: impl wasmtime::AsContextMut<Data = HostState>,
     unit: &CompiledUnit,
 ) -> Result<()> {
+    let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::INSTALL);
     let (memory, linker, tables, blocks) = {
         let data = cx.as_context().data();
         let jit = data
@@ -8091,6 +8134,7 @@ fn is_stale_table_trap(e: &anyhow::Error) -> bool {
 /// `None` when there was nothing to replay, which means the trap was not a
 /// stale table after all and the caller should report it.
 fn catch_up_and_resume(store: &mut Store<HostState>, ctx_addr: u64) -> Result<Option<u64>> {
+    let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::FILL);
     let behind = match store.data().jit.as_ref() {
         Some(jit) => {
             let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -8127,6 +8171,7 @@ fn catch_up_and_resume(store: &mut Store<HostState>, ctx_addr: u64) -> Result<Op
 /// always did; a table too short for the slot is grown to the end of its
 /// page first. Whether the slot was empty (and is the stub's now).
 fn fill_empty_slot(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, ctx_addr: u64) -> Result<bool> {
+    let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::FILL);
     if gex_abi::X86 {
         return Ok(false);
     }

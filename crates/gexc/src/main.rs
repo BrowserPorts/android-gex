@@ -27,6 +27,12 @@ mod host_walk;
 /// address the host's loader uses, and it uses this one.
 const INTERP_BASE: u64 = gex_abi::INTERP_BASE;
 
+/// `--features alloc-tags`: live heap bytes by what allocated them
+/// (`gex_mem::alloc_tag`), for finding what holds the host's memory.
+#[cfg(feature = "alloc-tags")]
+#[global_allocator]
+static ALLOC: gex_mem::alloc_tag::Tagged = gex_mem::alloc_tag::Tagged;
+
 fn main() -> ExitCode {
     // Every guest thread is a host thread, and glibc gives threads arenas
     // of their own, up to eight per core, each keeping what was freed in
