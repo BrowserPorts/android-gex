@@ -28,6 +28,8 @@ done
 L=$PREFIX/lib/gexcc-win
 mkdir -p "$PREFIX/bin" "$L" "$PREFIX/share/gexcc-win"
 printf 'WINE_BUILD=%s\nWINE_SRC=%s\nSYSROOT64=%s\nCXX=%s\n' "$WB" "$WS" "$(realpath "$GEX_WASM64_SYSROOT")" "$PREFIX/cxx" > "$L/config"
+# (Wine's headers matched regardless of case, as on Windows: nocase.py)
+python3 "$HERE/nocase.py" "$L/wine-nocase.yaml" "$WS/include" "$WB/include"
 if [ -n "${MINGW_W64:-}" ]; then
   MW=$(realpath "$MINGW_W64")
   python3 "$HERE/mingw-headers.py" "$MW/mingw-w64-headers" "$L/include-mingw"

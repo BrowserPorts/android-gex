@@ -301,6 +301,9 @@ if conf.get('MINGW_INCLUDE'):
     crt_dirs = []
 else:
     sdk_dirs = ['-isystem', here + '/include-rt', '-isystem', here + '/include-pre', '-isystem', B + '/include', '-isystem', S + '/include']
+    # (their names matched regardless of case, as on Windows)
+    if os.path.exists(LIB + '/wine-nocase.yaml'):
+        sdk_dirs += ['-ivfsoverlay', LIB + '/wine-nocase.yaml']
     crt_dirs = ['-isystem', S + '/include/msvcrt']
     # (MinGW's names Wine's headers lack, and Wine's wide-char mode)
     sdk_dirs += ['-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL']
