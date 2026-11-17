@@ -28,7 +28,7 @@ export default async function (t) {
       ...(ahead ? { restAhead: true } : {}),
       build: {
         arch: arch ?? 'aarch64', tar: [t.work('bb.tar')], lazy: t.work(`${dir}/lazy.json`), zstd,
-        exe: '/bin/sh', argv: ['-c', 'echo up; sleep 8; wc -c < /data/f0; head -c 3 /data/f0; echo; sleep 600'],
+        exe: '/bin/sh', argv: ['-c', 'echo up; sleep 8; echo reading; wc -c < /data/f0; head -c 3 /data/f0; echo; sleep 600'],
         env: ['PATH=/bin:/usr/bin', 'HOME=/root'], cwd: '/', featuresOff: [], compositor: false, jitFallback: true, gl: false,
         switches,
       },
@@ -54,10 +54,13 @@ export default async function (t) {
       const first = order.indexOf(bin), tar = order.indexOf('bb.tar'), list = order.indexOf(`${dir}/lazy.json`);
       check(`${name}: ... after the title files (the bundle and the lazy list)`, first > list && (tar < 0 || first > tar), order.join(' '));
     } else {
-      // up to just before the read: nothing of the rest bundle
+      // up to just before the read: nothing of the rest bundle. The program says "reading" before its read: a
+      // page that saw "up" late (the single-thread build, loaded) can be into the read 5 s on, and the frame it
+      // fetched then is the read's own
       await new Promise((r) => setTimeout(r, 5000));
-      const before = await t.hits(bin);
-      check(`${name}: no rest bundle byte before the first read`, atUp === 0 && before === 0 && !/65536/.test(app.state.out), `${atUp} at the program's start, ${before} 5 s on`);
+      const before = await t.hits(bin), reading = /^reading$/m.test(app.state.out.replace(/\r/g, ''));
+      check(`${name}: no rest bundle byte before the first read`, atUp === 0 && (before === 0 || reading),
+        `${atUp} at the program's start, ${before} 5 s on${reading ? ' (the read under way)' : ''}`);
     }
     await until(() => /^65536\naaa$/m.test(app.state.out.replace(/\r/g, '')), 'the read', 30000)
       .catch((e) => { throw new Error(`${e.message}: ${app.state.out.slice(-400)}`); });
