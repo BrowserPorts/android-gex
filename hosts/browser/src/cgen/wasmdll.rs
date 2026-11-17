@@ -195,13 +195,15 @@ struct WinePes {
     canon: std::collections::BTreeMap<(bool, String), u32>,
     /// The lowest of the PE32+ data window handed out so far.
     data_low: u64,
+    /// The last module's data placed above the compact island (`pe_data_big`), 0 for none.
+    big_low: u64,
 }
 
 /// Bumped each time the late list changes (an entry added, or its provider
 /// installed): a Worker reads the list again only when it moved
 /// (`gex_wasmdll_lates_gen`).
 static LATE_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static WINE_PE: Mutex<WinePes> = Mutex::new(WinePes { mods: Vec::new(), late: Vec::new(), canon: std::collections::BTreeMap::new(), data_low: 0 });
+static WINE_PE: Mutex<WinePes> = Mutex::new(WinePes { mods: Vec::new(), late: Vec::new(), canon: std::collections::BTreeMap::new(), data_low: 0, big_low: 0 });
 
 /// The core module's file name: the module a skeleton of a DLL linked as
 /// a module of its own finds beside itself.
@@ -838,7 +840,19 @@ fn install_module(
         let len = (size as u64).max(16) + a;
         match near.filter(|_| is64).and_then(|b| pe_data_near(g.data_low, b, len)) {
             Some(d) => d,
-            None => alloc_pe_data_window(&mut g.data_low, len, "[wine PE data]")?,
+            None => match alloc_pe_data_window(&mut g.data_low, len, "[wine PE data]") {
+                Ok(d) => d,
+                // (more than the window holds: above its image instead)
+                Err(e) => match near.filter(|_| is64) {
+                    Some(b) => pe_data_big(&mut g.big_low, b, len).or_else(|| pe_data_above(b, len)).ok_or_else(|| {
+                        let mm = crate::sigs::proc_home().mm().lock();
+                        let spans: Vec<String> = mm.arena_spans().iter().filter(|&&(_, y)| y > b).rev().take(6)
+                            .map(|(x, y)| format!("{x:#x}..{y:#x}")).collect();
+                        format!("{e}, nor above its image at {b:#x} within reach (arena above it: {})", spans.join(" "))
+                    })?,
+                    None => return Err(format!("{e}, and its image is not mapped yet (installed ahead of it)")),
+                },
+            },
         }
     } else {
         provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?
@@ -1359,7 +1373,6 @@ pub extern "C" fn gex_image_floats(fd: i32) -> i32 {
 /// instead, zeroed.
 /// None: the window's next is in reach, or nothing there is.
 fn pe_data_near(low: u64, base: u64, len: u64) -> Option<u64> {
-    use gex_kernel::mem::{flags, prot};
     if !gex_abi::mem64() {
         return None;
     }
@@ -1372,6 +1385,43 @@ fn pe_data_near(low: u64, base: u64, len: u64) -> Option<u64> {
     if reach(hi.saturating_sub(len)) {
         return None;
     }
+    pe_data_above(base, len)
+}
+
+/// In 64-bit Wine's compact space, `len` bytes for a PE32+ module's data
+/// the window cannot hold, from the top of `winspace::wine64_compact_big_data`
+/// down, below `low` (the last one's, 0 for none), zeroed: within reach of
+/// its image `base` below it.
+fn pe_data_big(low: &mut u64, base: u64, len: u64) -> Option<u64> {
+    use gex_kernel::mem::{flags, prot};
+    let (lo, mut hi) = crate::winspace::wine64_compact_big_data()?;
+    if *low != 0 {
+        hi = hi.min(*low);
+    }
+    let len = (len + 0xffff) & !0xffff;
+    let at = hi.checked_sub(len).filter(|&at| at >= lo && at >= base && at + len - base <= 1 << 32)?;
+    let mut mm = crate::sigs::proc_home().mm().lock();
+    let a = mm.mmap(at, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, "[wine PE data]").ok()?;
+    if a != at {
+        let _ = mm.unmap(a, len);
+        return None;
+    }
+    mm.note_host_data(a, a + len);
+    drop(mm);
+    *low = a;
+    let _ = crate::guest().zero(a, len as usize);
+    Some(a)
+}
+
+/// `len` bytes for a PE32+ module's data in the highest free range above
+/// its image `base` that its 32-bit RVAs reach, zeroed. In a 32-bit memory
+/// too, for data the window cannot hold (Firefox's xul.dll, 46 MB; the
+/// window is 8 or 16 MiB), as natively, where data the window cannot hold
+/// goes elsewhere above the code (`alloc_above_code_data`).
+fn pe_data_above(base: u64, len: u64) -> Option<u64> {
+    use gex_kernel::mem::{flags, prot};
+    let len = (len + 0xfff) & !0xfff;
+    let reach = |at: u64| at >= base && at + len - base <= 1 << 32;
     let mut mm = crate::sigs::proc_home().mm().lock();
     let at = mm.find_free_down(base, base + (1 << 32), len)?;
     let a = mm.mmap(at, len, prot::READ | prot::WRITE, flags::PRIVATE | flags::ANONYMOUS | flags::FIXED_NOREPLACE, "[wine PE data]").ok()?;
