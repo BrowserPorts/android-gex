@@ -6,6 +6,8 @@ extern "C" {
 #endif
 #ifndef _TIMEVAL_DEFINED
 #define _TIMEVAL_DEFINED
+/* (and says it defined the struct: Wine's winsock.h keeps the guard then) */
+#define _SYS_TIME_TIMEVAL
 struct timeval { long tv_sec; long tv_usec; };
 #endif
 #ifndef _TIMEZONE_DEFINED
