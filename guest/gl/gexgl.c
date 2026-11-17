@@ -5329,11 +5329,18 @@ unsigned eglQueryContext(void *dpy, void *ctx, int attr, int *value) {
 }
 
 unsigned eglQuerySurface(void *dpy, void *surface, int attr, int *value) {
-    (void)dpy; (void)surface;
+    (void)dpy;
     if (!value) return egl_fail(EGL_BAD_PARAMETER);
+    /* The surface asked about: the current one's size is the one kept up to
+       date (a resize, a swap); another's, the size it was made with -- a
+       window surface not yet made current (its attach waits for that) has
+       its window's size, not the last current one's or the default. */
+    const struct gexgl_egl_surface *q = egl_surface_of(surface);
+    const int qw = q && q != egl_surface && q->width > 0 ? q->width : egl_surface_width;
+    const int qh = q && q != egl_surface && q->height > 0 ? q->height : egl_surface_height;
     switch (attr) {
-    case 0x3057: *value = egl_surface_width; break;  /* EGL_WIDTH */
-    case 0x3056: *value = egl_surface_height; break; /* EGL_HEIGHT */
+    case 0x3057: *value = qw; break;  /* EGL_WIDTH */
+    case 0x3056: *value = qh; break; /* EGL_HEIGHT */
     case 0x3028: *value = 1; break;                  /* EGL_CONFIG_ID */
     default: *value = 0; break;
     }
