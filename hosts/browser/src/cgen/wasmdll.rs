@@ -800,7 +800,15 @@ fn install_module(
             if g.mods.iter().any(|w| w.ptr64 == is64 && w.name == f) || busy.contains(&f) || wait {
                 continue;
             }
-            let Ok(m) = read_module(dir, &f) else { continue };
+            let m = match read_module(dir, &f) {
+                Ok(m) => m,
+                // (its data's address is needed now: say which file is missing)
+                Err(e) if data_deps.contains(&f) => {
+                    busy.pop();
+                    return Err(format!("{name}: data from {f}: {e}"));
+                }
+                Err(_) => continue,
+            };
             if let Err(e) = install_module(g, dir, &f, m, core, is64, None, &Default::default(), busy) {
                 busy.pop();
                 return Err(e);
