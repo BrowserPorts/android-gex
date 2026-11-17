@@ -34,6 +34,9 @@
 //   (ModCase.exe, ModCase.exe.wasm) than the name its .wasmref gives
 //   (modcase.exe.wasm): the module found without case, as Windows finds
 //   files;
+// - prelude: a one-step C++ compile and link gets the program's own
+//   -include, then gexcc-win's prelude;
+// - wkdata: weak undefined data links and its address is null;
 // - missimp: an import no DLL exports, bound to a stub (listed at the
 //   link): the program runs, and a call of it ends the process as Wine's
 //   stubs do;

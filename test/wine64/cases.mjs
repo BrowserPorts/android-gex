@@ -337,6 +337,24 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     }
     t.check(`${pre}nodata: undefined data is a link error`, log !== null && /undefined data reference to `nodata_missing'/.test(log), log ?? 'linked');
   }
+  if (want('prelude')) {
+    // a one-step C++ compile and link: the program's -include, then the prelude
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'prelude.cpp'), 'prelude.exe', ['-O2', '-include', join(F, 'prelude.h')]); } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}prelude: build`, false, String(e.message));
+    }
+    await w.nt({ want: /prelude: ok 1/, ...o, name: `${pre}prelude`, exe, extra: [`${exe}.wasm`] });
+  }
+  if (want('wkdata')) {
+    // weak undefined data is not the undefined-data link error
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'wkdata.c'), 'wkdata.exe', ['-O2']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}wkdata: build`, false, String(e.message));
+    }
+    await w.nt({ want: /wkdata: null/, ...o, name: `${pre}wkdata`, exe, extra: [`${exe}.wasm`] });
+  }
   const mingwInstall = (() => {
     try { return /^MINGW_INCLUDE=/m.test(readFileSync(join(process.env.GEX_TEST_GEXCC_WIN ?? '', 'lib/gexcc-win/config'), 'utf8')); } catch { return false; }
   })();

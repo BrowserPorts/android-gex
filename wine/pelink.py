@@ -60,6 +60,7 @@ STUB_IMPORTS = False  # a program's missing imports bound to stubs (--stub-impor
 SYMBOLIC = False  # a --split module's own symbols bound locally (--symbolic)
 OTHER_NATIVE = {}  # function or data name -> the --other DLL that exports it (pelink's main)
 EXTRA = set()  # the --extra DLLs (pelink's main)
+WEAK_UNDEF = set()  # their objects' weak undefined names
 
 
 def cc(*args):
@@ -417,6 +418,12 @@ def main():
         STUB_IMPORTS = True
         del sys.argv[1]
     EXTRA.update(e[0] for e in extra)
+    # (their weak undefined names, which may stay undefined)
+    for _, ro, _, _ in extra:
+        # (wasm-objdump's linking section: llvm-objdump refuses a wasm64 -r
+        # output, "invalid function symbol index")
+        sym = subprocess.run(['wasm-objdump', '-x', '-j', 'linking', ro], capture_output=True, text=True).stdout
+        WEAK_UNDEF.update(re.findall(r'- \d+: D <([^>]+)> \[ undefined binding=weak', sym))
     build, src, out = sys.argv[1:4]
     global SRC, BUILD
     SRC = src
@@ -2062,7 +2069,9 @@ static void *gexw_ntdll_proc(const char *name)
         # mingw GUIDs, IID_ILatLongReport and the rest, failed only there)
         own = [m for m, _, _, _ in dlls if grp(m) == g]
         if own and all(m in EXTRA for m in own):
-            lost = sorted(n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if '!' not in n)
+            # (a weak one, `extern int x __attribute__((weak))` tested by
+            # &x, may: it binds to 0)
+            lost = sorted(n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if '!' not in n and n not in WEAK_UNDEF)
             if lost:
                 for n in lost:
                     print(f'pelink: error: {out}: undefined data reference to `{n}\'', file=sys.stderr)
