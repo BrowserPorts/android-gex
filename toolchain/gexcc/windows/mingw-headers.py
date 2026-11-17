@@ -44,6 +44,30 @@ def winrt_bool(text):
     return text.replace('<boolean,', '<bool,').replace(',boolean >', ',bool >').replace(',boolean,', ',bool,')
 
 
+METHOD = re.compile(r'(    virtual ([\w ]+?\**) STDMETHODCALLTYPE (\w+?)(_+)\(\n(.*?)\)( const)? = 0;\n)', re.S)
+
+
+def cxx_overloads(text):
+    # widl names a C++ overload X_ (X__ for the next) beside X, where the
+    # Windows SDK's headers have overloads: X as an inline overload
+    # forwarding to it, in the same interface (no vtable change)
+    def block(b):
+        body = b.group(1)
+        names = set(re.findall(r'STDMETHODCALLTYPE (\w+)\(', body))
+
+        def add(m):
+            whole, ret, base, us, params, const = m.groups()
+            if base not in names or '(' in params:
+                return whole
+            ps = [p.strip() for p in params.split(',') if p.strip()]
+            args = [re.search(r'(\w+)\s*(?:\[[^]]*\])?$', p).group(1) for p in ps]
+            fwd = '%s%s(%s)' % (base, us, ', '.join(args))
+            return whole + '    %s %s(%s)%s { %s%s; }\n\n' % (
+                ret, base, ', '.join(ps), const or '', '' if ret == 'void' else 'return ', fwd)
+        return b.group(0).replace(body, METHOD.sub(add, body))
+    return re.sub(r'#if defined\(__cplusplus\) && !defined\(CINTERFACE\)\nMIDL_INTERFACE\("[^"]*"\)\n\w+ : public \w+\n\{\n(.*?)\n\};', block, text, flags=re.S)
+
+
 def rewrite(text):
     out = []
     for line in text.split('\n'):
@@ -57,6 +81,8 @@ def rewrite(text):
     return '\n'.join(out)
 
 
+# (written beside OUT and swapped in, so compiles reading OUT never see it half made)
+FINAL, OUT = OUT, OUT.rstrip('/') + '.new'
 if os.path.exists(OUT):
     shutil.rmtree(OUT)
 os.makedirs(OUT)
@@ -75,6 +101,8 @@ for sub, dest in (('include', ''), ('crt', ''), ('ddk/include', '')):
                 text = text.replace('@DEFAULT_MSVCRT_VERSION@', '0xE00').replace('@DEFAULT_WIN32_WINNT@', '0xa00')
             if key not in KEEP:
                 text = rewrite(text)
+            if key.startswith('include/') and 'STDMETHODCALLTYPE' in text and re.search(r'STDMETHODCALLTYPE \w+_\(', text):
+                text = cxx_overloads(text)
             if re.match(r'include/windows\.[\w.]+\.h$', key):
                 text = winrt_bool(text)
             for f2, old, new in EDITS:
@@ -82,3 +110,12 @@ for sub, dest in (('include', ''), ('crt', ''), ('ddk/include', '')):
                     assert old in text, (key, old)
                     text = text.replace(old, new)
             open(o, 'w', encoding='latin-1').write(text)
+
+OLD = FINAL.rstrip('/') + '.old'
+if os.path.exists(OLD):
+    shutil.rmtree(OLD)
+if os.path.exists(FINAL):
+    os.rename(FINAL, OLD)
+os.rename(OUT, FINAL)
+if os.path.exists(OLD):
+    shutil.rmtree(OLD)
