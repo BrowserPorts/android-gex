@@ -38,6 +38,9 @@
 //   -include, then gexcc-win's prelude;
 // - wkdata: weak undefined data links and its address is null; weak data
 //   a DLL defines (wkdll) reads the DLL's;
+// - fficall: libffi (-lffi): ffi_call to a DLL's functions as native values
+//   and as GetProcAddress's guest ones, mixed scalars and structs by value,
+//   a variadic call; closures refused (FFI_BAD_ABI);
 // - missimp: an import no DLL exports, bound to a stub (listed at the
 //   link): the program runs, and a call of it ends the process as Wine's
 //   stubs do;

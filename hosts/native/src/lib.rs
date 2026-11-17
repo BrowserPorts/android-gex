@@ -4586,6 +4586,7 @@ fn alt_enter_in_store(store: &mut Store<HostState>, ctx_addr: u64, pc: u64) -> R
 fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let m = IMPORT_MODULE;
     libprov::register(linker)?;
+    ftab::register_ffi(linker)?;
 
     linker.func_wrap(
         m,

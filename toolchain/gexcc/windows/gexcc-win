@@ -515,6 +515,8 @@ try:
         if not p and mw and os.path.exists(mw + '/lib%s.a' % l):
             p = mw + '/lib%s.a' % l
             if l in dll_too: dlls.append(l)
+        if not p and os.path.exists(LIB + '/lib%s.a' % l):
+            p = LIB + '/lib%s.a' % l  # gexcc-win's own: ffi
         if not p and os.path.exists(B + '/libs/%s/lib%s.a' % (l, l)):
             p = B + '/libs/%s/lib%s.a' % (l, l)  # Wine's static ones: uuid, dxguid, strmiids
         if p:

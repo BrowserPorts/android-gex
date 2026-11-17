@@ -371,6 +371,20 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     // and on the page's loader (hosts/browser/src/cgen/wasmdll.rs)
     await w.nt({ want: /wkdata: null 42/, ...o, name: `${pre}wkdata-page`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`], page: {} });
   }
+  if (want('fficall')) {
+    // gexcc-win's libffi: native function values (gex.ffi_thunk's thunks)
+    // and guest ones (GetProcAddress), mixed scalars and structs by value
+    let dll, exe;
+    try {
+      dll = await w.gexccWin(join(F, 'ffidll.c'), 'ffidll.dll', ['-O2', '-shared', `-Wl,--out-implib,${join(w.work, 'libffidll.a')}`]);
+      exe = await w.gexccWin(join(F, 'fficall.c'), 'fficall.exe', ['-O2', `-L${w.work}`, '-lffidll', '-lffi']);
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}fficall: build`, false, String(e.message));
+    }
+    await w.nt({ want: /fficall: ok 0/, ...o, name: `${pre}fficall`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
+    await w.nt({ want: /fficall: ok 0/, ...o, name: `${pre}fficall-page`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`], page: {} });
+  }
   const mingwInstall = (() => {
     try { return /^MINGW_INCLUDE=/m.test(readFileSync(join(process.env.GEX_TEST_GEXCC_WIN ?? '', 'lib/gexcc-win/config'), 'utf8')); } catch { return false; }
   })();

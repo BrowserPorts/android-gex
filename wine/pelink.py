@@ -2061,7 +2061,12 @@ static void *gexw_ntdll_proc(const char *name)
         undefined = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
         names = sorted(set(re.findall(r'<- env\.(\S+)', undefined)) - {'memory', '__indirect_function_table',
                        '__stack_pointer', '__memory_base', '__table_base'}
-                       | {n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if n.split('!')[0] in OTHER_NATIVE.values()})
+                       | {n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if n.split('!')[0] in OTHER_NATIVE.values()}
+                       # (and an address of one of their functions: a program
+                       # that only takes &f of a DLL's export, a table for
+                       # libffi, still has Wine load that DLL, whose install
+                       # fills the slot)
+                       | {n for n in re.findall(r'<- GOT\.func\.(\S+)', undefined) if n.split('!')[0] in OTHER_NATIVE.values()})
         open(out + '.undefined', 'w').write('\n'.join(names) + '\n')
         # (a program module's data import that no DLL exports and no object
         # defines, GOT.mem.NAME with no DLL!: an undefined reference, as an

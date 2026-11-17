@@ -5447,6 +5447,9 @@ export class Gex {
           // is cached by index: the callers' (Wine's system call entry, wow64's
           // thunks) stay put.
           native_try: single.on || !globalThis.GEX_NATIVE_TRY ? () => -1 : (idx, arg) => this.#nativeTry(idx, arg),
+          // gexcc-win's libffi: the function value of the call thunk for the
+          // wasm signature at `sig` (`#ffiThunk`).
+          ffi_thunk: (sig, len) => this.#ffiThunk(sig, len),
           fault_hook: (idx) => e.gex_fault_hook_set?.(addrNum(idx)),
           signal_hook: (idx) => e.gex_signal_hook_set?.(addrNum(idx)),
           code_changed: (addr, len) => e.gex_code_changed?.(addrBig(addr), len),
@@ -8018,6 +8021,29 @@ export class Gex {
   #tryIdx = -1;
   #tryFn = null;
   #tryFns = new Map();
+
+  /** `gex.ffi_thunk(sig, len)` (gexcc-win's libffi): the slot of the call
+   *  thunk for the wasm signature at guest `sig` (fjit.rs `gex_ffi_thunk`,
+   *  made once per process and published as a JIT module), installed in
+   *  this Worker's table before it is handed back. Other Workers install it
+   *  as they catch up, before its value can reach them. */
+  #ffiThunk(sig, len) {
+    const e = this.#shim.exports;
+    if (!e.gex_ffi_thunk) throw new Error('gex.ffi_thunk: this shim has no libffi thunks');
+    const at = addrNum(sig);
+    const text = this.#bytes().slice(at, at + len);
+    const buf = e.gex_alloc(Math.max(1, len)) >>> 0;
+    let slot;
+    try {
+      new Uint8Array(this.#memory.buffer, buf, len).set(text);
+      slot = e.gex_ffi_thunk(buf, len) >>> 0;
+    } finally {
+      e.gex_free?.(buf, Math.max(1, len));
+    }
+    if (slot === 0xffffffff) throw new Error(`gex.ffi_thunk: no thunk for ${new TextDecoder().decode(text)}`);
+    this.#cgenCatchUp();
+    return BigInt(slot);
+  }
 
   #nativeTry(idx, arg) {
     let f;

@@ -60,6 +60,10 @@ for k in main wmain dll; do GEX_WASM_NO_ICALL=1 "$CC" -O2 -DONLY_$k -c "$HERE/rt
 for k in 0 3; do "$CC" -O2 -DONLY_$k -c "$HERE/rt/wmain.c" -o "$L/wmain$k.o"; done
 rm -f "$L/libgexcc-win.a"
 llvm-ar rcs "$L/libgexcc-win.a" "$T/cpp_exception.o" "$T/wchar.o" "$T/dirent.o" "$T/math.o" "$T/ssp.o" "$T/time.o" "$T/comsupp.o"
+# libffi (include-rt/ffi.h): -lffi, found in $L as a -L dir would be
+"$CC" -O2 -c "$HERE/rt/ffi.c" -o "$T/ffi.o" || exit 1
+"$CC" -O2 -c "$HERE/rt/ffilimit.c" -o "$T/ffilimit.o" || exit 1
+llvm-ar rcs "$L/libffi.a" "$T/ffi.o" "$T/ffilimit.o" || exit 1
 # with mingw-w64's headers: their stdio.h's printf and scanf families with
 # the UCRT are mingw-w64's small wrappers over ucrtbase's __stdio_common_*
 if [ -n "${MINGW_W64:-}" ]; then
