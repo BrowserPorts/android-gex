@@ -229,7 +229,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     }
     if (dll) await one('exitshape', join(F, 'exitshape.c'), ['-O2', `-I${F}`], { extra: [dll, `${dll}.wasm`], want: /exitshape: shapes agree\nexitshape ok/ });
   }
-  await one('imagebase', join(F, 'imagebase.c'), ['-O1'], { want: /imagebase: base 1 lfanew 1 phi 1 mz 1\nimagebase ok/ });
+  await one('imagebase', join(F, 'imagebase.c'), ['-O1'], { want: /imagebase: base 1 lfanew 1 phi 1 mz 1 agg 1\nimagebase ok/ });
   await one('fontset', join(F, 'fontset.c'), ['-O1', '-ldwrite'], { want: /fontset: system bold 700 regular 400\nfontset: in memory 400\nfontset ok/ });
   await one('glyphs', join(F, 'glyphs.c'), ['-O1', '-ldwrite'], { want: /glyphs: system [1-9]\d* heap [1-9]\d* static [1-9]\d*\nglyphs ok/ });
   if (want('missimp')) {

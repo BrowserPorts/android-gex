@@ -1181,6 +1181,35 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     return n;
   }
 
+  static GlobalVariable *Base0(Module &M, Type *Ptr) {
+    return cast<GlobalVariable>(M.getOrInsertGlobal("__gexw_image_base", Ptr));
+  }
+  static bool reaches(const Constant *C, const Constant *T, SmallPtrSet<const Constant *, 16> &seen) {
+    if (C == T) return true;
+    if (isa<GlobalValue>(C) || !seen.insert(C).second) return false;
+    for (const Use &O : C->operands())
+      if (reaches(cast<Constant>(O.get()), T, seen)) return true;
+    return false;
+  }
+  // `C` as a value at B, `T` in it being `V`
+  static Value *materialize(Constant *C, Constant *T, Value *V, IRBuilder<> &B) {
+    SmallPtrSet<const Constant *, 16> seen;
+    if (C == T) return V;
+    if (!reaches(C, T, seen)) return C;
+    if (auto *CE = dyn_cast<ConstantExpr>(C)) {
+      Instruction *I = CE->getAsInstruction();
+      for (unsigned i = 0; i < I->getNumOperands(); i++)
+        if (auto *O = dyn_cast<Constant>(I->getOperand(i))) I->setOperand(i, materialize(O, T, V, B));
+      return B.Insert(I);
+    }
+    Value *Agg = PoisonValue::get(C->getType());
+    for (unsigned i = 0; i < C->getNumOperands(); i++) {
+      Value *E = materialize(cast<Constant>(C->getOperand(i)), T, V, B);
+      Agg = C->getType()->isVectorTy() ? B.CreateInsertElement(Agg, E, B.getInt32(i)) : B.CreateInsertValue(Agg, E, i);
+    }
+    return Agg;
+  }
+
   // `__ImageBase`, the module's own image (MSVC's and MinGW's linkers define
   // it; `(HMODULE)&__ImageBase` is a module's handle to itself): here no
   // linker can, since the module's PE image is mapped where the loader puts
@@ -1195,7 +1224,36 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     if (!IB || !IB->isDeclaration() || IB->use_empty()) return 0;
     LLVMContext &C = M.getContext();
     Type *Ptr = PointerType::get(C, 0);
-    auto *Base = cast<GlobalVariable>(M.getOrInsertGlobal("__gexw_image_base", Ptr));
+    auto *Base = Base0(M, Ptr);
+    // A function's const aggregate holding it (`const WNDCLASSW wc = {
+    // .hInstance = (HMODULE)&__ImageBase }`: clang makes it a private
+    // constant global it copies from) is built at each use instead: a stack
+    // copy, its __ImageBase parts the loaded base. A global some other
+    // global or another module may see stays an error, below.
+    for (GlobalVariable &G : make_early_inc_range(M.globals())) {
+      if (&G == IB || !G.hasInitializer() || !G.isConstant() || !G.hasLocalLinkage()) continue;
+      SmallPtrSet<const Constant *, 16> seen;
+      if (!reaches(G.getInitializer(), IB, seen)) continue;
+      convertUsersOfConstantsToInstructions({&G});
+      if (!all_of(G.users(), [](User *U) { return isa<Instruction>(U); })) continue;
+      SmallVector<Use *, 8> gu;
+      for (Use &U : G.uses()) gu.push_back(&U);
+      for (Use *U : gu) {
+        auto *I = cast<Instruction>(U->getUser());
+        Instruction *At = I;
+        if (auto *Phi = dyn_cast<PHINode>(I)) At = Phi->getIncomingBlock(*U)->getTerminator();
+        Function *Fn = At->getFunction();
+        IRBuilder<> E(&*Fn->getEntryBlock().getFirstInsertionPt());
+        AllocaInst *Copy = E.CreateAlloca(G.getValueType(), nullptr, G.getName() + ".imagebase");
+        Copy->setAlignment(G.getAlign().valueOrOne());
+        IRBuilder<> B(At);
+        Value *Base = B.CreateLoad(Ptr, Base0(M, Ptr), "imagebase");
+        B.CreateAlignedStore(materialize(G.getInitializer(), IB, Base, B), Copy, G.getAlign().valueOrOne());
+        U->set(Copy);
+      }
+      G.eraseFromParent();
+    }
+    IB->removeDeadConstantUsers();
     // (constant expressions inside instructions become instructions, so each
     // use is an instruction's operand or a global's initialiser)
     convertUsersOfConstantsToInstructions({IB});
