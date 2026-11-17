@@ -1302,6 +1302,7 @@ async function handle(msg) {
     if (msg.inPlace === 0) gex.shim.exports.gex_set_in_place?.(0);
     if (msg.excTrace) gex.shim.exports.gex_set_exc_trace?.(1);
     if (msg.fcacheStats) gex.shim.exports.gex_set_fcache_stats?.(1);
+    if (msg.sysTime) gex.shim.exports.gex_set_sys_time?.(1);
     if (msg.winsize) {
       gex.shim.exports.gex_set_winsize?.(msg.winsize.rows, msg.winsize.cols);
     }
@@ -1498,6 +1499,16 @@ async function handle(msg) {
       threadGone: thread && !asThread ? true : undefined,
       carries: carries || undefined,
       guestMillis,
+      // `?systime=1`: the process's syscalls by time (the shim's `gex_sys_times`).
+      sysTimes: msg.sysTime && !thread ? (() => {
+        const e = gex.shim.exports;
+        if (!e.gex_sys_times) return undefined;
+        const p = e.gex_alloc(2048) >>> 0;
+        const n = e.gex_sys_times(p, 2048) >>> 0;
+        const t = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, p, n).slice());
+        e.gex_free?.(p, 2048);
+        return t || undefined;
+      })() : undefined,
       exitPc: msg.exitTrace ? Number(ex.gex_current_pc?.() ?? 0n) : undefined,
       // Whatever the runner asked to be read out of the guest before its
       // address space goes away with this thread.

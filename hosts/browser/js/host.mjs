@@ -2220,6 +2220,9 @@ export class ProcessHost {
           const t = m.traps;
           console.error(`[gex] pid ${pid}: traps straight on/through each step: run loop ${t.loop}/${t.loopFull}, call-outs ${t.callout}/${t.calloutFull}, native calls ${t.native}/${t.nativeFull}`);
         }
+        // `?systime=1`: where the process's syscall time went, by call (asked
+        // for, so said whatever the log level).
+        if (m.sysTimes) console.log(`[gex] pid ${pid}: syscalls ${m.sysTimes}${m.cmdline ? ` {${m.cmdline}}` : ''}`);
         // The page passes no `onExit`, so these per-process numbers were
         // computed and thrown away. Printed here, except under run-node
         // (`ownExitLines`), which prints its own.

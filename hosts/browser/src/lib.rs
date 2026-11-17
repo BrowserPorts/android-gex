@@ -8403,7 +8403,49 @@ static SYS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 
 /// Whether syscalls are timed and counted (`SYS_TOTAL_NS`, `SYS_CALLS`).
 fn sys_timed() -> bool {
-    (unsafe { HEARTBEAT } != 0) || tracing()
+    (unsafe { HEARTBEAT } != 0) || tracing() || SYS_TIME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `?systime=1` (options.mjs `sysTime`): every syscall timed by number
+/// (`SYS_NS`, `SYS_N`), for the process's exit report (`gex_sys_times`),
+/// without a heartbeat's census lines or a trace's. Off by default, and then
+/// costs the one load `sys_timed` already makes per call.
+static SYS_TIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn gex_set_sys_time(on: i32) {
+    SYS_TIME.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Calls of each syscall number, beside `SYS_NS`, while `SYS_TIME` is on.
+static SYS_N: [std::sync::atomic::AtomicU32; 512] = [const { std::sync::atomic::AtomicU32::new(0) }; 512];
+
+/// This process's time in syscalls by number, its threads' together (a call
+/// that blocks counts its wait): `total MS in N calls: name=MS/N ...`, the
+/// 16 longest, into `out` (at most `max` bytes). Empty unless `SYS_TIME`.
+#[no_mangle]
+pub extern "C" fn gex_sys_times(out: u32, max: u32) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !SYS_TIME.load(Relaxed) {
+        return 0;
+    }
+    let mut v: Vec<(u64, u32, usize)> = (0..512)
+        .map(|i| (unsafe { SYS_NS[i] }, SYS_N[i].load(Relaxed), i))
+        .filter(|x| x.0 > 0 || x.1 > 0)
+        .collect();
+    v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let ms = |ns: u64| format!("{:.1}", ns as f64 / 1e6);
+    let mut text = format!(
+        "{} ms in {} calls:",
+        ms(SYS_TOTAL_NS.load(Relaxed)),
+        SYS_CALLS.load(Relaxed)
+    );
+    for (ns, n, nr) in v.into_iter().take(16) {
+        text.push_str(&format!(" {}={}/{n}", gex_kernel::syscalls::syscall_name(nr as u64), ms(ns)));
+    }
+    let n = text.len().min(max as usize);
+    shim_slice_mut(out, n as u32).copy_from_slice(&text.as_bytes()[..n]);
+    n as u32
 }
 
 /// How long this process has spent in syscalls, in microseconds.
@@ -9478,12 +9520,18 @@ fn syscall_entry(ctx: i32, pc: i64) {
     if timed {
         let took = now_ns().saturating_sub(began);
         SYS_TOTAL_NS.fetch_add(took, std::sync::atomic::Ordering::Relaxed);
-        if unsafe { HEARTBEAT } != 0 {
+        let by_nr = SYS_TIME.load(std::sync::atomic::Ordering::Relaxed);
+        if unsafe { HEARTBEAT } != 0 || by_nr {
             // Canonical, as the census counts it (an i386-ABI process's
-            // own numbers name other calls in the canonical table).
+            // own numbers name other calls in the canonical table). Not
+            // atomic: threads racing here may lose a little of each other's
+            // time, which a profile's milliseconds can bear.
             let nr = this_nr as usize;
             if nr < 512 {
                 unsafe { SYS_NS[nr] = SYS_NS[nr].saturating_add(took) };
+                if by_nr {
+                    SYS_N[nr].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
