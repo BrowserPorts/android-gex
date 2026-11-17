@@ -24,6 +24,8 @@
 //   GEX_LOG=dlpack       a line per wasm32 library whose exports the page packs
 //                        (gex.mjs `packExports`): its size and time (only when named)
 //   GEX_LOG=nodlpack     no packing: every export kept, as before (only when named)
+//   GEX_LOG=lateuse      the PE modules a running thread's Worker left for its first
+//                        call (gex.mjs `#lateDefer`), and what each first call installed
 //   GEX_LOG=bridges      the unit entries each Worker entered through a bridge
 //                        (only when named: it puts a call on every such entry)
 //   GEX_LOG=traps        per process at its end, how its Worker's traps went on:

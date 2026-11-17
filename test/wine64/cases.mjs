@@ -440,7 +440,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     const o3 = await w.gexccWin(w3, 'wmain3.o', ['-O1', '-c']);
     await one('wmain3', o3, ['-municode'], { code: 43, want: /wmain3 ok 1 env/ });
   }
-  if (!want('xthr') && !want('xhoist')) return;
+  if (!want('xthr') && !want('xhoist') && !want('lazylate')) return;
   // xthr_dll.dll beside both
   let dll;
   try { dll = await w.gexccWin(join(F, 'xthr_dll.c'), 'xthr_dll.dll', ['-O2', '-shared', join(F, 'xthr_dll.def')]); } catch (e) {
@@ -448,6 +448,14 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     return t.check(`${pre}xthr_dll: build`, false, String(e.message));
   }
   for (const n of ['xthr', 'xhoist']) await one(n, join(F, `${n}.c`), ['-O2'], { extra: [dll, `${dll}.wasm`] });
+  if (!want('lazylate')) return;
+  // lazylate_dll.dll beside it: loaded once its threads run
+  let ldll;
+  try { ldll = await w.gexccWin(join(F, 'lazylate_dll.c'), 'lazylate_dll.dll', ['-O2', '-shared', join(F, 'lazylate_dll.def')]); } catch (e) {
+    if (e instanceof Skip) throw e;
+    return t.check(`${pre}lazylate_dll: build`, false, String(e.message));
+  }
+  await one('lazylate', join(F, 'lazylate.c'), ['-O2'], { extra: [ldll, `${ldll}.wasm`] });
 }
 
 /**

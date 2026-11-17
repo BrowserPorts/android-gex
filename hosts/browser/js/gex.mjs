@@ -2405,6 +2405,7 @@ export class Gex {
         // (the single-thread build: the staged fault then).
         fault_call: (idx, ctx, code, addr, kind, sp) => {
           if ((SP_CODE && single.on)) return 0;
+          if (this.#unitsDeferred.length) this.#unitWant(idx >>> 0);
           const f = this.#cgen.ftab.get(tIdx(this.#wide, idx >>> 0));
           const spG = this.#wasmprogSp ?? this.#wasmprogStack();
           const cur = this.#belowGuest(spG, sp);
@@ -2424,6 +2425,7 @@ export class Gex {
         // build: the shim stages the frame then, `#signalTake`).
         signal_call: (idx, ctx, pc, sp) => {
           if ((SP_CODE && single.on)) return 0;
+          if (this.#unitsDeferred.length) this.#unitWant(idx >>> 0);
           const f = this.#cgen.ftab.get(tIdx(this.#wide, idx >>> 0));
           const spG = this.#wasmprogSp ?? this.#wasmprogStack();
           const cur = this.#belowGuest(spG, sp);
@@ -5484,6 +5486,10 @@ export class Gex {
               return;
             }
             this.#cgenCatchUp();
+            // The image this thread maps is the one it runs next (its
+            // DllMain, its relocations): installed here at once, and its
+            // compiled module relayed to the process's other Workers.
+            if (number >= 0) this.#lateWantModule(number);
             if (number >= 0) {
               e.gex_cgen_pmod_installed(number);
               e.gex_wasmdll_installed();
@@ -5604,7 +5610,7 @@ export class Gex {
     // compile and its instantiation took.
     if (wasmdll && logNamed('wasmlib')) {
       const c = this.#fileModuleMs;
-      console.warn(`[wasmlib] pid ${e.gex_my_pid?.() ?? '?'} w${Math.round(performance.timeOrigin) % 1e6}: ${this.#cgenStr(e.gex_cgen_pmod_file, prov).split('/').pop()} ${c < 0 ? 'had' : `compiled ${c.toFixed(1)} ms`}${this.#spareWait ? ' (spare)' : ''}, instantiated ${ms.toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
+      console.warn(`[wasmlib] pid ${e.gex_my_pid?.() ?? '?'} w${Math.round(performance.timeOrigin) % 1e6}: ${this.#cgenStr(e.gex_cgen_pmod_file, prov).split('/').pop()} ${c < 0 ? 'had' : `compiled ${c.toFixed(1)} ms`}${this.#spareWait ? ' (spare)' : ''}${deferred && prov >= 0 ? ' (at its first call)' : ''}, instantiated ${ms.toFixed(1)} ms, at ${Math.round(performance.timeOrigin + performance.now()) % 1e7}`);
     }
     if (prov < 0 && jit < 0 && ms >= 20) console.error(`[unit] installed at ${base} in ${Math.round(ms)} ms (${bridges} bridges)`);
     return bridges;
@@ -5673,6 +5679,10 @@ export class Gex {
     }
     const x = d[lo];
     if (!x || idx < x.base) return;
+    if (x.prov !== undefined) {
+      this.#lateWant(x);
+      return;
+    }
     d.splice(lo, 1);
     if (logOn('unit')) console.error(`[unit] ${this.#whoFills()}: unit at ${x.base} instantiated at its first call (${d.length} still deferred)`);
     const timed = logNamed('unitstall');
@@ -5683,6 +5693,78 @@ export class Gex {
     // Its element segment filled every slot; those retired since go back.
     if (x.retired) for (const r of x.retired) this.#cgen.ftab.set(tIdx(this.#wide, r), this.#cgen.resolve);
   }
+
+  /** A Wine PE module the process installed after this Worker's thread
+   *  started (a LoadLibrary, by this thread or another), left for this
+   *  thread's first call into it: a Worker for each of a program's threads
+   *  installed every such module at once, mostly ones its thread never
+   *  calls (Firefox's media and GL DLLs: 2,602 installs and 13.7 s of CPU in
+   *  its live Workers, nearly all of them compiles of their own). A Worker
+   *  installs what the process had when it started, as before.
+   *
+   *  Its slots hold `resolve` and its bridges are written now, as a deferred
+   *  unit's (`#cgenDefer`), so a translated caller reaches `lookup`, which
+   *  installs it (`#unitWant`). Native PE code's calls keep to the ICALL
+   *  bound (`#raiseIcallLimit`), held at the lowest deferred module
+   *  (`#lateHold`): a call at or past it is the call-out's, which installs
+   *  first (`#calloutOpen`). An install below the bound already reached is
+   *  not deferred (native code calls those slots without a check), nor a
+   *  wasm32 program's or a replaced library's. False: install it now. */
+  #lateDefer(u, base, end) {
+    const e = this.#shim.exports;
+    const prov = u - 0x80000000;
+    if (!((e.gex_cgen_pmod_wasm_len?.(prov) >>> 0) > 0)) return false;
+    if (e.gex_cgen_pmod_wasmprog?.(prov) || e.gex_cgen_pmod_libprov?.(prov)) return false;
+    if (end <= base || base < (this.#icallLimit[1].value >>> 0)) return false;
+    const tables = this.#growTables(e.gex_cgen_pmod_slots(prov) >>> 0, 'cgen');
+    this.#cgenBridges((b, c) => e.gex_cgen_pmod_regs(prov, b, c), tables);
+    const d = this.#unitsDeferred.filter((x) => x.end <= base || x.base >= end);
+    let i = d.length;
+    while (i > 0 && d[i - 1].base > base) i--;
+    d.splice(i, 0, { u, base, end, retired: null, prov });
+    this.#unitsDeferred = d;
+    this.#lateHold = Math.min(this.#lateHold, base);
+    if (logNamed('lateuse')) console.warn(`[lateuse] ${this.#whoFills()}: deferred ${this.#cgenStr(e.gex_cgen_pmod_file, prov).split('/').pop()}`);
+    return true;
+  }
+
+  /** Install deferred PE module `x` (`#lateDefer`) and every deferred one
+   *  below it, in slot order: a module's imports are of modules installed
+   *  before it, and the ICALL bound covers only a whole prefix. Then the
+   *  bound goes up to the next deferred module. */
+  #lateWant(x) {
+    const e = this.#shim.exports;
+    const take = this.#unitsDeferred.filter((y) => y.prov !== undefined && y.base <= x.base);
+    this.#unitsDeferred = this.#unitsDeferred.filter((y) => !(y.prov !== undefined && y.base <= x.base));
+    const said = logNamed('lateuse');
+    const t0 = said ? performance.now() : 0;
+    for (const y of take) {
+      this.#cgenInstall(y.u, y.base, true);
+      if (y.retired) for (const r of y.retired) this.#cgen.ftab.set(tIdx(this.#wide, r), this.#cgen.resolve);
+    }
+    let hold = Infinity;
+    for (const y of this.#unitsDeferred) if (y.prov !== undefined && y.base < hold) hold = y.base;
+    this.#lateHold = hold;
+    this.#raiseIcallLimit(e.gex_ftab_size() >>> 0);
+    if (said) {
+      const name = (y) => this.#cgenStr(e.gex_cgen_pmod_file, y.prov).split('/').pop();
+      console.warn(`[lateuse] ${this.#whoFills()}: needed ${name(x)}` +
+        `${take.length > 1 ? `, with ${take.filter((y) => y !== x).map(name).join(' ')}` : ''} in ${(performance.now() - t0).toFixed(1)} ms`);
+    }
+  }
+
+  /** Deferred PE module number `prov` (`#lateDefer`), installed now if it is. */
+  #lateWantModule(prov) {
+    if (!this.#unitsDeferred.length) return;
+    const x = this.#unitsDeferred.find((y) => y.prov === prov);
+    if (x) this.#lateWant(x);
+  }
+  /** Whether this Worker's thread runs (`#runLoop`), so that a PE module the
+   *  process installs from now on waits for its first call here. */
+  #lazyRun = false;
+  /** The lowest slot of a deferred PE module, or Infinity: the ICALL bound
+   *  stays below it. */
+  #lateHold = Infinity;
 
   /** A retired function-table slot of a deferred unit: kept so, when the
    *  unit is instantiated. */
@@ -5979,6 +6061,7 @@ export class Gex {
       // a C longjmp).
       provider_try: (f, arg) => {
         try {
+          if (this.#unitsDeferred.length) this.#unitWant(Number(f) >>> 0);
           ftab.get(this.#wide ? BigInt(f) : f >>> 0)(arg);
           e.gex_provider_note(0);
           return 0;
@@ -6062,6 +6145,7 @@ export class Gex {
       if (e.gex_cgen_provider_libprov?.(u, i)) {
         const number = e.gex_libprov_publish(u, i);
         this.#cgenCatchUp();
+        if (number >= 0) this.#lateWantModule(number);
         if (number >= 0) {
           e.gex_cgen_pmod_installed(number);
           // its GexA64Icall entry thunks, bound as guest addresses
@@ -6073,6 +6157,7 @@ export class Gex {
       if (e.gex_cgen_provider_wasmdll?.(u, i)) {
         const number = e.gex_wasmdll_publish(u, i);
         this.#cgenCatchUp();
+        if (number >= 0) this.#lateWantModule(number);
         if (number >= 0) {
           e.gex_cgen_pmod_installed(number);
           e.gex_wasmdll_installed();
@@ -6260,7 +6345,9 @@ export class Gex {
           }
           else if (u >= 0x80000000) {
             if (spare && this.#relayAwaited(u - 0x80000000)) break;
-            try {
+            if (this.#lazyRun && this.#lateDefer(u, ib, iend)) {
+              // (deferred: its bridges are written, its slots hold `resolve`)
+            } else try {
               this.#cgenInstall(u, e.gex_ftab_install_base(v) >>> 0);
             } catch (err) {
               // A provider an execve is replacing: its install is killed
@@ -6564,6 +6651,8 @@ export class Gex {
             : new WebAssembly.Global({ value: 'i32', mutable: f[4] === '1' }, Number(f[3]) | 0));
           break;
         case 'E': {
+          // (a module this Worker deferred, `#lateDefer`: installed first)
+          if (!st.dyl.has(Number(f[3]))) this.#lateWantModule(Number(f[3]));
           const x = st.dyl.get(Number(f[3]))?.exports[f[4]];
           if (x === undefined) throw new Error(`Wine's PE module ${prov}: ${f[2]}: module ${f[3]} is not instantiated in this Worker`);
           set(f[1], f[2], x);
@@ -6629,6 +6718,9 @@ export class Gex {
     let fn = t.get(slot);
     if (!fn || fn === empty) {
       this.#cgenCatchUp();
+      // its callee's module, if this Worker deferred it (`#lateDefer`)
+      const prov = st.lateProv?.get(Number(slot));
+      if (prov !== undefined) this.#lateWantModule(prov);
       this.#wasmdllLate(st);
       fn = t.get(slot);
       if (!fn || fn === empty) throw new Error(`${name}: its module is not installed`);
@@ -6667,6 +6759,7 @@ export class Gex {
           if (seen.has(slot)) continue;
           seen.add(slot);
           const l = { slot, importer: Number(f[1]), provider: Number(f[2]), name: f[3], done: false };
+          (st.lateProv ??= new Map()).set(slot, l.provider);
           fresh.push(l);
           under(l.importer, l);
           under(l.provider, l);
@@ -6743,7 +6836,7 @@ export class Gex {
    *  NATIVE_FN_TOP (`#raiseIcallLimit`). */
   #icallLimit = [new WebAssembly.Global({ value: 'i64', mutable: true }, 0n), new WebAssembly.Global({ value: 'i32', mutable: true }, 0)];
   #raiseIcallLimit(held) {
-    const v = Math.min(held, NATIVE_FN_TOP);
+    const v = Math.min(held, NATIVE_FN_TOP, this.#lateHold);
     if (v <= Number(this.#icallLimit[1].value >>> 0)) return;
     this.#icallLimit[0].value = BigInt(v);
     this.#icallLimit[1].value = v;
@@ -8060,6 +8153,7 @@ export class Gex {
       }
       const i = idx & 0x7fffffff;
       f = this.#tryFns.get(i);
+      if (!f && this.#unitsDeferred.length) this.#unitWant(i);
       if (!f) this.#tryFns.set(i, (f = tab.get(tIdx(this.#wide, i))));
       this.#tryIdx = idx;
       this.#tryFn = f;
@@ -8414,6 +8508,10 @@ export class Gex {
     let hook = null;
     // Units for what booting mapped (the exe, ntdll), before the guest runs.
     this.#cgenServe();
+    // From here this Worker runs its thread: a Wine PE module the process
+    // installs from now on waits for this thread's first call into it
+    // (`#lateDefer`).
+    if (!(SP_CODE && single.on) && !globalThis.GEX_EAGER_LATE) this.#lazyRun = true;
     // A program the shim refused there (a 32-bit Wine built for another probe
     // layout, cgen/wasmprog.rs): the process has ended, and its ELF container
     // is not guest code to enter.
@@ -9581,7 +9679,11 @@ export class Gex {
     // A table index native code took for a guest address: at or past this
     // Worker's ICALL bound, a module another Worker installed since. In this
     // Worker's table before the entry thunk bound at that index runs.
-    if (!resume && Number(target) < NATIVE_FN_TOP) this.#cgenCatchUp();
+    if (!resume && Number(target) < NATIVE_FN_TOP) {
+      this.#cgenCatchUp();
+      // or a module this Worker left for its first call (`#lateDefer`)
+      if (this.#unitsDeferred.length) this.#unitWant(Number(target));
+    }
     const sp0 = e.__stack_pointer.value;
     const psp0 = this.#progSpAt();
     const me = this.#callouts.length;
@@ -9985,6 +10087,7 @@ export class Gex {
     } finally {
       e.gex_free?.(buf, 16);
     }
+    if (this.#unitsDeferred.length) this.#unitWant(hook);
     const f = this.#cgenStore().ftab.get(tIdx(this.#wide, hook));
     if (!f) throw new Error(`gex: the guest fault hook (function ${hook}) is not in this Worker's table`);
     const rsp = this.#snapHooks ? this.#dv().getBigUint64(ctx + this.#ctxSp(), true) : 0n;
@@ -10008,6 +10111,7 @@ export class Gex {
     const dv = new DataView(this.#memory.buffer);
     const pc = dv.getBigUint64(buf, true);
     const sp = dv.getBigUint64(buf + 8, true);
+    if (this.#unitsDeferred.length) this.#unitWant(hook);
     const f = this.#cgenStore().ftab.get(tIdx(this.#wide, hook));
     if (!f) throw new Error(`gex: the guest signal hook (function ${hook}) is not in this Worker's table`);
     const spG = this.#wasmprogSp ?? this.#wasmprogStack();

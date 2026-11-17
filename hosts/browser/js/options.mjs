@@ -58,6 +58,10 @@ export const OPTIONS = [
   ['pinRegion',      'GEX_PIN_REGION',       'pinregion',     'GEX_PIN_REGION',        'num',    'extra', true],
   // A crash report names the SEH chain and a longjmp's jmp_buf.
   ['sehReport',      'GEX_SEH_REPORT',       'sehreport',     'GEX_SEH_REPORT',        'one',    'extra', true],
+  // A running thread's Worker installs each Wine PE module its process
+  // loads at once, not at the thread's first call into it (gex.mjs
+  // `#lateDefer`): a debugging opt-in, off by default.
+  ['eagerLate',      'GEX_EAGER_LATE',       'eagerlate',     'GEX_EAGER_LATE',        'one',    'extra', true],
   // The processors every process is told it has (`gex_kernel::cpus`), in
   // place of navigator.hardwareConcurrency: for a page that wants fewer.
   ['cpus',           'GEX_CPUS',             'cpus',          'GEX_CPUS',              'num',    'extra', false],
