@@ -52,6 +52,7 @@
 // it.
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/ReplaceConstant.h"
 #include "llvm/IR/Module.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/IR/PassManager.h"
@@ -1180,6 +1181,44 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     return n;
   }
 
+  // `__ImageBase`, the module's own image (MSVC's and MinGW's linkers define
+  // it; `(HMODULE)&__ImageBase` is a module's handle to itself): here no
+  // linker can, since the module's PE image is mapped where the loader puts
+  // it, and again elsewhere after a FreeLibrary and a new load while the
+  // wasm instance stays. The loader writes that base into the module's own
+  // `__gexw_image_base` (winecrt0) at each first mapping, so every use of
+  // `__ImageBase`'s address reads it there, at the use. A use in a global's
+  // initialiser cannot (it is fixed before any mapping): an error naming
+  // the source file, never a wrong value.
+  unsigned imageBase(Module &M) {
+    GlobalVariable *IB = M.getGlobalVariable("__ImageBase", true);
+    if (!IB || !IB->isDeclaration() || IB->use_empty()) return 0;
+    LLVMContext &C = M.getContext();
+    Type *Ptr = PointerType::get(C, 0);
+    auto *Base = cast<GlobalVariable>(M.getOrInsertGlobal("__gexw_image_base", Ptr));
+    // (constant expressions inside instructions become instructions, so each
+    // use is an instruction's operand or a global's initialiser)
+    convertUsersOfConstantsToInstructions({IB});
+    unsigned n = 0;
+    SmallVector<Use *, 16> uses;
+    for (Use &U : IB->uses()) uses.push_back(&U);
+    for (Use *U : uses) {
+      auto *I = dyn_cast<Instruction>(U->getUser());
+      if (!I) {
+        C.emitError(Twine(M.getSourceFileName()) + ": __ImageBase in a global's initialiser: the module's "
+                    "image base is known only once it is mapped (take it in code)");
+        continue;
+      }
+      // (a phi's operand is read at the end of its incoming block)
+      Instruction *At = I;
+      if (auto *Phi = dyn_cast<PHINode>(I)) At = Phi->getIncomingBlock(*U)->getTerminator();
+      LoadInst *L = new LoadInst(Ptr, Base, "imagebase", At->getIterator());
+      U->set(L);
+      n++;
+    }
+    return n;
+  }
+
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
     LLVMContext &C = M.getContext();
     Wasm64 = Triple(M.getTargetTriple()).getArch() == Triple::wasm64;
@@ -1187,6 +1226,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     // the pointer-sized integer a function pointer is compared as
     Type *IP = Wasm64 ? Type::getInt64Ty(C) : I32;
     unsigned narrowed = narrowInts(M);
+    imageBase(M);
     emitSigs(M);
     unsigned thunks = getenv("GEXW_NO_ENTRY_THUNKS") ? 0
                       : Wasm64 && classesMode() ? classAdapters(M)

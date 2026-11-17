@@ -17,6 +17,8 @@
 //   access violation its vectored handler sees, and the process goes on;
 // - ptval: user32 calls taking a POINT by value, directly and through
 //   GetProcAddress's pointers;
+// - imagebase: &__ImageBase is the program's module handle (GexIcall reads
+//   __gexw_image_base at each use).
 // - selfaddr: GetModuleHandleExW(FROM_ADDRESS) on the program's own data,
 //   zeroed data and function is the program's module;
 // - exitshape: native calls of a native DLL's exports through GetProcAddress's
