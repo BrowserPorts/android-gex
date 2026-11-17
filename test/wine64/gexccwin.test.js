@@ -45,6 +45,13 @@
 // - xthr: a just-loaded DLL's function called by a thread with no system
 //   call since; xhoist: a call loop's hoisted ICALL bound while another
 //   thread loads a DLL and points the loop into it.
+// - sigadapt: calls through declarations whose types are not the
+//   functions' (a K&R definition called with arguments, a missing argument,
+//   i64 for i32 both ways, void against a value) adapted at the link with
+//   Windows x64's slot semantics and listed with GEX_WCC_VERBOSE; sigrefuse:
+//   an int where the callee reads a double is refused;
+// - defdll: a .def with an export named twice, data without DATA and an
+//   export named `name`.
 // The null driver where a window is made.
 import { gexccWin } from './cases.mjs';
 import { wine64 } from '../lib/winerun.mjs';

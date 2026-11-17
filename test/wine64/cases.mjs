@@ -288,6 +288,44 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     }
     await w.nt({ want: allOk, ...o, name: `${pre}owndll`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
   }
+  if (want('sigadapt')) {
+    // calls through declarations whose types are not the functions' (extra
+    // and missing arguments, i64 for i32 both ways, void against a value):
+    // adapted at the link as Windows x64's slots make them work, each listed
+    // with GEX_WCC_VERBOSE; an int where the callee reads a double is refused
+    let exe;
+    try {
+      exe = await w.gexccWin(join(F, 'sigadapt.c'), 'sigadapt.exe', ['-O1', join(F, 'sigadapt2.c')], { env: { GEX_WCC_VERBOSE: '1' } });
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}sigadapt: build`, false, String(e.message));
+    }
+    const log = readFileSync(`${exe}.build`, 'utf8');
+    for (const n of ['sig_extra', 'sig_missing', 'sig_narrow', 'sig_val', 'sig_novalue', 'sig_widen'])
+      t.check(`${pre}sigadapt: the link lists ${n}'s adapter`, new RegExp(`wcc64: ${n}: adapted `).test(log));
+    await w.nt({ want: /sigadapt: ok/, ...o, name: `${pre}sigadapt`, exe, extra: [`${exe}.wasm`] });
+    let refused = null;
+    try { await w.gexccWin(join(F, 'sigrefuse.c'), 'sigrefuse.exe', ['-O1', join(F, 'sigrefuse2.c')]); } catch (e) {
+      if (e instanceof Skip) throw e;
+      refused = readFileSync(join(w.work, 'sigrefuse.exe.build'), 'utf8');
+    }
+    t.check(`${pre}sigrefuse: an int against a double is not adapted`,
+      refused !== null && /sig_float: \(i32\) -> i32 calls \(f64\) -> f64: not adapted: an integer against a float/.test(refused), refused ?? 'linked');
+  }
+  if (want('defdll')) {
+    // a DLL whose .def names an export twice, exports data without DATA and
+    // has an export named `name`: the first entry taken, the data imported
+    // as data, the program's call and its reads and writes of the DLL's ints
+    let dll, exe;
+    try {
+      dll = await w.gexccWin(join(F, 'defdll.c'), 'defdll.dll', ['-O2', '-shared', join(F, 'defdll.def'), `-Wl,--out-implib,${join(w.work, 'libdefdll.a')}`]);
+      exe = await w.gexccWin(join(F, 'defmain.c'), 'defmain.exe', ['-O2', `-L${w.work}`, '-ldefdll']);
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}defdll: build`, false, String(e.message));
+    }
+    await w.nt({ want: /defdll: ok/, ...o, name: `${pre}defdll`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
+  }
   if (want('modcase')) {
     // installed under other case than its link (an installer naming the
     // files ModCase.exe and ModCase.exe.wasm): its .wasmref still names

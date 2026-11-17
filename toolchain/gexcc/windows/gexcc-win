@@ -518,8 +518,12 @@ try:
     data = None
     if defs:
         data = set()
-        r = subprocess.run(['llvm-nm', '--defined-only', '--extern-only'] + [o for o in objs if o.endswith(('.o', '.obj', '.a'))],
+        # (the objects and the static archives -l found: both are the DLL's)
+        r = subprocess.run(['llvm-nm', '--defined-only', '--extern-only'] + [o for o in objs + archives if o.endswith(('.o', '.obj', '.a'))],
                            capture_output=True, text=True)
+        if r.returncode:
+            sys.stderr.write('gexcc-win: llvm-nm failed, a .def\'s data exports may be taken for functions: %s\n'
+                             % r.stderr.strip().split('\n')[-1])
         for line in r.stdout.splitlines():
             w = line.split()
             if len(w) == 3 and w[1] in 'DBRVdbr':
@@ -528,17 +532,23 @@ try:
         seen, lines, dup, sect = set(), [], False, ''
         for line in open(d, errors='surrogateescape'):
             w = line.split(';', 1)[0].split()
-            if w and w[0].upper() in ('EXPORTS', 'IMPORTS', 'LIBRARY', 'NAME', 'SECTIONS', 'HEAPSIZE', 'STACKSIZE', 'VERSION', 'DESCRIPTION'):
-                sect = w[0].upper()
+            # (the keywords are upper case, as MSVC's link takes them: an
+            # export named `name` or `version` is an export)
+            if w and w[0] in ('EXPORTS', 'IMPORTS', 'LIBRARY', 'NAME', 'SECTIONS', 'HEAPSIZE', 'STACKSIZE', 'VERSION', 'DESCRIPTION'):
+                sect = w[0]
                 w = w[1:]
             if sect == 'EXPORTS' and w:
-                n = w[0].split('=', 1)[0]
+                # (EXTERNAL=INTERNAL: deduped by the external name, the
+                # objects define the internal one)
+                n, _, internal = w[0].partition('=')
+                internal = internal or n
                 if n in seen:
                     dup = True
                     continue
                 seen.add(n)
-                if n in data and 'DATA' not in (x.upper() for x in w[1:]):
-                    line = line.rstrip('\n').split(';', 1)[0].rstrip() + ' DATA\n'
+                if internal in data and 'DATA' not in w[1:]:
+                    code, sc, comment = line.rstrip('\n').partition(';')
+                    line = code.rstrip() + ' DATA' + (' ;' + comment if sc else '') + '\n'
                     dup = True
             lines.append(line)
         if dup:
@@ -660,10 +670,13 @@ try:
     if shared:
         spec = os.path.join(tmp, name.rsplit('.', 1)[0] + '.spec')
         with open(spec, 'w') as f:
+            seen = set()
             for line in open(so + '.exports'):
                 n, t = line.split()[:2]
-                if n.startswith('__wine') or n.startswith('__gexw'):
+                # (once each: an alias, EXTERNAL=INTERNAL, lists INTERNAL again)
+                if n.startswith('__wine') or n.startswith('__gexw') or n in seen:
                     continue
+                seen.add(n)
                 f.write('@ extern %s\n' % n if t == 'data' else '@ cdecl %s()\n' % n)
         kind = ['--dll', '-E', spec]
     skel = os.path.abspath(out)
