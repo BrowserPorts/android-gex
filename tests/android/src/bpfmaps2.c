@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -71,6 +72,15 @@ static const char expected[] =
     "devmap lookup: 0 1\n"
     "devmap delete: 0\n"
     "devmap delete again: -2\n"
+    "mappable per-cpu array: -22\n"
+    "mappable array: 0\n"
+    "mapped: 1\n"
+    "two pages: -22\n"
+    "private: -22\n"
+    "an array not made mappable: -22\n"
+    "element 1 written in the mapping, looked up: 0 77\n"
+    "element 2 updated, in the mapping: 99, element 0: 0\n"
+    "read-only for programs, mapped for writing: -13, for reading: 0\n"
 ;
 
 static char out_buf[8192];
@@ -240,6 +250,39 @@ int main(void) {
     SAY("devmap lookup: %ld %u\n", elem(BPF_MAP_LOOKUP_ELEM, dm, &k1, &got32, 0), got32);
     SAY("devmap delete: %ld\n", elem(BPF_MAP_DELETE_ELEM, dm, &k1, NULL, 0));
     SAY("devmap delete again: %ld\n", elem(BPF_MAP_DELETE_ELEM, dm, &k1, NULL, 0));
+
+    // A mappable array: its elements eight bytes apart in the mapping,
+    // a write there seen by a lookup, an update seen there. (msync before
+    // the lookup, and a call before the read: a mapping here is a copy
+    // brought up to date at system calls.)
+    SAY("mappable per-cpu array: %ld\n", MADE(make(BPF_MAP_TYPE_PERCPU_ARRAY, 4, 4, 3, BPF_F_MMAPABLE)));
+    long ma = make(BPF_MAP_TYPE_ARRAY, 4, 4, 3, BPF_F_MMAPABLE);
+    SAY("mappable array: %ld\n", MADE(ma));
+    void *pg = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, (int)ma, 0);
+    SAY("mapped: %d\n", pg != MAP_FAILED);
+    void *twop = mmap(NULL, 8192, PROT_READ, MAP_SHARED, (int)ma, 0);
+    SAY("two pages: %d\n", twop == MAP_FAILED ? -errno : 0);
+    void *priv = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, (int)ma, 0);
+    SAY("private: %d\n", priv == MAP_FAILED ? -errno : 0);
+    long plain = make(BPF_MAP_TYPE_ARRAY, 4, 4, 3, 0);
+    void *pl = mmap(NULL, 4096, PROT_READ, MAP_SHARED, (int)plain, 0);
+    SAY("an array not made mappable: %d\n", pl == MAP_FAILED ? -errno : 0);
+    if (pg != MAP_FAILED) {
+        ((volatile uint32_t *)pg)[2] = 77;
+        msync(pg, 4096, MS_SYNC);
+        uint32_t one = 1, got = 0;
+        SAY("element 1 written in the mapping, looked up: %ld %u\n", elem(BPF_MAP_LOOKUP_ELEM, (int)ma, &one, &got, 0), got);
+        uint32_t two_k = 2, ninety = 99;
+        elem(BPF_MAP_UPDATE_ELEM, (int)ma, &two_k, &ninety, BPF_ANY);
+        // (A system call: bionic answers getpid without one.)
+        syscall(__NR_getppid);
+        SAY("element 2 updated, in the mapping: %u, element 0: %u\n", ((volatile uint32_t *)pg)[4], ((volatile uint32_t *)pg)[0]);
+        munmap(pg, 4096);
+    }
+    long rop = make(BPF_MAP_TYPE_ARRAY, 4, 4, 3, BPF_F_MMAPABLE | BPF_F_RDONLY_PROG);
+    void *rw = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, (int)rop, 0);
+    void *rd = mmap(NULL, 4096, PROT_READ, MAP_SHARED, (int)rop, 0);
+    SAY("read-only for programs, mapped for writing: %d, for reading: %d\n", rw == MAP_FAILED ? -errno : 0, rd == MAP_FAILED ? -errno : 0);
 
     if (expected[0] && strcmp(out_buf, expected) != 0) {
         printf("bpfmaps2: not what Linux shows\n");

@@ -106,6 +106,8 @@ pub struct Map {
     /// The BTF it was made with, and its key's and value's type ids.
     btf: Option<(Arc<crate::btf::Btf>, u32, u32)>,
     data: Mutex<Data>,
+    /// Counted at each change a mapping would show (a mappable array's).
+    changes: std::sync::atomic::AtomicU64,
 }
 
 /// A hash map's elements: in the order they were put there, and where
@@ -260,7 +262,7 @@ impl Map {
                 return Err(Errno::EINVAL);
             }
             let ring = Ring { consumer: vec![0; PAGE as usize], producer: vec![0; PAGE as usize], data: vec![0; max_entries as usize], changes: 1 };
-            return Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(Data::Ringbuf(ring)) });
+            return Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(Data::Ringbuf(ring)), changes: std::sync::atomic::AtomicU64::new(1) });
         }
         // (Socket storage has no number of entries: one a socket.)
         if value_size == 0 || (max_entries == 0) != (ty == map_type::SK_STORAGE) || key_size > MAX_KEY {
@@ -291,11 +293,11 @@ impl Map {
                 if key_size != 4 {
                     return Err(Errno::EINVAL);
                 }
-                let len = (value_size as u64).checked_mul(max_entries as u64).filter(|n| *n < 1 << 32).ok_or(Errno::ENOMEM)?;
-                if flags & MMAPABLE != 0 {
-                    unsupported_flags(MMAPABLE);
-                    return Err(Errno::EINVAL);
-                }
+                // Each element at a multiple of its value rounded up to
+                // eight bytes (`elem_size`), as a mapping of it shows; a
+                // mappable array's data in whole pages.
+                let len = (value_size as u64).next_multiple_of(8).checked_mul(max_entries as u64).filter(|n| *n < 1 << 32).ok_or(Errno::ENOMEM)?;
+                let len = if flags & MMAPABLE != 0 { len.next_multiple_of(PAGE) } else { len };
                 Data::Array(vec![0; len as usize])
             }
             map_type::PERCPU_ARRAY => {
@@ -355,7 +357,7 @@ impl Map {
         // A devmap's lookup gives programs the ifindex itself, so they may
         // not write it (`dev_map_init_map`).
         let flags = if ty == map_type::DEVMAP_HASH { flags | RDONLY_PROG } else { flags };
-        Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(data) })
+        Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(data), changes: std::sync::atomic::AtomicU64::new(1) })
     }
 
     pub fn id(&self) -> u32 {
@@ -452,7 +454,11 @@ impl Map {
     pub fn with_value<R>(&self, at: &ValueAt, f: impl FnOnce(&mut [u8]) -> R) -> Option<R> {
         let vs = self.value_size as usize;
         match (&mut *self.lock(), at) {
-            (Data::Array(v), ValueAt::Index(i)) => Some(f(&mut v[*i as usize * vs..(*i as usize + 1) * vs])),
+            (Data::Array(v), ValueAt::Index(i)) => {
+                let at = *i as usize * self.stride();
+                self.changed();
+                Some(f(&mut v[at..at + vs]))
+            }
             (Data::PercpuArray(v), ValueAt::Index(i)) => {
                 let each = self.user_value_size();
                 Some(f(&mut v[*i as usize * each..*i as usize * each + vs]))
@@ -507,6 +513,21 @@ impl Map {
         self.ty
     }
 
+    /// An array's elements' spacing (`elem_size`).
+    fn stride(&self) -> usize {
+        (self.value_size as usize).next_multiple_of(8)
+    }
+
+    /// Something a mapping of the map shows has changed: counted, and, for
+    /// a map that can be mapped, said, so that mappings are brought up to
+    /// date at their processes' next system calls (`crate::locks`).
+    fn changed(&self) {
+        if self.flags & map_flag::MMAPABLE != 0 {
+            self.changes.fetch_add(1, std::sync::atomic::Ordering::Release);
+            crate::locks::note_written("anon_inode:bpf-map");
+        }
+    }
+
     fn index(&self, key: &[u8]) -> u32 {
         u32::from_le_bytes(key[..4].try_into().unwrap())
     }
@@ -519,7 +540,8 @@ impl Map {
                 if i >= self.max_entries {
                     return Err(Errno::ENOENT);
                 }
-                Ok(v[i as usize * vs..(i as usize + 1) * vs].to_vec())
+                let at = i as usize * self.stride();
+                Ok(v[at..at + vs].to_vec())
             }
             Data::Hash(h) => h.at.get(key).map(|o| h.order[o].1.clone()).ok_or(Errno::ENOENT),
             Data::PercpuArray(v) => {
@@ -556,7 +578,9 @@ impl Map {
                 if flags == NOEXIST {
                     return Err(Errno::EEXIST);
                 }
-                v[i as usize * vs..(i as usize + 1) * vs].copy_from_slice(value);
+                let at = i as usize * self.stride();
+                v[at..at + vs].copy_from_slice(value);
+                self.changed();
                 Ok(())
             }
             Data::SkStorage(_) => Err(Errno::EINVAL),
@@ -820,6 +844,22 @@ impl FileHandle for MapFile {
     /// refused when made), shared, and of it only the consumer's page for
     /// writing (`ringbuf_map_mmap_kern`), no further than its pages.
     fn may_map(&self, offset: u64, len: u64, prot: u32, shared: bool) -> Result<(), Errno> {
+        let map = &self.map;
+        // An array: if it was made mappable, its data's pages
+        // (`array_map_mmap`); not to be written for a map programs only
+        // read.
+        if let Data::Array(v) = &*map.lock() {
+            if !shared {
+                return Err(Errno::EINVAL);
+            }
+            if prot & crate::mem::prot::WRITE != 0 && map.flags & map_flag::RDONLY_PROG != 0 {
+                return Err(Errno::EACCES);
+            }
+            if map.flags & map_flag::MMAPABLE == 0 || offset.checked_add(len).is_none_or(|end| end > v.len() as u64) {
+                return Err(Errno::EINVAL);
+            }
+            return Ok(());
+        }
         let Data::Ringbuf(ring) = &*self.map.lock() else { return Err(crate::btf::ENOTSUPP) };
         if !shared {
             return Err(Errno::EINVAL);
@@ -839,12 +879,19 @@ impl FileHandle for MapFile {
     fn mapped_len(&self) -> Option<u64> {
         match &*self.map.lock() {
             Data::Ringbuf(ring) => Some(2 * PAGE + 2 * ring.data.len() as u64),
+            Data::Array(v) if self.map.flags & map_flag::MMAPABLE != 0 => Some(v.len() as u64),
             _ => None,
         }
     }
     fn read_mapped(&self, offset: u64, buf: &mut [u8]) -> crate::errno::SysResult {
         match &*self.map.lock() {
             Data::Ringbuf(ring) => Ok(ring.read(offset, buf) as u64),
+            Data::Array(v) if self.map.flags & map_flag::MMAPABLE != 0 => {
+                let start = (offset as usize).min(v.len());
+                let n = buf.len().min(v.len() - start);
+                buf[..n].copy_from_slice(&v[start..start + n]);
+                Ok(n as u64)
+            }
             _ => Err(Errno::EINVAL),
         }
     }
@@ -856,12 +903,18 @@ impl FileHandle for MapFile {
                 ring.changes += 1;
                 Ok(buf.len() as u64)
             }
+            Data::Array(v) if self.map.flags & map_flag::MMAPABLE != 0 && offset.checked_add(buf.len() as u64).is_some_and(|end| end <= v.len() as u64) => {
+                v[offset as usize..offset as usize + buf.len()].copy_from_slice(buf);
+                self.map.changed();
+                Ok(buf.len() as u64)
+            }
             _ => Err(Errno::EINVAL),
         }
     }
     fn changes(&self) -> u64 {
         match &*self.map.lock() {
             Data::Ringbuf(ring) => ring.changes,
+            Data::Array(_) if self.map.flags & map_flag::MMAPABLE != 0 => self.map.changes.load(std::sync::atomic::Ordering::Acquire),
             _ => 0,
         }
     }
