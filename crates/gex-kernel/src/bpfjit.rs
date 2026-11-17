@@ -137,6 +137,7 @@ fn encode(op: &Op) -> [u8; OP_BYTES] {
                 Imm64::Value(v) => (0, *v),
                 Imm64::Map(m) => (1, m.id() as u64),
                 Imm64::MapValue(m, off) => (2, m.id() as u64 | (*off as u64) << 32),
+                Imm64::Func(f) => (3, *f as u64),
             };
             b[3] = kind;
             b[8..16].copy_from_slice(&v.to_le_bytes());
@@ -217,10 +218,11 @@ fn size_of(code: u8) -> u8 {
 /// jump out of its function, or a function that runs on into the next, is
 /// refused as `check_subprogs` refuses them (`EINVAL`).
 pub fn compile(insns: &[Insn], imm64: &std::collections::BTreeMap<usize, Imm64>) -> Result<Image, Errno> {
-    // The functions: the program, and each one a call in it names.
+    // The functions: the program, each one a call in it names, and each
+    // whose address it takes.
     let mut entries = vec![0usize];
     for (i, x) in insns.iter().enumerate() {
-        if x.code == 0x85 && x.src == 1 {
+        if (x.code == 0x85 && x.src == 1) || (x.code == 0x18 && x.src == 4) {
             entries.push((i as i64 + x.imm as i64 + 1) as usize);
         }
     }
@@ -284,7 +286,11 @@ pub fn compile(insns: &[Insn], imm64: &std::collections::BTreeMap<usize, Imm64>)
                     }
                 }
                 0x00 if x.code == 0x18 => {
-                    let value = imm64.get(&i).cloned().ok_or(Errno::EINVAL)?;
+                    let mut value = imm64.get(&i).cloned().ok_or(Errno::EINVAL)?;
+                    // A function's address, as the number of the function.
+                    if let Imm64::Func(at) = value {
+                        value = Imm64::Func(entries.iter().position(|&e| e == at).ok_or(Errno::EINVAL)?);
+                    }
                     i += 1;
                     Op::Imm64 { dst: x.dst, value }
                 }

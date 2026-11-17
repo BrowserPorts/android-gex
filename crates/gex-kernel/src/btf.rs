@@ -416,6 +416,14 @@ impl Btf {
         matches!(self.types.get(id as usize), Some(Some(t)) if t.kind == kind::FUNC)
     }
 
+    /// A function's linkage (its `vlen`): 0 static, 1 global, 2 extern.
+    pub fn func_linkage(&self, id: u32) -> Option<u32> {
+        match self.types.get(id as usize) {
+            Some(Some(t)) if t.kind == kind::FUNC => Some(t.vlen),
+            _ => None,
+        }
+    }
+
     /// Whether type `id` is a datasec (`btf_type_is_datasec`).
     pub fn is_datasec(&self, id: u32) -> bool {
         matches!(self.types.get(id as usize), Some(Some(t)) if t.kind == kind::DATASEC)

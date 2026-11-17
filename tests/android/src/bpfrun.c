@@ -55,6 +55,12 @@ static const char expected[] =
     "array lookup and atomic add: 0 0x4d3\n"
     "the array's value: 0 1235\n"
     "array lookup out of range: 0 0\n"
+    "for each, without BTF: load -22\n"
+    "for each: 0 0xa04\n"
+    "one record for two functions: -22\n"
+    "the callback global: -22\n"
+    "for each, stopping at 2, without BTF: load -22\n"
+    "for each, stopping at 2: 0 0x603\n"
     "ld_abs: 0 0x162e11\n"
     "ld_abs word: 0 0xa000001\n"
     "ld_ind: 0 0x4d2\n"
@@ -344,6 +350,82 @@ int main(void) {
         struct bpf_insn q[] = {ST(BPF_W, 10, -4, 9), LDMAP(1, (int)arr), MOVR(2, 10), A64(BPF_ADD, 2, -4), CALL(BPF_FUNC_map_lookup_elem),
                                EXIT};
         one("array lookup out of range", SF, q, N(q));
+    }
+    // A callback for each element (bpf_for_each_map_elem): the sum of an
+    // array's values and how many it was given; one that stops at key 2.
+    {
+        long sums = map(BPF_MAP_TYPE_ARRAY, 4, 4, 4);
+        for (uint32_t k = 0; k < 4; k++) {
+            uint32_t v = k + 1;
+            elem(BPF_MAP_UPDATE_ELEM, (int)sums, &k, &v);
+        }
+        for (int stop = 0; stop < 2; stop++) {
+            struct bpf_insn p[] = {ST(BPF_DW, 10, -8, 0), LDMAP(1, (int)sums), I(BPF_LD | BPF_DW | BPF_IMM, 2, BPF_PSEUDO_FUNC, 0, 9),
+                                   I(0, 0, 0, 0, 0), MOVR(3, 10), A64(BPF_ADD, 3, -8), MOV64(4, 0), CALL(BPF_FUNC_for_each_map_elem),
+                                   LDX(BPF_DW, 1, 10, -8), A64(BPF_LSH, 1, 8), A64R(BPF_OR, 0, 1), EXIT,
+                                   // The callback: (map, key, value, ctx).
+                                   LDX(BPF_W, 6, 3, 0), LDX(BPF_DW, 7, 4, 0), A64R(BPF_ADD, 7, 6), STX(BPF_DW, 4, 7, 0), MOV64(0, 0),
+                                   LDX(BPF_W, 8, 2, 0), J(BPF_JNE, 8, 2, 1), MOV64(0, stop), EXIT};
+            // Described in BTF, the callback static (as the verifier holds a
+            // function whose address is taken to): a prototype, "main"
+            // global, "cb" static.
+            unsigned char btf[24 + 36 + 9];
+            memset(btf, 0, sizeof btf);
+            uint16_t magic = 0xeb9f;
+            memcpy(btf, &magic, 2);
+            btf[2] = 1;
+            uint32_t h[] = {24, 0, 36, 36, 9};
+            memcpy(btf + 4, h, sizeof h);
+            uint32_t t[] = {0, 13u << 24, 0, 1, (12u << 24) | 1, 1, 6, 12u << 24, 1};
+            memcpy(btf + 24, t, sizeof t);
+            memcpy(btf + 60, "\0main\0cb\0", 9);
+            union bpf_attr a;
+            memset(&a, 0, sizeof a);
+            a.btf = (uintptr_t)btf;
+            a.btf_size = sizeof btf;
+            long bfd = sys_bpf(BPF_BTF_LOAD, &a, sizeof a);
+            uint32_t finfo[] = {0, 2, 13, 3};
+            for (int with = 0; with < 2; with++) {
+                memset(&a, 0, sizeof a);
+                a.prog_type = SF;
+                a.insns = (uintptr_t)p;
+                a.insn_cnt = N(p);
+                a.license = (uintptr_t) "GPL";
+                if (with) {
+                    a.prog_btf_fd = bfd;
+                    a.func_info_rec_size = 8;
+                    a.func_info = (uintptr_t)finfo;
+                    a.func_info_cnt = 2;
+                }
+                long fd = sys_bpf(BPF_PROG_LOAD, &a, sizeof a);
+                const char *what = stop ? "for each, stopping at 2" : "for each";
+                if (fd < 0) {
+                    SAY("%s, %s BTF: load %ld\n", what, with ? "with" : "without", fd);
+                    continue;
+                }
+                uint32_t ret = 0;
+                long r = run(fd, pkt, sizeof pkt, NULL, 1, &ret, NULL);
+                SAY("%s: %ld %#x\n", what, r, ret);
+                close(fd);
+            }
+            if (!stop) {
+                // A record too few, and the callback global.
+                memset(&a, 0, sizeof a);
+                a.prog_type = SF;
+                a.insns = (uintptr_t)p;
+                a.insn_cnt = N(p);
+                a.license = (uintptr_t) "GPL";
+                a.prog_btf_fd = bfd;
+                a.func_info_rec_size = 8;
+                a.func_info = (uintptr_t)finfo;
+                a.func_info_cnt = 1;
+                SAY("one record for two functions: %ld\n", sys_bpf(BPF_PROG_LOAD, &a, sizeof a));
+                uint32_t global[] = {0, 2, 13, 2};
+                a.func_info = (uintptr_t)global;
+                a.func_info_cnt = 2;
+                SAY("the callback global: %ld\n", sys_bpf(BPF_PROG_LOAD, &a, sizeof a));
+            }
+        }
     }
     // The packet: the old loads, from the network header.
     {

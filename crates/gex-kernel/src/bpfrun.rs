@@ -29,6 +29,10 @@ fn addr(region: usize, off: u64) -> u64 {
     BASE + ((region as u64) << 32) + off
 }
 
+/// A function of the program as a value (`BPF_PSEUDO_FUNC`): its number
+/// past this.
+const FUNC: u64 = 0xffff_8f00_0000_0000;
+
 fn region_of(a: u64) -> Option<(usize, u64)> {
     let d = a.checked_sub(BASE)?;
     Some(((d >> 32) as usize, d & 0xffff_ffff))
@@ -91,6 +95,8 @@ enum Region {
     Packet,
     Value(Arc<Map>, ValueAt),
     Map(Arc<Map>),
+    /// Bytes a helper hands a program to read (a key it walks to).
+    Bytes(Vec<u8>),
 }
 
 /// Why a run ended without an answer.
@@ -115,6 +121,9 @@ struct Machine<'p, 'c> {
     prog: &'p Prog,
     regions: Vec<Region>,
     ctx: &'c mut dyn Context,
+    budget: u64,
+    /// How deep callbacks run inside helpers (`MAX_CALL_FRAMES` bounds it).
+    depth: u32,
 }
 
 const PACKET: usize = 1;
@@ -143,6 +152,7 @@ impl Machine<'_, '_> {
             },
             Region::Packet => self.ctx.packet().and_then(|p| get(p)),
             Region::Value(m, at) => m.with_value(at, |v| get(v)).flatten(),
+            Region::Bytes(b) => get(b),
             Region::Map(_) => None,
         };
         v.ok_or(Self::bad(op, a))
@@ -161,7 +171,7 @@ impl Machine<'_, '_> {
             Region::Packet if self.ctx.packet_writable() => self.ctx.packet().and_then(|p| put(p)),
             Region::Packet => None,
             Region::Value(m, at) => m.with_value(at, |v| put(v)).flatten(),
-            Region::Map(_) => None,
+            Region::Map(_) | Region::Bytes(_) => None,
         };
         done.ok_or(Self::bad(op, a))
     }
@@ -244,6 +254,28 @@ impl Machine<'_, '_> {
                 }
             }
             15 => self.ctx.current_uid_gid(),
+            // for_each_map_elem(map, callback, ctx, flags): the callback
+            // with each element's key and value until it answers other than
+            // 0; how many it was given.
+            164 => {
+                if r[4] != 0 {
+                    return Ok(err(Errno::EINVAL));
+                }
+                let m = self.map_arg(op, r[1])?;
+                let f = r[2].checked_sub(FUNC).filter(|&f| (f as usize) < self.prog.image.funcs.len()).ok_or(Self::bad(op, r[2]))? as usize;
+                let mut n = 0u64;
+                for (key, at) in m.elements() {
+                    self.regions.push(Region::Bytes(key));
+                    let k = addr(self.regions.len() - 1, 0);
+                    self.regions.push(Region::Value(Arc::clone(&m), at));
+                    let v = addr(self.regions.len() - 1, 0);
+                    n += 1;
+                    if self.exec(f, [r[1], k, v, r[3], 0])? != 0 {
+                        break;
+                    }
+                }
+                n
+            }
             46 => self.ctx.socket_cookie(),
             47 => self.ctx.socket_uid(),
             // sk_storage_get(map, sk, value, flags), sk_storage_delete(map,
@@ -275,18 +307,31 @@ impl Machine<'_, '_> {
         })
     }
 
-    fn run(&mut self) -> Result<u64, Fault> {
-        let funcs = &self.prog.image.funcs;
+    /// Run function `entry` with `args` in r1 to r5 until it returns.
+    fn exec(&mut self, entry: usize, args: [u64; 5]) -> Result<u64, Fault> {
+        // (A callback inside a helper inside a callback, so deep: the
+        // verifier bounds the frames at eight.)
+        if self.depth >= 8 {
+            return Err(Fault::Stuck);
+        }
+        self.depth += 1;
+        let r = self.exec_frames(entry, args);
+        self.depth -= 1;
+        r
+    }
+
+    fn exec_frames(&mut self, entry: usize, args: [u64; 5]) -> Result<u64, Fault> {
+        let prog = self.prog;
+        let funcs = &prog.image.funcs;
         let mut r = [0u64; 11];
         self.regions.push(Region::Stack(vec![0; STACK]));
         let mut stack = self.regions.len() - 1;
-        r[1] = addr(CTX, 0);
+        r[1..6].copy_from_slice(&args);
         r[10] = addr(stack, STACK as u64);
         let mut frames: Vec<Frame> = Vec::new();
-        let (mut func, mut pc) = (0usize, 0u32);
-        let mut budget = BUDGET;
+        let (mut func, mut pc) = (entry, 0u32);
         loop {
-            budget = budget.checked_sub(1).ok_or(Fault::Stuck)?;
+            self.budget = self.budget.checked_sub(1).ok_or(Fault::Stuck)?;
             let at = pc;
             let o = &funcs[func].ops[pc as usize];
             pc += 1;
@@ -343,6 +388,7 @@ impl Machine<'_, '_> {
                             self.regions.push(Region::Value(Arc::clone(m), ValueAt::Index(0)));
                             addr(self.regions.len() - 1, *off as u64)
                         }
+                        Imm64::Func(f) => FUNC + *f as u64,
                     };
                 }
                 Op::Load { size, signed, dst, src: s, off } => {
@@ -505,8 +551,8 @@ fn alu32(op: u8, signed: bool, a: u32, b: u32) -> u32 {
 
 /// Run `prog` on `ctx`: its return value, or why it has none.
 pub fn run(prog: &Prog, ctx: &mut dyn Context) -> Result<u64, Fault> {
-    let mut m = Machine { prog, regions: vec![Region::Ctx, Region::Packet], ctx };
-    let r = m.run();
+    let mut m = Machine { prog, regions: vec![Region::Ctx, Region::Packet], ctx, budget: BUDGET, depth: 0 };
+    let r = m.exec(0, [addr(CTX, 0), 0, 0, 0, 0]);
     if let Err(f) = &r {
         let name = String::from_utf8_lossy(&prog.name).trim_end_matches('\0').to_string();
         crate::bpf::note_once(&format!("program {} ({name}) ended: {f:?}", prog.id));

@@ -467,6 +467,16 @@ impl Map {
         }
     }
 
+    /// Each element's key and where its value is, in the order a walk
+    /// takes them (`map_for_each_callback`: arrays and hashes).
+    pub fn elements(&self) -> Vec<(Vec<u8>, ValueAt)> {
+        match &*self.lock() {
+            Data::Array(_) | Data::PercpuArray(_) => (0..self.max_entries).map(|i| (i.to_le_bytes().to_vec(), ValueAt::Index(i))).collect(),
+            Data::Hash(h) => h.order.values().map(|(k, _)| (k.clone(), ValueAt::Key(k.clone()))).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// `bpf_sk_storage_get` from a program: the socket's value, made
     /// (from `init`, or zeros) when `create` and it has none.
     pub fn sk_get(&self, sock: &Arc<dyn FileHandle>, init: Option<&[u8]>, create: bool) -> Option<ValueAt> {
@@ -1576,7 +1586,7 @@ fn prog_load(c: &Caller<'_>, m: &mut GuestMem<'_>, attr: u64, a: &[u8]) -> crate
     if log_level != 0 {
         let text = match &prog {
             Ok(_) => format!("processed {insn_cnt} insns (limit 1000000) max_states_per_insn 0 total_states 0 peak_states 0 mark_read 0\n"),
-            Err(_) => String::from("program refused\n"),
+            Err(_) => format!("{}\nprogram refused\n", crate::bpfprog::last_reason()),
         };
         let room = log_size as usize - 1;
         let n = text.len().min(room);

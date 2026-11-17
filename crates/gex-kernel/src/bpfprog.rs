@@ -166,6 +166,9 @@ pub enum Imm64 {
     Map(Arc<Map>),
     /// The address of a map's value at an offset (`BPF_PSEUDO_MAP_VALUE`).
     MapValue(Arc<Map>, u32),
+    /// A function of the program, by its first instruction
+    /// (`BPF_PSEUDO_FUNC`): what a helper that calls back is given.
+    Func(usize),
 }
 
 /// The BTF a program was loaded with, and its function and line records
@@ -222,6 +225,21 @@ fn calc_tag(insns: &[Insn]) -> [u8; 8] {
     }
     let d = h.finish();
     d[..8].try_into().unwrap()
+}
+
+thread_local! {
+    /// Why the last load on this thread was refused, as a verifier's log
+    /// would say it.
+    static WHY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn why(s: String) {
+    WHY.with(|w| *w.borrow_mut() = s);
+}
+
+/// Why the last load on this thread was refused.
+pub fn last_reason() -> String {
+    WHY.with(|w| w.borrow().clone())
 }
 
 fn next_id() -> u32 {
@@ -368,6 +386,14 @@ fn form(insns: &[Insn], i: usize, ty: u32, gpl: bool) -> Result<Flow, Errno> {
                 let Some(y) = insns.get(i + 1) else { return bad };
                 if y.code != 0 || y.dst != 0 || y.src != 0 || y.off != 0 || x.off != 0 {
                     return bad;
+                }
+                // A function's address: one in the program, and nothing in
+                // the high half.
+                if x.src == 4 {
+                    jump(x.imm)?;
+                    if y.imm != 0 {
+                        return bad;
+                    }
                 }
                 if x.dst == 10 {
                     return Err(Errno::EACCES);
@@ -518,7 +544,10 @@ fn check(insns: &[Insn], ty: u32, gpl: bool) -> Result<(), Errno> {
     let mut second = vec![false; n];
     let mut i = 0;
     while i < n {
-        let f = form(insns, i, ty, gpl)?;
+        let f = form(insns, i, ty, gpl).inspect_err(|_| {
+            let x = insns[i];
+            why(format!("insn {i}: code {:#04x} dst r{} src r{} off {} imm {} is not accepted", x.code, x.dst, x.src, x.off, x.imm))
+        })?;
         let wide = f.wide;
         flows.push(Some(f));
         if wide {
@@ -533,19 +562,26 @@ fn check(insns: &[Insn], ty: u32, gpl: bool) -> Result<(), Errno> {
     for (i, f) in flows.iter().enumerate() {
         let Some(f) = f else { continue };
         if f.target.is_some_and(|t| second[t]) {
+            why(format!("insn {i}: jumps into the middle of a 64-bit load"));
             return Err(Errno::EINVAL);
         }
         let after = i + if f.wide { 2 } else { 1 };
         if f.next && after >= n {
+            why(format!("insn {i}: falls off the end"));
             return Err(Errno::EINVAL);
         }
     }
-    // The functions: the program, and each a call of one in it begins.
+    // The functions: the program, each a call of one in it begins, and
+    // each whose address it takes (a callback, which a helper calls with
+    // its arguments in r1 to r5).
     let mut entries = vec![0usize];
     for (i, f) in flows.iter().enumerate() {
         if let Some(f) = f {
             if insns[i].code == 0x85 && insns[i].src == 1 {
                 entries.push(f.target.unwrap());
+            }
+            if insns[i].code == 0x18 && insns[i].src == 4 {
+                entries.push((i as i64 + insns[i].imm as i64 + 1) as usize);
             }
         }
     }
@@ -563,6 +599,8 @@ fn check(insns: &[Insn], ty: u32, gpl: bool) -> Result<(), Errno> {
         let Some(f) = &flows[i] else { continue };
         let have = known[i].unwrap();
         if f.reads & !have != 0 {
+            let r = (f.reads & !have).trailing_zeros();
+            why(format!("insn {i}: R{r} !read_ok"));
             return Err(Errno::EACCES);
         }
         let after = (have & !f.clobbers) | f.writes;
@@ -583,7 +621,8 @@ fn check(insns: &[Insn], ty: u32, gpl: bool) -> Result<(), Errno> {
             }
         }
     }
-    if flows.iter().enumerate().any(|(i, f)| f.is_some() && known[i].is_none()) {
+    if let Some(i) = flows.iter().enumerate().position(|(i, f)| f.is_some() && known[i].is_none()) {
+        why(format!("insn {i}: unreachable"));
         return Err(Errno::EINVAL);
     }
     Ok(())
@@ -595,6 +634,7 @@ impl Prog {
     /// map.
     #[allow(clippy::too_many_arguments)]
     pub fn load(ty: u32, expected_attach: u32, raw: &[u8], license: &str, name: [u8; 16], uid: u32, btf: Option<ProgBtf>, maps: &dyn Fn(i32) -> Result<Arc<Map>, Errno>) -> Result<Prog, Errno> {
+        why(String::new());
         if ty == 0 || ty > prog_type::MAX {
             return Err(Errno::EINVAL);
         }
@@ -622,8 +662,10 @@ impl Prog {
                         }
                         Imm64::MapValue(map, off)
                     }
+                    4 => Imm64::Func((i as i64 + x.imm as i64 + 1) as usize),
                     other => {
                         crate::bpf::say_once(&format!("a 64-bit load of pseudo kind {other}"));
+                        why(format!("insn {i}: a 64-bit load of pseudo kind {other}"));
                         return Err(Errno::EINVAL);
                     }
                 };
@@ -633,10 +675,50 @@ impl Prog {
                 i += 1;
             }
         }
+        // The program's functions, as `check_subprogs` finds them.
+        let mut entries = vec![0usize];
+        for (i, x) in insns.iter().enumerate() {
+            if (x.code == 0x85 && x.src == 1) || (x.code == 0x18 && x.src == 4) {
+                entries.push((i as i64 + x.imm as i64 + 1) as usize);
+            }
+        }
+        entries.sort_unstable();
+        entries.dedup();
+        // Function records, when given, one a function and at its start
+        // (`check_btf_func`).
+        let records: Vec<(u32, u32)> = btf.as_ref().map_or(Vec::new(), |b| {
+            b.func_info.chunks(8).map(|r| (u32::from_le_bytes(r[0..4].try_into().unwrap()), u32::from_le_bytes(r[4..8].try_into().unwrap()))).collect()
+        });
+        if !records.is_empty() {
+            if records.len() != entries.len() {
+                why(format!("number of funcs in func_info ({}) doesn't match number of subprogs ({})", records.len(), entries.len()));
+                return Err(Errno::EINVAL);
+            }
+            if records.iter().zip(&entries).any(|((off, _), e)| *off as usize != *e) {
+                why("func_info BTF section doesn't match subprog layout in BPF program".into());
+                return Err(Errno::EINVAL);
+            }
+        }
+        // A function whose address is taken: described, and static
+        // (`check_ld_imm`).
+        for (&i, v) in &imm64 {
+            if let Imm64::Func(at) = v {
+                if records.is_empty() {
+                    why(format!("insn {i}: missing btf func_info"));
+                    return Err(Errno::EINVAL);
+                }
+                let k = entries.iter().position(|e| e == at).unwrap_or(0);
+                let linkage = btf.as_ref().and_then(|b| b.btf.func_linkage(records[k].1));
+                if linkage != Some(0) {
+                    why(format!("insn {i}: callback function not static"));
+                    return Err(Errno::EINVAL);
+                }
+            }
+        }
         let tag = calc_tag(&insns);
         // Compiled, as the JIT that is always on would be; a program it
         // cannot compile is not loaded.
-        let image = crate::bpfjit::compile(&insns, &imm64)?;
+        let image = crate::bpfjit::compile(&insns, &imm64).inspect_err(|_| why("a jump out of its function, or a function running on into the next".into()))?;
         let func_tags = image
             .funcs
             .iter()
@@ -680,7 +762,7 @@ impl Prog {
                         x.imm = m.id() as i32;
                         y.imm = *off as i32;
                     }
-                    Imm64::Value(_) => {}
+                    Imm64::Value(_) | Imm64::Func(_) => {}
                 }
                 out.extend_from_slice(&x.encode());
                 out.extend_from_slice(&y.encode());
@@ -825,5 +907,39 @@ impl Prog {
             }
         }
         Ok(b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A program from a file (`GEX_BPF_PROG_FILE`, its raw instructions;
+    /// `GEX_BPF_PROG_TYPE`, its type): whether it loads, and if not why.
+    /// Programs from files (`GEX_BPF_PROG_LIST`, lines of a type, an
+    /// expected attach type and a path): each one's verdict.
+    #[test]
+    #[ignore]
+    fn programs_given() {
+        let list = std::fs::read_to_string(std::env::var("GEX_BPF_PROG_LIST").expect("GEX_BPF_PROG_LIST")).unwrap();
+        for line in list.lines() {
+            let mut f = line.splitn(3, ' ');
+            let (Some(ty), Some(att), Some(path)) = (f.next(), f.next(), f.next()) else { continue };
+            let raw = std::fs::read(path).unwrap();
+            let name = path.rsplit('/').next().unwrap_or(path);
+            match super::Prog::load(ty.parse().unwrap(), att.parse().unwrap(), &raw, "GPL", [0; 16], 0, None, &|_| Err(crate::errno::Errno::EBADF)) {
+                Ok(_) => println!("ok      {name}"),
+                Err(e) => println!("REFUSED {name}: {e:?} {}", super::last_reason()),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn a_program_given() {
+        let raw = std::fs::read(std::env::var("GEX_BPF_PROG_FILE").expect("GEX_BPF_PROG_FILE")).unwrap();
+        let ty: u32 = std::env::var("GEX_BPF_PROG_TYPE").ok().and_then(|t| t.parse().ok()).unwrap_or(super::prog_type::SCHED_CLS);
+        match super::Prog::load(ty, 0, &raw, "GPL", [0; 16], 0, None, &|_| Err(crate::errno::Errno::EBADF)) {
+            Ok(p) => println!("loaded: {} operations", p.image.funcs.iter().map(|f| f.ops.len()).sum::<usize>()),
+            Err(e) => panic!("refused {e:?}: {}", super::last_reason()),
+        }
     }
 }
