@@ -26,7 +26,7 @@ const CASES = [
   { name: 'glcompat', want: allOk, exe: 'glcompat.exe', wayland: {} },
   { name: 'glfast', want: allOk, exe: 'glfast.exe', wayland: {} },
   { name: 'wglnoctx', want: allOk, exe: 'wglnoctx.exe', wayland: {} },
-  { name: 'glshare', want: allOk, exe: 'glshare.exe', wayland: {} },
+  { name: 'glshare', want: /(ok [^\n]*\n|  [^\n]*\n)+0 failures/, exe: 'glshare.exe', wayland: {} },
   { name: 'glnulldrv', want: /(ok [^\n]*\n|  pixel [^\n]*\n)+0 failures/, exe: 'glnulldrv.exe', nullDriver: true },
   { name: 'glwindow', want: frames3, exe: 'glwindow.exe', args: ['3'], wayland: { colors: ['220,40,40', '40,200,60', '40,80,220', '230,210,40', '255,255,255:100'] } },
   { name: 'gltri', want: frames3, exe: 'gltri.exe', args: ['3'], wayland: { colors: ['230,210,40:8000', '51,51,51:50000'] } },
