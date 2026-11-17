@@ -10352,8 +10352,12 @@ pub fn futex_call(cx: &FutexCx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> SysRes
             // there goes out to the file first, where the waiters, each
             // with a copy of its own, will read it; then they are woken
             // wherever they are.
-            if let Some((key, map)) = cx.shared_word(uaddr, raw_op) {
-                sync_shared_file(cx.shared, m, &map.file, MapSync::Release, None);
+            // All of them, not the word's file alone: a waiter woken reads
+            // what the waker stored anywhere it shares (Android's init adds
+            // a property to one file, then bumps a serial in another and
+            // wakes on that; the waiter looks the property up in the first).
+            if let Some((key, _map)) = cx.shared_word(uaddr, raw_op) {
+                release_shared(cx.shared, m);
                 return Ok(futex::shared().wake(key, val));
             }
             Ok(cx.table.wake(uaddr, val))
@@ -10720,6 +10724,21 @@ fn sync_shared_file_own(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>, fi
             let _ = refresh(m, map, false, seen, false);
         }
     }
+}
+
+/// Every shared mapping of this process written back, as a release that
+/// publishes all its stores (`futex` wake on a shared word).
+fn release_shared(shared: Option<&SharedMapView>, m: &mut GuestMem<'_>) {
+    let Some(view) = shared else { return };
+    let maps = view.get();
+    if maps.is_empty() {
+        return;
+    }
+    let user = m.take_user();
+    for map in maps.iter().filter(|s| !s.file.handle.is_stream()) {
+        let _ = write_back(m, map, 0, u64::MAX);
+    }
+    m.set_user(user);
 }
 
 /// Which way a lock call synchronises a process's shared mappings with
