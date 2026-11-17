@@ -371,6 +371,22 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     // and on the page's loader (hosts/browser/src/cgen/wasmdll.rs)
     await w.nt({ want: /wkdata: null 42/, ...o, name: `${pre}wkdata-page`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`], page: {} });
   }
+  if (want('wkfunc')) {
+    // weak undefined functions are null, not stubs: a C weak declaration
+    // nobody defines, and C++'s thread_local init function (_ZTH*), which
+    // the TLS wrapper calls only when it is non-null (ANGLE's
+    // gCurrentValidContext)
+    let exe;
+    try {
+      // (the thread_local's definition in its own translation unit)
+      exe = await w.gexccWin(join(F, 'wkfunc.cpp'), 'wkfunc.exe', ['-O2', join(F, 'wkfunc2.cpp')]);
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}wkfunc: build`, false, String(e.message));
+    }
+    await w.nt({ want: /wkfunc: null 5/, ...o, name: `${pre}wkfunc`, exe, extra: [`${exe}.wasm`] });
+    await w.nt({ want: /wkfunc: null 5/, ...o, name: `${pre}wkfunc-page`, exe, extra: [`${exe}.wasm`], page: {} });
+  }
   if (want('fficall')) {
     // gexcc-win's libffi: native function values (gex.ffi_thunk's thunks)
     // and guest ones (GetProcAddress), mixed scalars and structs by value

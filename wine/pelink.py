@@ -60,7 +60,8 @@ STUB_IMPORTS = False  # a program's missing imports bound to stubs (--stub-impor
 SYMBOLIC = False  # a --split module's own symbols bound locally (--symbolic)
 OTHER_NATIVE = {}  # function or data name -> the --other DLL that exports it (pelink's main)
 EXTRA = set()  # the --extra DLLs (pelink's main)
-WEAK_UNDEF = set()  # their objects' weak undefined names
+WEAK_UNDEF = set()  # their objects' weak undefined names (data)
+WEAK_UNDEF_FUNCS = set()  # and functions: no stub, their address 0
 
 
 def cc(*args):
@@ -424,6 +425,7 @@ def main():
         # output, "invalid function symbol index")
         sym = subprocess.run(['wasm-objdump', '-x', '-j', 'linking', ro], capture_output=True, text=True).stdout
         WEAK_UNDEF.update(re.findall(r'- \d+: D <([^>]+)> \[ undefined binding=weak', sym))
+        WEAK_UNDEF_FUNCS.update(re.findall(r'- \d+: F <([^>]+)> func=\d+ \[ undefined binding=weak', sym))
     build, src, out = sys.argv[1:4]
     global SRC, BUILD
     SRC = src
@@ -1001,7 +1003,7 @@ def stub_imports(objs, dlls, grp, sigs, syms, shim, elsewhere, gexrt, needs, tmp
         for m in mods:
             for (n, k), sig in sigs.get(m, {}).items():
                 if (k == 'undefined' and n in undef and '!' not in n and n not in elsewhere and n not in rt
-                        and n not in shim and n not in LOADER_IMPORTS and n not in WEAK_IMPORTS
+                        and n not in shim and n not in LOADER_IMPORTS and n not in WEAK_IMPORTS and n not in WEAK_UNDEF_FUNCS
                         and n not in CROSS_MODE and not n.startswith(('__gexw_', 'gexw_', '__wasm'))):
                     gaps.setdefault(n, sig)
         if not gaps:
@@ -2196,7 +2198,7 @@ def check_imports(core, splits):
     for m in mods:
         others = set().union(*(have[o] for o in mods if o != m))
         gaps = sorted({n for n in func_imports(m) if n not in others and n not in LOADER_IMPORTS
-                       and n not in WEAK_IMPORTS and n not in CROSS_MODE
+                       and n not in WEAK_IMPORTS and n not in WEAK_UNDEF_FUNCS and n not in CROSS_MODE
                        and n.split('!')[0] not in OTHER_NATIVE.values()})
         if gaps:
             bad.append(f'{os.path.basename(m)}: {" ".join(gaps[:20])}' + (f' (and {len(gaps) - 20} more)' if len(gaps) > 20 else ''))
