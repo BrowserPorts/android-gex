@@ -12,7 +12,7 @@ The headers whose x64 parts are x86 code (inline asm, x86 intrinsics) keep
 their generic paths or are replaced by include-mingw-pre/ (intrin-impl.h's
 intrinsics in portable C). A front end that is x86_64 itself (the wasm32-as-i386
 plan's end state) needs none of this rewriting, only the overlays."""
-import os, re, shutil, sys
+import json, os, re, shutil, sys
 
 SRC, OUT = sys.argv[1], sys.argv[2]
 
@@ -34,6 +34,19 @@ EDITS = [
     ('crt/_mingw.h.in', '  __asm__ __volatile__("int {$}3":);', '  __builtin_trap();'),
     ('crt/_mingw.h.in', '  __asm__ __volatile__("int {$}0x29"::"c"(_Code));', '  (void)_Code; __builtin_trap();'),
 ]
+
+
+def ipproto_enum(text):
+    """winsock2.h's IPPROTO_* as the Windows SDK has them: the IPPROTO enum
+    (ws2def.h's there), each name a macro of itself, which programs written
+    for the SDK define again (CPython's socketmodule.c)."""
+    names = re.findall(r'^#define (IPPROTO_\w+) (\d+)$', text, re.M)
+    if not names:
+        return text
+    text = re.sub(r'^#define (IPPROTO_\w+) (\d+)$', r'#define \1 \1', text, flags=re.M)
+    enum = 'typedef enum {\n' + ''.join('  %s = %s,\n' % n for n in names) + '} IPPROTO, *PIPROTO;\n'
+    first = re.search(r'^#define IPPROTO_', text, re.M).start()
+    return text[:first] + enum + text[first:]
 
 
 def winrt_bool(text):
@@ -103,6 +116,8 @@ for sub, dest in (('include', ''), ('crt', ''), ('ddk/include', '')):
                 text = rewrite(text)
             if key.startswith('include/') and 'STDMETHODCALLTYPE' in text and re.search(r'STDMETHODCALLTYPE \w+_\(', text):
                 text = cxx_overloads(text)
+            if key == 'include/winsock2.h':
+                text = ipproto_enum(text)
             if re.match(r'include/windows\.[\w.]+\.h$', key):
                 text = winrt_bool(text)
             for f2, old, new in EDITS:
@@ -110,6 +125,24 @@ for sub, dest in (('include', ''), ('crt', ''), ('ddk/include', '')):
                     assert old in text, (key, old)
                     text = text.replace(old, new)
             open(o, 'w', encoding='latin-1').write(text)
+
+# Windows' file names have no case: a source's <Rpc.h> is rpc.h. A clang
+# VFS overlay (-ivfsoverlay) over the headers that matches names regardless
+# of case, as gexcc-win passes it.
+def tree(d, final):
+    out = []
+    for n in sorted(os.listdir(d)):
+        p = os.path.join(d, n)
+        if os.path.isdir(p):
+            out.append({'name': n, 'type': 'directory', 'contents': tree(p, os.path.join(final, n))})
+        else:
+            out.append({'name': n, 'type': 'file', 'external-contents': os.path.join(final, n)})
+    return out
+
+
+final = os.path.abspath(FINAL)
+json.dump({'version': 0, 'case-sensitive': 'false', 'roots': [{'name': final, 'type': 'directory', 'contents': tree(OUT, final)}]},
+          open(os.path.join(OUT, 'nocase.yaml'), 'w'))
 
 OLD = FINAL.rstrip('/') + '.old'
 if os.path.exists(OLD):
