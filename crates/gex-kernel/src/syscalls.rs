@@ -2496,9 +2496,11 @@ impl FdIo<'_> {
         }
         if name != 0 {
             if let Ok(sock) = self.socket_of(fd) {
-                let bytes = m.read(name, 16)?.to_vec();
-                if let Ok((ip, port)) = net::parse_sockaddr(&bytes) {
-                    sock.set_peer(ip, port);
+                let bytes = m.read(name, sock.sockaddr_len())?.to_vec();
+                match sock.sockaddr_in(&bytes) {
+                    Ok((ip, port)) => sock.set_peer(ip, port),
+                    Err(Errno::ENETUNREACH) => return Err(Errno::ENETUNREACH),
+                    Err(_) => {}
                 }
             }
         }
@@ -2756,9 +2758,10 @@ impl FdIo<'_> {
             if unix_sock.is_some() {
                 m.write_u32(namelen_at, 0)?;
             } else {
+                let s6 = self.socket_of(fd).ok().is_some_and(|s| s.v6.load(std::sync::atomic::Ordering::Relaxed));
                 let peer = self.socket_of(fd).ok().and_then(|s| s.last_from().or_else(|| s.peer()));
                 let (ip, port) = peer.unwrap_or((0, 0));
-                self.write_sockaddr(m, ip, port, name, namelen_at)?;
+                self.write_sockaddr(m, s6, ip, port, name, namelen_at)?;
             }
         }
         let given = !received.is_empty();
@@ -2828,6 +2831,7 @@ impl FdIo<'_> {
     fn write_sockaddr(
         &self,
         m: &mut GuestMem<'_>,
+        v6: bool,
         ip: u32,
         port: u16,
         addr: u64,
@@ -2836,7 +2840,7 @@ impl FdIo<'_> {
         if addr == 0 {
             return Ok(0);
         }
-        let sa = net::build_sockaddr(ip, port);
+        let sa = if v6 { net::build_sockaddr6(ip, port).to_vec() } else { net::build_sockaddr(ip, port).to_vec() };
         let room = if addrlen != 0 {
             m.read_u32(addrlen)? as usize
         } else {
@@ -5999,8 +6003,9 @@ impl NetIo<'_> {
                 FdIo::write_sockaddr_nl(m, a[1], a[2], pid, groups)
             }
             nr::GETPEERNAME => {
-                let (ip, port) = io.socket_of(fd)?.peer().ok_or(Errno::ENOTCONN)?;
-                io.write_sockaddr(m, ip, port, a[1], a[2])
+                let sock = io.socket_of(fd)?;
+                let (ip, port) = sock.peer().ok_or(Errno::ENOTCONN)?;
+                io.write_sockaddr(m, sock.v6.load(std::sync::atomic::Ordering::Relaxed), ip, port, a[1], a[2])
             }
             // An unbound, unconnected socket is at 0.0.0.0; a connected one
             // not bound to an address is on the interface its peer is
@@ -6037,7 +6042,8 @@ impl NetIo<'_> {
                             (local, _) => local,
                         })
                         .unwrap_or((0, 0));
-                    io.write_sockaddr(m, ip, port, a[1], a[2])
+                    let s6 = io.socket_of(fd).ok().is_some_and(|s| s.v6.load(std::sync::atomic::Ordering::Relaxed));
+                    io.write_sockaddr(m, s6, ip, port, a[1], a[2])
                 }
             },
             // `SO_PASSCRED` on a unix socket (`SCM_CREDENTIALS` on each
@@ -6090,9 +6096,11 @@ impl NetIo<'_> {
                 Err(Errno::ENOTSOCK) => match io.socket_of(fd) {
                     // An internet socket remembers where it is (`listen`,
                     // `getsockname`).
+                    // (An IPv6 address this machine does not have:
+                    // EADDRNOTAVAIL.)
                     Ok(sock) => m
                         .read(a[1], (a[2] as usize).min(128))
-                        .and_then(|b| net::parse_sockaddr(b))
+                        .and_then(|b| sock.sockaddr_in(b).map_err(|e| if e == Errno::ENETUNREACH { Errno::EADDRNOTAVAIL } else { e }))
                         .and_then(|(ip, port)| sock.bind(ip, port).map(|_| 0)),
                     Err(_) => io.fds.get(fd).map(|_| 0),
                 },
@@ -6129,8 +6137,8 @@ impl NetIo<'_> {
         match n {
             nr::CONNECT => {
                 let bytes = m.read(a[1], (a[2] as usize).min(128)).ok()?.to_vec();
-                let (ip, port) = net::parse_sockaddr(&bytes).ok()?;
                 let socket = io.socket_of(a[0] as i32).ok()?;
+                let (ip, port) = socket.sockaddr_in(&bytes).ok()?;
                 let started = socket.connect(ip, port);
                 let waits = file.would_block() && started == Err(Errno::EINPROGRESS);
                 waits.then_some(BlockOp::Connect { socket })
@@ -6203,7 +6211,10 @@ impl NetIo<'_> {
             let file = OpenFile::new(handle, "socket:[netlink]".to_string(), flags, true, true);
             return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
         }
-        if domain != AF_INET {
+        // AF_INET6: an IPv6 socket, on a machine with no IPv6 route
+        // (net::Socket::v6).
+        const AF_INET6: u64 = 10;
+        if domain != AF_INET && domain != AF_INET6 {
             return Err(Errno::EAFNOSUPPORT);
         }
         // Without a network stack (the browser with no relay), loopback still
@@ -6215,6 +6226,7 @@ impl NetIo<'_> {
             _ => return Err(Errno::EPROTONOSUPPORT),
         };
         let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(self.resolver), Arc::clone(self.ports), self.unix_remote));
+        sock.v6.store(domain == AF_INET6, std::sync::atomic::Ordering::Relaxed);
         sock.set_self();
         sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
         let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
@@ -6225,7 +6237,7 @@ impl NetIo<'_> {
             net::Kind::Tcp => (SOCK_STREAM as u32, 6),
             net::Kind::Udp => (SOCK_DGRAM as u32, 17),
         };
-        crate::bpfsock::created(&handle, &sock.opts, io.pid, io.creds.ruid(), io.creds.rgid(), AF_INET as u32, sock_ty, proto)?;
+        crate::bpfsock::created(&handle, &sock.opts, io.pid, io.creds.ruid(), io.creds.rgid(), domain as u32, sock_ty, proto)?;
         let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
         io.fds.insert(file, ty & SOCK_CLOEXEC != 0)
     }
@@ -6434,8 +6446,9 @@ fn insert_remote_unix(io: &FdIo<'_>, sock: Arc<unix::RemoteUnix>, flags: u64, cl
 
 fn inet_connect(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -> SysResult {
     let bytes = m.read(addr, (len as usize).min(128))?.to_vec();
-    let (ip, port) = net::parse_sockaddr(&bytes)?;
-    io.socket_of(fd)?.connect(ip, port).map(|_| 0)
+    let sock = io.socket_of(fd)?;
+    let (ip, port) = sock.sockaddr_in(&bytes)?;
+    sock.connect(ip, port).map(|_| 0)
 }
 
 /// `accept`: a unix listener's, else a TCP listener's (`net::Socket`).
@@ -6456,7 +6469,7 @@ fn inet_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
     let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
     let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
     let new_fd = io.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
-    io.write_sockaddr(m, ip, port, addr, len_out)?;
+    io.write_sockaddr(m, listener.v6.load(std::sync::atomic::Ordering::Relaxed), ip, port, addr, len_out)?;
     Ok(new_fd)
 }
 
@@ -6503,9 +6516,11 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
     }
     if dest != 0 {
         if let Ok(sock) = io.socket_of(fd) {
-            let bytes = m.read(dest, 16)?.to_vec();
-            if let Ok((ip, port)) = net::parse_sockaddr(&bytes) {
-                sock.set_peer(ip, port);
+            let bytes = m.read(dest, sock.sockaddr_len())?.to_vec();
+            match sock.sockaddr_in(&bytes) {
+                Ok((ip, port)) => sock.set_peer(ip, port),
+                Err(Errno::ENETUNREACH) => return Err(Errno::ENETUNREACH),
+                Err(_) => {}
             }
         }
     }
@@ -6562,9 +6577,10 @@ fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, fl
     if addr != 0 {
         // Where the datagram came from (a guest's port, the resolver),
         // else the connected peer.
+        let s6 = io.socket_of(fd).ok().is_some_and(|s| s.v6.load(std::sync::atomic::Ordering::Relaxed));
         let peer = io.socket_of(fd).ok().and_then(|s| s.last_from().or_else(|| s.peer()));
         let (ip, port) = peer.unwrap_or((0, 0));
-        io.write_sockaddr(m, ip, port, addr, addrlen)?;
+        io.write_sockaddr(m, s6, ip, port, addr, addrlen)?;
     }
     Ok(n)
 }
@@ -6657,7 +6673,8 @@ fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     const SOCK_STREAM: u32 = 1;
     const SOCK_DGRAM: u32 = 2;
     if let Ok(s) = io.socket_of(fd) {
-        return Ok((AF_INET, if s.kind == net::Kind::Udp { SOCK_DGRAM } else { SOCK_STREAM }));
+        let family = if s.v6.load(std::sync::atomic::Ordering::Relaxed) { 10 } else { AF_INET };
+        return Ok((family, if s.kind == net::Kind::Udp { SOCK_DGRAM } else { SOCK_STREAM }));
     }
     if io.dgram_of(fd).is_ok() {
         return Ok((AF_UNIX, SOCK_DGRAM));
@@ -6701,6 +6718,15 @@ fn setsockopt_kernel(io: &FdIo<'_>, fd: i32, level: u64, name: u64, value: &[u8]
             }
             o.priority = v;
         }
+        return Ok(0);
+    }
+    // IPV6_V6ONLY on an IPv6 socket, before it is bound or connected.
+    if let (41, 26, Ok(sock)) = (level, name, io.socket_of(fd)) {
+        if !sock.v6.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(Errno::ENOPROTOOPT);
+        }
+        let v = u32_of(value).ok_or(Errno::EINVAL)?;
+        sock.v6only.store(v != 0, std::sync::atomic::Ordering::Relaxed);
         return Ok(0);
     }
     if level == SOL_SOCKET && name == SO_PASSCRED {
@@ -6779,7 +6805,9 @@ fn getsockopt_kernel(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, n
         let v = match name {
             SO_TYPE => ty as u64,
             SO_DOMAIN => family,
-            _ => io.netlink_of(fd).map_or(0, |s| s.protocol() as u64),
+            // An internet socket's protocol (TCP's or UDP's), a netlink
+            // socket's.
+            _ => socket_kind(io, fd).map_or(0, |k| k.2 as u64),
         };
         if val != 0 {
             m.write_u32(val, v as u32)?;
@@ -6966,7 +6994,7 @@ fn getsockopt_kernel(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, n
         // IPV6_V6ONLY
         (IPPROTO_IPV6, 16) => (64, 4),
         (IPPROTO_IPV6, 18 | 19) => (1, 4),
-        (IPPROTO_IPV6, 26) => (0, 4),
+        (IPPROTO_IPV6, 26) => (io.socket_of(fd).map_or(0, |s| s.v6only.load(std::sync::atomic::Ordering::Relaxed) as u64), 4),
         _ => return Err(Errno::ENOPROTOOPT),
     };
     if val != 0 {
@@ -13229,9 +13257,9 @@ impl Kernel {
             }
             nr::CONNECT => {
                 let bytes = m.read(a[1], (a[2] as usize).min(128)).ok()?.to_vec();
-                let (ip, port) = net::parse_sockaddr(&bytes).ok()?;
                 let file = self.fds.get(a[0] as i32).ok()?;
                 let socket = self.socket_of(a[0] as i32).ok()?;
+                let (ip, port) = socket.sockaddr_in(&bytes).ok()?;
                 // Start it here, whichever way this goes: the non-blocking
                 // path reaches `sys_connect`, which finds the connection
                 // already under way and only reports on it.
@@ -17094,8 +17122,8 @@ mod tests {
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), 0, "EOF after shutdown, lock_free {lock_free}");
 
-            // The errors.
-            set_args(&mut m, at, nr::SOCKET, &[10, SOCK_STREAM, 0]);
+            // The errors: a family this kernel does not have (AppleTalk's).
+            set_args(&mut m, at, nr::SOCKET, &[5, SOCK_STREAM, 0]);
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), -(Errno::EAFNOSUPPORT.0 as i64));
             // A socketpair's peer is unnamed: the family alone, as Linux has it.

@@ -608,6 +608,12 @@ pub struct Socket {
     /// Its mark, priority and interface (`SO_MARK` and its kin, and what a
     /// BPF program at its making set).
     pub opts: Mutex<crate::bpfsock::SockOpts>,
+    /// An IPv6 socket (`AF_INET6`), and whether it is for IPv6 alone
+    /// (`IPV6_V6ONLY`). This machine has no IPv6 route: such a socket
+    /// reaches IPv4 by mapped addresses (`::ffff:a.b.c.d`), and `::` and
+    /// `::1` as their IPv4 kin.
+    pub v6: AtomicBool,
+    pub v6only: AtomicBool,
     net: Arc<dyn NetStack>,
     resolver: Arc<Resolver>,
     transport: Mutex<Option<Arc<dyn Transport>>>,
@@ -673,6 +679,8 @@ impl Socket {
         Socket {
             kind,
             opts: Mutex::new(Default::default()),
+            v6: AtomicBool::new(false),
+            v6only: AtomicBool::new(false),
             net,
             resolver,
             transport: Mutex::new(None),
@@ -2202,6 +2210,70 @@ pub fn parse_sockaddr(bytes: &[u8]) -> Result<(u32, u16), Errno> {
     let port = u16::from_be_bytes([bytes[2], bytes[3]]);
     let addr = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     Ok((addr, port))
+}
+
+/// A `sockaddr_in6` for an IPv6 socket: the IPv4 address and port it
+/// comes to here (`ENETUNREACH` for an IPv6 address this machine has no
+/// route to; `EINVAL` for too short; `EAFNOSUPPORT` for another family).
+pub fn parse_sockaddr6(bytes: &[u8], v6only: bool) -> Result<(u32, u16), Errno> {
+    // `SIN6_LEN_RFC2133`.
+    if bytes.len() < 24 {
+        return Err(Errno::EINVAL);
+    }
+    if u16::from_le_bytes([bytes[0], bytes[1]]) != 10 {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+    let a: [u8; 16] = bytes[8..24].try_into().unwrap();
+    if a == [0; 16] {
+        return Ok((0, port));
+    }
+    if a[..15] == [0; 15] && a[15] == 1 {
+        return Ok((0x7f00_0001, port));
+    }
+    if a[..10] == [0; 10] && a[10] == 0xff && a[11] == 0xff && !v6only {
+        return Ok((u32::from_be_bytes([a[12], a[13], a[14], a[15]]), port));
+    }
+    Err(Errno::ENETUNREACH)
+}
+
+/// A `sockaddr_in6` for an address an IPv6 socket is at or reaches: `::`
+/// for none, the mapped form of an IPv4 one.
+pub fn build_sockaddr6(addr: u32, port: u16) -> [u8; 28] {
+    let mut out = [0u8; 28];
+    out[0..2].copy_from_slice(&10u16.to_le_bytes());
+    out[2..4].copy_from_slice(&port.to_be_bytes());
+    if addr != 0 {
+        out[18] = 0xff;
+        out[19] = 0xff;
+        out[20..24].copy_from_slice(&addr.to_be_bytes());
+    }
+    out
+}
+
+impl Socket {
+    /// An address given this socket, as its family has it.
+    pub fn sockaddr_in(&self, bytes: &[u8]) -> Result<(u32, u16), Errno> {
+        if self.v6.load(Ordering::Relaxed) {
+            parse_sockaddr6(bytes, self.v6only.load(Ordering::Relaxed))
+        } else {
+            parse_sockaddr(bytes)
+        }
+    }
+
+    /// An address as this socket's family writes it.
+    pub fn sockaddr_out(&self, addr: u32, port: u16) -> Vec<u8> {
+        if self.v6.load(Ordering::Relaxed) {
+            build_sockaddr6(addr, port).to_vec()
+        } else {
+            build_sockaddr(addr, port).to_vec()
+        }
+    }
+
+    /// How many bytes an address for this socket's family is.
+    pub fn sockaddr_len(&self) -> usize {
+        if self.v6.load(Ordering::Relaxed) { 28 } else { 16 }
+    }
 }
 
 /// Write a `sockaddr_in`.

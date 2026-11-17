@@ -65,6 +65,7 @@ impl Errno {
     /// armed against was set (`TFD_TIMER_CANCEL_ON_SET`).
     pub const ECANCELED: Errno = Errno(125);
     pub const ESTALE: Errno = Errno(116);
+    pub const EADDRNOTAVAIL: Errno = Errno(99);
     pub const ENETUNREACH: Errno = Errno(101);
     pub const ENOTSOCK: Errno = Errno(88);
     pub const EMSGSIZE: Errno = Errno(90);
