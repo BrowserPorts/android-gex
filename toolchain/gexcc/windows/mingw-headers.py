@@ -103,7 +103,7 @@ for sub, dest in (('include', ''), ('crt', ''), ('ddk/include', '')):
     base = os.path.join(SRC, sub)
     for root, dirs, files in os.walk(base):
         for f in files:
-            if not f.endswith(('.h', '.hxx', '.inl', '.h.in')) and '.' in f:
+            if not f.endswith(('.h', '.hxx', '.inl', '.h.in', '.rh')) and '.' in f:
                 continue
             rel = os.path.relpath(os.path.join(root, f), base)
             key = os.path.join(sub.split('/')[0], rel)
