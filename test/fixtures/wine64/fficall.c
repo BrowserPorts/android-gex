@@ -1,7 +1,8 @@
 /* gexcc-win's libffi: ffi_call with mixed integer, floating, pointer and
  * struct-by-value arguments and results, to native function values (a DLL's
  * imports, the program's own variadic one: gex.ffi_thunk's thunks) and to
- * guest ones (GetProcAddress: __gexw_guest_call64); closures refused */
+ * guest ones (GetProcAddress: __gexw_guest_call64); closures called
+ * directly, through ffi_call and from a DLL, freed and made again */
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -24,6 +25,7 @@ __declspec(dllimport) float fsum(float, float);
 __declspec(dllimport) unsigned char uc_add(unsigned char, unsigned char);
 __declspec(dllimport) short s_neg(short);
 __declspec(dllimport) void set_out(int *, int);
+__declspec(dllimport) int call_cb(int (*)(int, int), int, int);
 unsigned long long __gexw_ffi_icall_limit(void);
 
 /* the program's own: variable ints and doubles */
@@ -38,6 +40,57 @@ static double vsum(int n, ...)
 }
 
 static int fails;
+
+/* the closures' functions */
+static void cl_mix(ffi_cif *cif, void *ret, void **a, void *data)
+{
+    struct pt *p = a[3];
+    struct big *b = a[4];
+    (void)cif;
+    *(double *)ret = *(int *)data + *(int8_t *)a[0] + *(float *)a[1] + *(double *)a[2] + p->x + p->y * 10
+                     + b->a + b->b + b->c + (double)*(int64_t *)a[5] + *(uint16_t *)a[6];
+}
+
+static void cl_pt(ffi_cif *cif, void *ret, void **a, void *data)
+{
+    struct pt *p = a[0], r = { p->x + *(int *)a[1] + *(int *)data, p->y + *(int *)a[1] + *(int *)data };
+    (void)cif;
+    memcpy(ret, &r, sizeof(r));
+}
+
+static void cl_big(ffi_cif *cif, void *ret, void **a, void *data)
+{
+    struct big *b = a[0], r;
+    double k = *(double *)a[1];
+    (void)cif; (void)data;
+    r.a = b->a * k; r.b = b->b * k; r.c = b->c * k;
+    memcpy(ret, &r, sizeof(r));
+}
+
+static void cl_fsum(ffi_cif *cif, void *ret, void **a, void *data)
+{
+    (void)cif; (void)data;
+    *(float *)ret = *(float *)a[0] + *(float *)a[1];
+}
+
+/* (int, int) -> int + *data, for a DLL to call back */
+static void cl_add(ffi_cif *cif, void *ret, void **a, void *data)
+{
+    (void)cif;
+    *(ffi_arg *)ret = (ffi_arg)(int64_t)(*(int *)a[0] + *(int *)a[1] + *(int *)data);
+}
+
+static ffi_closure *cb_closure;
+static ffi_cif cb_cif;
+static ffi_type *cb_at[] = { &ffi_type_sint32, &ffi_type_sint32 };
+static void *cb_code(int *data)
+{
+    void *code = NULL;
+    cb_closure = ffi_closure_alloc(sizeof(ffi_closure), &code);
+    if (ffi_prep_cif(&cb_cif, FFI_DEFAULT_ABI, 2, &ffi_type_sint32, cb_at) != FFI_OK
+        || ffi_prep_closure_loc(cb_closure, &cb_cif, cl_add, data, code) != FFI_OK) return NULL;
+    return code;
+}
 #define CHECK(what, cond) do { if (!(cond)) { printf("fficall: FAIL %s %s\n", tag, what); fails++; } } while (0)
 
 static ffi_type *pt_el[] = { &ffi_type_sint32, &ffi_type_sint32, NULL };
@@ -181,13 +234,67 @@ int main(void)
         CHECK("vsum", r == 7.75);
     }
     {
-        ffi_cif cif;
-        void *code;
-        ffi_closure *cl = ffi_closure_alloc(sizeof(ffi_closure), &code);
+        /* closures: mixed arguments and a double result; a struct results
+         * in RAX, by sret and in XMM0 */
+        ffi_cif c1, c2, c3, c4;
+        ffi_type *a1[] = { &ffi_type_sint8, &ffi_type_float, &ffi_type_double, &pt_t, &big_t, &ffi_type_sint64, &ffi_type_uint16 };
+        ffi_type *a2[] = { &pt_t, &ffi_type_sint32 };
+        ffi_type *a3[] = { &big_t, &ffi_type_double };
+        ffi_type *a4[] = { &ffi_type_float, &ffi_type_float };
+        void *k1, *k2, *k3, *k4;
+        ffi_closure *l1 = ffi_closure_alloc(sizeof(ffi_closure), &k1), *l2 = ffi_closure_alloc(sizeof(ffi_closure), &k2);
+        ffi_closure *l3 = ffi_closure_alloc(sizeof(ffi_closure), &k3), *l4 = ffi_closure_alloc(sizeof(ffi_closure), &k4);
+        int base = 1000;
         tag = "closure";
-        ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 0, &ffi_type_void, NULL);
-        CHECK("refused", cl && ffi_prep_closure_loc(cl, &cif, NULL, NULL, code) == FFI_BAD_ABI);
-        ffi_closure_free(cl);
+        CHECK("prep", ffi_prep_cif(&c1, FFI_DEFAULT_ABI, 7, &ffi_type_double, a1) == FFI_OK
+              && ffi_prep_cif(&c2, FFI_DEFAULT_ABI, 2, &pt_t, a2) == FFI_OK
+              && ffi_prep_cif(&c3, FFI_DEFAULT_ABI, 2, &big_t, a3) == FFI_OK
+              && ffi_prep_cif(&c4, FFI_DEFAULT_ABI, 2, &ffi_type_float, a4) == FFI_OK);
+        CHECK("bind", ffi_prep_closure_loc(l1, &c1, cl_mix, &base, k1) == FFI_OK
+              && ffi_prep_closure_loc(l2, &c2, cl_pt, &base, k2) == FFI_OK
+              && ffi_prep_closure_loc(l3, &c3, cl_big, NULL, k3) == FFI_OK
+              && ffi_prep_closure_loc(l4, &c4, cl_fsum, NULL, k4) == FFI_OK);
+        CHECK("guest value", (uintptr_t)k1 >= lim);
+        {
+            struct pt p = { 3, 4 }, q;
+            struct big b = { 1, 2, 3 }, rb;
+            double r = ((double (*)(int8_t, float, double, struct pt, struct big, int64_t, uint16_t))k1)(-2, 1.5f, 0.25, p, b, 1LL << 40, 65535);
+            CHECK("direct mix", r == 1000 - 2 + 1.5 + 0.25 + 3 + 40 + 6 + 1099511627776.0 + 65535);
+            q = ((struct pt (*)(struct pt, int))k2)(p, 10);
+            CHECK("direct pt", q.x == 1013 && q.y == 1014);
+            rb = ((struct big (*)(struct big, double))k3)(b, 2);
+            CHECK("direct big", rb.a == 2 && rb.b == 4 && rb.c == 6);
+            CHECK("direct float", ((float (*)(float, float))k4)(1.25f, 2.5f) == 3.75f);
+        }
+        {
+            /* through ffi_call (a guest value: call_guest) */
+            struct pt p = { 5, 6 }, q = { 0, 0 };
+            int m = 1;
+            void *av[] = { &p, &m };
+            ffi_call(&c2, FFI_FN(k2), &q, av);
+            CHECK("ffi_call pt", q.x == 1006 && q.y == 1007);
+        }
+        /* from a DLL: a callback it calls */
+        CHECK("from dll", call_cb((int (*)(int, int))cb_code(&base), 7, 8) == 1015);
+        ffi_closure_free(l1);
+        ffi_closure_free(l2);
+        {
+            /* freed and made again (often at the same address): the new data */
+            void *k;
+            ffi_closure *l = ffi_closure_alloc(sizeof(ffi_closure), &k);
+            int other = -50;
+            CHECK("rebind", ffi_prep_closure_loc(l, &c2, cl_pt, &other, k) == FFI_OK);
+            if (l)
+            {
+                struct pt p = { 1, 1 }, q = ((struct pt (*)(struct pt, int))k)(p, 0);
+                CHECK("rebound pt", q.x == -49 && q.y == -49);
+            }
+            ffi_closure_free(l);
+        }
+        CHECK("bad codeloc", ffi_prep_closure_loc(l3, &c3, cl_big, NULL, (char *)k3 + 16) == FFI_BAD_ABI);
+        ffi_closure_free(l3);
+        ffi_closure_free(l4);
+        ffi_closure_free(cb_closure);
     }
     printf("fficall: %s %d\n", fails ? "failed" : "ok", fails);
     return fails != 0;

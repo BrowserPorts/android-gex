@@ -40,3 +40,9 @@ __declspec(dllexport) float fsum(float a, float b) { return a + b; }
 __declspec(dllexport) unsigned char uc_add(unsigned char a, unsigned char b) { return a + b; }
 __declspec(dllexport) short s_neg(short a) { return -a; }
 __declspec(dllexport) void set_out(int *out, int v) { *out = v; }
+
+/* a callback's caller (fficall's closures) */
+__declspec(dllexport) int call_cb(int (*cb)(int, int), int a, int b)
+{
+    return cb(a, b);
+}

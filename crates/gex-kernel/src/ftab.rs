@@ -399,6 +399,21 @@ impl FuncMap {
         }
     }
 
+    /// Map `addr` to the existing slot `idx` of a kept install
+    /// ([`FuncMap::keep`]): a guest address that enters a module's own
+    /// function, such as one of libffi's closures (gexcc-win's libffi binds
+    /// each closure's address to its one entry). False, and nothing mapped,
+    /// when `idx` is in no kept install: forgetting the address
+    /// ([`FuncMap::retire`]) must never retire a slot others still use.
+    pub fn bind_index(&mut self, addr: u64, idx: u32) -> bool {
+        let Some(i) = self.install_of(idx).filter(|i| self.kept.contains(i)) else { return false };
+        if addr == 0 {
+            return false;
+        }
+        self.map_addr(addr, Func { idx, install: i });
+        true
+    }
+
     /// Forget `addr`'s function: its index is pointed back at the resolve
     /// stub in every table (as each catches up) and a lookup translates the
     /// address again. Returns the retired index. An entry's lifted twin
@@ -702,6 +717,25 @@ mod tests {
         m.kill_module(2);
         assert_eq!(m.get(ab as u64 + 2), None);
         assert_eq!(m.get(bb as u64), None);
+    }
+
+    #[test]
+    fn bind_index_only_in_a_kept_install_and_retires_no_slot() {
+        let mut m = FuncMap::new();
+        let n = m.publish(4, 0, Tier::Jit, &[]);
+        let base = m.install(n).base;
+        assert!(!m.bind_index(0x5000_0000, base + 1));
+        m.keep(n);
+        assert!(m.bind_index(0x5000_0000, base + 1));
+        assert!(m.bind_index(0x5000_0040, base + 1));
+        assert_eq!(m.get(0x5000_0000).map(|f| f.idx), Some(base + 1));
+        let len = m.log_len();
+        assert_eq!(m.retire(0x5000_0000), Some(base + 1));
+        assert_eq!(m.retire(0x5000_0040), Some(base + 1));
+        assert!(m.get(0x5000_0000).is_none());
+        // (the slot is the module's own: no Retire event)
+        assert_eq!(m.log_len(), len);
+        assert!(!m.bind_index(0x5000_0000, base + 9));
     }
 
     #[test]

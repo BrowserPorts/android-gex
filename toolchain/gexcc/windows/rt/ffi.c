@@ -313,25 +313,116 @@ void ffi_call(ffi_cif *cif, void (*fn)(void), void *rvalue, void **avalue)
     else call_guest(cif, f, rvalue, avalue);
 }
 
+/* Closures. A closure's function value is a guest address: the closure
+ * itself, where ffi_prep_closure_loc writes a skeleton stub (ud2; ud2) and
+ * gex binds the address (gex.ffi_closure) to this module's one closure
+ * entry, as it binds an export's skeleton to its adapter. A call reaches it
+ * as any guest function: guest code calls it, native code through the ICALL
+ * exit stub (the value is above gex.icall_limit64) and __gexw_guest_call64.
+ * The entry finds the closure by the address the call went to
+ * (ctx::LAST_TARGET), reads the arguments as Win64 passed them (call_guest's
+ * layout, the other way), and calls the closure's function. No code is made
+ * per closure, so it is the same with and without gex's JIT. */
+__attribute__((import_module("gex"), import_name("ffi_closure")))
+int __gexw_ffi_closure_bind(unsigned long long addr, unsigned long long entry);
+__attribute__((import_module("gex"), import_name("ffi_closure_free")))
+void __gexw_ffi_closure_unbind(unsigned long long addr);
+
+uint64_t __gexw_arg(int ctx, uint32_t k);
+double __gexw_argf64(int ctx, uint32_t k);
+float __gexw_argf32(int ctx, uint32_t k);
+uint64_t __gexw_argptr(int ctx, uint32_t k);
+int __gexw_ret(int ctx, uint64_t ret, uint64_t rax);
+int __gexw_ret_void(int ctx, uint64_t ret);
+int __gexw_ret_f64(int ctx, uint64_t ret, double v);
+int __gexw_ret_f32(int ctx, uint64_t ret, float v);
+int __gexw_entry(int ctx, int depth, unsigned int need, unsigned long long ret,
+                 int (*body)(int, int, unsigned int, unsigned long long));
+
+/* gex_abi::ctx::LAST_TARGET: the address the guest's call went to */
+#define GEXW_CTX_LAST_TARGET 352u
+
+static int win64_small(size_t size)
+{
+    return size == 1 || size == 2 || size == 4 || size == 8;
+}
+
+static int __gexw_ffi_closure_body(int ctx, int depth, unsigned int need, unsigned long long ret)
+{
+    ffi_closure *c = (ffi_closure *)(uintptr_t)*(uint64_t *)(uintptr_t)(uint32_t)(ctx + GEXW_CTX_LAST_TARGET);
+    ffi_cif *cif = c->cif;
+    ffi_type *rt = cif->rtype;
+    int sret = rt->type == FFI_TYPE_STRUCT && !win64_small(rt->size);
+    unsigned n = cif->nargs, k = sret, i;
+    void **av = __builtin_alloca(sizeof(void *) * (n ? n : 1));
+    uint64_t *vals = __builtin_alloca(8 * (n ? n : 1));
+    uint64_t rbuf[4] = { 0, 0, 0, 0 };
+    void *rv = sret ? (void *)(uintptr_t)__gexw_arg(ctx, 0) : (void *)rbuf;
+    uint64_t r = 0;
+    (void)depth; (void)need;
+
+    for (i = 0; i < n; i++, k++)
+    {
+        ffi_type *t = cif->arg_types[i];
+        if (t->type == FFI_TYPE_STRUCT)
+            av[i] = (void *)(uintptr_t)(win64_small(t->size) ? __gexw_argptr(ctx, k) : __gexw_arg(ctx, k));
+        else if (t->type == FFI_TYPE_FLOAT) { float f = __gexw_argf32(ctx, k); vals[i] = 0; memcpy(&vals[i], &f, 4); av[i] = &vals[i]; }
+        else if (t->type == FFI_TYPE_DOUBLE) { double d = __gexw_argf64(ctx, k); memcpy(&vals[i], &d, 8); av[i] = &vals[i]; }
+        else { vals[i] = __gexw_arg(ctx, k); av[i] = &vals[i]; }
+    }
+    c->fun(cif, rv, av, c->user_data);
+    if (sret) return __gexw_ret(ctx, ret, (uint64_t)(uintptr_t)rv);
+    switch (rt->type)
+    {
+    case FFI_TYPE_VOID: return __gexw_ret_void(ctx, ret);
+    case FFI_TYPE_FLOAT: { float f; memcpy(&f, rbuf, 4); return __gexw_ret_f32(ctx, ret, f); }
+    case FFI_TYPE_DOUBLE: { double d; memcpy(&d, rbuf, 8); return __gexw_ret_f64(ctx, ret, d); }
+    case FFI_TYPE_STRUCT: memcpy(&r, rbuf, rt->size); return __gexw_ret(ctx, ret, r);
+    default: return __gexw_ret(ctx, ret, rbuf[0]);  /* (libffi widens it to ffi_arg) */
+    }
+}
+
+/* the entry gex binds each closure's address to (an adapter's type) */
+static int __gexw_ffi_closure_entry(int ctx, int depth, unsigned int need, unsigned long long ret)
+{
+    return __gexw_entry(ctx, depth, need, ret, __gexw_ffi_closure_body);
+}
+
 void *ffi_closure_alloc(size_t size, void **code)
 {
+    /* (16-aligned, as Win64's heap gives every block) */
     void *c = calloc(1, size < sizeof(ffi_closure) ? sizeof(ffi_closure) : size);
-    if (code) *code = NULL;
+    if (code) *code = c;
     return c;
 }
 
 void ffi_closure_free(void *closure)
 {
-    free(closure);
+    ffi_closure *c = closure;
+    if (!c) return;
+    if (c->tramp[0] == 0x0f) __gexw_ffi_closure_unbind((uint64_t)(uintptr_t)c);
+    free(c);
 }
 
 ffi_status ffi_prep_closure_loc(ffi_closure *closure, ffi_cif *cif,
                                 void (*fun)(ffi_cif *, void *, void **, void *), void *user_data, void *codeloc)
 {
-    static int said;
-    (void)closure; (void)cif; (void)fun; (void)user_data; (void)codeloc;
-    if (!said++) fprintf(stderr, "libffi (gexcc-win): closures are not supported yet (gex mints no function values for them), FFI_BAD_ABI\n");
-    return FFI_BAD_ABI;
+    static const unsigned char stub[4] = { 0x0f, 0x0b, 0x0f, 0x0b };
+    /* (the entry finds the closure at the address called: the code is the
+     * closure, as ffi_closure_alloc gives it) */
+    if (!closure || codeloc != (void *)closure || ((uintptr_t)closure & 15)) return FFI_BAD_ABI;
+    if (cif->abi <= FFI_FIRST_ABI || cif->abi >= FFI_LAST_ABI) return FFI_BAD_ABI;
+    closure->cif = cif;
+    closure->fun = fun;
+    closure->user_data = user_data;
+    if (closure->tramp[0] == 0x0f) return FFI_OK;  /* bound already: a new cif, function or data */
+    memcpy(closure->tramp, stub, sizeof(stub));
+    if (__gexw_ffi_closure_bind((uint64_t)(uintptr_t)closure, (uint64_t)(uintptr_t)&__gexw_ffi_closure_entry))
+    {
+        memset(closure->tramp, 0, sizeof(stub));
+        return FFI_BAD_ABI;
+    }
+    return FFI_OK;
 }
 
 ffi_status ffi_prep_closure(ffi_closure *closure, ffi_cif *cif,

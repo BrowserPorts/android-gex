@@ -1514,6 +1514,31 @@ pub(super) fn bind(install: u32, pairs: &[(u64, u32)]) {
     binds_push(Bind { regs, dirs, slots });
 }
 
+/// `gex.ffi_closure(addr, entry)`'s shim half: guest address `addr` (a
+/// libffi closure's, where gexcc-win's libffi wrote a skeleton stub) enters
+/// the module's function `entry` (its one Win64 entry, which finds the
+/// closure by ctx::LAST_TARGET), bridged in every Worker as an export's
+/// binding is. 0, or -1 when `entry` is no kept module's
+/// (`FuncMap::bind_index`).
+#[no_mangle]
+pub extern "C" fn gex_ffi_closure(addr: u64, entry: u64) -> i32 {
+    let Ok(idx) = u32::try_from(entry) else { return -1 };
+    let Some(install) = ftab(|m| m.bind_index(addr, idx).then(|| m.get(addr).map(|f| f.install)).flatten()) else { return -1 };
+    clear(&[addr]);
+    let alt = lock(&ALT_INSTALLS).contains(&install);
+    let (regs, dirs, slots) = super::bridges_mode(&[addr], alt);
+    binds_push(Bind { regs, dirs, slots });
+    0
+}
+
+/// `gex.ffi_closure_free(addr)`'s shim half: the closure at `addr` is
+/// forgotten (its entry stays the module's: `FuncMap::bind_index`).
+#[no_mangle]
+pub extern "C" fn gex_ffi_closure_free(addr: u64) {
+    ftab(|m| m.retire(addr));
+    clear(&[addr]);
+}
+
 /// Provider module `number`'s bytes when they are in the shim's heap (a
 /// wasm32 program's), else 0: Wine's PE modules' are read from their files
 /// ([`gex_cgen_pmod_read`]).
