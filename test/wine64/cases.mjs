@@ -230,6 +230,16 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     if (dll) await one('exitshape', join(F, 'exitshape.c'), ['-O2', `-I${F}`], { extra: [dll, `${dll}.wasm`], want: /exitshape: shapes agree\nexitshape ok/ });
   }
   await one('imagebase', join(F, 'imagebase.c'), ['-O1'], { want: /imagebase: base 1 lfanew 1 phi 1 mz 1 agg 1\nimagebase ok/ });
+  if (want('ibstatic')) {
+    // refused at compile time: __ImageBase in an object whose address escapes
+    try {
+      await w.gexccWin(join(F, 'ibstatic.c'), 'ibstatic.exe', ['-O1']);
+      t.check(`${pre}ibstatic: refused`, false, 'built');
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      t.check(`${pre}ibstatic: refused`, /ibstatic\.c: __ImageBase in a global's initialiser/.test(String(e.message)), String(e.message));
+    }
+  }
   await one('fontset', join(F, 'fontset.c'), ['-O1', '-ldwrite'], { want: /fontset: system bold 700 regular 400\nfontset: in memory 400\nfontset ok/ });
   await one('glyphs', join(F, 'glyphs.c'), ['-O1', '-ldwrite'], { want: /glyphs: system [1-9]\d* heap [1-9]\d* static [1-9]\d*\nglyphs ok/ });
   if (want('missimp')) {

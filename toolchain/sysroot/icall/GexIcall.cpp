@@ -347,7 +347,11 @@ struct GexIcall : PassInfoMixin<GexIcall> {
   // thunk calling it through `void ()` links to a trap (wcc64's mismatch
   // check). The address it hands out is the definition's, which comes with
   // the definition's own thunk and facts. (A direct call names the type
-  // the caller knows; a declaration with one is left alone.)
+  // the caller knows; a declaration with one is left alone.) That holds
+  // as every object of a gexcc-win module goes through this pass, its C++
+  // runtime and archives included; a real `void f()` defined in an object
+  // that did not (assembly, a foreign archive) and only addressed here gets
+  // no thunk, and gex finds no facts for its address.
   static bool placeholderDecl(Function &F) {
     if (!F.isDeclaration() || !F.getName().starts_with("_Z")) return false;
     FunctionType *T = F.getFunctionType();
@@ -1181,8 +1185,13 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     return n;
   }
 
+  // winecrt0's (unix_lib.c), linked into every module the pass builds:
+  // dso_local, so a module without it fails its link rather than taking
+  // another module's through GOT.mem
   static GlobalVariable *Base0(Module &M, Type *Ptr) {
-    return cast<GlobalVariable>(M.getOrInsertGlobal("__gexw_image_base", Ptr));
+    auto *G = cast<GlobalVariable>(M.getOrInsertGlobal("__gexw_image_base", Ptr));
+    if (G->isDeclaration()) G->setDSOLocal(true);
+    return G;
   }
   static bool reaches(const Constant *C, const Constant *T, SmallPtrSet<const Constant *, 16> &seen) {
     if (C == T) return true;
@@ -1193,8 +1202,10 @@ struct GexIcall : PassInfoMixin<GexIcall> {
   }
   // `C` as a value at B, `T` in it being `V`
   static Value *materialize(Constant *C, Constant *T, Value *V, IRBuilder<> &B) {
-    SmallPtrSet<const Constant *, 16> seen;
     if (C == T) return V;
+    // (a fresh set per level: quadratic in the nesting, which an
+    // initialiser's is not deep enough to matter)
+    SmallPtrSet<const Constant *, 16> seen;
     if (!reaches(C, T, seen)) return C;
     if (auto *CE = dyn_cast<ConstantExpr>(C)) {
       Instruction *I = CE->getAsInstruction();
@@ -1227,28 +1238,54 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     auto *Base = Base0(M, Ptr);
     // A function's const aggregate holding it (`const WNDCLASSW wc = {
     // .hInstance = (HMODULE)&__ImageBase }`: clang makes it a private
-    // constant global it copies from) is built at each use instead: a stack
-    // copy, its __ImageBase parts the loaded base. A global some other
-    // global or another module may see stays an error, below.
+    // unnamed_addr constant it copies from, by memcpy or loads) is built
+    // instead in a stack copy, one per function, filled before each use
+    // with the loaded base in its __ImageBase parts. Only such a copy
+    // source: an object whose own address can escape (a function's static
+    // const, a file's const table, anything another global holds) would
+    // get a dead and different address per use, so it stays an error,
+    // below.
     for (GlobalVariable &G : make_early_inc_range(M.globals())) {
-      if (&G == IB || !G.hasInitializer() || !G.isConstant() || !G.hasLocalLinkage()) continue;
+      if (&G == IB || !G.hasInitializer() || !G.isConstant() || !G.hasPrivateLinkage() || !G.hasGlobalUnnamedAddr())
+        continue;
       SmallPtrSet<const Constant *, 16> seen;
       if (!reaches(G.getInitializer(), IB, seen)) continue;
+      // (its constant-expression users made instructions first, which
+      // changes nothing for a global then left alone: the optimiser's
+      // partial copies read it through GEPs)
       convertUsersOfConstantsToInstructions({&G});
-      if (!all_of(G.users(), [](User *U) { return isa<Instruction>(U); })) continue;
+      std::function<bool(const Value *)> copied = [&](const Value *P) {
+        return all_of(P->uses(), [&](const Use &U) {
+          const User *Us = U.getUser();
+          if (auto *L = dyn_cast<LoadInst>(Us)) return L->getPointerOperand() == P;
+          if (auto *T = dyn_cast<MemTransferInst>(Us)) return T->getRawSource() == P && T->getRawDest() != P;
+          if (auto *GEP = dyn_cast<GetElementPtrInst>(Us)) return GEP->getPointerOperand() == P && copied(GEP);
+          return false;
+        });
+      };
+      // (clang's copy source of a function's local aggregate, `__const.F.x`,
+      // stands for that local: the optimiser may hand its address on in
+      // place of the copy, within the local's lifetime, and one stack copy
+      // per function serves it, its contents the same at every store)
+      bool local = G.getName().starts_with("__const.") &&
+                   all_of(G.users(), [](const User *U) { return isa<Instruction>(U); });
+      if (!local && !copied(&G)) continue;
+      std::map<Function *, AllocaInst *> copies;
       SmallVector<Use *, 8> gu;
       for (Use &U : G.uses()) gu.push_back(&U);
       for (Use *U : gu) {
         auto *I = cast<Instruction>(U->getUser());
         Instruction *At = I;
         if (auto *Phi = dyn_cast<PHINode>(I)) At = Phi->getIncomingBlock(*U)->getTerminator();
-        Function *Fn = At->getFunction();
-        IRBuilder<> E(&*Fn->getEntryBlock().getFirstInsertionPt());
-        AllocaInst *Copy = E.CreateAlloca(G.getValueType(), nullptr, G.getName() + ".imagebase");
-        Copy->setAlignment(G.getAlign().valueOrOne());
+        AllocaInst *&Copy = copies[I->getFunction()];
+        if (!Copy) {
+          IRBuilder<> E(&*I->getFunction()->getEntryBlock().getFirstInsertionPt());
+          Copy = E.CreateAlloca(G.getValueType(), nullptr, G.getName() + ".imagebase");
+          Copy->setAlignment(G.getAlign().valueOrOne());
+        }
         IRBuilder<> B(At);
-        Value *Base = B.CreateLoad(Ptr, Base0(M, Ptr), "imagebase");
-        B.CreateAlignedStore(materialize(G.getInitializer(), IB, Base, B), Copy, G.getAlign().valueOrOne());
+        Value *V = B.CreateLoad(Ptr, Base, "imagebase");
+        B.CreateAlignedStore(materialize(G.getInitializer(), IB, V, B), Copy, G.getAlign().valueOrOne());
         U->set(Copy);
       }
       G.eraseFromParent();
@@ -1258,6 +1295,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     // use is an instruction's operand or a global's initialiser)
     convertUsersOfConstantsToInstructions({IB});
     unsigned n = 0;
+    std::map<BasicBlock *, LoadInst *> atEnd;
     SmallVector<Use *, 16> uses;
     for (Use &U : IB->uses()) uses.push_back(&U);
     for (Use *U : uses) {
@@ -1267,11 +1305,17 @@ struct GexIcall : PassInfoMixin<GexIcall> {
                     "image base is known only once it is mapped (take it in code)");
         continue;
       }
-      // (a phi's operand is read at the end of its incoming block)
-      Instruction *At = I;
-      if (auto *Phi = dyn_cast<PHINode>(I)) At = Phi->getIncomingBlock(*U)->getTerminator();
-      LoadInst *L = new LoadInst(Ptr, Base, "imagebase", At->getIterator());
-      U->set(L);
+      // (a phi's operand is read at the end of its incoming block, one
+      // load there for every phi operand from that block: a switch's two
+      // cases into one successor list it twice, with the same value)
+      if (auto *Phi = dyn_cast<PHINode>(I)) {
+        BasicBlock *From = Phi->getIncomingBlock(*U);
+        LoadInst *&L = atEnd[From];
+        if (!L) L = new LoadInst(Ptr, Base, "imagebase", From->getTerminator()->getIterator());
+        U->set(L);
+      } else {
+        U->set(new LoadInst(Ptr, Base, "imagebase", I->getIterator()));
+      }
       n++;
     }
     return n;
