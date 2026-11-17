@@ -34,9 +34,13 @@ pub fn count() -> u32 {
     if n != 0 {
         return n;
     }
+    // Only over "not set": a `set` made meanwhile (the page's, or a test's
+    // on another thread) is kept, not overwritten by the host's count.
     let n = host().clamp(1, MAX);
-    SET.store(n, Ordering::Relaxed);
-    n
+    match SET.compare_exchange(0, n, Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => n,
+        Err(now) => now,
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
