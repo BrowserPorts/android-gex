@@ -373,19 +373,32 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
   }
   if (want('wkfunc')) {
     // weak undefined functions are null, not stubs: a C weak declaration
-    // nobody defines, and C++'s thread_local init function (_ZTH*), which
-    // the TLS wrapper calls only when it is non-null (ANGLE's
-    // gCurrentValidContext)
-    let exe;
+    // nobody defines, C++'s thread_local init function (_ZTH*), which the
+    // TLS wrapper calls only when it is non-null (ANGLE's
+    // gCurrentValidContext), and a DLL's weak reference (wkweak)
+    let exe, weakDll, strongExe;
     try {
+      weakDll = await w.gexccWin(join(F, 'wkweak.c'), 'wkweak.dll', ['-O2', '-shared', `-Wl,--out-implib,${join(w.work, 'libwkweak.a')}`]);
       // (the thread_local's definition in its own translation unit)
-      exe = await w.gexccWin(join(F, 'wkfunc.cpp'), 'wkfunc.exe', ['-O2', join(F, 'wkfunc2.cpp')]);
+      exe = await w.gexccWin(join(F, 'wkfunc.cpp'), 'wkfunc.exe', ['-O2', join(F, 'wkfunc2.cpp'), `-L${w.work}`, '-lwkweak']);
+      strongExe = await w.gexccWin(join(F, 'wkstrongexe.c'), 'wkstrongexe.exe', ['-O2'], { env: { GEXCC_WIN_UNDEFINED: 'stub' } });
     } catch (e) {
       if (e instanceof Skip) throw e;
       return t.check(`${pre}wkfunc: build`, false, String(e.message));
     }
-    await w.nt({ want: /wkfunc: null 5/, ...o, name: `${pre}wkfunc`, exe, extra: [`${exe}.wasm`] });
-    await w.nt({ want: /wkfunc: null 5/, ...o, name: `${pre}wkfunc-page`, exe, extra: [`${exe}.wasm`], page: {} });
+    // a strong reference to the same name in another module is still an
+    // undefined reference: another module's weak one does not excuse it
+    let refused = '';
+    try { await w.gexccWin(join(F, 'wkstrong.c'), 'wkstrong.dll', ['-O2', '-shared']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      refused = String(e.message);
+    }
+    t.check(`${pre}wkfunc: strong reference refused`, /undefined reference to `wkx'/.test(refused), refused || 'it linked');
+    await w.nt({ want: /wkfunc: null 5 0/, ...o, name: `${pre}wkfunc`, exe, extra: [`${exe}.wasm`, weakDll, `${weakDll}.wasm`] });
+    await w.nt({ want: /wkfunc: null 5 0/, ...o, name: `${pre}wkfunc-page`, exe, extra: [`${exe}.wasm`, weakDll, `${weakDll}.wasm`], page: {} });
+    // and a strong one, stubbed, is never a silent null (natively or on the page)
+    await w.nt({ want: /wkstrong: set/, ...o, name: `${pre}wkstrong`, exe: strongExe, extra: [`${strongExe}.wasm`] });
+    await w.nt({ want: /wkstrong: set/, ...o, name: `${pre}wkstrong-page`, exe: strongExe, extra: [`${strongExe}.wasm`], page: {} });
   }
   if (want('fficall')) {
     // gexcc-win's libffi: native function values (gex.ffi_thunk's thunks)
