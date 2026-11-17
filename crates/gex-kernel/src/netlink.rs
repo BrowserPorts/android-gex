@@ -267,6 +267,102 @@ pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
 /// `NETLINK_XFRM`: IPsec's security associations and policies
 /// ([`xfrm_answer`]).
 pub const NETLINK_XFRM: u32 = 6;
+/// `NETLINK_NETFILTER`: nfnetlink ([`nfnl_answer`]).
+pub const NETLINK_NETFILTER: u32 = 12;
+
+/// nfnetlink_log's instances: each log group bound, and the port of the
+/// socket that bound it (`instance_create`).
+static NFLOG: std::sync::Mutex<Vec<(u16, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// `nfnetlink_rcv_msg` and `nfulnl_recv_config` for what Android's netd
+/// sends (`NFLogListener`): every message takes CAP_NET_ADMIN; of the
+/// subsystems only nfnetlink_log's configuration is here. Its protocol
+/// commands always succeed; a group's instance is its binder's (another
+/// socket's change is EPERM, a second bind EBUSY), and goes with its
+/// socket (`NETLINK_URELEASE`); an unbind of none, or a setting of a
+/// group never bound, is ENODEV; a copy mode is taken whatever it is. No
+/// packet passes a hook here, so nothing is ever logged to an instance.
+fn nfnl_answer(req: &[u8], net_admin: bool, portid: u32) -> Option<Vec<u8>> {
+    const NFNL_SUBSYS_ULOG: u16 = 4;
+    const NFULNL_MSG_PACKET: u16 = 0;
+    const NFULNL_MSG_CONFIG: u16 = 1;
+    let kind = u16::from_le_bytes(req[4..6].try_into().unwrap());
+    if req.len() < 20 {
+        return change_reply(req, Err(Errno::EINVAL));
+    }
+    if !net_admin {
+        return change_reply(req, Err(Errno::EPERM));
+    }
+    let (subsys, msg) = (kind >> 8, kind & 0xff);
+    if subsys != NFNL_SUBSYS_ULOG {
+        crate::bpf::say_once(&format!("nfnetlink subsystem {subsys} (only nfnetlink_log's configuration here)"));
+        return change_reply(req, Err(Errno::EOPNOTSUPP));
+    }
+    if msg != NFULNL_MSG_CONFIG {
+        return change_reply(req, Err(if msg == NFULNL_MSG_PACKET { Errno::EOPNOTSUPP } else { Errno::EINVAL }));
+    }
+    let group = u16::from_be_bytes([req[18], req[19]]);
+    // Attributes after the nfgenmsg (`NFULA_CFG_*`).
+    let mut cmd: Option<u8> = None;
+    let mut mode: Option<(u8, u32)> = None;
+    let mut at = 20;
+    while at + 4 <= req.len() {
+        let len = u16::from_le_bytes([req[at], req[at + 1]]) as usize;
+        let ty = u16::from_le_bytes([req[at + 2], req[at + 3]]) & 0x3fff;
+        if len < 4 || at + len > req.len() {
+            break;
+        }
+        let data = &req[at + 4..at + len];
+        match ty {
+            1 => cmd = Some(*data.first().unwrap_or(&0)),
+            2 if data.len() >= 6 => mode = Some((data[4], u32::from_be_bytes(data[..4].try_into().unwrap()))),
+            2 => return change_reply(req, Err(Errno::ERANGE)),
+            _ => {}
+        }
+        at += (len + 3) & !3;
+    }
+    const BIND: u8 = 1;
+    const UNBIND: u8 = 2;
+    const PF_BIND: u8 = 3;
+    const PF_UNBIND: u8 = 4;
+    if matches!(cmd, Some(PF_BIND | PF_UNBIND)) {
+        return change_reply(req, Ok(()));
+    }
+    let r = (|| {
+        let mut g = NFLOG.lock().unwrap_or_else(|e| e.into_inner());
+        // An instance whose socket is gone went with it.
+        let live: Vec<u32> = sockets(NETLINK_NETFILTER).iter().map(|s| s.state().portid).collect();
+        g.retain(|(_, p)| live.contains(p));
+        let inst = g.iter().position(|(grp, _)| *grp == group);
+        if let Some(i) = inst {
+            if g[i].1 != portid {
+                return Err(Errno::EPERM);
+            }
+        }
+        match cmd {
+            Some(BIND) => {
+                if inst.is_some() {
+                    return Err(Errno::EBUSY);
+                }
+                g.push((group, portid));
+            }
+            Some(UNBIND) => {
+                let i = inst.ok_or(Errno::ENODEV)?;
+                g.remove(i);
+                return Ok(());
+            }
+            Some(_) => return Err(crate::btf::ENOTSUPP),
+            None if inst.is_none() => return Err(Errno::ENODEV),
+            None => {}
+        }
+        // `nfulnl_set_mode` refuses a mode it does not know, and
+        // `nfulnl_recv_config` does not look at what it says: the
+        // request succeeds all the same.
+        let _ = mode;
+        Ok(())
+    })();
+    change_reply(req, r)
+}
 
 /// The reply a change is owed: an acknowledgement when asked for one
 /// (the request's header after it), or its error, which is always said
@@ -819,7 +915,7 @@ impl Socket {
     /// address.
     fn to_kernel(&self, who: Sender, named: bool, data: &[u8]) {
         match self.protocol {
-            NETLINK_ROUTE | NETLINK_XFRM => {
+            NETLINK_ROUTE | NETLINK_XFRM | NETLINK_NETFILTER => {
                 // A request is answered; the answers to one datagram are
                 // one datagram.
                 let mut at = 0;
@@ -831,8 +927,13 @@ impl Socket {
                     }
                     let flags = u16::from_le_bytes(data[at + 6..at + 8].try_into().unwrap());
                     if flags & NLM_F_REQUEST != 0 {
-                        let answer = if self.protocol == NETLINK_XFRM { xfrm_answer } else { route_answer };
-                        if let Some(r) = answer(&data[at..at + len], who.net_admin) {
+                        let portid = self.state().portid;
+                        let r = match self.protocol {
+                            NETLINK_XFRM => xfrm_answer(&data[at..at + len], who.net_admin),
+                            NETLINK_NETFILTER => nfnl_answer(&data[at..at + len], who.net_admin, portid),
+                            _ => route_answer(&data[at..at + len], who.net_admin),
+                        };
+                        if let Some(r) = r {
                             out.extend_from_slice(&r);
                         }
                     }
