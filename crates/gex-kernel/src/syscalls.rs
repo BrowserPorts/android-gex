@@ -4677,11 +4677,33 @@ impl PathIo<'_> {
         if matches!(kind, 0 | 3) && name.starts_with("security.") && !label && !self.creds.capable(CAP_SYS_ADMIN) {
             return Err(Errno::EPERM);
         }
+        // Linux's xattr_permission (fs/xattr.c), above every filesystem,
+        // for a `user.` name: only regular files and directories carry
+        // one (a write elsewhere is EPERM, a read ENODATA), and then the
+        // node's own read or write permission. Its third rule, a sticky
+        // directory's `user.` names for its owner alone, is not made here.
+        let user = kind != 2 && name.starts_with("user.");
+        let write = matches!(kind, 0 | 3);
+        let user_rules = |md: Result<crate::vfs::Metadata, Errno>, access: &dyn Fn(u32) -> Result<(), Errno>| -> Result<(), Errno> {
+            let md = md?;
+            if md.file_type != FileType::Regular && md.file_type != FileType::Directory {
+                return Err(if write { Errno::EPERM } else { Errno::ENODATA });
+            }
+            access(if write { 2 } else { 4 })
+        };
         // A file's label, or the list it is in, is SELinux's to answer
         // once a policy is loaded.
         let selinux = label || kind == 2;
         if form == 2 {
             let f = self.map.fds.get(a[0] as i32)?;
+            if user {
+                // The node open, its permission asked by the name it was
+                // opened under while that name is still this node's.
+                let md = f.handle.metadata();
+                let ino = md.as_ref().map(|m| m.ino).unwrap_or(0);
+                let named = !f.path.is_empty() && self.ns.metadata(&f.path).is_ok_and(|m| m.ino == ino);
+                user_rules(md, &|mode| if named { self.ns.access(&f.path, mode) } else { Ok(()) })?;
+            }
             // Its own node, where the handle has one; or by the name it
             // was opened under, as `fchmod` falls back. A pipe or socket
             // has no name, and no attributes. (A handle answers for its
@@ -4704,6 +4726,11 @@ impl PathIo<'_> {
             return x.run(m, |op| Some(call(op))).unwrap_or(Err(Errno::EOPNOTSUPP));
         }
         let path = self.at_path(m, AT_FDCWD, a[0])?;
+        if user {
+            // `lsetxattr` and its kin ask of the link itself.
+            let md = if form == 0 { self.ns.metadata(&path) } else { self.ns.metadata_nofollow(&path) };
+            user_rules(md, &|mode| self.ns.access(&path, mode))?;
+        }
         let call = |op: crate::vfs::XattrOp<'_>| self.ns.xattr(&path, form == 0, op);
         if selinux {
             let at = self.ns.located(&path, form == 0)?;

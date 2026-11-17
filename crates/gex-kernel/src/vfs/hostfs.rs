@@ -966,12 +966,10 @@ pub mod host_xattr {
                 Err(Errno::ENODATA) => calls(&on, XattrOp::Get { name: LABEL, buf }).map_err(|_| Errno::ENODATA),
                 r => r,
             },
+            // (A `user.` name's rules are the Linux calls', above every
+            // filesystem: `sys_xattr`.)
             XattrOp::Get { name, buf } => {
-                let user = name.starts_with("user.");
                 let name = host_name(name).map_err(not_user)?;
-                if user {
-                    user_permission(&on, false)?;
-                }
                 calls(&on, XattrOp::Get { name, buf })
             }
             XattrOp::Set { name: LABEL, value, flags } => {
@@ -986,19 +984,11 @@ pub mod host_xattr {
                 calls(&on, XattrOp::Set { name: HOST_LABEL, value, flags })
             }
             XattrOp::Set { name, value, flags } => {
-                let user = name.starts_with("user.");
                 let name = host_name(name)?;
-                if user {
-                    user_permission(&on, true)?;
-                }
                 calls(&on, XattrOp::Set { name, value, flags })
             }
             XattrOp::Remove { name } => {
-                let user = name.starts_with("user.");
                 let name = host_name(name).map_err(not_user)?;
-                if user {
-                    user_permission(&on, true)?;
-                }
                 calls(&on, XattrOp::Remove { name })
             }
             XattrOp::List { buf } => {
@@ -1027,28 +1017,6 @@ pub mod host_xattr {
                 Ok(mine.len())
             }
         }
-    }
-
-    /// Linux's `xattr_permission` for a guest's `user.` name: only regular files
-    /// and directories carry one (a write elsewhere is `EPERM`, a read
-    /// `ENODATA`); in a sticky directory only its owner (or root) writes
-    /// one; and then the node's own permission, read or write. A Linux host
-    /// applies these itself; XNU applies none of them.
-    fn user_permission(on: &On<'_>, write: bool) -> Result<(), Errno> {
-        use std::os::unix::fs::MetadataExt;
-        let md = match on {
-            On::Path(p) => std::fs::symlink_metadata(p),
-            On::Fd(f) => f.metadata(),
-        }
-        .map_err(|e| Errno::from_io(&e))?;
-        if !md.is_file() && !md.is_dir() {
-            return Err(if write { Errno::EPERM } else { Errno::ENODATA });
-        }
-        let ids = super::host_ids();
-        if write && md.is_dir() && md.mode() & 0o1000 != 0 && ids.uid != 0 && md.uid() != ids.uid {
-            return Err(Errno::EPERM);
-        }
-        super::access_by(&md, if write { 2 } else { 4 })
     }
 }
 
