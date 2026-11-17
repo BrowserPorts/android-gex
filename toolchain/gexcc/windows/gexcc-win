@@ -419,6 +419,7 @@ T = tools_dir()
 out = 'a.exe'; shared = False; objs = []; libs = []; libdirs = []; ress = []; srcs = []; defs = []
 subsys = None; extra_cflags = []; unicode = False; deflibs = True
 out_implib = None
+at = {}  # an object's or -l library's place on the link line
 # -s (or GEXCC_WIN_STRIP=1): a release build, the module's name and debug sections
 # out; GEXCC_WIN_STRIP=0 keeps them whatever the build asks
 strip = os.environ.get('GEXCC_WIN_STRIP') == '1'
@@ -446,7 +447,7 @@ while i < len(args):
                 subsys = p.split('=', 1)[1] if '=' in p else None
     elif a.startswith('-L'): libdirs.append(a[2:] or args[i + 1]); i += (1 if a[2:] else 2); continue
     elif a.startswith('-l'):
-        libs.append(a[2:] or args[i + 1]); i += (1 if a[2:] else 2); continue
+        libs.append(a[2:] or args[i + 1]); at.setdefault('-l' + libs[-1], i); i += (1 if a[2:] else 2); continue
     elif a.endswith('.res'): ress.append(a)
     elif a.endswith('.def'): defs.append(a)
     elif a.endswith(('.c', '.cc', '.cpp', '.cxx')) and not a.startswith('-'): srcs.append(a)
@@ -455,6 +456,7 @@ while i < len(args):
         with open(a, 'rb') as f:
             head = f.read(32)
         (ress if head[:8] == b'\0\0\0\0\x20\0\0\0' else objs).append(a)
+        at.setdefault(a, i)
     elif a.startswith(('-I', '-D', '-U', '-O', '-f', '-std', '-m', '-W', '-g')):
         extra_cflags.append(a)
     i += 1
@@ -483,6 +485,7 @@ try:
             p = B + '/libs/%s/lib%s.a' % (l, l)  # Wine's static ones: uuid, dxguid, strmiids
         if p:
             archives.append(p)
+            at.setdefault(p, at['-l' + l])
         elif l in ('stdc++', 'c++', 'supc++', 'gcc', 'gcc_s', 'gcc_eh', 'mingw32', 'mingwex', 'moldname', 'pthread', 'm', 'msvcrt', 'ucrt', 'winpthread'):
             continue
         else:
@@ -500,7 +503,10 @@ try:
                 if not os.path.isdir(d):
                     os.makedirs(d)
                     subprocess.check_call(['llvm-ar', 'x', '--output', d, os.path.abspath(a)])
-                    own.append((n, os.path.join(d, n + '.so.exports')))
+                    own.append((at.get(a, len(args)), n, os.path.join(d, n + '.so.exports')))
+    # (in link-line order: a name two of them export binds to the first, as
+    # GNU ld takes it from the first import library that defines it)
+    own = [(n, ex) for _, n, ex in sorted(own)]
     # A DLL without a .def exports what its objects define with default
     # visibility: what it marks dllexport or dllimport (the GexLLP64
     # plugin's attributes) or visibility("default")
