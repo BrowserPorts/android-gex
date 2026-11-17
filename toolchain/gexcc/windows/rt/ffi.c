@@ -322,11 +322,10 @@ void ffi_call(ffi_cif *cif, void (*fn)(void), void *rvalue, void **avalue)
  * The entry finds the closure by the address the call went to
  * (ctx::LAST_TARGET), reads the arguments as Win64 passed them (call_guest's
  * layout, the other way), and calls the closure's function. No code is made
- * per closure, so it is the same with and without gex's JIT. */
+ * per closure, so it is the same with and without gex's JIT. A closure
+ * stays bound for the process's life (the pool below). */
 __attribute__((import_module("gex"), import_name("ffi_closure")))
 int __gexw_ffi_closure_bind(unsigned long long addr, unsigned long long entry);
-__attribute__((import_module("gex"), import_name("ffi_closure_free")))
-void __gexw_ffi_closure_unbind(unsigned long long addr);
 
 uint64_t __gexw_arg(int ctx, uint32_t k);
 double __gexw_argf64(int ctx, uint32_t k);
@@ -388,40 +387,128 @@ static int __gexw_ffi_closure_entry(int ctx, int depth, unsigned int need, unsig
     return __gexw_entry(ctx, depth, need, ret, __gexw_ffi_closure_body);
 }
 
+/* The addresses gex has bound (an open-addressing set: what is bound is
+ * never read from the closure's own bytes, which may be the caller's), and
+ * the closures ffi_closure_free gave back. A freed closure stays bound and
+ * is handed out again: gex keeps a bridge record per bound address for the
+ * process's life (each thread's dispatch replays them), so making and
+ * freeing callbacks costs records only up to the most closures ever live,
+ * not one per closure made. Its memory never goes back to the heap,
+ * whose unmapping would take the binding back; the stub stays in it,
+ * since gex forgets an address whose stub is gone. */
+static volatile int closure_lock;
+static uintptr_t *bound_set;
+static size_t bound_cap, bound_n;
+/* (a pooled closure keeps its stub: the link and size sit after it, in
+ * the trampoline's bytes) */
+struct pooled { char stub[8]; struct pooled *next; size_t size; };
+_Static_assert(sizeof(struct pooled) <= FFI_TRAMPOLINE_SIZE, "pool link outside the trampoline");
+static struct pooled *closure_pool;
+
+static void lock_closures(void)
+{
+    while (__atomic_exchange_n(&closure_lock, 1, __ATOMIC_ACQUIRE)) {}
+}
+
+static void unlock_closures(void)
+{
+    __atomic_store_n(&closure_lock, 0, __ATOMIC_RELEASE);
+}
+
+static size_t bound_slot(uintptr_t a)
+{
+    size_t h = (size_t)((a >> 4) * 0x9e3779b97f4a7c15ull), m = bound_cap - 1;
+    for (h &= m; bound_set[h] && bound_set[h] != a; h = (h + 1) & m) {}
+    return h;
+}
+
+/* whether `a` is bound (under the lock) */
+static int is_bound(uintptr_t a)
+{
+    return bound_cap && bound_set[bound_slot(a)] == a;
+}
+
+/* note `a` as bound (under the lock): 0, or -1 when out of memory */
+static int add_bound(uintptr_t a)
+{
+    if (2 * (bound_n + 1) > bound_cap)
+    {
+        size_t old = bound_cap, i;
+        uintptr_t *was = bound_set;
+        bound_cap = old ? 2 * old : 64;
+        if (!(bound_set = calloc(bound_cap, sizeof(*bound_set)))) { bound_set = was; bound_cap = old; return -1; }
+        for (i = 0; i < old; i++) if (was[i]) bound_set[bound_slot(was[i])] = was[i];
+        free(was);
+    }
+    bound_set[bound_slot(a)] = a;
+    bound_n++;
+    return 0;
+}
+
+static const unsigned char closure_stub[4] = { 0x0f, 0x0b, 0x0f, 0x0b };
+
 void *ffi_closure_alloc(size_t size, void **code)
 {
+    size_t want = size < sizeof(ffi_closure) ? sizeof(ffi_closure) : size;
+    struct pooled **p, *c = NULL;
+    lock_closures();
+    for (p = &closure_pool; *p; p = &(*p)->next)
+        if ((*p)->size >= want) { c = *p; *p = c->next; break; }
+    unlock_closures();
+    if (c)
+    {
+        memset((char *)c + sizeof(closure_stub), 0, c->size - sizeof(closure_stub));
+    }
     /* (16-aligned, as Win64's heap gives every block) */
-    void *c = calloc(1, size < sizeof(ffi_closure) ? sizeof(ffi_closure) : size);
+    else c = calloc(1, want);
     if (code) *code = c;
     return c;
 }
 
+/* A closure ffi_closure_alloc made goes back to the pool, bound; its size
+ * is read again from the heap (msvcrt's _msize). */
+size_t _msize(void *);
 void ffi_closure_free(void *closure)
 {
-    ffi_closure *c = closure;
+    struct pooled *c = closure;
+    int bound;
     if (!c) return;
-    if (c->tramp[0] == 0x0f) __gexw_ffi_closure_unbind((uint64_t)(uintptr_t)c);
-    free(c);
+    lock_closures();
+    bound = is_bound((uintptr_t)c);
+    if (bound)
+    {
+        c->size = _msize(c);
+        c->next = closure_pool;
+        closure_pool = c;
+    }
+    unlock_closures();
+    if (!bound) free(c);
 }
 
 ffi_status ffi_prep_closure_loc(ffi_closure *closure, ffi_cif *cif,
                                 void (*fun)(ffi_cif *, void *, void **, void *), void *user_data, void *codeloc)
 {
-    static const unsigned char stub[4] = { 0x0f, 0x0b, 0x0f, 0x0b };
+    uintptr_t a = (uintptr_t)closure;
+    int bound;
     /* (the entry finds the closure at the address called: the code is the
      * closure, as ffi_closure_alloc gives it) */
-    if (!closure || codeloc != (void *)closure || ((uintptr_t)closure & 15)) return FFI_BAD_ABI;
+    if (!closure || codeloc != (void *)closure || (a & 15)) return FFI_BAD_ABI;
     if (cif->abi <= FFI_FIRST_ABI || cif->abi >= FFI_LAST_ABI) return FFI_BAD_ABI;
     closure->cif = cif;
     closure->fun = fun;
     closure->user_data = user_data;
-    if (closure->tramp[0] == 0x0f) return FFI_OK;  /* bound already: a new cif, function or data */
-    memcpy(closure->tramp, stub, sizeof(stub));
-    if (__gexw_ffi_closure_bind((uint64_t)(uintptr_t)closure, (uint64_t)(uintptr_t)&__gexw_ffi_closure_entry))
+    memcpy(closure->tramp, closure_stub, sizeof(closure_stub));
+    lock_closures();
+    bound = is_bound(a);
+    /* (bound already: a pooled closure, or one prepared again with a new
+     * cif, function or data) */
+    if (!bound && (__gexw_ffi_closure_bind((uint64_t)a, (uint64_t)(uintptr_t)&__gexw_ffi_closure_entry) || add_bound(a)))
     {
-        memset(closure->tramp, 0, sizeof(stub));
+        /* (bound but not noted, out of memory: binding it again is harmless) */
+        unlock_closures();
         return FFI_BAD_ABI;
     }
+    unlock_closures();
     return FFI_OK;
 }
 

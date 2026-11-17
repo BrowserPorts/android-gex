@@ -73,6 +73,15 @@ static void cl_fsum(ffi_cif *cif, void *ret, void **a, void *data)
     *(float *)ret = *(float *)a[0] + *(float *)a[1];
 }
 
+/* vsum's: (int n, ...) of alternating ints and doubles */
+static void cl_vsum(ffi_cif *cif, void *ret, void **a, void *data)
+{
+    double s = 0;
+    (void)data;
+    for (unsigned i = 1; i < cif->nargs; i++) s += (i & 1) ? *(int *)a[i] : *(double *)a[i];
+    *(double *)ret = s;
+}
+
 /* (int, int) -> int + *data, for a DLL to call back */
 static void cl_add(ffi_cif *cif, void *ret, void **a, void *data)
 {
@@ -276,6 +285,22 @@ int main(void)
         }
         /* from a DLL: a callback it calls */
         CHECK("from dll", call_cb((int (*)(int, int))cb_code(&base), 7, 8) == 1015);
+        {
+            /* a variadic closure, (int n, ...) of ints and doubles, through
+             * ffi_call (Win64 has each variable double in both registers) */
+            ffi_cif cv;
+            ffi_type *av_t[] = { &ffi_type_sint32, &ffi_type_sint32, &ffi_type_double, &ffi_type_sint32, &ffi_type_double };
+            void *kv;
+            ffi_closure *lv = ffi_closure_alloc(sizeof(ffi_closure), &kv);
+            int n = 4, a = 10, c = -3;
+            double b = 0.5, d = 0.25, r = 0;
+            void *av[] = { &n, &a, &b, &c, &d };
+            CHECK("var prep", ffi_prep_cif_var(&cv, FFI_DEFAULT_ABI, 1, 5, &ffi_type_double, av_t) == FFI_OK
+                  && ffi_prep_closure_loc(lv, &cv, cl_vsum, NULL, kv) == FFI_OK);
+            ffi_call(&cv, FFI_FN(kv), &r, av);
+            CHECK("var closure", r == 7.75);
+            ffi_closure_free(lv);
+        }
         ffi_closure_free(l1);
         ffi_closure_free(l2);
         {
@@ -283,6 +308,8 @@ int main(void)
             void *k;
             ffi_closure *l = ffi_closure_alloc(sizeof(ffi_closure), &k);
             int other = -50;
+            /* (from the pool, still bound) */
+            CHECK("pooled", l == l2 || l == l1);
             CHECK("rebind", ffi_prep_closure_loc(l, &c2, cl_pt, &other, k) == FFI_OK);
             if (l)
             {

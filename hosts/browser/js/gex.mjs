@@ -5454,7 +5454,6 @@ export class Gex {
           // and its closures: guest address `addr` (the closure's) enters the
           // module's function `entry` (wasmdll.rs `gex_ffi_closure`); 0 or -1
           ffi_closure: (addr, entry) => (e.gex_ffi_closure ? e.gex_ffi_closure(BigInt.asUintN(64, BigInt(addr)), BigInt.asUintN(64, BigInt(entry))) : -1),
-          ffi_closure_free: (addr) => { e.gex_ffi_closure_free?.(BigInt.asUintN(64, BigInt(addr))); },
           fault_hook: (idx) => e.gex_fault_hook_set?.(addrNum(idx)),
           signal_hook: (idx) => e.gex_signal_hook_set?.(addrNum(idx)),
           code_changed: (addr, len) => e.gex_code_changed?.(addrBig(addr), len),
