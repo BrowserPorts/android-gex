@@ -131,6 +131,16 @@ function watchWait(note, pid) {
   }
 }
 
+/** A process or thread Worker's `error` or `messageerror` event, said
+ *  always (a critical error): before this a process Worker's was only a
+ *  rejected promise nobody may await, and the process looked hung. Where the
+ *  event says, the script and line it came from. */
+function workerFailed(pid, role, e) {
+  const what = e?.message ?? (e?.type === 'messageerror' ? 'a message that could not be read' : String(e));
+  const at = e?.filename ? ` (${e.filename}:${e.lineno ?? '?'}:${e.colno ?? '?'})` : '';
+  console.error(`[gex] pid ${pid} (${role} Worker): failed: ${what}${at}`);
+}
+
 function crashed(what) {
   try {
     globalThis.GEX_ON_CRASH?.(what);
@@ -1193,11 +1203,13 @@ export class ProcessHost {
       w.addEventListener?.('message', onEvent);
       w.on?.('message', onMsg);
       const fail = (e) => {
+        workerFailed(pid, 'process', e);
         this.#workers.delete(pid);
         reject(e instanceof Error ? e : new Error(e?.message ?? String(e)));
       };
       w.addEventListener?.('error', fail);
       w.on?.('error', fail);
+      w.addEventListener?.('messageerror', fail);
       w[LISTENING] = { onEvent, onMsg, fail };
       this.#pending.set(pid, { ...msg, pid });
       const kind = msg.kind;
@@ -1319,6 +1331,7 @@ export class ProcessHost {
     w.removeEventListener?.('message', l.onEvent);
     w.off?.('message', l.onMsg);
     w.removeEventListener?.('error', l.fail);
+    w.removeEventListener?.('messageerror', l.fail);
     w.off?.('error', l.fail);
     w[REUSES] = n;
     this.#reused++;
@@ -1489,10 +1502,12 @@ export class ProcessHost {
     // A thread that throws, said out loud: a thread Worker had no `error`
     // listener, so an exception was swallowed and read as a hang.
     const threadFailed = (e) => {
+      workerFailed(pid, `thread ${ref.key}`, e);
       this.#onOutput(2, `gex: thread ${ref.key} failed: ${e?.message ?? String(e)}\n`, pid);
       crashed(`thread ${ref.key}: ${e?.message ?? String(e)}`);
     };
     w2.addEventListener?.('error', threadFailed);
+    w2.addEventListener?.('messageerror', threadFailed);
     w2.on?.('error', threadFailed);
     // Sent from the `ready` case, which finds it here.
     this.#pending.set(key, rec);
