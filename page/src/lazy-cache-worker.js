@@ -174,7 +174,25 @@ async function read(cache, url, from, len) {
 const bundles = new Map();
 // Decoded frames, `URL#k` -> promise of the bytes, most recently used last.
 const decoded = new Map();
-const FRAMES_KEPT = 4;
+// Kept by bytes, not count (8 MiB frames: eight of them): a program's start maps image after image, each
+// image's headers in another frame, and four kept made a WinSCP install decode 64 frames again from their
+// held compressed bytes (?systime=1). At least two, whatever their size.
+const DECODED_BUDGET = globalThis.GEX_DECODED_BUDGET ?? 64 << 20;
+const FRAMES_KEPT_MIN = 2;
+// Decoded frames' sizes, `URL#k` -> bytes, once each is decoded.
+const decodedBytes = new Map();
+let decodedTotal = 0;
+function dropDecoded(key) {
+  decoded.delete(key);
+  const n = decodedBytes.get(key);
+  if (n !== undefined) { decodedBytes.delete(key); decodedTotal -= n; }
+}
+function trimDecoded() {
+  for (const k of decoded.keys()) {
+    if (decodedTotal <= DECODED_BUDGET || decoded.size <= FRAMES_KEPT_MIN) break;
+    dropDecoded(k);
+  }
+}
 // Fetched frames as they came, compressed, `URL#k` -> bytes, most recently
 // used last, up to PACKED_BUDGET bytes: a decoded frame that was let go is
 // decoded again from here, not fetched again. Only the last few frames are
@@ -533,6 +551,7 @@ function frameOf(url, b, k) {
   const key = `${url}#${k}`;
   let f = decoded.get(key);
   if (f) {
+    // (moved to the end: most recently used; its size stays counted)
     decoded.delete(key);
   } else {
     if (failed.held(key)) return Promise.reject(heldError);
@@ -546,10 +565,14 @@ function frameOf(url, b, k) {
       return fetchFrame(url, b, k, false);
     });
     f = Promise.all([z, decoder()]).then(([zb, d]) => d.decode(zb, k === b.frames.length - 1 ? 0 : b.frame));
-    f.catch(() => { decoded.delete(key); failed.failed(key); });
+    f.then((v) => {
+      // (still kept: counted, and the budget kept)
+      if (decoded.get(key) !== f || decodedBytes.has(key)) return;
+      decodedBytes.set(key, v.length); decodedTotal += v.length; trimDecoded();
+    }, () => { if (decoded.get(key) === f) dropDecoded(key); failed.failed(key); });
   }
   decoded.set(key, f);
-  while (decoded.size > FRAMES_KEPT) decoded.delete(decoded.keys().next().value);
+  trimDecoded();
   return f;
 }
 /** A rest bundle's index (BUNDLE.json), fetched once. */
