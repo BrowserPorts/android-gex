@@ -683,6 +683,37 @@ void window_default_drawn() {
     window_default.scissor = false;
 }
 
+/* The guest's name for the object a binding query answers with the host's:
+ * an application that saves a binding and puts it back afterwards (Qt does,
+ * around what it draws) gives back what it was told. */
+GLint guest_name_of(const std::unordered_map<uint32_t, GLuint>& names, GLint host) {
+    if (host <= 0) return host;
+    for (const auto& entry : names)
+        if ((GLint)entry.second == host) return (GLint)entry.first;
+    return host;
+}
+
+GLint guest_binding(GLenum pname, GLint host) {
+    switch (pname) {
+    case 0x8068: case 0x8069: case 0x806A: case 0x8514: case 0x84F6: /* TEXTURE_BINDING_1D, 2D, 3D, CUBE_MAP, RECTANGLE */
+    case 0x8C1C: case 0x8C1D: case 0x8C2C: case 0x900A: case 0x9104: case 0x9105: /* the array, buffer, cube array and multisample ones */
+        return guest_name_of(textures, host);
+    case 0x8894: case 0x8895: case 0x88ED: case 0x88EF: case 0x8A28: case 0x8C8F: /* ARRAY, ELEMENT_ARRAY, PIXEL_PACK, PIXEL_UNPACK, UNIFORM, TRANSFORM_FEEDBACK */
+    case 0x8F36: case 0x8F37: case 0x8F43: case 0x90D3: case 0x90EF: case 0x92C1: case 0x9193: case 0x8C2A: /* COPY_READ, COPY_WRITE, DRAW_INDIRECT, SHADER_STORAGE, DISPATCH_INDIRECT, ATOMIC_COUNTER, QUERY, TEXTURE _BUFFER(_BINDING) */
+        return guest_name_of(buffers, host);
+    case 0x8CA6: case 0x8CAA: /* DRAW_ and READ_FRAMEBUFFER_BINDING */
+        return guest_name_of(framebuffers, host);
+    case 0x8CA7: return guest_name_of(renderbuffers, host);       /* RENDERBUFFER_BINDING */
+    case 0x8919: return guest_name_of(samplers, host);            /* SAMPLER_BINDING */
+    case 0x8E25: return guest_name_of(transform_feedbacks, host); /* TRANSFORM_FEEDBACK_BINDING */
+    case 0x825A: return guest_name_of(program_pipelines, host);   /* PROGRAM_PIPELINE_BINDING */
+    case 0x8B8D: return host ? (GLint)current_guest_program : 0;  /* CURRENT_PROGRAM */
+    case 0x85B5: /* VERTEX_ARRAY_BINDING: the default one the guest's 0 stands for is 0 */
+        return host && (GLuint)host == default_vao ? 0 : guest_name_of(vertex_arrays, host);
+    default: return host;
+    }
+}
+
 /* Set what the window default still owes, to the current surface's size. */
 void window_default_apply() {
     if (!mesa_context || !sur) return;
@@ -2990,6 +3021,7 @@ bool one(uint32_t op, Reader& a) {
         /* Room for what GL writes even where the table says less. */
         std::vector<GLint> values(std::max<size_t>(n, 16));
         if (n) glGetIntegerv(pname, values.data());
+        if (n == 1) values[0] = guest_binding(pname, values[0]);
         put_blob(values.data(), n * sizeof(values[0]));
         break;
     }
