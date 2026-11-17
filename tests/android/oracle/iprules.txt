@@ -12,3 +12,5 @@ ip rule add pref 11000 table 97; ip rule del pref 11000; echo rc=$?; ip rule del
 ip rule add pref 11000 table 97; ip rule add pref 12000 table 98; ip rule flush; ip rule show; ip -6 rule flush; ip -6 rule show
 ip rule add pref 13000 uidrange 10-5 lookup 99; echo rc=$?
 ip rule add pref 21000 sport 1000-2000 dport 53 ipproto udp lookup 90; ip rule show
+ip xfrm state flush; echo rc=$?; ip xfrm policy flush; echo rc=$?; ip xfrm state; ip xfrm policy; echo done
+ip -6 xfrm state flush; echo rc=$?; ip xfrm state count; echo rc=$?

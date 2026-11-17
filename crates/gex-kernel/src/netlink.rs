@@ -212,23 +212,7 @@ fn route_answer(req: &[u8], net_admin: bool) -> Option<Vec<u8>> {
     // A change, refused or done (`rtnetlink_rcv_msg`: anything but a GET
     // takes CAP_NET_ADMIN), acknowledged when asked; an error is always
     // said, with the request after it.
-    let change = |r: Result<(), Errno>| -> Option<Vec<u8>> {
-        let mut out = Vec::new();
-        match r {
-            Ok(()) if flags & NLM_F_ACK == 0 => return None,
-            Ok(()) => {
-                let mut b = 0i32.to_le_bytes().to_vec();
-                b.extend_from_slice(&req[..16]);
-                message(&mut out, NLMSG_ERROR, NLM_F_CAPPED, seq, &b);
-            }
-            Err(e) => {
-                let mut b = (-(e.0 as i32)).to_le_bytes().to_vec();
-                b.extend_from_slice(req);
-                message(&mut out, NLMSG_ERROR, 0, seq, &b);
-            }
-        }
-        Some(out)
-    };
+    let change = |r: Result<(), Errno>| change_reply(req, r);
     let ifindex = |name: &str| IFACES.iter().find(|i| i.name == name).map(|i| i.index);
     match kind {
         crate::fibrules::RTM_NEWRULE | crate::fibrules::RTM_DELRULE if !net_admin => return change(Err(Errno::EPERM)),
@@ -264,6 +248,86 @@ fn route_answer(req: &[u8], net_admin: bool) -> Option<Vec<u8>> {
 pub const NETLINK_ROUTE: u32 = 0;
 /// `NETLINK_KOBJECT_UEVENT`: the device events `ueventd` and udev listen to.
 pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
+/// `NETLINK_XFRM`: IPsec's security associations and policies
+/// ([`xfrm_answer`]).
+pub const NETLINK_XFRM: u32 = 6;
+
+/// The reply a change is owed: an acknowledgement when asked for one
+/// (the request's header after it), or its error, which is always said
+/// (the whole request after it).
+fn change_reply(req: &[u8], r: Result<(), Errno>) -> Option<Vec<u8>> {
+    let flags = u16::from_le_bytes(req[6..8].try_into().unwrap());
+    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+    let mut out = Vec::new();
+    match r {
+        Ok(()) if flags & NLM_F_ACK == 0 => return None,
+        Ok(()) => {
+            let mut b = 0i32.to_le_bytes().to_vec();
+            b.extend_from_slice(&req[..16]);
+            message(&mut out, NLMSG_ERROR, NLM_F_CAPPED, seq, &b);
+        }
+        Err(e) => {
+            let mut b = (-(e.0 as i32)).to_le_bytes().to_vec();
+            b.extend_from_slice(req);
+            message(&mut out, NLMSG_ERROR, 0, seq, &b);
+        }
+    }
+    Some(out)
+}
+
+/// `xfrm_user_rcv_msg` for what Android's netd asks at its start
+/// (`XfrmController::Init`): every message takes CAP_NET_ADMIN; the
+/// databases are flushed (`xfrm_flush_sa`, `xfrm_flush_policy`: an empty
+/// one flushed is no error) and dumped. Nothing adds to them here yet, so
+/// they are empty, and anything else is refused, said once.
+fn xfrm_answer(req: &[u8], net_admin: bool) -> Option<Vec<u8>> {
+    const MSG_BASE: u16 = 0x10;
+    const MSG_MAX: u16 = 0x28;
+    const GETSA: u16 = 0x12;
+    const GETPOLICY: u16 = 0x15;
+    const FLUSHSA: u16 = 0x1c;
+    const FLUSHPOLICY: u16 = 0x1d;
+    const GETSADINFO: u16 = 0x23;
+    let kind = u16::from_le_bytes(req[4..6].try_into().unwrap());
+    let flags = u16::from_le_bytes(req[6..8].try_into().unwrap());
+    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+    if !(MSG_BASE..=MSG_MAX).contains(&kind) {
+        return change_reply(req, Err(Errno::EINVAL));
+    }
+    if !net_admin {
+        return change_reply(req, Err(Errno::EPERM));
+    }
+    match kind {
+        // `xfrm_usersa_flush`: one byte, the protocol.
+        FLUSHSA if req.len() < 17 => change_reply(req, Err(Errno::EINVAL)),
+        FLUSHSA | FLUSHPOLICY => change_reply(req, Ok(())),
+        GETSA | GETPOLICY if flags & NLM_F_DUMP == NLM_F_DUMP => {
+            let mut out = Vec::new();
+            message(&mut out, NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_le_bytes());
+            Some(out)
+        }
+        GETSA | GETPOLICY => change_reply(req, Err(Errno::ESRCH)),
+        // `xfrm_get_sadinfo`: how many SAs (none) and the hash's buckets,
+        // as a namespace starts it (8) and at most (1M).
+        GETSADINFO => {
+            const NEWSADINFO: u16 = 0x22;
+            const XFRMA_SAD_CNT: u16 = 1;
+            const XFRMA_SAD_HINFO: u16 = 2;
+            let mut b = 0u32.to_le_bytes().to_vec();
+            attr(&mut b, XFRMA_SAD_CNT, &0u32.to_le_bytes());
+            let mut h = 8u32.to_le_bytes().to_vec();
+            h.extend_from_slice(&(1u32 << 20).to_le_bytes());
+            attr(&mut b, XFRMA_SAD_HINFO, &h);
+            let mut out = Vec::new();
+            message(&mut out, NEWSADINFO, 0, seq, &b);
+            Some(out)
+        }
+        _ => {
+            crate::bpf::say_once(&format!("xfrm message {kind:#x} (IPsec: only flushing and empty dumps here)"));
+            change_reply(req, Err(Errno::EOPNOTSUPP))
+        }
+    }
+}
 /// `SOL_NETLINK`.
 pub const SOL_NETLINK: u64 = 270;
 
@@ -739,7 +803,7 @@ impl Socket {
     /// address.
     fn to_kernel(&self, who: Sender, named: bool, data: &[u8]) {
         match self.protocol {
-            NETLINK_ROUTE => {
+            NETLINK_ROUTE | NETLINK_XFRM => {
                 // A request is answered; the answers to one datagram are
                 // one datagram.
                 let mut at = 0;
@@ -751,7 +815,8 @@ impl Socket {
                     }
                     let flags = u16::from_le_bytes(data[at + 6..at + 8].try_into().unwrap());
                     if flags & NLM_F_REQUEST != 0 {
-                        if let Some(r) = route_answer(&data[at..at + len], who.net_admin) {
+                        let answer = if self.protocol == NETLINK_XFRM { xfrm_answer } else { route_answer };
+                        if let Some(r) = answer(&data[at..at + len], who.net_admin) {
                             out.extend_from_slice(&r);
                         }
                     }
