@@ -1644,7 +1644,7 @@ fn run_program_with(
             if program_failed(&e) {
                 gex_kernel::syscalls::outgrow_ending(k.pid, signal::SIGSEGV as i32, &k.procs);
             }
-            k.fds.close_all();
+            k.release_at_exit();
             // A trap or a Wasm exception is the program's crash, not
             // gexc's: it ends as one that a signal ended (SIGSEGV), and its
             // crash is reported. Anything else is gex declining or failing
@@ -2607,7 +2607,7 @@ fn guest_thread_body(cx: Arc<SpawnContext>, child: ThreadState) {
             });
             let mut k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
             gex_kernel::syscalls::outgrow_ending(k.pid, signal::SIGSEGV as i32, &k.procs);
-            k.fds.close_all();
+            k.release_at_exit();
         }
         // `exit_group` or a fatal signal on this thread: the process
         // ends with it, and the first thread, parked in a futex
@@ -3026,11 +3026,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                         stop_other_threads(&cx, false);
                     }
                     gex_kernel::syscalls::outgrow_ending(pid, 127 << 8, &procs);
-                    kernel
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .fds
-                        .close_all();
+                    kernel.lock().unwrap_or_else(|e| e.into_inner()).release_at_exit();
                     (127, 127 << 8)
                 }
             };
@@ -3060,7 +3056,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // Linux: a listening socket's port is free once `wait4` returns.
             {
                 let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
-                k.fds.close_all();
+                k.release_at_exit();
             }
             procs.exit(pid, wstatus);
             usage::forget(pid);

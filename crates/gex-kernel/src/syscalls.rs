@@ -11763,6 +11763,20 @@ impl SharedMaps {
         }
     }
 
+    /// The process has ended: what files hold for its mappings is let go
+    /// ([`SharedMap::hold`]), as Linux releases a dying process's memory
+    /// before its parent can see it gone (a BPF map it had mapped for
+    /// writing can be frozen once it is reaped). The mappings themselves
+    /// stay for what may still read them.
+    pub fn drop_holds(&mut self) {
+        if self.list.iter().any(|s| !s.hold.0.is_empty()) {
+            for s in &mut self.list {
+                s.hold.0.clear();
+            }
+            self.publish();
+        }
+    }
+
     /// What an `munmap` of `[addr, addr + len)` (page-aligned) is to the
     /// mappings it names exactly: one holder's of several ([`Unalias::Keep`]:
     /// nothing to unmap), the last holder's ([`Unalias::Whole`]: unmap the
@@ -11905,6 +11919,15 @@ pub struct ThreadState {
 impl ThreadState {
     pub fn new(ctx_addr: u64, tid: i32) -> ThreadState {
         ThreadState { ctx_addr, tid }
+    }
+}
+
+impl Kernel {
+    /// What a process lets go of as it ends, before its parent can see it
+    /// gone: its descriptors, and what files hold for its mappings.
+    pub fn release_at_exit(&mut self) {
+        self.fds.close_all();
+        self.mem.lock().log.shared_maps.drop_holds();
     }
 }
 
