@@ -58,7 +58,7 @@ STATIC = {}  # DLL -> the static libraries its IMPORTS name (libuuid.a), as path
 KEEP_EXPORTS = set()  # names the core exports if it defines them (--exports-of)
 STUB_IMPORTS = False  # a program's missing imports bound to stubs (--stub-imports)
 SYMBOLIC = False  # a --split module's own symbols bound locally (--symbolic)
-OTHER_DATA = {}  # data name -> the --other DLL that exports it (pelink's main)
+OTHER_NATIVE = {}  # function or data name -> the --other DLL that exports it (pelink's main)
 EXTRA = set()  # the --extra DLLs (pelink's main)
 
 
@@ -514,8 +514,8 @@ def main():
         others[mod] = ex
         for line in open(ex):
             w = line.split()
-            if len(w) >= 2 and w[1] == 'data' and not w[0].startswith('__gexw'):
-                OTHER_DATA.setdefault(w[0], mod)
+            if len(w) >= 2 and w[1] in ('data', 'func') and not w[0].startswith('__gexw'):
+                OTHER_NATIVE.setdefault(w[0], mod)
     link(dlls, out, os.path.join(build, 'libs', 'gexrt', 'libgexrt.a'), others)
 
 
@@ -1212,7 +1212,7 @@ def link(dlls, out, gexrt, others=None):
             continue
         for line in open(oex):
             parts = line.split()
-            if len(parts) >= 2 and parts[1] in ('func', 'forward'):
+            if len(parts) >= 2 and parts[1] in ('func', 'forward') and OTHER_NATIVE.get(parts[0]) != omod:
                 owner_of.setdefault(parts[0], []).append(omod)
     # A forward to what the native DLL itself takes from an i386 one
     # (user32's BeginPaint is win32u's NtUserBeginPaint): that DLL's export,
@@ -1474,10 +1474,11 @@ def link(dlls, out, gexrt, others=None):
                 sym = guest_sym(mod, f'{gdll}.{gname}' + ('' if name == gname else f'={name}'), have)
                 guest_binds.append((f'gexw-guest!{sym}', have, gdll, gname, grp(mod), mod))
                 f.write(f'{name} gexw-guest {sym}\n')
-            # an --other DLL's data: its GOT.mem import named DLL!name, which
-            # gex binds to that DLL's data
+            # an --other DLL's functions and data (a program's own DLL, native
+            # code too): imports named DLL!name, which gex binds to that
+            # DLL's exports, its data through GOT.mem
             if mod in EXTRA:
-                for name, owner in sorted(OTHER_DATA.items()):
+                for name, owner in sorted(OTHER_NATIVE.items()):
                     f.write(f'{name} {owner}\n')
         bound = os.path.join(tmp, mod + '.o')
         subprocess.check_call([sys.executable, os.path.join(here, 'pesym.py'), 'imports', local, bound, mod, mapfile])
@@ -1880,6 +1881,15 @@ static void *gexw_ntdll_proc(const char *name)
                         w = line.split()
                         if w and not w[0].startswith('__wine'):
                             f.write(f'--export-if-defined={mod}!{w[0]}\n')
+            # an --extra DLL's exports (a program's own DLL, a .def's
+            # exports too): its programs' and other DLLs' imports of it
+            # bind to them (--other)
+            for mod, _, ex, _ in dlls:
+                if mod in EXTRA and grp(mod) == g and not os.environ.get('PELINK_EXPORT_ALL'):
+                    for line in open(ex):
+                        w = line.split()
+                        if len(w) >= 2 and w[1] == 'func' and not w[0].startswith(('__wine', '__gexw')):
+                            f.write(f'--export-if-defined={mod}!{w[0]}\n')
             # what the other mode's modules call (wasmdll's CROSS_MODE)
             for n in CROSS_MODE:
                 f.write(f'--export-if-defined={n}\n')
@@ -2033,7 +2043,7 @@ static void *gexw_ntdll_proc(const char *name)
         if SPLIT:
             core_file = os.path.basename(out) if not g else os.path.basename(main_out)
             mods = '\n'.join([f'{d} {SPLIT.get(d) or core_file}' for d in sorted({m for m, _, _, _ in dlls})] +
-                             [f'{d} {d}.wasm' for d in sorted(set(OTHER_DATA.values()))])
+                             [f'{d} {d}.wasm' for d in sorted(set(OTHER_NATIVE.values()))])
             payload = enc_name('gexw.modules') + mods.encode() + b'\n'
             with open(out, 'ab') as f:
                 f.write(bytes([0]) + enc_leb(len(payload)) + payload)
@@ -2042,7 +2052,7 @@ static void *gexw_ntdll_proc(const char *name)
         undefined = subprocess.run(['wasm-objdump', '-x', '-j', 'Import', out], capture_output=True, text=True).stdout
         names = sorted(set(re.findall(r'<- env\.(\S+)', undefined)) - {'memory', '__indirect_function_table',
                        '__stack_pointer', '__memory_base', '__table_base'}
-                       | {n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if n.split('!')[0] in OTHER_DATA.values()})
+                       | {n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if n.split('!')[0] in OTHER_NATIVE.values()})
         open(out + '.undefined', 'w').write('\n'.join(names) + '\n')
         print(f'{out}: {sum(grp(d[0]) == g for d in dlls)} DLLs, {os.path.getsize(out) >> 20} MiB, {len(names)} undefined '
               f'(listed in {out}.undefined)')
@@ -2159,7 +2169,8 @@ def check_imports(core, splits):
     for m in mods:
         others = set().union(*(have[o] for o in mods if o != m))
         gaps = sorted({n for n in func_imports(m) if n not in others and n not in LOADER_IMPORTS
-                       and n not in WEAK_IMPORTS and n not in CROSS_MODE})
+                       and n not in WEAK_IMPORTS and n not in CROSS_MODE
+                       and n.split('!')[0] not in OTHER_NATIVE.values()})
         if gaps:
             bad.append(f'{os.path.basename(m)}: {" ".join(gaps[:20])}' + (f' (and {len(gaps) - 20} more)' if len(gaps) > 20 else ''))
     if bad:
