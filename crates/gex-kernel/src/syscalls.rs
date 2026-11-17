@@ -20070,7 +20070,11 @@ mod tests {
                 (raw::FSTATAT64, [cwd32, 0x20000, 0x22000, 0, 0, 0]),
             ] {
                 got.push(sys(&mut m, &mut k, n, a));
-                got.extend(m.read(0x22000, 96).unwrap().iter().map(|&b| b as i64));
+                // (The first eight bytes, `st_dev`, are a filesystem's
+                // number from a count every test shares, and tests run at
+                // once: there, and not compared, as in the 64-bit test.)
+                let stat = m.read(0x22000, 96).unwrap().to_vec();
+                got.extend(stat.iter().enumerate().map(|(i, &b)| if i < 8 { 0 } else { b as i64 }));
             }
             got.push(sys(&mut m, &mut k, raw::ACCESS, [0x20000, 4, 0, 0, 0, 0]));
             got.push(sys(&mut m, &mut k, raw::ACCESS, [0x20200, 0, 0, 0, 0, 0]));
