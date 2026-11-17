@@ -6,6 +6,7 @@ struct pt { int x, y; };          /* wasm: by pointer / sret; Win64: in a slot *
 struct big { double a, b, c; };   /* by pointer / sret on both */
 struct wrapd { double d; };       /* wasm: an f64; Win64: in a slot */
 struct trio { char c[3]; };       /* wasm: by pointer; Win64: by pointer */
+struct wrapf { float f; };        /* wasm: an f32; Win64: in a slot */
 
 __declspec(dllexport) double mix(int8_t a, uint16_t b, int c, int64_t d, float e, double f, const int *p)
 {
@@ -24,6 +25,11 @@ __declspec(dllexport) struct big big_scale(struct big v, double k)
 __declspec(dllexport) struct wrapd wrap_half(struct wrapd v)
 {
     struct wrapd r = { v.d / 2 };
+    return r;
+}
+__declspec(dllexport) struct wrapf wrapf_mul(struct wrapf v, float k, struct wrapd w)
+{
+    struct wrapf r = { v.f * k * (float)w.d };
     return r;
 }
 __declspec(dllexport) int trio_sum(struct trio t, int k)

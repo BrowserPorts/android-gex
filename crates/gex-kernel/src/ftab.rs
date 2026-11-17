@@ -95,6 +95,15 @@ pub mod facts {
     pub const fn byval(i: u32) -> u32 {
         1 << (2 + i)
     }
+    /// On a float or double parameter, the same bit: a struct of that one
+    /// scalar (`struct { double d; }`), which wasm passes as the scalar and
+    /// Win64 in its integer slot, as any struct of 4 or 8 bytes.
+    pub const fn int_fp(i: u32) -> u32 {
+        byval(i)
+    }
+    /// Win64: a float or double result that was a struct of that one
+    /// scalar, which comes back in RAX, not XMM0.
+    pub const RET_INT: u32 = 1 << 30;
     /// The guest cannot call it (varargs, or a type with no guest shape).
     pub const REFUSED: u32 = 1 << 31;
 }

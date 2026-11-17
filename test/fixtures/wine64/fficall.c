@@ -13,11 +13,13 @@ struct pt { int x, y; };
 struct big { double a, b, c; };
 struct wrapd { double d; };
 struct trio { char c[3]; };
+struct wrapf { float f; };
 __declspec(dllimport) double mix(int8_t, uint16_t, int, int64_t, float, double, const int *);
 __declspec(dllimport) struct pt pt_add(struct pt, struct pt);
 __declspec(dllimport) struct big big_scale(struct big, double);
 __declspec(dllimport) struct wrapd wrap_half(struct wrapd);
 __declspec(dllimport) int trio_sum(struct trio, int);
+__declspec(dllimport) struct wrapf wrapf_mul(struct wrapf, float, struct wrapd);
 __declspec(dllimport) float fsum(float, float);
 __declspec(dllimport) unsigned char uc_add(unsigned char, unsigned char);
 __declspec(dllimport) short s_neg(short);
@@ -44,10 +46,12 @@ static ffi_type *big_el[] = { &ffi_type_double, &ffi_type_double, &ffi_type_doub
 static ffi_type big_t = { 0, 0, FFI_TYPE_STRUCT, big_el };
 static ffi_type *wrapd_el[] = { &ffi_type_double, NULL };
 static ffi_type wrapd_t = { 0, 0, FFI_TYPE_STRUCT, wrapd_el };
+static ffi_type *wrapf_el[] = { &ffi_type_float, NULL };
+static ffi_type wrapf_t = { 0, 0, FFI_TYPE_STRUCT, wrapf_el };
 static ffi_type *trio_el[] = { &ffi_type_sint8, &ffi_type_sint8, &ffi_type_sint8, NULL };
 static ffi_type trio_t = { 0, 0, FFI_TYPE_STRUCT, trio_el };
 
-struct fns { void *mix, *pt_add, *big_scale, *wrap_half, *trio_sum, *fsum, *uc_add, *s_neg, *set_out; };
+struct fns { void *mix, *pt_add, *big_scale, *wrap_half, *trio_sum, *fsum, *uc_add, *s_neg, *set_out, *wrapf_mul; };
 
 static void run(const char *tag, const struct fns *f)
 {
@@ -81,16 +85,26 @@ static void run(const char *tag, const struct fns *f)
         ffi_call(&cif, FFI_FN(f->big_scale), &r, av);
         CHECK("big_scale", r.a == 1.5 && r.b == 3 && r.c == 4.5 && v.c == 3);
     }
-    /* (not to a guest value yet: GexIcall's entry thunk returns a struct
-     * that wasm lowers to a double, as here, in XMM0, where Win64 returns
-     * any 8-byte struct in RAX; the IR no longer says it was a struct) */
-    if (strcmp(tag, "guest")) {
+    /* (a struct of one double: an f64 on wasm, an 8-byte struct in RAX and
+     * in an integer slot on Win64, as GexIcall's adapter takes it) */
+    {
         ffi_type *at[] = { &wrapd_t };
         struct wrapd v = { 5 }, r = { 0 };
         void *av[] = { &v };
         CHECK("wrapd prep", ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 1, &wrapd_t, at) == FFI_OK);
         ffi_call(&cif, FFI_FN(f->wrap_half), &r, av);
         CHECK("wrap_half", r.d == 2.5);
+    }
+    {
+        /* one float's struct as argument and result, one double's beside it */
+        ffi_type *at[] = { &wrapf_t, &ffi_type_float, &wrapd_t };
+        struct wrapf v = { 1.5f }, r = { 0 };
+        float k = 2;
+        struct wrapd w = { 4 };
+        void *av[] = { &v, &k, &w };
+        CHECK("wrapf prep", ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 3, &wrapf_t, at) == FFI_OK);
+        ffi_call(&cif, FFI_FN(f->wrapf_mul), &r, av);
+        CHECK("wrapf_mul", r.f == 12);
     }
     {
         ffi_type *at[] = { &trio_t, &ffi_type_sint32 };
@@ -144,12 +158,12 @@ int main(void)
     const char *tag = "main";
     unsigned long long lim = __gexw_ffi_icall_limit();
     struct fns native = { (void *)mix, (void *)pt_add, (void *)big_scale, (void *)wrap_half, (void *)trio_sum,
-                          (void *)fsum, (void *)uc_add, (void *)s_neg, (void *)set_out };
+                          (void *)fsum, (void *)uc_add, (void *)s_neg, (void *)set_out, (void *)wrapf_mul };
     HMODULE h = GetModuleHandleA("ffidll.dll");
     struct fns guest = { 0 };
     void **g = (void **)&guest;
-    static const char *names[] = { "mix", "pt_add", "big_scale", "wrap_half", "trio_sum", "fsum", "uc_add", "s_neg", "set_out" };
-    for (int i = 0; i < 9; i++) g[i] = (void *)GetProcAddress(h, names[i]);
+    static const char *names[] = { "mix", "pt_add", "big_scale", "wrap_half", "trio_sum", "fsum", "uc_add", "s_neg", "set_out", "wrapf_mul" };
+    for (int i = 0; i < 10; i++) g[i] = (void *)GetProcAddress(h, names[i]);
     CHECK("native values", (uintptr_t)native.mix < lim && (uintptr_t)vsum < lim);
     CHECK("guest values", guest.mix && (uintptr_t)guest.mix >= lim);
     run("native", &native);
