@@ -482,19 +482,36 @@ pub fn load_or_compile(
     }
 
     let (wasm, metadata) = build()?;
-    let module = compile(engine, &wasm).context("validating translated wasm")?;
+    // Compiled here and not kept by the process (`memo`): what is kept is
+    // the file.
+    let mut module = compile_uncached(engine, &wasm).context("validating translated wasm")?;
     if let Some(serialized) = serialize(&module) {
         // Metadata first: a reader requires both, so the module's arrival is
         // what publishes the entry.
         store(dir, &meta_path, &metadata);
         store(dir, &path, &serialized);
         account_store(dir, (metadata.len() + serialized.len()) as u64, budget());
+        module = mapped_instead(engine, &path, module);
     }
     Ok(Loaded {
         module,
         metadata,
         hit: false,
     })
+}
+
+/// A module just compiled and stored at `path`, as the stored file mapped
+/// ([`artifact`]) rather than the compiled copy: that copy is the
+/// process's own anonymous memory for as long as the module lives (a
+/// booting Android's daemons came to some 1.7 GiB of it, past what the
+/// host had), where the file's pages are one copy for every process that
+/// maps them, and the host's to drop and read again. The compiled copy
+/// when the file cannot be mapped.
+fn mapped_instead(engine: &Engine, path: &Path, compiled: Module) -> Module {
+    match artifact(engine, path) {
+        Some(Ok(m)) => m,
+        _ => compiled,
+    }
 }
 
 /// How stale a hit's metadata mtime may be before the hit refreshes it.
@@ -598,9 +615,10 @@ fn load_or_compile_at_uncached(engine: &Engine, path: &Path, wasm: &[u8]) -> Res
         }
         None => {}
     }
-    let m = compile(engine, wasm).context("validating the module")?;
+    let m = compile_uncached(engine, wasm).context("validating the module")?;
     if let (Some(bytes), Some(dir)) = (serialize(&m), path.parent()) {
         store(dir, path, &bytes);
+        return Ok(mapped_instead(engine, path, m));
     }
     Ok(m)
 }
