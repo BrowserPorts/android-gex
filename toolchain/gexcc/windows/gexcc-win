@@ -554,6 +554,7 @@ try:
             w = line.split()
             if len(w) == 3 and w[1] in 'DBRVdbr':
                 data.add(w[2])
+    listed = set()  # the names the .def files export, external and internal
     for k, d in enumerate(defs):
         seen, lines, dup, sect = set(), [], False, ''
         for line in open(d, errors='surrogateescape'):
@@ -572,6 +573,7 @@ try:
                     dup = True
                     continue
                 seen.add(n)
+                listed |= {n, internal}
                 if internal in data and 'DATA' not in w[1:]:
                     code, sc, comment = line.rstrip('\n').partition(';')
                     line = code.rstrip() + ' DATA' + (' ;' + comment if sc else '') + '\n'
@@ -581,12 +583,15 @@ try:
             defs[k] = os.path.join(tmp, '%d-%s' % (k, os.path.basename(d)))
             with open(defs[k], 'w', errors='surrogateescape') as f:
                 f.writelines(lines)
-    # A DLL without a .def exports what its objects define with default
-    # visibility: what it marks dllexport or dllimport (the GexLLP64
-    # plugin's attributes) or visibility("default")
+    # A DLL exports what its objects define with default visibility: what
+    # it marks dllexport or dllimport (the GexLLP64 plugin's attributes) or
+    # visibility("default"). Without a .def that is its export list; with
+    # one, the names the .def leaves out are added, as MSVC's link and GNU
+    # ld export a .def's entries and every dllexport (nss3's .def leaves
+    # NSPR out, which exports itself through PR_IMPLEMENT)
     symbolic = False
-    if shared and not defs:
-        exp = []
+    exp = []
+    if shared:
         for o in objs:
             if o.endswith('.a'):
                 continue
@@ -594,6 +599,21 @@ try:
                 w = line.split()
                 if len(w) >= 5 and w[1] == 'g' and w[-2] != '.hidden' and w[2] in ('F', 'O') and w[3] != '*UND*':
                     exp.append((w[-1], w[2] == 'O'))
+    if shared and defs:
+        more = sorted({e for e in exp if e[0] not in listed})
+        if more:
+            k = len(defs) - 1
+            df = os.path.join(tmp, '%d-more-%s' % (k, os.path.basename(defs[k])))
+            with open(df, 'w', errors='surrogateescape') as f:
+                f.write(open(defs[k], errors='surrogateescape').read().rstrip('\n') + '\n')
+                # (an EXPORTS section of its own: the .def may end in another)
+                f.write('EXPORTS\n')
+                for n, isdata in more:
+                    f.write('  %s%s\n' % (n, ' DATA' if isdata else ''))
+            defs[k] = df
+        # (its own references to its dllexports bound locally, as below)
+        symbolic = bool(exp)
+    elif shared:
         if exp:
             dname = os.path.basename(out)
             df = os.path.join(tmp, 'exports.def')
@@ -679,6 +699,11 @@ try:
         sys.exit(1)
     sys.stderr.writelines(warns)
     odir = os.path.dirname(os.path.abspath(out))
+    # (and beside the module, OUT.wasm.stubs: the names bound to stubs that
+    # raise EXCEPTION_WINE_STUB, which a build that hides the link's warnings,
+    # mach's, would not show)
+    with open(os.path.join(odir, os.path.basename(out) + '.wasm.stubs'), 'w') as f:
+        f.writelines(l.split('when called: ', 1)[1].replace(' ', '\n') for l in warns if 'when called: ' in l)
     # (the loader runs an exported __wasm_call_ctors when it installs the
     # module, before the DLLs the constructors call are loaded)
     subprocess.call([sys.executable, here + '/renexp.py', os.path.join(tmp, name + '.wasm'), '__wasm_call_ctors', '__gexw_ctors'])
