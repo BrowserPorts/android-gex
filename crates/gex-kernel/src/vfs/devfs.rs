@@ -120,6 +120,25 @@ impl FileHandle for DevHandle {
     fn is_tty(&self) -> bool {
         self.device == Device::Tty
     }
+
+    /// Nothing is ever there to read at a terminal here (`read_at`):
+    /// readable said otherwise, a parked read found nothing and was tried
+    /// again at once, for ever.
+    fn poll_readable(&self) -> bool {
+        self.device != Device::Tty
+    }
+
+    /// A terminal read waits here: a queue nothing notifies, since nothing
+    /// is ever typed (without one a parked read was tried again and again,
+    /// a CPU's worth of it, and the console shell's starved init's other
+    /// services).
+    fn wait_queue(&self) -> u32 {
+        static NOBODY_TYPES: std::sync::OnceLock<crate::wait::Queue> = std::sync::OnceLock::new();
+        match self.device {
+            Device::Tty => NOBODY_TYPES.get_or_init(crate::wait::Queue::new).id(),
+            _ => 0,
+        }
+    }
 }
 
 /// The `/dev` filesystem.
