@@ -253,7 +253,7 @@ impl FileHandle for ProgFile {
         Err(Errno::EINVAL)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o600, ino: self.0.id as u64, mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None })
+        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o600, ino: self.0.id as u64, mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: None })
     }
     fn bpf_object(&self) -> Option<Object> {
         Some(Object::Prog(Arc::clone(&self.0)))
@@ -855,7 +855,7 @@ impl FileHandle for MapFile {
         Err(Errno::EINVAL)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o600, ino: self.map.id as u64, mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None })
+        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o600, ino: self.map.id as u64, mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: None })
     }
     fn bpf_object(&self) -> Option<Object> {
         Some(Object::Map(Arc::clone(&self.map)))

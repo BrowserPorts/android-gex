@@ -627,7 +627,7 @@ impl crate::vfs::FileHandle for RemotePipeEnd {
             ino: crate::vfs::anon_ino((0x10000 + self.id as usize) as *const u8),
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: 0, dev: 0,
             times: Default::default(),
             owner: None,
         })

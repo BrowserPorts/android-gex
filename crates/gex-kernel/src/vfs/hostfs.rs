@@ -155,6 +155,9 @@ pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
         mtime: md.mtime(),
         nlink: md.nlink() as u32,
         rdev: 0,
+        // The host file's own filesystem: a tree crosses into others at
+        // their mount points (every APFS volume's root is inode 2).
+        dev: md.dev(),
         times: super::Times {
             mtime_ns: md.mtime_nsec() as u32,
             atime: md.atime(),
@@ -442,9 +445,9 @@ impl FileSystem for HostFs {
     /// By the host's number for the filesystem the tree is on: two
     /// mounts of one host tree (a sysroot, and a directory of it bound in
     /// again) are one filesystem, whose files are the same files by
-    /// `st_dev` and `st_ino` as they are on the host. A tree that crosses
-    /// into another of the host's filesystems is taken as one all the
-    /// same, and two of its files could then share both numbers.
+    /// `st_dev` and `st_ino` as they are on the host. A file of the tree
+    /// on another of the host's filesystems (past a host mount point)
+    /// says its own ([`super::Metadata::dev`]).
     fn dev(&self) -> u64 {
         *self.dev.get_or_init(|| match std::fs::metadata(&self.root) {
             Ok(md) => super::anon_dev(super::DevKey::Host(md.dev())),
@@ -1023,6 +1026,18 @@ pub mod host_xattr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_file_keeps_its_device() {
+        // Two volumes' roots share an inode on macOS (2); only the device
+        // tells them apart, as it tells a mount point from what it hides.
+        use std::os::unix::fs::MetadataExt;
+        let tmp = std::env::temp_dir();
+        for p in [std::path::Path::new("/"), tmp.as_path()] {
+            let host = std::fs::metadata(p).unwrap();
+            assert_eq!(convert(&host).dev, host.dev(), "{}", p.display());
+        }
+    }
 
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gex-hostfs-{}", std::process::id()));

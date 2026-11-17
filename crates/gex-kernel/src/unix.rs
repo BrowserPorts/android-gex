@@ -828,7 +828,7 @@ impl FileHandle for UnixSocket {
             ino: crate::vfs::anon_ino(self as *const Self as *const u8),
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: 0, dev: 0,
             times: Default::default(),
             owner: None,
         })
@@ -1273,7 +1273,7 @@ impl FileHandle for UnixDgram {
             ino: 0,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: 0, dev: 0,
             times: Default::default(),
             owner: None,
         })
@@ -1803,7 +1803,7 @@ impl FileHandle for MemFd {
             ino: 0,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: 0, dev: 0,
             times: Default::default(),
             owner: None,
         })
@@ -2161,7 +2161,7 @@ impl FileHandle for EpollSet {
             ino: 0,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: 0, dev: 0,
             times: Default::default(),
             owner: None,
         })
@@ -2480,7 +2480,7 @@ impl crate::vfs::FileHandle for RemoteUnix {
             ino: 0,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: 0, dev: 0,
             times: Default::default(),
             owner: None,
         })

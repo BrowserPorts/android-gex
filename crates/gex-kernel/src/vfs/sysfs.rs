@@ -288,7 +288,7 @@ fn ino(path: &str) -> u64 {
 }
 
 fn file_meta(path: &str, file_type: FileType, mode: u32, size: u64, nlink: u32) -> Metadata {
-    Metadata { file_type, size, mode, ino: ino(path), mtime: 0, nlink, rdev: 0, times: Default::default(), owner: None }
+    Metadata { file_type, size, mode, ino: ino(path), mtime: 0, nlink, rdev: 0, dev: 0, times: Default::default(), owner: None }
 }
 
 /// What an action written to a `uevent` file asks for

@@ -511,7 +511,7 @@ impl crate::vfs::FileHandle for BtfFile {
         Err(Errno::EINVAL)
     }
     fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
-        Ok(crate::vfs::Metadata { file_type: crate::vfs::FileType::Regular, size: 0, mode: 0o600, ino: self.0.id as u64, mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None })
+        Ok(crate::vfs::Metadata { file_type: crate::vfs::FileType::Regular, size: 0, mode: 0o600, ino: self.0.id as u64, mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: None })
     }
     fn bpf_object(&self) -> Option<crate::bpf::Object> {
         Some(crate::bpf::Object::Btf(std::sync::Arc::clone(&self.0)))

@@ -50,13 +50,13 @@ impl Cgroup1Fs {
         match node {
             Node::Group(id) => {
                 let g = h.groups.get(id).ok_or(Errno::ENOENT)?;
-                Ok(Metadata { file_type: FileType::Directory, size: 0, mode: g.mode, ino: ino(*id, 0), mtime: 0, nlink: 2 + g.children.len() as u32, rdev: 0, times: Default::default(), owner: Some(g.owner) })
+                Ok(Metadata { file_type: FileType::Directory, size: 0, mode: g.mode, ino: ino(*id, 0), mtime: 0, nlink: 2 + g.children.len() as u32, rdev: 0, dev: 0, times: Default::default(), owner: Some(g.owner) })
             }
             Node::File(id, name, mode) => {
                 let g = h.groups.get(id).ok_or(Errno::ENOENT)?;
                 let k = h.files_of(*id).iter().position(|(n, _, _)| n == name).unwrap_or(0) + 1;
                 let (mode, uid, gid) = g.files.get(name).copied().unwrap_or((*mode, g.made_by.0, g.made_by.1));
-                Ok(Metadata { file_type: FileType::Regular, size: 0, mode, ino: ino(*id, k), mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: Some((uid, gid)) })
+                Ok(Metadata { file_type: FileType::Regular, size: 0, mode, ino: ino(*id, k), mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: Some((uid, gid)) })
             }
         }
     }

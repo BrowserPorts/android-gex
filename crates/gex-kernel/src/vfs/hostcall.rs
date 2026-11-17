@@ -45,7 +45,7 @@ pub fn metadata() -> Metadata {
         mtime: 0,
         nlink: 1,
         // A misc device's number (10:240, of the local use range).
-        rdev: (10 << 8) | 240,
+        rdev: (10 << 8) | 240, dev: 0,
         times: Default::default(),
         owner: None,
     }

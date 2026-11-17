@@ -49,12 +49,12 @@ fn metadata_of(node: &Node) -> Result<Metadata, Errno> {
     match *node {
         Node::Group(id) => {
             let g = t.groups.get(&id).ok_or(Errno::ENOENT)?;
-            Ok(Metadata { file_type: FileType::Directory, size: 0, mode: g.mode, ino: ino(id, None), mtime: 0, nlink: 2 + g.children.len() as u32, rdev: 0, times: Default::default(), owner: Some(g.owner) })
+            Ok(Metadata { file_type: FileType::Directory, size: 0, mode: g.mode, ino: ino(id, None), mtime: 0, nlink: 2 + g.children.len() as u32, rdev: 0, dev: 0, times: Default::default(), owner: Some(g.owner) })
         }
         Node::File(id, name) => {
             let g = t.groups.get(&id).ok_or(Errno::ENOENT)?;
             let (mode, uid, gid) = g.files.get(name).copied().unwrap_or((cgroup::file_mode(name, id == cgroup::ROOT).unwrap_or(0), g.made_by.0, g.made_by.1));
-            Ok(Metadata { file_type: FileType::Regular, size: 0, mode, ino: ino(id, Some(name)), mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: Some((uid, gid)) })
+            Ok(Metadata { file_type: FileType::Regular, size: 0, mode, ino: ino(id, Some(name)), mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: Some((uid, gid)) })
         }
     }
 }

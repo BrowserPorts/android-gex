@@ -152,7 +152,7 @@ impl Inode {
             ino: self.ino as u64,
             mtime: self.mtime.0,
             nlink: self.links as u32,
-            rdev: self.rdev(),
+            rdev: self.rdev(), dev: 0,
             times: Times { mtime_ns: self.mtime.1, atime: self.atime.0, atime_ns: self.atime.1, ctime: self.ctime.0, ctime_ns: self.ctime.1 },
             owner: Some((self.uid, self.gid)),
         }

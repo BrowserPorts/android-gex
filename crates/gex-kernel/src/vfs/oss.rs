@@ -510,7 +510,7 @@ impl FileHandle for OssHandle {
             mtime: 0,
             nlink: 1,
             // 14:3 and 14:0, Linux's sound major.
-            rdev: if self.node == OssNode::Dsp { 0xe03 } else { 0xe00 },
+            rdev: if self.node == OssNode::Dsp { 0xe03 } else { 0xe00 }, dev: 0,
             times: Default::default(),
             owner: None,
         })

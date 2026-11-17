@@ -113,7 +113,7 @@ impl Inner {
             Kind::Obj(_) => (FileType::Regular, 0),
         };
         let nlink = if matches!(n.kind, Kind::Dir) { 2 } else { 1 };
-        Ok(Metadata { file_type, size, mode: n.mode, ino: n.ino, mtime: 0, nlink, rdev: 0, times: Default::default(), owner: Some((n.uid, n.gid)) })
+        Ok(Metadata { file_type, size, mode: n.mode, ino: n.ino, mtime: 0, nlink, rdev: 0, dev: 0, times: Default::default(), owner: Some((n.uid, n.gid)) })
     }
 
     fn children(&self, dir: &str) -> impl Iterator<Item = (&String, &Node)> {

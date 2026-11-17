@@ -1030,7 +1030,7 @@ impl FileHandle for Socket {
             ino: crate::vfs::anon_ino(self as *const Self as *const u8),
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: 0, dev: 0,
             times: Default::default(),
             owner: None,
         })

@@ -866,7 +866,7 @@ impl crate::vfs::FileHandle for RawSocket {
         Err(Errno::EOPNOTSUPP)
     }
     fn metadata(&self) -> Result<crate::vfs::Metadata, Errno> {
-        Ok(crate::vfs::Metadata { file_type: crate::vfs::FileType::Socket, size: 0, mode: 0o140777, ino: 0, mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None })
+        Ok(crate::vfs::Metadata { file_type: crate::vfs::FileType::Socket, size: 0, mode: 0o140777, ino: 0, mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: None })
     }
     fn raw_socket(&self) -> Option<(Family, u32)> {
         Some((self.family, self.protocol))

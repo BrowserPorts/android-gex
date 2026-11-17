@@ -449,7 +449,7 @@ impl FileHandle for Uffd {
     }
 
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o600, ino: self.id, mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None })
+        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o600, ino: self.id, mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: None })
     }
 
     fn is_stream(&self) -> bool {

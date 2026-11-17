@@ -137,6 +137,12 @@ pub struct Metadata {
     /// Linux's `makedev` encoding. Zero where the node does not say; `stat`
     /// then reports a character device as a pseudo-terminal (136:0).
     pub rdev: u64,
+    /// The device of the host's filesystem a host file is on (its own
+    /// `st_dev`), where a filesystem's files are not all on one: a host
+    /// tree holds the host's other filesystems at their mount points. Zero
+    /// for every other file: its `st_dev` is its filesystem's
+    /// ([`FileSystem::dev`]).
+    pub dev: u64,
     /// The other times and the nanoseconds, where the filesystem keeps
     /// them (the host's). All zero: every time is `mtime`, whole seconds.
     pub times: Times,
@@ -166,7 +172,7 @@ impl Metadata {
             ino: 1,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: 0, dev: 0,
             times: Default::default(),
             owner: None,
         }
@@ -179,7 +185,7 @@ impl Metadata {
             ino: 1,
             mtime: 0,
             nlink: 2,
-            rdev: 0,
+            rdev: 0, dev: 0,
             times: Default::default(),
             owner: None,
         }
@@ -1075,7 +1081,7 @@ pub trait FileSystem: Send + Sync {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
-                rdev: 0,
+                rdev: 0, dev: 0,
                 times: Default::default(),
                 owner: None,
             });
@@ -1594,7 +1600,7 @@ impl FileHandle for MountNsFile {
         Err(Errno::EINVAL)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o444, ino: self.0.id(), mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None })
+        Ok(Metadata { file_type: FileType::Regular, size: 0, mode: 0o444, ino: self.0.id(), mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: None })
     }
     fn as_mount_ns(self: Arc<Self>) -> Option<Arc<MountNs>> {
         Some(Arc::clone(&self.0))
@@ -2480,15 +2486,23 @@ impl Namespace {
     /// the number of the device of the filesystem the file is in
     /// ([`FileSystem::dev`]): what `stat` says of a path.
     pub fn metadata_on(&self, path: &str, follow: bool) -> Result<(Metadata, u64), Errno> {
+        // A host file's own filesystem's number where it says one
+        // ([`Metadata::dev`]), by the same key the host tree's own number
+        // is made from: the same number for every file on the tree's own
+        // host filesystem, another across a host mount point.
+        let own = |md: Metadata, fs_dev: u64| {
+            let dev = if md.dev != 0 { anon_dev(DevKey::Host(md.dev)) } else { fs_dev };
+            (md, dev)
+        };
         if !follow {
             let (fs, rel) = self.resolve(path)?;
-            return Ok((fs.metadata_nofollow(&rel)?, fs.dev()));
+            return Ok(own(fs.metadata_nofollow(&rel)?, fs.dev()));
         }
         let mut current = normalize_cow(path, &self.cwd);
         // As `metadata`: in the root, one step.
         if let Some(root) = self.mounts.get("/") {
             if let Some(md) = root.walk_metadata(&current, &self.others)? {
-                return Ok((md, root.dev()));
+                return Ok(own(md, root.dev()));
             }
         }
         for _ in 0..40 {
@@ -2501,7 +2515,7 @@ impl Namespace {
                         normalize(&target, &parent_of(&current))
                     });
                 }
-                Err(_) => return Ok((fs.metadata(&rel)?, fs.dev())),
+                Err(_) => return Ok(own(fs.metadata(&rel)?, fs.dev())),
             }
         }
         Err(Errno::ELOOP)

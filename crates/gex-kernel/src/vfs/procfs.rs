@@ -760,7 +760,7 @@ impl FileHandle for Generated {
             ino: 1,
             mtime: 0,
             nlink: 1,
-            rdev: 0,
+            rdev: 0, dev: 0,
             times: Default::default(),
             owner: None,
         })
@@ -1181,7 +1181,7 @@ impl FileSystem for ProcFs {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
-                rdev: 0,
+                rdev: 0, dev: 0,
                 times: Default::default(),
                 owner: None,
             });
@@ -1196,7 +1196,7 @@ impl FileSystem for ProcFs {
                     ino: 1,
                     mtime: 0,
                     nlink: 1,
-                    rdev: 0,
+                    rdev: 0, dev: 0,
                     times: Default::default(),
                     owner: None,
                 }),
@@ -1214,7 +1214,7 @@ impl FileSystem for ProcFs {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
-                rdev: 0,
+                rdev: 0, dev: 0,
                 times: Default::default(),
                 owner: None,
             }),
@@ -1290,7 +1290,7 @@ fn uuid_text(id: [u8; 16]) -> String {
 }
 
 fn attr_metadata(which: usize) -> Metadata {
-    Metadata { file_type: FileType::Regular, size: 0, mode: procattr::mode(which), ino: 1, mtime: 0, nlink: 1, rdev: 0, times: Default::default(), owner: None }
+    Metadata { file_type: FileType::Regular, size: 0, mode: procattr::mode(which), ino: 1, mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: None }
 }
 
 /// A file of a process's `attr`, open: its SELinux context, or one it has
@@ -1715,7 +1715,7 @@ impl FileSystem for SysCpuFs {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
-                rdev: 0,
+                rdev: 0, dev: 0,
                 times: Default::default(),
                 owner: None,
             });
