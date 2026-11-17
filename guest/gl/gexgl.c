@@ -139,18 +139,26 @@ static int ring_open(void) {
     if (ring) {
         return 0;
     }
+    /* (a process without the device, gexc run without --gl, does not have it
+       later either: tried and said once, not on every EGL entry) */
+    static int open_errno;
     pthread_mutex_lock(&submit_mutex);
-    if (gl_fd < 0) gl_fd = open("/dev/gex-gl", O_RDWR | O_CLOEXEC);
-    const int open_errno = errno;
+    int first = 0;
+    if (gl_fd < 0 && !open_errno) {
+        gl_fd = open("/dev/gex-gl", O_RDWR | O_CLOEXEC);
+        if (gl_fd < 0) { open_errno = errno ? errno : ENODEV; first = 1; }
+    }
+    const int fd = gl_fd, err = open_errno;
     pthread_mutex_unlock(&submit_mutex);
-    errno = open_errno;
-    if (gl_fd < 0) {
+    if (fd < 0) {
         /* Said out loud. A silent failure here is indistinguishable, from the
            application's side, from a GL that simply reports nothing: every
            later glGetString answers from the empty string cache and the app
            selects a fallback renderer, many screens away from the cause. */
-        fprintf(stderr, "gexgl: open(/dev/gex-gl) failed: %s\n",
-                strerror(errno));
+        if (first)
+            fprintf(stderr, "gexgl: open(/dev/gex-gl) failed: %s\n",
+                    strerror(err));
+        errno = err;
         return -1;
     }
     size_t total = HEADER_BYTES + CMD_CAPACITY + REPLY_CAPACITY;
@@ -4774,6 +4782,10 @@ static void *egl_create_window_surface(void *win);
 void *eglCreateWindowSurface(void *dpy, void *config, void *win,
                              const int *attrs) {
     (void)dpy; (void)config; (void)attrs;
+    /* (no surface from a display eglInitialize refused: wined3d's adapter
+       probe goes on after it, and each probe window became a host surface
+       nothing draws) */
+    if (!egl_ready) return egl_fail_null(EGL_NOT_INITIALIZED);
     group_lock();
     void *r = egl_create_window_surface(win);
     group_unlock();
@@ -4828,11 +4840,11 @@ static void *egl_create_window_surface(void *win) {
         unsigned args[4] = { GEXGL_SURFACE_WAYLAND, s->id,
                              (unsigned)egl_surface_width,
                              (unsigned)egl_surface_height };
-        const int marked = ioctl(gl_fd, GEXGL_SURFACE, args);
-        fprintf(stderr, "gex-gl: wl_surface %u is drawn on the host,"
-                        " %dx%d (%s)\n",
-                s->id, egl_surface_width, egl_surface_height,
-                marked == 0 ? "ok" : strerror(errno));
+        if (ioctl(gl_fd, GEXGL_SURFACE, args) != 0)
+            fprintf(stderr, "gex-gl: wl_surface %u is drawn on the host,"
+                            " %dx%d, but its compositor was not told (%s)\n",
+                    s->id, egl_surface_width, egl_surface_height,
+                    strerror(errno));
     } else {
         fprintf(stderr, "gex-gl: eglCreateWindowSurface: %p is neither an X"
                         " window nor a wl_egl_window\n", win);
@@ -4847,6 +4859,7 @@ static void *egl_create_window_surface(void *win) {
 static void *egl_create_pbuffer_surface(const int *attrs);
 void *eglCreatePbufferSurface(void *dpy, void *config, const int *attrs) {
     (void)dpy; (void)config;
+    if (!egl_ready) return egl_fail_null(EGL_NOT_INITIALIZED);
     group_lock();
     void *r = egl_create_pbuffer_surface(attrs);
     group_unlock();
@@ -5098,6 +5111,7 @@ static void ring_thread_exit(void *unused) {
 
 void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
     (void)dpy; (void)config; (void)share;
+    if (!egl_ready) return egl_fail_null(EGL_NOT_INITIALIZED);
     group_lock();
     /* EGL's defaults: version 1.0, which for desktop GL means a context of
        whatever version the implementation offers that is backward compatible
