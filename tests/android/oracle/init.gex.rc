@@ -12,6 +12,16 @@
 # entry can be longer. logcat's own complaints go to the kernel log
 # (stdio_to_kmsg).
 
+# This device is slow by construction (every program translated, the
+# first run of each translated afresh), as a translated emulator is, so it
+# says so as such devices do: ro.hw_timeout_multiplier scales the time
+# Android's daemons give each other (android::base::HwTimeoutMultiplier).
+# netd gives its iptables-restore 50 polls of 100 ms times it to answer, and
+# the first one of a boot loads and translates every iptables extension.
+# Set before anything reads it; the image's build properties do not set it.
+on early-init
+    setprop ro.hw_timeout_multiplier 10
+
 on post-fs
     start gex_logcat
 
