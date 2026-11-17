@@ -20,7 +20,7 @@ x86_64-w64-mingw32-{ar,ranlib,nm,objcopy,objdump}: llvm's; strip does
 The install's PREFIX/lib/gexcc-win/config names the 64-bit Wine build and
 source it builds against, the wasm64 sysroot and the libc++ prefix.
 """
-import os, subprocess, sys, tempfile, shutil
+import os, re, subprocess, sys, tempfile, shutil
 
 here = os.path.dirname(os.path.realpath(__file__))
 PREFIX = os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[0])))
@@ -219,6 +219,17 @@ if tool == 'windres':
     # windres syntax through wrc: -i/-o/--input/--output, -I, -D, -O coff
     T = tools_dir()
     inp = out = None; incl = []; fmt = None; i = 0
+    # (a long option abbreviated, as getopt_long takes it: --include for
+    # --include-dir)
+    LONG = ('--input', '--output', '--output-format', '--include-dir', '--define', '--undefine',
+            '--input-format', '--preprocessor', '--language', '--codepage', '--target', '--verbose')
+    def unabbrev(a):
+        k, eq, v = a.partition('=')
+        if not k.startswith('--') or k in LONG:
+            return a
+        hits = [l for l in LONG if l.startswith(k)]
+        return hits[0] + eq + v if len(hits) == 1 else a
+    args = [unabbrev(a) for a in args]
     while i < len(args):
         a = args[i]
         if a in ('-i', '--input'): inp = args[i + 1]; i += 2; continue
@@ -236,9 +247,34 @@ if tool == 'windres':
             else: out = a
         i += 1
     res = out if out and out.endswith('.res') else (out or 'a') + '.res'
-    cmd = [T + '/tools/wrc/wrc', '-m64', '--nostdinc', '-I' + B + '/include', '-I' + S + '/include', '-I' + here + '/include',
-           '--nls-dir=' + S + '/nls', '-D_WIN32', '-D_WIN64', '-o', res] + incl + [inp]
-    r = subprocess.call(cmd)
+    wrc = [T + '/tools/wrc/wrc', '-m64', '--nostdinc', '--nls-dir=' + S + '/nls', '-D_WIN32', '-D_WIN64', '-o', res]
+    if conf.get('MINGW_INCLUDE'):
+        # with mingw-w64's headers as MinGW's windres does it: the C
+        # preprocessor (this toolchain's) with RC_INVOKED, dropping what the
+        # included C headers (*.h) declare, then the resource compiler on the
+        # rest; the script's files are found beside it
+        cc_ = os.path.join(PREFIX, 'bin', 'x86_64-w64-mingw32-gcc')
+        p = subprocess.run([cc_, '-E', '-xc', '-DRC_INVOKED', '-D_WIN32', '-D_WIN64'] + incl + [inp],
+                           stdout=subprocess.PIPE, text=True, errors='surrogateescape')
+        r = p.returncode
+        if not r:
+            keep, lines = True, []
+            for line in p.stdout.split('\n'):
+                m = re.match(r'# \d+ "(.*)"', line)
+                if m:
+                    keep = not m.group(1).lower().endswith(('.h', '.hpp', '.hh', '.hxx'))
+                elif keep:
+                    # (a file a statement names with Windows' separator,
+                    # "icons\\x.ico", which wrc would read as an escape)
+                    lines.append(re.sub(r'"([^"]*\\[^"]*\.\w{1,8})"\s*$',
+                                        lambda m: '"%s"' % re.sub(r'\\+', '/', m.group(1)), line))
+            fd, pre = tempfile.mkstemp(suffix='.rc')
+            with os.fdopen(fd, 'w', errors='surrogateescape') as f:
+                f.write('\n'.join(lines) + '\n')
+            r = subprocess.call(wrc + ['-I' + (os.path.dirname(inp) or '.')] + [a for a in incl if a.startswith('-I')] + [pre])
+            os.unlink(pre)
+    else:
+        r = subprocess.call(wrc + ['-I' + B + '/include', '-I' + S + '/include', '-I' + here + '/include'] + incl + [inp])
     if r or res == out:
         sys.exit(r)
     # a ".o" the link takes: the .res itself (the link passes .res files
