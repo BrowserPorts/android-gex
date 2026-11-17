@@ -478,6 +478,9 @@ struct ParsedModule {
     /// Its slots' wasm types (`gex_dylink::slot_types`), when it has class
     /// adapters (`__gexw_adapters`).
     slot_types: Option<Arc<(Vec<u32>, Vec<Option<String>>)>>,
+    /// Its weak undefined names (`dylink.0` import info): a data one no
+    /// module defines binds to address 0, as a weak symbol does.
+    weak: gex_dylink::HashSet<String>,
     module: wasmtime::Module,
 }
 
@@ -556,6 +559,7 @@ fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::tim
         modules,
         dll_slots: Arc::new(dll_slots(&wasm)),
         slot_types,
+        weak: gex_dylink::weak_import_names(&wasm)?,
         module,
     });
     MEMO.lock().unwrap_or_else(|e| e.into_inner()).push((id, engine.clone(), Arc::clone(&pm)));
@@ -935,8 +939,10 @@ fn install_module(
     // first (no code of theirs runs until Wine loads their DLLs): its
     // imports then bind to their functions directly, and a function
     // address is the defining module's own. Only a cycle's far side is
-    // left to `Late` slots.
-    if core.is_some() {
+    // left to `Late` slots. (A program installed without a core beside
+    // it, its own DLLs beside it: theirs too, a GOT.mem import of their
+    // data has no `Late` binding.)
+    if core.is_some() || file.file_name().is_some_and(|n| n != CORE_MODULE) {
         thread_local! {
             static BUSY: std::cell::RefCell<Vec<std::path::PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -947,7 +953,7 @@ fn install_module(
         let delayed: std::collections::HashSet<&str> =
             module.exports().filter_map(|e| e.name().strip_prefix("gexw-delay!")).collect();
         for imp in module.imports() {
-            if let (true, Some((dll, _))) = (matches!(imp.module(), "env" | "GOT.func"), imp.name().split_once('!')) {
+            if let (true, Some((dll, _))) = (matches!(imp.module(), "env" | "GOT.func" | "GOT.mem"), imp.name().split_once('!')) {
                 if delayed.contains(dll) {
                     continue;
                 }
@@ -1004,6 +1010,20 @@ fn install_module(
         let b = if m == "GOT.func" {
             gots.push((imports.len(), name.clone()));
             crate::dylink::NBind::Shim
+        } else if m == "GOT.mem" && name.contains('!') {
+            // another module's data export (a program's DLL's): its address,
+            // that module's data plus the export's offset
+            let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let a = s
+                .wine_pe
+                .iter()
+                .chain(s.wine_pe_split.iter())
+                .filter(|wp| wp.ptr64 == is64)
+                .find_map(|wp| wp.data_exports.get(&name).map(|&off| wp.data + off as u64));
+            match a {
+                Some(a) => crate::dylink::NBind::Addr(a),
+                None => bail!("{}: GOT.mem::{name}: no installed module exports it", file.display()),
+            }
         } else if m == "env" && core.is_some() && have_core.contains(&name) {
             crate::dylink::NBind::Export { module: core.as_ref().unwrap().module, name: name.clone() }
         } else if m == "env" && matches!(imp.ty(), wasmtime::ExternType::Func(_)) && !gex_dylink::shim_import(&m, &name) {
@@ -1025,6 +1045,18 @@ fn install_module(
                     crate::dylink::NBind::LateOwn(len - 1)
                 }
             }
+        } else if m == "GOT.mem" && pm.weak.contains(&name) {
+            // weak undefined data, `extern int x __attribute__((weak))`: an
+            // installed module's export of it if one has it, else null, as a
+            // weak symbol nothing defines is (pelink refuses a strong one)
+            let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let a = s
+                .wine_pe
+                .iter()
+                .chain(s.wine_pe_split.iter())
+                .filter(|wp| wp.ptr64 == is64)
+                .find_map(|wp| wp.data_exports.get(&name).map(|&off| wp.data + off as u64));
+            crate::dylink::NBind::Addr(a.unwrap_or(0))
         } else {
             crate::dylink::NBind::Shim
         };

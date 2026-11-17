@@ -212,6 +212,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
   await one('cxxcatch', join(F, 'cxxcatch.cpp'), ['-O2']);
   await one('dllimps', join(F, 'dllimps.c'), ['-O2']);
   await one('cxxthr', join(F, 'cxxthr.cpp'), ['-O2']);
+  await one('vtdecl', join(F, 'vtdecl.cpp'), ['-O2', join(F, 'vtdecl2.cpp')], { want: /vtdecl: ok 39 15/ });
   await one('timerproc', join(W, 'timerproc.c'), ['-O1', '-municode', '-lcomctl32'], { nullDriver: true });
   await one('lresult', join(F, 'lresult.c'), ['-O1', '-mwindows'], { nullDriver: true });
   await one('cbfault', join(F, 'cbfault.c'), ['-O1'], { nullDriver: true,
@@ -227,6 +228,17 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
       t.check(`${pre}exitshape: convdll build`, false, String(e.message));
     }
     if (dll) await one('exitshape', join(F, 'exitshape.c'), ['-O2', `-I${F}`], { extra: [dll, `${dll}.wasm`], want: /exitshape: shapes agree\nexitshape ok/ });
+  }
+  await one('imagebase', join(F, 'imagebase.c'), ['-O1'], { want: /imagebase: base 1 lfanew 1 phi 1 mz 1 agg 1\nimagebase ok/ });
+  if (want('ibstatic')) {
+    // refused at compile time: __ImageBase in an object whose address escapes
+    try {
+      await w.gexccWin(join(F, 'ibstatic.c'), 'ibstatic.exe', ['-O1']);
+      t.check(`${pre}ibstatic: refused`, false, 'built');
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      t.check(`${pre}ibstatic: refused`, /ibstatic\.c: __ImageBase in a global's initialiser/.test(String(e.message)), String(e.message));
+    }
   }
   await one('fontset', join(F, 'fontset.c'), ['-O1', '-ldwrite'], { want: /fontset: system bold 700 regular 400\nfontset: in memory 400\nfontset ok/ });
   await one('glyphs', join(F, 'glyphs.c'), ['-O1', '-ldwrite'], { want: /glyphs: system [1-9]\d* heap [1-9]\d* static [1-9]\d*\nglyphs ok/ });
@@ -273,6 +285,131 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     await one('bigdata', src, ['-O1'], { want: /bigdata: ends 1 module 1 1/ });
   }
   await one('hostdatacc', join(W, 'hostdata.c'), ['-O2']);
+  if (want('owndll')) {
+    // a program linked against its own DLL's import library (the DLL
+    // without a .def: its default-visibility symbols are its exports):
+    // calls, a struct by value, the DLL's data written and read on both sides
+    let dll, exe;
+    try {
+      dll = await w.gexccWin(join(F, 'owndll.c'), 'owndll.dll', ['-O2', '-shared', `-Wl,--out-implib,${join(w.work, 'libowndll.a')}`]);
+      exe = await w.gexccWin(join(F, 'ownmain.c'), 'ownmain.exe', ['-O2', `-L${w.work}`, '-lowndll']);
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}owndll: build`, false, String(e.message));
+    }
+    await w.nt({ want: allOk, ...o, name: `${pre}owndll`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
+  }
+  if (want('sigadapt')) {
+    // calls through declarations whose types are not the functions' (extra
+    // and missing arguments, i64 for i32 both ways, void against a value):
+    // adapted at the link as Windows x64's slots make them work, each listed
+    // with GEX_WCC_VERBOSE; an int where the callee reads a double is refused
+    let exe;
+    try {
+      exe = await w.gexccWin(join(F, 'sigadapt.c'), 'sigadapt.exe', ['-O1', join(F, 'sigadapt2.c')], { env: { GEX_WCC_VERBOSE: '1' } });
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}sigadapt: build`, false, String(e.message));
+    }
+    const log = readFileSync(`${exe}.build`, 'utf8');
+    for (const n of ['sig_extra', 'sig_missing', 'sig_narrow', 'sig_val', 'sig_novalue', 'sig_widen'])
+      t.check(`${pre}sigadapt: the link lists ${n}'s adapter`, new RegExp(`wcc64: ${n}: adapted `).test(log));
+    await w.nt({ want: /sigadapt: ok/, ...o, name: `${pre}sigadapt`, exe, extra: [`${exe}.wasm`] });
+    let refused = null;
+    try { await w.gexccWin(join(F, 'sigrefuse.c'), 'sigrefuse.exe', ['-O1', join(F, 'sigrefuse2.c')]); } catch (e) {
+      if (e instanceof Skip) throw e;
+      refused = readFileSync(join(w.work, 'sigrefuse.exe.build'), 'utf8');
+    }
+    t.check(`${pre}sigrefuse: an int against a double is not adapted`,
+      refused !== null && /sig_float: \(i32\) -> i32 calls \(f64\) -> f64: not adapted: an integer against a float/.test(refused), refused ?? 'linked');
+  }
+  if (want('defdll')) {
+    // a DLL whose .def names an export twice, exports data without DATA and
+    // has an export named `name`: the first entry taken, the data imported
+    // as data, the program's call and its reads and writes of the DLL's ints
+    let dll, exe;
+    try {
+      dll = await w.gexccWin(join(F, 'defdll.c'), 'defdll.dll', ['-O2', '-shared', join(F, 'defdll.def'), `-Wl,--out-implib,${join(w.work, 'libdefdll.a')}`]);
+      exe = await w.gexccWin(join(F, 'defmain.c'), 'defmain.exe', ['-O2', `-L${w.work}`, '-ldefdll']);
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}defdll: build`, false, String(e.message));
+    }
+    await w.nt({ want: /defdll: ok/, ...o, name: `${pre}defdll`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
+  }
+  if (want('nodata')) {
+    // a DLL reading data nothing defines: the link fails, even with
+    // GEXCC_WIN_UNDEFINED=stub, rather than the module at its load
+    let log = null;
+    try { await w.gexccWin(join(F, 'nodata.c'), 'nodata.dll', ['-O2', '-shared'], { env: { GEXCC_WIN_UNDEFINED: 'stub' } }); } catch (e) {
+      if (e instanceof Skip) throw e;
+      log = readFileSync(join(w.work, 'nodata.dll.build'), 'utf8');
+    }
+    t.check(`${pre}nodata: undefined data is a link error`, log !== null && /undefined data reference to `nodata_missing'/.test(log), log ?? 'linked');
+  }
+  if (want('prelude')) {
+    // a one-step C++ compile and link: the program's -include, then the prelude
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'prelude.cpp'), 'prelude.exe', ['-O2', '-include', join(F, 'prelude.h')]); } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}prelude: build`, false, String(e.message));
+    }
+    await w.nt({ want: /prelude: ok 1/, ...o, name: `${pre}prelude`, exe, extra: [`${exe}.wasm`] });
+  }
+  if (want('wkdata')) {
+    // weak undefined data is not the undefined-data link error, and is
+    // null; weak data a DLL defines is that DLL's
+    let dll, exe;
+    try {
+      dll = await w.gexccWin(join(F, 'wkdll.c'), 'wkdll.dll', ['-O2', '-shared', `-Wl,--out-implib,${join(w.work, 'libwkdll.a')}`]);
+      exe = await w.gexccWin(join(F, 'wkdata.c'), 'wkdata.exe', ['-O2', `-L${w.work}`, '-lwkdll']);
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}wkdata: build`, false, String(e.message));
+    }
+    await w.nt({ want: /wkdata: null 42/, ...o, name: `${pre}wkdata`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
+    // and on the page's loader (hosts/browser/src/cgen/wasmdll.rs)
+    await w.nt({ want: /wkdata: null 42/, ...o, name: `${pre}wkdata-page`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`], page: {} });
+  }
+  if (want('fficall')) {
+    // gexcc-win's libffi: native function values (gex.ffi_thunk's thunks)
+    // and guest ones (GetProcAddress), mixed scalars and structs by value
+    let dll, exe;
+    try {
+      dll = await w.gexccWin(join(F, 'ffidll.c'), 'ffidll.dll', ['-O2', '-shared', `-Wl,--out-implib,${join(w.work, 'libffidll.a')}`]);
+      exe = await w.gexccWin(join(F, 'fficall.c'), 'fficall.exe', ['-O2', `-L${w.work}`, '-lffidll', '-lffi']);
+    } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}fficall: build`, false, String(e.message));
+    }
+    await w.nt({ want: /fficall: ok 0/, ...o, name: `${pre}fficall`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
+    await w.nt({ want: /fficall: ok 0/, ...o, name: `${pre}fficall-page`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`], page: {} });
+    // and with run-time translation off (an eject without the JIT): the
+    // thunks are made code, not translated code, and still install
+    await w.nt({ want: /fficall: ok 0/, ...o, name: `${pre}fficall-nojit`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`], page: { flags: ['--no-jit'] } });
+  }
+  const mingwInstall = (() => {
+    try { return /^MINGW_INCLUDE=/m.test(readFileSync(join(process.env.GEX_TEST_GEXCC_WIN ?? '', 'lib/gexcc-win/config'), 'utf8')); } catch { return false; }
+  })();
+  if (want('mingwguid') && mingwInstall) {
+    // with mingw-w64's headers: its static GUID libraries, one of them
+    // (ksuser) also a DLL's import library
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'mingwguid.c'), 'mingwguid.exe', ['-O2', '-llocationapi', '-lksuser']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}mingwguid: build`, false, String(e.message));
+    }
+    await w.nt({ want: /mingwguid: ok 7fed806d 00000001/, ...o, name: `${pre}mingwguid`, exe, extra: [`${exe}.wasm`] });
+  }
+  if (want('mingwstdio') && mingwInstall) {
+    // mingw-w64's ANSI stdio (__mingw_printf ...) over the UCRT
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'mingwstdio.c'), 'mingwstdio.exe', ['-O2']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}mingwstdio: build`, false, String(e.message));
+    }
+    await w.nt({ want: /mingwstdio: 16 1234567 1 77 4 ab\/5 2\.5 1\.50/, ...o, name: `${pre}mingwstdio`, exe, extra: [`${exe}.wasm`] });
+  }
   if (want('modcase')) {
     // installed under other case than its link (an installer naming the
     // files ModCase.exe and ModCase.exe.wasm): its .wasmref still names
