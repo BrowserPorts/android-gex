@@ -1227,7 +1227,11 @@ function launchBuild(m, at) {
       pieces,
       // A unit's module, by key: what the page names while one is fetched.
       unitNames: Object.fromEntries((m.units ?? []).map((u) => [u.key, String(u.path ?? '').split(/[\\/]/).pop()])),
-      switches: { cgen: '1', cgenurl: at('project/build/web/units'), ...p },
+      // Units looked up only when the build has some: with none (every x86
+      // program on the JIT), each image a process maps cost a synchronous
+      // request for a unit that is not there -- an installer's
+      // vlc-cache-gen.exe loading 365 plugins took 106 s for 25 s without.
+      switches: { ...((m.units ?? []).length ? { cgen: '1', cgenurl: at('project/build/web/units') } : {}), ...p },
     };
   }
   if (m.unsupported) throw new Error(`gex-eject: this project has no web build: ${m.unsupported}`);
