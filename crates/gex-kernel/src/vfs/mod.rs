@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub mod binderfs;
 pub mod bpffs;
 pub mod cgroupfs;
+pub mod cgroup1fs;
 pub mod devfs;
 pub mod devices;
 pub mod evdev;

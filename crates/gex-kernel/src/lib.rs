@@ -77,6 +77,7 @@ pub mod bpfrun;
 pub mod bpfskb;
 pub mod bpfsock;
 pub mod cgroup;
+pub mod cgroup1;
 /// The x87's extended-precision arithmetic (its own crate, shared with the
 /// IR interpreter and the code generators).
 pub use gex_f80 as f80;

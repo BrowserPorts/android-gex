@@ -967,6 +967,7 @@ impl ProcFs {
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
             "sys/vm/mmap_rnd_bits" => format!("{}\n", mmap_rnd_bits::get()).into_bytes(),
             p if Pressure::at(p) => Pressure::text(p == "pressure/irq").as_bytes().to_vec(),
+            "cgroups" => crate::cgroup1::proc_cgroups(),
             // The limit `F_SETPIPE_SZ` holds an unprivileged caller to.
             "sys/fs/nr_open" => format!("{}\n", crate::file::NR_OPEN).into_bytes(),
             "sys/fs/pipe-max-size" => format!("{}\n", crate::pipe::PIPE_MAX_SIZE).into_bytes(),
@@ -1072,7 +1073,7 @@ impl FileSystem for ProcFs {
                 for pid in pids {
                     out.push(DirEntry { name: pid.to_string(), file_type: FileType::Directory, ino: 1 });
                 }
-                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "mounts", "sys", "pressure", "cmdline", "filesystems"].into_iter().chain(BOOTCONFIG.get().map(|_| "bootconfig")) {
+                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "mounts", "sys", "pressure", "cmdline", "filesystems", "cgroups"].into_iter().chain(BOOTCONFIG.get().map(|_| "bootconfig")) {
                     let file_type = match name {
                         "self" => FileType::Symlink,
                         "sys" | "pressure" => FileType::Directory,

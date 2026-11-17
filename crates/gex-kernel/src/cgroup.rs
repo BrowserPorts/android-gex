@@ -257,27 +257,63 @@ pub fn set_procs(procs: &Arc<crate::proc::ProcTable>) {
 
 // -- membership, as the process table changes ------------------------------
 
-/// A process made by a fork: in its parent's group.
+/// A process made by a fork: in its parent's group, in each hierarchy.
 pub fn fork(ppid: i32, pid: i32) {
-    let mut t = tree();
-    let g = t.group_of(ppid);
-    t.changing(|t| {
-        t.members.insert(pid, g);
-    });
+    {
+        let mut t = tree();
+        let g = t.group_of(ppid);
+        t.changing(|t| {
+            t.members.insert(pid, g);
+        });
+    }
+    crate::cgroup1::fork(ppid, pid);
 }
 
 /// A thread made in a process.
 pub fn thread_start(pid: i32, tid: i32) {
     tree().threads.insert(tid, pid);
+    crate::cgroup1::thread_start(pid, tid);
 }
 
 pub fn thread_end(tid: i32) {
     tree().threads.remove(&tid);
+    crate::cgroup1::thread_end(tid);
+}
+
+/// The processes the threads `tids` are of, each once, in order.
+pub fn procs_of_threads(tids: impl Iterator<Item = i32>) -> Vec<i32> {
+    let t = tree();
+    let mut v: Vec<i32> = tids.map(|x| t.threads.get(&x).copied().unwrap_or(x)).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// The threads a write of `tid` to a v1 group's `tasks` (one) or
+/// `cgroup.procs` (its process's every one) moves; `None` for no such
+/// task.
+pub fn threads_for_move(tid: i32, whole: bool) -> Option<Vec<i32>> {
+    let procs = PROCS.get().and_then(Weak::upgrade)?;
+    let pid = procs.task_owner(tid).filter(|&p| procs.alive(p))?;
+    if !whole {
+        return Some(vec![tid]);
+    }
+    let t = tree();
+    let mut v = vec![pid];
+    v.extend(t.threads.iter().filter(|(_, &p)| p == pid).map(|(&x, _)| x));
+    Some(v)
 }
 
 /// A process has ended (`cgroup_exit`): out of its group, its time kept
 /// there.
 pub fn exit(pid: i32, cpu_ns: u64) {
+    let tids: Vec<i32> = {
+        let t = tree();
+        std::iter::once(pid).chain(t.threads.iter().filter(|(_, &p)| p == pid).map(|(&x, _)| x)).collect()
+    };
+    for x in tids {
+        crate::cgroup1::thread_end(x);
+    }
     let mut t = tree();
     t.changing(|t| {
         if let Some(g) = t.members.remove(&pid) {
@@ -289,10 +325,12 @@ pub fn exit(pid: i32, cpu_ns: u64) {
     });
 }
 
-/// `/proc/<pid>/cgroup`: the one hierarchy's line.
+/// `/proc/<pid>/cgroup`: a line for each version 1 hierarchy, then the
+/// version 2 one's.
 pub fn proc_file(pid: i32) -> Vec<u8> {
+    let v1 = crate::cgroup1::proc_lines(pid);
     let t = tree();
-    format!("0::{}\n", t.path_of(t.group_of(pid))).into_bytes()
+    format!("{v1}0::{}\n", t.path_of(t.group_of(pid))).into_bytes()
 }
 
 // -- groups made and removed ------------------------------------------------

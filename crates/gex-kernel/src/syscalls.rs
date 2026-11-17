@@ -5033,7 +5033,15 @@ impl PathIo<'_> {
                 self.view.mount_unless_there(&target, || mounted(crate::vfs::cgroupfs::instance()));
                 Ok(0)
             }
-            "debugfs" | "cgroup" => {
+            // A version 1 hierarchy (crate::cgroup1): of the controllers
+            // the options name, or named.
+            "cgroup" => {
+                let options = if a[4] == 0 { Vec::new() } else { m.read_cstr(a[4], 4096)? };
+                let hier = crate::cgroup1::mount(&String::from_utf8_lossy(&options))?;
+                self.view.mount(&target, mounted(crate::vfs::cgroup1fs::instance(hier)));
+                Ok(0)
+            }
+            "debugfs" => {
                 self.view.mount_unless_there(&target, || mounted(Arc::new(crate::vfs::TmpFs::new())));
                 Ok(0)
             }
