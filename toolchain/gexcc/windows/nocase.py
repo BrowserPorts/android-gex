@@ -2,7 +2,8 @@
 """nocase.py OUT.yaml DIR...: a clang VFS overlay (-ivfsoverlay) over the
 header trees DIR... that matches their names regardless of case, as Windows
 does: a source's <Rpc.h> is rpc.h. Names the overlay doesn't list (a header
-added later) still resolve as spelled."""
+added later) still resolve as spelled. The overlay holds absolute paths:
+an install tree that moves needs install.sh run again."""
 import json
 import os
 import sys

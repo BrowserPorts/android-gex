@@ -301,8 +301,10 @@ if tool == 'windres':
             fd, pre = tempfile.mkstemp(suffix='.rc')
             with os.fdopen(fd, 'w', errors='surrogateescape') as f:
                 f.write('\n'.join(lines) + '\n')
-            r = subprocess.call(wrc + ['-I' + (os.path.dirname(inp) or '.')] + [a for a in incl if a.startswith('-I')] + [pre])
-            os.unlink(pre)
+            try:
+                r = subprocess.call(wrc + ['-I' + (os.path.dirname(inp) or '.')] + [a for a in incl if a.startswith('-I')] + [pre])
+            finally:
+                os.unlink(pre)
     else:
         # (and the C runtime's, which rc finds through INCLUDE: a script that
         # includes a program's C headers reaches stdarg.h and the rest)
@@ -316,9 +318,11 @@ if tool == 'windres':
             fd, pre = tempfile.mkstemp(suffix='.rc')
             with os.fdopen(fd, 'w', errors='surrogateescape') as f:
                 f.write(fixed)
-        r = subprocess.call(wrc + ['-I' + (os.path.dirname(inp) or '.'), '-I' + B + '/include', '-I' + S + '/include', '-I' + S + '/include/msvcrt', '-I' + here + '/include'] + incl + [pre or inp])
-        if pre:
-            os.unlink(pre)
+        try:
+            r = subprocess.call(wrc + ['-I' + (os.path.dirname(inp) or '.'), '-I' + B + '/include', '-I' + S + '/include', '-I' + S + '/include/msvcrt', '-I' + here + '/include'] + incl + [pre or inp])
+        finally:
+            if pre:
+                os.unlink(pre)
     if r or res == out:
         sys.exit(r)
     # a ".o" the link takes: the .res itself (the link passes .res files
