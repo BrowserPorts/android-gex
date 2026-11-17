@@ -4,8 +4,7 @@
  * format a char string. Not mingwex's own pformat and gdtoa: they keep a
  * long double as the x87's 80 bits, and gexcc-win's is a double
  * (-mlong-double-64), which the UCRT's %Lf and strtold take it as. Also
- * ldexpf, an inline in the Windows SDK's math.h that ucrtbase does not
- * export. Linked by a mingw-headers install (install.sh). */
+ * ldexpf in mingwldexpf.c. Linked by a mingw-headers install (install.sh). */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +70,3 @@ long double __cdecl __mingw_strtold(const char *s, char **end) { return strtold(
 double __cdecl __mingw_wcstod(const wchar_t *s, wchar_t **end) { return wcstod(s, end); }
 float __cdecl __mingw_wcstof(const wchar_t *s, wchar_t **end) { return wcstof(s, end); }
 long double __cdecl __mingw_wcstold(const wchar_t *s, wchar_t **end) { return wcstold(s, end); }
-
-#undef ldexpf
-float __cdecl ldexpf(float x, int e) { return (float)ldexp((double)x, e); }
