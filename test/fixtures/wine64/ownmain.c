@@ -3,6 +3,7 @@
  * written by each side and read back by the other. */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 #include "owndll.h"
 
 /* initialised from the DLL's addresses when the program's data is */
@@ -22,6 +23,10 @@ int main(void)
     struct own_pt p = {3, 4};
     check("call", own_add(1, 2) == 44);
     check("struct by value", own_pt_sum(p) == 34);
+    char buf[32];
+    check("variadic call", own_vsum(4, 1, 2, 3, 40) == 46);
+    check("variadic call's string and 64-bit argument",
+          own_vfmt(buf, sizeof buf, "%s %lld", "x", 1ll << 40) == 15 && !strcmp(buf, "x 1099511627776"));
     check("int's address", &own_count == own_count_addr());
     check("struct's address", &own_pt == own_pt_addr() && &own_pt.y == &own_pt_addr()->y);
     check("addresses in the program's data", count_at == own_count_addr() && pt_at == own_pt_addr());
