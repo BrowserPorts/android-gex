@@ -436,6 +436,10 @@ const ADD_LINE: u8 = 2;
 /// ([`ProcTable::notice`]).
 const NOTICE: u8 = 3;
 
+/// A note's first byte when the rest is a line for the process's crash if
+/// it says how it crashed, else a notice ([`ProcTable::end_line_or_notice`]).
+const LINE_OR_NOTICE: u8 = 4;
+
 /// The longest notice kept.
 const NOTICE_MAX: usize = 512;
 
@@ -873,6 +877,17 @@ impl ProcTable {
             }
             return;
         }
+        if let Some((&LINE_OR_NOTICE, text)) = note.split_first() {
+            let mut t = self.lock();
+            let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
+            if !p.crash.is_empty() {
+                p.crash_more = text.to_vec();
+            } else if t.record_notice(pid, text) {
+                drop(t);
+                self.crash_notify();
+            }
+            return;
+        }
         if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
             match note.split_first() {
                 Some((&UNLESS_SAID, rest)) if p.crash.is_empty() => p.crash = rest.to_vec(),
@@ -901,6 +916,23 @@ impl ProcTable {
         let mut v = Vec::with_capacity(line.len() + 1);
         v.push(ADD_LINE);
         v.extend_from_slice(line.as_bytes());
+        self.set_crash(pid, &v);
+    }
+
+    /// What gex knows of why process `pid` is ending, which is no crash of
+    /// its own (a program moving to a 64-bit memory at its next start,
+    /// `outgrow_ending`): one more line for its crash's reason if it says
+    /// how it crashed itself, and otherwise a notice ([`Crash::notice`]),
+    /// its end then no crash, even a nonzero exit (its exit status is kept).
+    pub fn end_line_or_notice(&self, pid: i32, line: &str) {
+        let line = line.trim_end();
+        let mut cut = line.len().min(NOTICE_MAX);
+        while !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut v = Vec::with_capacity(cut + 1);
+        v.push(LINE_OR_NOTICE);
+        v.extend_from_slice(&line.as_bytes()[..cut]);
         self.set_crash(pid, &v);
     }
 

@@ -1098,8 +1098,11 @@ pub fn outgrow_armed(pid: i32, wasm32: bool) -> bool {
 /// of address space ([`Kernel::note_short`]) and ends abnormally (a signal
 /// that dumps core, or a nonzero exit) within [`OUTGROW_WINDOW_NS`] of it
 /// has its image recorded for a 64-bit memory (`user.gex.mem64` = `1`,
-/// which [`Kernel::exec_flavour`] and gexc read at its next start), and its
-/// crash notice says so, or that the record could not be made. A process
+/// which [`Kernel::exec_flavour`] and gexc read at its next start). That
+/// end is no crash: a notice says it moves ([`ProcTable::end_line_or_notice`]),
+/// unless it crashed (a signal that dumps core, or a crash it said), whose
+/// reason then says so. A record that could not be made is a crash saying
+/// why. A process
 /// that carried on, or exited 0, keeps its memory. Hosts call this as the
 /// process ends, before its descriptors close and before `procs` hears of
 /// it: whatever sees it gone may start it again at once (a Windows parent
@@ -1123,19 +1126,17 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
         return;
     }
     let sig = (status & 0x7f) as u32;
-    let abnormal = rec.ended
-        || rec.runtime
-        || match sig {
-            0 => (status >> 8) & 0xff != 0,
-            0x7f => false,
-            s => matches!(s, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31),
-        };
-    if rec.ended {
-        let why = format!("\0ended by gex: it asked again for {:#x} bytes, which its 32-bit memory has no room for", rec.last);
-        procs.set_crash_unless_said(pid, why.as_bytes());
-    }
+    let core = matches!(sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31);
+    let abnormal = rec.ended || rec.runtime || core || (sig == 0 && (status >> 8) & 0xff != 0);
+    // gex's own account of the end, unless it is moving (below)
+    let ended = || {
+        if rec.ended {
+            let why = format!("\0ended by gex: it asked again for {:#x} bytes, which its 32-bit memory has no room for", rec.last);
+            procs.set_crash_unless_said(pid, why.as_bytes());
+        }
+    };
     if !abnormal || raw_ns(rec.clock).saturating_sub(at) > OUTGROW_WINDOW_NS {
-        return;
+        return ended();
     }
     // a module with no memory64 build: a 64-bit memory would not run it
     if let (Some(true), Some(m)) = (rec.core_m64, &rec.no64) {
@@ -1143,11 +1144,12 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
             "{} ran out of memory (2 GiB); {m} has no 64-bit memory build ({m}.m64), so it cannot move to a 64-bit memory\n",
             rec.image.as_deref().unwrap_or("")
         ));
+        ended();
         procs.add_crash_line(pid, "ran out of memory (2 GiB); this program has no 64-bit memory build");
         return;
     }
     if !(host.reachable)() {
-        return;
+        return ended();
     }
     let set = match &rec.image {
         Some(p) => rec.ns.get().xattr(p, true, crate::vfs::XattrOp::Set { name: "user.gex.mem64", value: b"1", flags: 0 }).map(|_| ()),
@@ -1161,7 +1163,17 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
                 format!("a reservation of {len:#x} bytes did not fit")
             };
             (host.say)(&format!("{} needs 64-bit memory ({why}); it gets it from its next start\n", rec.image.as_deref().unwrap_or("")));
-            "needs 64-bit memory; it will get it the next time it starts".to_string()
+            let line = "needs 64-bit memory; it will get it the next time it starts";
+            // Moving is no crash: a notice, unless it crashed (a signal
+            // that dumps core, not one of gex's for want of room, or a
+            // crash it gave itself)
+            if core && !rec.runtime {
+                ended();
+                procs.add_crash_line(pid, line);
+            } else {
+                procs.end_line_or_notice(pid, line);
+            }
+            return;
         }
         Err(e) => {
             let why = match e {
@@ -1174,6 +1186,7 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
             format!("needs 64-bit memory, which could not be recorded for its next start ({why}): start it with GEX_MEM64=1")
         }
     };
+    ended();
     procs.add_crash_line(pid, &line);
 }
 
@@ -17454,6 +17467,55 @@ mod tests {
             assert_eq!(fl & oflags::ACCMODE, oflags::O_RDWR);
             assert_eq!(fl & g(oflags::O_DIRECTORY | oflags::O_NOFOLLOW), 0, "F_GETFL {fl:#o}");
         }
+    }
+
+    /// A program that fell short of its 32-bit memory and ends for it is
+    /// recorded for a 64-bit one at its next start, and that end is no
+    /// crash: a notice (a nonzero exit, and an end gex made for want of
+    /// room). A signal that dumps core, or a crash the program said, stays
+    /// a crash, with the move as one more line of its reason.
+    #[test]
+    fn a_program_moving_to_a_64_bit_memory_gives_a_notice_not_a_crash() {
+        use crate::proc::{Crash, INIT_PID};
+        if gex_abi::mem64() {
+            return;
+        }
+        set_outgrow_host(OutgrowHost { reachable: || true, debug: |_| {}, say: |_| {} });
+        let (_, mut k) = setup();
+        const LINE: &str = "needs 64-bit memory; it will get it the next time it starts";
+        let mut end = |name: &str, said: Option<&[u8]>, again: bool, status: i32| {
+            let path = format!("/{name}");
+            k.vfs.open(&path, (oflags::O_RDWR | oflags::O_CREAT) as u64, 0o755).unwrap();
+            k.pid = k.procs.spawn(INIT_PID);
+            k.procs.set_info(k.pid, format!("{name}\n{name}\0").as_bytes());
+            k.outgrow_arm(&path, true);
+            assert!(!note_short(k.pid, 3 << 30, false, false));
+            if again {
+                assert!(note_short(k.pid, 3 << 30, false, false), "asked again: gex ends it");
+            }
+            if let Some(n) = said {
+                k.procs.set_crash(k.pid, n);
+            }
+            outgrow_ending(k.pid, status, &k.procs);
+            k.procs.exit(k.pid, status);
+            let mut v = [0u8; 4];
+            assert_eq!(k.vfs.xattr(&path, true, crate::vfs::XattrOp::Get { name: "user.gex.mem64", buf: &mut v }), Ok(1), "{name} recorded");
+            assert_eq!(&v[..1], b"1");
+            (k.pid, k.procs.take_crashes())
+        };
+        let notice = |pid, name: &str| Crash { pid, name: name.into(), reason: LINE.into(), code: 0, signal: 0, notice: true };
+        // a nonzero exit
+        let (pid, got) = end("exits", None, false, 1 << 8);
+        assert_eq!(got, vec![notice(pid, "exits")]);
+        // ended by gex (SIGKILL) for asking again
+        let (pid, got) = end("asks", None, true, 9);
+        assert_eq!(got, vec![notice(pid, "asks")]);
+        // SIGSEGV: a crash
+        let (pid, got) = end("faults", None, false, 11);
+        assert_eq!(got, vec![Crash { pid, name: "faults".into(), reason: format!("SIGSEGV; {LINE}"), code: 139, signal: 11, notice: false }]);
+        // a Windows program's own crash, then a nonzero exit
+        let (pid, got) = end("said", Some(b"app.exe\0page fault on read access to 00000000\03221225477"), false, 5 << 8);
+        assert_eq!(got, vec![Crash { pid, name: "app.exe".into(), reason: format!("page fault on read access to 00000000; {LINE}"), code: 0xc0000005, signal: 0, notice: false }]);
     }
 
     /// Extended attributes (`user.` only) on the root tmpfs, through the
