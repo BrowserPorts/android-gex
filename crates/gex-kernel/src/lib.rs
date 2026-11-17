@@ -36,6 +36,7 @@ pub mod cpus;
 pub mod entropy;
 pub mod errno;
 pub mod eventfd;
+pub mod hostos;
 pub mod inotify;
 pub mod locks;
 pub mod netlink;
