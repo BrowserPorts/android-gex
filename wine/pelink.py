@@ -2056,6 +2056,17 @@ static void *gexw_ntdll_proc(const char *name)
                        '__stack_pointer', '__memory_base', '__table_base'}
                        | {n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if n.split('!')[0] in OTHER_NATIVE.values()})
         open(out + '.undefined', 'w').write('\n'.join(names) + '\n')
+        # (a program module's data import that no DLL exports and no object
+        # defines, GOT.mem.NAME with no DLL!: an undefined reference, as an
+        # undefined function is; nothing could bind it at load, and xul.dll's
+        # mingw GUIDs, IID_ILatLongReport and the rest, failed only there)
+        own = [m for m, _, _, _ in dlls if grp(m) == g]
+        if own and all(m in EXTRA for m in own):
+            lost = sorted(n for n in re.findall(r'<- GOT\.mem\.(\S+)', undefined) if '!' not in n)
+            if lost:
+                for n in lost:
+                    print(f'pelink: error: {out}: undefined data reference to `{n}\'', file=sys.stderr)
+                sys.exit(1)
         print(f'{out}: {sum(grp(d[0]) == g for d in dlls)} DLLs, {os.path.getsize(out) >> 20} MiB, {len(names)} undefined '
               f'(listed in {out}.undefined)')
 

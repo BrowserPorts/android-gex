@@ -501,8 +501,16 @@ try:
                 return B + '/dlls/%s/lib%s.a' % (x, d)
         return B + '/dlls/%s/lib%s.a' % (d, d)
     dlls = []; archives = []
+    # (with mingw-w64's headers, its static libraries ahead of Wine's: the
+    # GUIDs those headers declare, install.sh's L/mingw; dll-too lists those
+    # whose MinGW libNAME.a also imports the DLL, ksuser's and the rest)
+    mw = LIB + '/mingw' if conf.get('MINGW_INCLUDE') else None
+    dll_too = set(open(mw + '/dll-too').read().split()) if mw and os.path.exists(mw + '/dll-too') else set()
     for l in libs:
         p = next((os.path.join(d, 'lib%s.a' % l) for d in libdirs if os.path.exists(os.path.join(d, 'lib%s.a' % l))), None)
+        if not p and mw and os.path.exists(mw + '/lib%s.a' % l):
+            p = mw + '/lib%s.a' % l
+            if l in dll_too: dlls.append(l)
         if not p and os.path.exists(B + '/libs/%s/lib%s.a' % (l, l)):
             p = B + '/libs/%s/lib%s.a' % (l, l)  # Wine's static ones: uuid, dxguid, strmiids
         if p:

@@ -326,6 +326,29 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     }
     await w.nt({ want: /defdll: ok/, ...o, name: `${pre}defdll`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
   }
+  if (want('nodata')) {
+    // a DLL reading data nothing defines: the link fails, even with
+    // GEXCC_WIN_UNDEFINED=stub, rather than the module at its load
+    let log = null;
+    try { await w.gexccWin(join(F, 'nodata.c'), 'nodata.dll', ['-O2', '-shared'], { env: { GEXCC_WIN_UNDEFINED: 'stub' } }); } catch (e) {
+      if (e instanceof Skip) throw e;
+      log = readFileSync(join(w.work, 'nodata.dll.build'), 'utf8');
+    }
+    t.check(`${pre}nodata: undefined data is a link error`, log !== null && /undefined data reference to `nodata_missing'/.test(log), log ?? 'linked');
+  }
+  const mingwInstall = (() => {
+    try { return /^MINGW_INCLUDE=/m.test(readFileSync(join(process.env.GEX_TEST_GEXCC_WIN ?? '', 'lib/gexcc-win/config'), 'utf8')); } catch { return false; }
+  })();
+  if (want('mingwguid') && mingwInstall) {
+    // with mingw-w64's headers: its static GUID libraries, one of them
+    // (ksuser) also a DLL's import library
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'mingwguid.c'), 'mingwguid.exe', ['-O2', '-llocationapi', '-lksuser']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}mingwguid: build`, false, String(e.message));
+    }
+    await w.nt({ want: /mingwguid: ok/, ...o, name: `${pre}mingwguid`, exe, extra: [`${exe}.wasm`] });
+  }
   if (want('modcase')) {
     // installed under other case than its link (an installer naming the
     // files ModCase.exe and ModCase.exe.wasm): its .wasmref still names

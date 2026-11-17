@@ -75,6 +75,18 @@ if [ -n "${MINGW_W64:-}" ]; then
     "$CC" -O2 -c "$f" -o "$T/ws2_$(basename "$f" .c).o"
   done
   llvm-ar rs "$L/libgexcc-win.a" "$T"/ucrt_*.o "$T/oldnames.o" "$T"/ws2_*.o
+  # and its static libraries: the GUIDs (uuid, dxguid, strmiids, locationapi,
+  # ksuser's beside its imports ...), in L/mingw, where gexcc-win's -lNAME
+  # finds them; the list 'dll' marks those that are a DLL's imports too
+  rm -rf "$L/mingw"; mkdir -p "$L/mingw"
+  python3 "$HERE/mingwlibs.py" "$MW/mingw-w64-crt" | while read -r n kind fs; do
+    os=
+    for f in $fs; do
+      o="$T/ml-$n-$(basename "$f" .c).o"; "$CC" -O2 -c "$MW/mingw-w64-crt/$f" -o "$o"; os="$os $o"
+    done
+    llvm-ar rcs "$L/mingw/lib$n.a" $os
+    if [ "$kind" = dll ]; then echo "$n" >> "$L/mingw/dll-too"; fi
+  done
 fi
 # setjmp/longjmp, a copy of the program's own (a program has no core beside
 # it to share the tag with): libgexrt's
