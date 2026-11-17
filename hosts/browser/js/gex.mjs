@@ -8030,6 +8030,8 @@ export class Gex {
   #ffiThunk(sig, len) {
     const e = this.#shim.exports;
     if (!e.gex_ffi_thunk) throw new Error('gex.ffi_thunk: this shim has no libffi thunks');
+    // (a signature is at most gex_cgen::ffi's 256 parameters, ':' and a result)
+    if (len >>> 0 > 259) throw new Error(`gex.ffi_thunk: a ${len >>> 0}-byte signature is no wasm signature`);
     const at = addrNum(sig);
     const text = this.#bytes().slice(at, at + len);
     const buf = e.gex_alloc(Math.max(1, len)) >>> 0;

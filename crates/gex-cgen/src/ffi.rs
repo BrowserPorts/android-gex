@@ -94,6 +94,8 @@ pub fn thunk(sig: &str) -> Result<Vec<u8>, String> {
         f.instruction(&I::I32WrapI64);
     }
     f.instruction(&I::CallIndirect { type_index: 0, table_index: 0 });
+    // (an i32 or f32 result leaves the rest of libffi's 8-byte rvalue as
+    // it was: the C side reads it at its own width)
     match result {
         Some(ValType::I32) => f.instruction(&I::I32Store(arg(0))),
         Some(ValType::I64) => f.instruction(&I::I64Store(arg(0))),

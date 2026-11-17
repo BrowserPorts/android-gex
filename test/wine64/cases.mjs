@@ -384,6 +384,9 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     }
     await w.nt({ want: /fficall: ok 0/, ...o, name: `${pre}fficall`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
     await w.nt({ want: /fficall: ok 0/, ...o, name: `${pre}fficall-page`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`], page: {} });
+    // and with run-time translation off (an eject without the JIT): the
+    // thunks are made code, not translated code, and still install
+    await w.nt({ want: /fficall: ok 0/, ...o, name: `${pre}fficall-nojit`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`], page: { flags: ['--no-jit'] } });
   }
   const mingwInstall = (() => {
     try { return /^MINGW_INCLUDE=/m.test(readFileSync(join(process.env.GEX_TEST_GEXCC_WIN ?? '', 'lib/gexcc-win/config'), 'utf8')); } catch { return false; }

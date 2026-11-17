@@ -591,8 +591,8 @@ pub(crate) fn register_ffi(linker: &mut wasmtime::Linker<HostState>) -> Result<(
                     let n = publish(&sh, &memory, module, &[0], Tier::Jit, Vec::new())?;
                     let mut s = sh.lock().unwrap_or_else(|e| e.into_inner());
                     let base = s.ftab.map.installs()[n as usize].base;
-                    // (two threads making one at once: the first stays, the
-                    // other's slot goes unused)
+                    // (two threads making one at once: the first stays; the
+                    // other's install still takes a table slot, unused)
                     *s.ftab.ffi_thunks.entry(sig).or_insert(base)
                 }
             };

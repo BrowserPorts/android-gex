@@ -820,7 +820,7 @@ pub extern "C" fn gex_ffi_thunk(buf: u32, len: u32) -> u32 {
     modules.push(Module { wasm, regs: Vec::new(), dirs: Vec::new(), slots: 0 });
     drop(modules);
     let base = crate::cgen::gex_ftab_install_base(install);
-    // (two Workers making one at once: the first stays, the other's slot
-    // goes unused)
+    // (two Workers making one at once: the first stays; the other's install
+    // still takes a slot in every Worker's table, unused)
     *lock(&FFI_THUNKS).get_or_insert_with(Default::default).entry(sig.to_string()).or_insert(base)
 }
