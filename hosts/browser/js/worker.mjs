@@ -97,15 +97,29 @@ import { logNamed, logOn, setLog } from './log.mjs';
 
 /** The MiB of `memory` in 64 KiB pages not all zero: what a browser holds
  *  resident for it, near enough (a page written and zeroed again is the only
- *  miss). */
-function touchedMib(memory) {
+ *  miss). Only the spans anything was handed (`exports`' gex_resident_spans:
+ *  the guest's accessible mappings, gex's own regions): a memory64 is 8 GiB,
+ *  nearly none of it ever mapped, and a pass over all of it took seconds per
+ *  exit. The whole memory when the map cannot say. */
+function touchedMib(memory, exports) {
   const words = new Uint32Array(memory.buffer);
-  let pages = 0;
-  for (let p = 0; p < words.length; p += 16384) {
-    const end = Math.min(p + 16384, words.length);
-    for (let i = p; i < end; i++) {
-      if (words[i]) { pages++; break; }
+  const spans = [];
+  const n = exports?.gex_resident_spans ? exports.gex_resident_spans() : 0;
+  for (let i = 0; i < n; i++) {
+    const a = Number(exports.gex_resident_span(i, 0)), b = Number(exports.gex_resident_span(i, 1));
+    if (b > a) spans.push([Math.floor(a / 65536), Math.ceil(Math.min(b, memory.buffer.byteLength) / 65536)]);
+  }
+  if (!spans.length) spans.push([0, words.length / 16384]);
+  spans.sort((x, y) => x[0] - y[0]);
+  let pages = 0, done = 0;
+  for (const [a, b] of spans) {
+    for (let pg = Math.max(a, done); pg < b; pg++) {
+      const end = Math.min((pg + 1) * 16384, words.length);
+      for (let i = pg * 16384; i < end; i++) {
+        if (words[i]) { pages++; break; }
+      }
     }
+    done = Math.max(done, b);
   }
   return Math.round(pages / 16);
 }
@@ -1583,7 +1597,7 @@ async function handle(msg) {
       // what the browser keeps resident for it (a memory's size is not: a
       // memory64 is 8 GiB from its first instruction). Only where the exit
       // line is said: a pass over the whole memory.
-      touchedMib: logOn('debug') || logNamed('touched') || globalThis.process?.env?.GEX_DEBUG_EXIT ? touchedMib(gex.memory) : undefined,
+      touchedMib: logOn('debug') || logNamed('touched') || globalThis.process?.env?.GEX_DEBUG_EXIT ? touchedMib(gex.memory, gex.shim.exports) : undefined,
       // Dispatch slots the page has left, in thousands. A budget nothing
       // refills: when it runs out, the next module names a table that does not
       // exist and the engine refuses it. Per process, because the question is
