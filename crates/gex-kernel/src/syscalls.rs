@@ -4409,6 +4409,13 @@ impl PathIo<'_> {
         if Self::path_tail(m, path)?.1 != 0 {
             return Err(if self.ns.metadata(&p).is_ok() { Errno::EEXIST } else { Errno::ENOENT });
         }
+        // A name that is there is EEXIST before the filesystem is asked
+        // (`filename_create`): one that makes nothing (sysfs, proc) says
+        // so of a directory it has, as libprocessgroup's mkdir of
+        // /sys/fs/cgroup expects.
+        if self.ns.metadata_nofollow(&p).is_ok() {
+            return Err(Errno::EEXIST);
+        }
         self.ns.mkdir(&p, mode & !self.fs.umask())?;
         self.label_new(&p);
         Ok(0)

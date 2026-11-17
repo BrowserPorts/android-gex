@@ -40,6 +40,7 @@ static const char expected[] =
     "mounted again: 0, a there: 1\n"
     "a file made in a: -13\n"
     "remove a: 0\n"
+    "mkdir of the mount point: -17, of /proc/self: -17\n"
 ;
 
 static char out_buf[8192];
@@ -162,6 +163,8 @@ int main(void) {
     umount("/tmp/gexv1b");
     SAY("a file made in a: %d\n", open("/tmp/gexv1/a/x", O_CREAT | O_WRONLY, 0644) >= 0 ? 0 : -errno);
     SAY("remove a: %d\n", rmdir("/tmp/gexv1/a") == 0 ? 0 : -errno);
+    // A name that is there is EEXIST whatever the filesystem makes.
+    SAY("mkdir of the mount point: %d, of /proc/self: %d\n", mkdir(base, 0755) == 0 ? 0 : -errno, mkdir("/proc/self", 0755) == 0 ? 0 : -errno);
     umount(base);
 
     if (expected[0] && strcmp(out_buf, expected) != 0) {
