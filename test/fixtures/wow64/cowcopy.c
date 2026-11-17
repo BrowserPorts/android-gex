@@ -1,10 +1,11 @@
-/* cowcopy [DIR]: CopyFileW of a 64 MiB file in DIR (C:\cowcopy), then a write to the copy and to the
+/* cowcopy [DIR [keep]]: CopyFileW of a 64 MiB file in DIR (C:\cowcopy), then a write to the copy and to the
  * source. Each file keeps its own bytes; under gex's kernel file system the
  * copy shares the source's until written (Wine's CopyFile asks for
  * FSCTL_DUPLICATE_EXTENTS_TO_FILE: copy_file_range), which Shmem in
  * /proc/meminfo (Z:\proc\meminfo) shows. Prints "cowcopy shmem added N KiB"
  * and what the source took ("cowcopy source held N KiB"; -1 where there is
- * no Shmem) and "cowcopy ok", or what was wrong. */
+ * no Shmem) and "cowcopy ok", or what was wrong. With "keep" the written copy
+ * (b.bin: the pattern, "copy!" at 70000) is left for a reader after. */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,8 +100,11 @@ int wmain(int argc, WCHAR **argv)
     if (!check(A, 5, "source!", "the written source")) return 1;
     DeleteFileW(A);
     if (!check(B, 70000, "copy!", "the copy, its source deleted")) return 1;
-    DeleteFileW(B);
-    RemoveDirectoryW(D);
+    if (argc <= 2 || wcscmp(argv[2], L"keep"))
+    {
+        DeleteFileW(B);
+        RemoveDirectoryW(D);
+    }
     printf("cowcopy ok\n");
     return 0;
 }

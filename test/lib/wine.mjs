@@ -12,10 +12,11 @@ export const WINE = '/wine64/lib/wine/x86_64-unix/wine';
  *  classes, made before boot; `system`: more of System's options (`units`,
  *  `xcache`) and `debug` its switches; `wow64`: 32-bit programs through WoW64 (the
  *  install's i386-windows); `nullDriver`: USER with no display (Wine's null
- *  graphics driver; WoW64's default). */
-export async function bootWine(t, { env = {}, parts, wow64 = false, nullDriver = wow64, system = {}, debug = {} } = {}) {
+ *  graphics driver; WoW64's default); `filesystem(sys)`: the root's
+ *  Filesystem (a MemoryFilesystem otherwise). */
+export async function bootWine(t, { env = {}, parts, wow64 = false, nullDriver = wow64, system = {}, debug = {}, filesystem } = {}) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug(debug), ...system });
-  const fs = new MemoryFilesystem(sys);
+  const fs = filesystem ? filesystem(sys) : new MemoryFilesystem(sys);
   fs.addTar(t.work('wine64.tar'), { lazy: t.work('wine64-lazy.json') });
   fs.addTar(t.work('win-progs.tar'), { at: '/progs' });
   const more = parts?.(sys, fs);

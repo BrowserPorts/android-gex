@@ -528,6 +528,10 @@ extern "C" {
     fn k_fs_meta(handle: i32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_truncate(handle: i32, len: u64) -> i32;
     fn k_fs_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32;
+    /// A copy of all of `src` into `dst` (empty) that shares its bytes until
+    /// written (`FileHandle::share_from`): the size, a negated errno, or
+    /// `remote::NOT_SHARED`.
+    fn k_fs_share(dst: i32, src: i32) -> i64;
     /// `fsync`/`fdatasync` of an open file, and `sync(2)`: the root's
     /// contents in the page's store made durable (0 or a negated errno).
     fn k_fs_sync(handle: i32, data_only: u32) -> i32;
@@ -1212,6 +1216,9 @@ extern "C" fn rf_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32 
     let r = unsafe { k_fs_advise(handle, offset, len, advice) };
     gex_kernel::phase::mark(8);
     r
+}
+extern "C" fn rf_share(dst: i32, src: i32) -> i64 {
+    unsafe { k_fs_share(dst, src) }
 }
 extern "C" fn rf_sync(handle: i32, data_only: u32) -> i32 {
     unsafe { k_fs_sync(handle, data_only) }
@@ -2004,6 +2011,7 @@ fn global_root() -> Option<Arc<gex_kernel::vfs::RemoteFs>> {
             meta: rf_meta,
             truncate: rf_truncate,
             advise: rf_advise,
+            share: rf_share,
             sync: rf_sync,
             read_dir: rf_read_dir,
             path_meta: rf_path_meta,

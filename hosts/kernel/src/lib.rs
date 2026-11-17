@@ -3452,6 +3452,19 @@ pub extern "C" fn k_fs_advise(handle: i32, offset: u64, len: u64, advice: u32) -
     as_unit(h.advise(offset, len, advice))
 }
 
+/// A copy of all of open file `src` into `dst` (empty) that shares its bytes
+/// until written (`FileHandle::share_from`): the size, a negated errno, or
+/// `remote::NOT_SHARED` where the file system cannot.
+#[no_mangle]
+pub extern "C" fn k_fs_share(dst: i32, src: i32) -> i64 {
+    let (Some(d), Some(s)) = (handle_at(dst), handle_at(src)) else { return -9 };
+    match d.share_from(&*s) {
+        Some(Ok(n)) => n as i64,
+        Some(Err(e)) => -(e.0 as i64),
+        None => gex_kernel::vfs::remote::NOT_SHARED,
+    }
+}
+
 /// A directory listing, or `-ERANGE` when `cap` will not hold it.
 #[no_mangle]
 pub extern "C" fn k_fs_read_dir(handle: i32, at: gex_kmem::PAddr, cap: u32) -> i32 {

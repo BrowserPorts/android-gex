@@ -67,6 +67,7 @@ const PROBES = {
   'rt-joy': [],
   'rt-truncate': [],
   'rt-sockpass': [],
+  'rt-clonecopy': [],
   'rt-repaint': [],
   'rt-deadclient': [],
   'rt-unix': [],
