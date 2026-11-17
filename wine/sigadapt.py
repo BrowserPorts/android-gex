@@ -41,6 +41,7 @@ SYM_UNDEFINED, SYM_LOCAL, SYM_EXPLICIT_NAME = 0x10, 0x02, 0x40
 # relocation types that carry an addend
 ADDEND = {3, 4, 5, 8, 9, 11, 14, 15, 16, 17, 21, 22, 23, 25}
 R_FUNCTION_INDEX_LEB = 0
+R_TYPE_INDEX_LEB = 6
 
 
 def uleb(b, i):
@@ -330,7 +331,8 @@ def adapt(path, names=None):
         for _ in range(n):
             ty = p[i]; i += 1
             off, i = uleb(p, i); ix, i = uleb(p, i)
-            if ty != R_FUNCTION_INDEX_LEB and ix in retarget:
+            # (R_WASM_TYPE_INDEX_LEB's index is a type's, not a symbol's)
+            if ty not in (R_FUNCTION_INDEX_LEB, R_TYPE_INDEX_LEB) and ix in retarget:
                 ix = retarget[ix]
             e = bytes([ty]) + enc_u(off + (delta if code else 0)) + enc_u(ix)
             if ty in ADDEND:
