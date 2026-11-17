@@ -667,7 +667,7 @@ fn take(pre: &Pre) -> Rec {
                 let pg = node.paged_for(len);
                 match pg.as_ref() {
                     Some(p) => Body::Blocks(p.size, p.blocks().to_vec()),
-                    None => Body::Inline(node.data.lock().unwrap().clone()),
+                    None => Body::Inline(node.inline_bytes()),
                 }
             };
             Rec::File { ino: node.ino, mode: *mode, mtime, body, xattrs: xattrs.clone() }

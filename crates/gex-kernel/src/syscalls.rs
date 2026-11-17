@@ -1864,6 +1864,35 @@ impl FdIo<'_> {
         }
         Ok(sent)
     }
+    /// A `copy_file_range` of all of a file, from its start, into an empty
+    /// one at its start, as the filesystem's own copy that shares the bytes
+    /// until either file is written ([`crate::vfs::FileHandle::share_from`]),
+    /// each descriptor's position moved on as a copy's would be. `None`
+    /// where that is not this copy or the filesystem cannot.
+    fn share_whole(&self, in_fd: i32, in_off: Option<u64>, out_fd: i32, out_off: Option<u64>, len: u64) -> Result<Option<u64>, Errno> {
+        let in_file = self.fds.get(in_fd)?;
+        let out_file = self.fds.get(out_fd)?;
+        if !in_file.readable || !out_file.writable || out_file.flags() & crate::fs::oflags::O_APPEND != 0 {
+            return Ok(None);
+        }
+        let at = |f: &OpenFile, o: Option<u64>| o.map_or_else(|| f.seek(0, 1 /* SEEK_CUR */).ok(), Some);
+        if at(&in_file, in_off) != Some(0) || at(&out_file, out_off) != Some(0) {
+            return Ok(None);
+        }
+        let (Ok(src), Ok(dst)) = (in_file.handle.metadata(), out_file.handle.metadata()) else { return Ok(None) };
+        if dst.size != 0 || len < src.size || src.size == 0 {
+            return Ok(None);
+        }
+        let Some(r) = out_file.handle.share_from(&*in_file.handle) else { return Ok(None) };
+        let n = r?;
+        if in_off.is_none() {
+            in_file.seek(n as i64, 0 /* SEEK_SET */)?;
+        }
+        if out_off.is_none() {
+            out_file.seek(n as i64, 0 /* SEEK_SET */)?;
+        }
+        Ok(Some(n))
+    }
     /// `copy_file_range(fd_in, off_in_ptr, fd_out, off_out_ptr, len, flags)`.
     /// Both offset pointers are optional; each non-null one is used for the
     /// transfer and then advanced by the bytes copied. `flags` is reserved and
@@ -1891,7 +1920,10 @@ impl FdIo<'_> {
         } else {
             None
         };
-        let copied = self.transfer_fds(fd_in, in_off, fd_out, out_off, len)?;
+        let copied = match self.share_whole(fd_in, in_off, fd_out, out_off, len)? {
+            Some(n) => n,
+            None => self.transfer_fds(fd_in, in_off, fd_out, out_off, len)?,
+        };
         if let Some(o) = in_off {
             m.write_u64(off_in, o + copied)?;
         }
