@@ -14,7 +14,8 @@
 #                     its runtime those headers expect (the UCRT stdio wrappers)
 # Then C++: toolchain/gexcc/windows/build-cxx.sh PREFIX LLVM_SRC.
 # Out: PREFIX/bin/x86_64-w64-mingw32-{gcc,g++,cc,c++,windres,ar,ranlib,nm,
-# strip,objcopy,objdump}, PREFIX/lib/gexcc-win (the runtime every program
+# strip,objcopy,objdump} and x86_64-pc-windows-msvc-{clang,clang++,...} (clang-cl's
+# identity), PREFIX/lib/gexcc-win (the runtime every program
 # links, the install's config), PREFIX/share/gexcc-win/toolchain.cmake.
 set -eu
 PREFIX=$(realpath -m "$1")
@@ -37,6 +38,10 @@ if [ -n "${MINGW_W64:-}" ]; then
 fi
 for t in gcc g++ cc c++ windres ar ranlib nm strip objcopy objdump; do
   ln -sfn "$HERE/gexcc-win" "$PREFIX/bin/x86_64-w64-mingw32-$t"
+done
+# (clang-cl's identity, for projects written for MSVC: gexcc-win's docstring)
+for t in clang clang++ windres ar ranlib nm strip objcopy objdump; do
+  ln -sfn "$HERE/gexcc-win" "$PREFIX/bin/x86_64-pc-windows-msvc-$t"
 done
 sed -e "s#@BIN@#$PREFIX/bin#" -e "s#@AR@#$(command -v llvm-ar)#" -e "s#@RANLIB@#$(command -v llvm-ranlib)#" \
   "$HERE/win64.cmake" > "$PREFIX/share/gexcc-win/toolchain.cmake"

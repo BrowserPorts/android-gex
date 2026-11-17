@@ -13,6 +13,9 @@ x86_64-w64-mingw32-gcc / -g++ / -cc / -c++:
     (peimports.py). Out: X (the skeleton) and X.wasm beside it. -s (or
     GEXCC_WIN_STRIP=1) is a release link: names gex never reads out
     (stripnames.py); GEXCC_WIN_STRIP=0 keeps them.
+x86_64-pc-windows-msvc-clang / -clang++ (or --target=x86_64-pc-windows-msvc): the same with
+  clang-cl's identity (_MSC_VER, _M_X64, no __GNUC__) and Wine's headers,
+  for projects written for MSVC.
 x86_64-w64-mingw32-windres: Wine's wrc (-o X.res, or a COFF .o made from it).
 x86_64-w64-mingw32-{ar,ranlib,nm,objcopy,objdump}: llvm's; strip does
   nothing (a release link strips).
@@ -207,8 +210,35 @@ def implib_of(path):
 
 
 tool = os.path.basename(sys.argv[0])
-tool = tool[len('x86_64-w64-mingw32-'):] if tool.startswith('x86_64-w64-mingw32-') else tool
 args = expand_rsp(sys.argv[1:])
+# The compiler's identity: MinGW GCC's (x86_64-w64-mingw32-*, the default), or
+# clang-cl's for a project written for MSVC (x86_64-pc-windows-msvc-clang, or
+# --target=x86_64-pc-windows-msvc): _MSC_VER and _M_X64, no __GNUC__ or
+# __MINGW64__, Wine's headers as its SDK, as Wine builds its own PE code with
+# clang's msvc target. Each identity is what that real compiler predefines;
+# code reaches the other's paths only as it would there.
+MSVC_TRIPLES = ('x86_64-pc-windows-msvc', 'x86_64-windows-msvc', 'x86_64-windows')
+msvc = False
+for pre in ('x86_64-w64-mingw32-', 'x86_64-pc-windows-msvc-'):
+    if tool.startswith(pre):
+        tool = tool[len(pre):]
+        msvc = pre.startswith('x86_64-pc-windows-msvc')
+if tool == 'clang':
+    tool = 'gcc'
+elif tool == 'clang++':
+    tool = 'g++'
+for i, a in enumerate(list(args)):
+    t = a[len('--target='):] if a.startswith('--target=') else None
+    if t is None and a in ('-target', '--target') and i + 1 < len(args):
+        t = args[i + 1]
+    if t in MSVC_TRIPLES + ('x86_64-w64-mingw32', 'x86_64-w64-windows-gnu'):
+        msvc = t in MSVC_TRIPLES
+        args = [x for j, x in enumerate(args) if j != i and not (a in ('-target', '--target') and j == i + 1)]
+        break
+if msvc:
+    # (mingw-w64's headers are written for GCC's identity: with clang-cl's,
+    # Wine's are the SDK, as when Wine builds its PE code with clang)
+    conf.pop('MINGW_INCLUDE', None)
 
 if tool in ('ar', 'ranlib', 'nm', 'strip', 'objcopy', 'objdump'):
     if tool == 'strip':
@@ -298,7 +328,7 @@ if tool == 'windres':
 
 cxx = tool in ('g++', 'c++', 'clang++')
 if args[:1] == ['-dumpmachine']:
-    print('x86_64-w64-mingw32'); sys.exit(0)
+    print('x86_64-pc-windows-msvc' if msvc else 'x86_64-w64-mingw32'); sys.exit(0)
 cc = os.path.join(W, 'wcc64++' if cxx else 'wcc64')
 # the SDK headers: mingw-w64's (MINGW_INCLUDE, installed by mingw-headers.py),
 # or Wine's own; before them either way the headers of gexcc-win's own
@@ -321,7 +351,21 @@ else:
     crt_dirs = ['-isystem', S + '/include/msvcrt']
     # (MinGW's names Wine's headers lack, and Wine's wide-char mode)
     sdk_dirs += ['-DWINE_UNICODE_NATIVE', '-DWINBOOL=BOOL']
-base = ['-D_WIN32', '-D_UCRT', '-D__stdcall=', '-D__cdecl=', '-D__fastcall=', '-D__thiscall=', '-D__vectorcall=', '-D_stdcall=', '-D_cdecl=', '-D_fastcall=', '-D_thiscall=', '-D__MINGW32__', '-D__MINGW64__', '-Wno-ignored-attributes', '-Wno-unknown-attributes', '-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__', '-fPIC', '-Wno-unused-command-line-argument',
+if msvc:
+    # (clang-cl's: _MSC_VER of Visual Studio 2022 17.10, the x64 machine, the
+    # DLL runtime /MD gives, Microsoft's extensions and compatibility)
+    IDENTITY = ['-U__GNUC__', '-U__GNUC_MINOR__', '-U__GNUC_PATCHLEVEL__', '-U__GNUC_STDC_INLINE__', '-U__GXX_ABI_VERSION',
+                '-D_MSC_VER=1940', '-D_MSC_FULL_VER=194033811', '-D_MSC_BUILD=1', '-D_MSC_EXTENSIONS=1',
+                '-D_M_X64=100', '-D_M_AMD64=100', '-D_INTEGRAL_MAX_BITS=64', '-D_MT', '-D_DLL', '-D_WIN64',
+                '-fms-extensions', '-fms-compatibility',
+                # (the intrinsics MSVC has built in, which Wine's headers only
+                # declare: those clang on wasm lacks, in C)
+                '-include', 'gexw-intrin.h']
+    if cxx:
+        IDENTITY += ['-D_MSVC_LANG=201703L', '-D_CPPRTTI=1', '-D_NATIVE_WCHAR_T_DEFINED=1', '-D_WCHAR_T_DEFINED=1']
+else:
+    IDENTITY = ['-D__MINGW32__', '-D__MINGW64__']
+base = ['-D_WIN32', '-D_UCRT', '-D__stdcall=', '-D__cdecl=', '-D__fastcall=', '-D__thiscall=', '-D__vectorcall=', '-D_stdcall=', '-D_cdecl=', '-D_fastcall=', '-D_thiscall=', *IDENTITY, '-Wno-ignored-attributes', '-Wno-unknown-attributes', '-U__linux__', '-U__linux', '-Ulinux', '-U__gnu_linux__', '-U__unix__', '-U__unix', '-Uunix', '-U__ELF__', '-fPIC', '-Wno-unused-command-line-argument',
         # (long is 32-bit here, but what the backend lowers these builtins to
         # returns the target's 64-bit long)
         '-fno-builtin-lround', '-fno-builtin-lroundf', '-fno-builtin-lroundl', '-fno-builtin-lrint',
