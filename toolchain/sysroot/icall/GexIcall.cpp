@@ -337,34 +337,27 @@ struct GexIcall : PassInfoMixin<GexIcall> {
     else report_fatal_error("gex icall: unsupported return type in " + F->getName());
   }
 
-  // Is F's address taken by anything other than calls and metadata?
   // A C++ declaration clang gave its placeholder type: `void ()`, which it
-  // uses for a method whose real type this object cannot lower (a parameter
-  // or result of a type incomplete here, `unique_ptr<LinkEvent>` say), and
-  // only ever taken into a global's initialiser (a vtable), never called or
-  // otherwise used by code here. Its type is not the function's, so nothing
-  // may be made from it: a thunk calling it through `void ()` links to a
-  // trap (wcc64's mismatch check). The address it hands out is the
-  // definition's, which comes with the definition's own thunk and facts.
+  // uses for a function whose real type this object cannot lower (a
+  // parameter or result of a type incomplete here: `unique_ptr<LinkEvent>`,
+  // `already_AddRefed<T>`), and which code here never calls: only its
+  // address is used (a vtable's initialiser, a call's argument, a store).
+  // Its type is not the function's, so nothing may be made from it: a
+  // thunk calling it through `void ()` links to a trap (wcc64's mismatch
+  // check). The address it hands out is the definition's, which comes with
+  // the definition's own thunk and facts. (A direct call names the type
+  // the caller knows; a declaration with one is left alone.)
   static bool placeholderDecl(Function &F) {
     if (!F.isDeclaration() || !F.getName().starts_with("_Z")) return false;
     FunctionType *T = F.getFunctionType();
     if (!T->getReturnType()->isVoidTy() || T->getNumParams() || T->isVarArg()) return false;
-    SmallVector<const User *, 8> work(F.user_begin(), F.user_end());
-    SmallPtrSet<const User *, 16> seen;
-    while (!work.empty()) {
-      const User *U = work.pop_back_val();
-      if (!seen.insert(U).second) continue;
-      if (isa<GlobalVariable>(U)) continue;
-      // (a constant expression or aggregate the initialiser holds it in;
-      // anything else -- an instruction, an alias, a function's personality
-      // -- is a use this rule does not cover)
-      if (!isa<Constant>(U) || isa<GlobalValue>(U)) return false;
-      for (const User *Y : U->users()) work.push_back(Y);
-    }
+    for (const Use &U : F.uses())
+      if (auto *CB = dyn_cast<CallBase>(U.getUser()))
+        if (CB->isCallee(&U)) return false;
     return true;
   }
 
+  // Is F's address taken by anything other than calls and metadata?
   static bool escapes(Function &F) {
     for (const Use &U : F.uses()) {
       const User *Us = U.getUser();
