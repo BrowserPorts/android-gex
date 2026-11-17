@@ -686,7 +686,9 @@ pub extern "C" fn k_slot_alloc(count: u64) -> u64 {
 /// to, each that adopted a base in it ([`k_slot_get_held`]) or installed a
 /// module whose pages are in it ([`k_mod_hold`]), and each one's forked
 /// children ([`k_spawn`]). A process lets go of all of them as it ends
-/// ([`k_exit`]).
+/// ([`k_exit`]). (One that ends without it, its Worker torn down, keeps
+/// them: never taken back, which is safe, as is a later process given its
+/// pid holding them.)
 ///
 /// A range no live process holds stays as it is, its code cached: the next
 /// run of the same program finds its pages in the slot map and its modules
@@ -808,6 +810,18 @@ fn reclaim(m: &mut ModStore, sl: &mut BTreeMap<(u64, u64), u32>, r: &mut SlotRan
     r.reclaimed.1 += gone.iter().map(|g| g.1).sum::<u64>();
     r.said = false;
     r.free.extend(gone);
+    // neighbours in one table join, so a request larger than any one range
+    // taken back can still be met from them
+    r.free.sort_unstable();
+    let per = slots_per_table();
+    let mut joined: Vec<(u64, u64)> = Vec::with_capacity(r.free.len());
+    for (b, c) in r.free.drain(..) {
+        match joined.last_mut() {
+            Some(l) if l.0 + l.1 == b && l.0 / per == b / per => l.1 += c,
+            _ => joined.push((b, c)),
+        }
+    }
+    r.free = joined;
 }
 
 /// [`k_slot_alloc`] for process `pid`, which holds the range from now. Past
