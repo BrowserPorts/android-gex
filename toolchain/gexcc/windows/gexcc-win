@@ -295,6 +295,9 @@ if conf.get('MINGW_INCLUDE'):
     # printf)
     sdk_dirs = ['-U_GNU_SOURCE', '-D__GEXW_SDK_X64__', '-isystem', here + '/include-rt', '-isystem', here + '/include-mingw-pre',
                 '-isystem', conf['MINGW_INCLUDE']]
+    # (their names matched regardless of case, as on Windows)
+    if os.path.exists(conf['MINGW_INCLUDE'] + '/nocase.yaml'):
+        sdk_dirs += ['-ivfsoverlay', conf['MINGW_INCLUDE'] + '/nocase.yaml']
     crt_dirs = []
 else:
     sdk_dirs = ['-isystem', here + '/include-rt', '-isystem', here + '/include-pre', '-isystem', B + '/include', '-isystem', S + '/include']
