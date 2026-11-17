@@ -79,6 +79,98 @@ pub fn trim_heap() {
     }
 }
 
+/// Hold the host's allocator to what the program uses. A run's host
+/// threads compile and translate in bursts, each in its own glibc arena,
+/// and glibc keeps what they free: a booting Android's arenas held 3.3 GiB
+/// from the system with 0.3 to 0.6 GiB in use, and the host killed the run
+/// for it. Two things: blocks of a megabyte or more are mapped of their own
+/// and given back when freed (glibc raises that threshold to 32 MiB as
+/// large blocks are freed, which puts the next ones in the arenas for
+/// good; a fixed value stops it), and every `GEX_HEAP_TRIM` seconds (10
+/// unless set; 0 for never) the arenas' free pages are given back when
+/// they come to 64 MiB or more. Nothing on a host with another allocator.
+pub fn tune_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            extern "C" {
+                fn mallopt(param: i32, value: i32) -> i32;
+            }
+            const M_MMAP_THRESHOLD: i32 = -3;
+            // SAFETY: glibc's own call, made before the run's threads.
+            unsafe {
+                mallopt(M_MMAP_THRESHOLD, 1 << 20);
+            }
+            let secs = std::env::var("GEX_HEAP_TRIM").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(10);
+            if secs == 0 {
+                return;
+            }
+            let _ = std::thread::Builder::new().name("gex-heap-trim".into()).spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                if mallinfo().fordblks >= 64 << 20 {
+                    trim_heap();
+                }
+            });
+        });
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[repr(C)]
+struct Mallinfo2 {
+    arena: usize,
+    ordblks: usize,
+    smblks: usize,
+    hblks: usize,
+    hblkhd: usize,
+    usmblks: usize,
+    fsmblks: usize,
+    uordblks: usize,
+    fordblks: usize,
+    keepcost: usize,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn mallinfo() -> Mallinfo2 {
+    extern "C" {
+        fn mallinfo2() -> Mallinfo2;
+    }
+    // SAFETY: glibc's own call, which takes each arena's lock.
+    unsafe { mallinfo2() }
+}
+
+/// `GEX_HEAP_STATS=<seconds>`: every so many seconds, what the host's
+/// allocator holds from the system against what is in use in it (glibc's
+/// `mallinfo2`), one line on standard error: to tell memory the program
+/// holds from memory the allocator keeps after it was freed. Nothing on a
+/// host with another allocator, or unless asked.
+pub fn heap_stats_every() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let Some(secs) = std::env::var("GEX_HEAP_STATS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else {
+            return;
+        };
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let start = std::time::Instant::now();
+            let _ = std::thread::Builder::new().name("gex-heap-stats".into()).spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                let m = mallinfo();
+                eprintln!(
+                    "gex: heap at {}s: {} MiB from the system in arenas, {} MiB in use, {} MiB free in them; {} MiB in {} mapped blocks",
+                    start.elapsed().as_secs(),
+                    m.arena >> 20,
+                    m.uordblks >> 20,
+                    m.fordblks >> 20,
+                    m.hblkhd >> 20,
+                    m.hblks
+                );
+            });
+        });
+    }
+}
+
 /// Let the host process open as many files as its hard limit allows (the
 /// soft limit is 1024 on most Linux hosts). A run's guest processes share
 /// the host's descriptors: every file a guest has open on the host's
