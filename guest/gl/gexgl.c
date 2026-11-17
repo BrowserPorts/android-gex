@@ -4033,6 +4033,12 @@ struct gexgl_egl_surface {
        attached to. */
     unsigned x_swaps;
     unsigned long x_top;
+    /* Not attached on the host yet: attaching binds the surface to the host's
+       current context, so it waits for the make-current that means it
+       (egl_surface_use). Done at creation, it was charged to whichever
+       context was current then -- the window default of a context already
+       drawing elsewhere was reset to the new window's size. */
+    unsigned char attach_pending;
 };
 static struct gexgl_egl_surface egl_surfaces[GEXGL_MAX_SURFACES];
 static unsigned egl_next_surface_handle = 1;
@@ -4073,7 +4079,7 @@ static void egl_surface_reap(void) {
         if (!s->handle || s->kind != GEXGL_SURFACE_X) continue;
         int w = 0, h = 0;
         if (gexgl_x11_window_size(s->native, &w, &h)) continue;
-        CMD1(GEXGL_SURFACE_DETACH, s->handle);
+        if (!s->attach_pending) CMD1(GEXGL_SURFACE_DETACH, s->handle);
         if (egl_surface == s) egl_surface = NULL;
         if (ring_surface == s->handle) ring_surface = 0;
         *s = (struct gexgl_egl_surface){ .kind = -1 };
@@ -4122,8 +4128,16 @@ static void egl_surface_use(struct gexgl_egl_surface *s) {
         egl_surface_height = s->height > 0 ? s->height : egl_surface_height;
     }
     /* Another thread's may be the host's (ring_surface 0: not known). */
-    if (s->handle == ring_surface) return;
-    CMD1(GEXGL_SURFACE_CURRENT, s->handle);
+    if (s->handle == ring_surface && !s->attach_pending) return;
+    if (s->attach_pending) {
+        s->attach_pending = 0;
+        const unsigned kind = s->kind == GEXGL_SURFACE_X ? GEXGL_SURFACE_X : GEXGL_SURFACE_WAYLAND;
+        CMD4(GEXGL_SURFACE_ATTACH, kind, kind == GEXGL_SURFACE_X ? (unsigned)s->x_top : s->id,
+             (unsigned)getpid(), s->handle);
+        if (s->width > 0 && s->height > 0) CMD2(GEXGL_SURFACE_RESIZE, s->width, s->height);
+    } else {
+        CMD1(GEXGL_SURFACE_CURRENT, s->handle);
+    }
     ring_surface = s->handle;
 }
 static int egl_context_major = 3;
@@ -4792,15 +4806,9 @@ static void *egl_create_window_surface(void *win) {
            what allows a second window at the same time -- the host keeps a
            drawable per handle. Attaching also makes it current. */
         s->x_top = gexgl_x11_toplevel(win);
-        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X,
-             (unsigned)s->x_top, (unsigned)getpid(), s->handle);
-        egl_surface = s;
-        ring_surface = s->handle;
-        egl_surface_width = w;
-        egl_surface_height = h;
-        /* The host's drawable is what reaches the screen, so the size the
-           application's window has is the size to draw at. */
-        CMD2(GEXGL_SURFACE_RESIZE, w, h);
+        /* Attached, and sized to the application's window (the host's
+           drawable is what reaches the screen), when it is made current. */
+        s->attach_pending = 1;
     } else if (gexgl_wl_surface_id_into(win, s)) {
         s->native = win;
         const struct gexgl_wl_egl_window *ww = win;
@@ -4808,14 +4816,10 @@ static void *egl_create_window_surface(void *win) {
             s->width = ww->width;
             s->height = ww->height;
         }
-        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_WAYLAND, s->id,
-             (unsigned)getpid(), s->handle);
-        egl_surface = s;
-        ring_surface = s->handle;
+        s->attach_pending = 1;
         if (s->width > 0 && s->height > 0) {
             egl_surface_width = s->width;
             egl_surface_height = s->height;
-            CMD2(GEXGL_SURFACE_RESIZE, s->width, s->height);
         }
         /* And tell this process's own compositor, which is a different thing
            from telling the host: nothing will ever be attached to this
@@ -4888,7 +4892,7 @@ static unsigned egl_destroy_surface(void *surface) {
        drawing. Saying it is gone is what frees them; a client that exits
        without saying so is cleaned up by the page instead, which notices the
        process has gone. */
-    CMD1(GEXGL_SURFACE_DETACH, s->handle);
+    if (!s->attach_pending) CMD1(GEXGL_SURFACE_DETACH, s->handle);
     if (ring_surface == s->handle) ring_surface = 0;
     flush();
     /* A Wayland surface's compositor is told too, unless another EGL surface
