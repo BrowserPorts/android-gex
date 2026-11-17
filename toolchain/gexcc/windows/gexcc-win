@@ -274,7 +274,21 @@ if tool == 'windres':
             r = subprocess.call(wrc + ['-I' + (os.path.dirname(inp) or '.')] + [a for a in incl if a.startswith('-I')] + [pre])
             os.unlink(pre)
     else:
-        r = subprocess.call(wrc + ['-I' + B + '/include', '-I' + S + '/include', '-I' + here + '/include'] + incl + [inp])
+        # (and the C runtime's, which rc finds through INCLUDE: a script that
+        # includes a program's C headers reaches stdarg.h and the rest)
+        # (the script's file names with Windows' separator, "icons\\x.ico", as
+        # rc reads them, not as escapes: a copy with '/', its files found
+        # beside the original)
+        text = open(inp, errors='surrogateescape').read()
+        fixed = re.sub(r'"([^"\n]*\\[^"\n]*\.\w{1,8})"(\s*)$', lambda m: '"%s"%s' % (re.sub(r'\\+', '/', m.group(1)), m.group(2)), text, flags=re.M)
+        pre = None
+        if fixed != text:
+            fd, pre = tempfile.mkstemp(suffix='.rc')
+            with os.fdopen(fd, 'w', errors='surrogateescape') as f:
+                f.write(fixed)
+        r = subprocess.call(wrc + ['-I' + (os.path.dirname(inp) or '.'), '-I' + B + '/include', '-I' + S + '/include', '-I' + S + '/include/msvcrt', '-I' + here + '/include'] + incl + [pre or inp])
+        if pre:
+            os.unlink(pre)
     if r or res == out:
         sys.exit(r)
     # a ".o" the link takes: the .res itself (the link passes .res files
