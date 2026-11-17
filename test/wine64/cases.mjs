@@ -212,7 +212,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
   await one('cxxcatch', join(F, 'cxxcatch.cpp'), ['-O2']);
   await one('dllimps', join(F, 'dllimps.c'), ['-O2']);
   await one('cxxthr', join(F, 'cxxthr.cpp'), ['-O2']);
-  await one('vtdecl', join(F, 'vtdecl.cpp'), ['-O2', join(F, 'vtdecl2.cpp')], { want: /vtdecl: ok/ });
+  await one('vtdecl', join(F, 'vtdecl.cpp'), ['-O2', join(F, 'vtdecl2.cpp')], { want: /vtdecl: ok 39 15/ });
   await one('timerproc', join(W, 'timerproc.c'), ['-O1', '-municode', '-lcomctl32'], { nullDriver: true });
   await one('lresult', join(F, 'lresult.c'), ['-O1', '-mwindows'], { nullDriver: true });
   await one('cbfault', join(F, 'cbfault.c'), ['-O1'], { nullDriver: true,
@@ -348,7 +348,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
       if (e instanceof Skip) throw e;
       return t.check(`${pre}mingwguid: build`, false, String(e.message));
     }
-    await w.nt({ want: /mingwguid: ok/, ...o, name: `${pre}mingwguid`, exe, extra: [`${exe}.wasm`] });
+    await w.nt({ want: /mingwguid: ok 7fed806d 00000001/, ...o, name: `${pre}mingwguid`, exe, extra: [`${exe}.wasm`] });
   }
   if (want('modcase')) {
     // installed under other case than its link (an installer naming the
