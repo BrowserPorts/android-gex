@@ -1,0 +1,9 @@
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:fw_OUTPUT - [0:0]
+-A OUTPUT -j fw_OUTPUT
+-A fw_OUTPUT -p ipv6-icmp -m icmp6 --icmpv6-type 135 -j RETURN
+-A fw_OUTPUT -m owner --uid-owner 10000 -j REJECT --reject-with icmp6-adm-prohibited
+COMMIT

@@ -1,0 +1,13 @@
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:idletimer_mangle_POSTROUTING - [0:0]
+-A POSTROUTING -j idletimer_mangle_POSTROUTING
+-A INPUT -j CONNMARK --set-xmark 0x1/0x1
+-A INPUT -m connmark --mark 0x1/0x1 -j MARK --set-xmark 0x5/0xffffffff
+-A FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+-A idletimer_mangle_POSTROUTING -o wlan0 -j IDLETIMER --timeout 10 --label 1
+COMMIT

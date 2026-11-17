@@ -642,6 +642,11 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     }
 
     /// This handle as a netlink socket, when it is one.
+    /// A raw internet socket's family and protocol (`crate::xtables`).
+    fn raw_socket(&self) -> Option<(crate::xtables::Family, u32)> {
+        None
+    }
+
     fn as_netlink(self: Arc<Self>) -> Option<Arc<crate::netlink::Socket>> {
         None
     }

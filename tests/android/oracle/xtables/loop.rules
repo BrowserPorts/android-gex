@@ -1,0 +1,10 @@
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:a - [0:0]
+:b - [0:0]
+-A INPUT -j a
+-A a -j b
+-A b -j a
+COMMIT

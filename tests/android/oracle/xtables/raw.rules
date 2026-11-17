@@ -1,0 +1,6 @@
+*raw
+:PREROUTING ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A PREROUTING -m rpfilter --invert -j DROP
+-A OUTPUT -p udp -m udp --dport 1234 -j CT --notrack
+COMMIT

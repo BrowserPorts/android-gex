@@ -1,0 +1,11 @@
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:POSTROUTING ACCEPT [0:0]
+:routectrl_mangle_INPUT - [0:0]
+-A INPUT -j routectrl_mangle_INPUT
+-A routectrl_mangle_INPUT -i wlan0 -j MARK --set-xmark 0x10063/0xffefffff
+-A routectrl_mangle_INPUT -m connmark --mark 0x0/0xffff -j CONNMARK --save-mark --nfmask 0xffff --ctmask 0xffff
+COMMIT

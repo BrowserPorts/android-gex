@@ -6055,6 +6055,28 @@ impl NetIo<'_> {
             // anything -- and refusing makes libraries treat the socket as
             // broken: agreed to without effect, on a descriptor that exists.
             nr::SETSOCKOPT if io.netlink_of(fd).is_ok() => netlink_setsockopt(io, m, &*io.netlink_of(fd)?, a[1], a[2], a[3], a[4]),
+            // iptables' tables, through a raw socket of their family.
+            nr::SETSOCKOPT if xt_family(io, fd, a[1]).is_some() => {
+                let family = xt_family(io, fd, a[1]).unwrap();
+                let (val, len) = (a[3], a[4] as usize);
+                let admin = io.creds.capable(12);
+                let mut read = |at: usize, n: usize| -> Result<Vec<u8>, Errno> {
+                    if at + n > len {
+                        return Err(Errno::EFAULT);
+                    }
+                    Ok(m.read(val + at as u64, n)?.to_vec())
+                };
+                let mut out: Option<(u64, Vec<u8>)> = None;
+                let r = crate::xtables::set(family, admin, a[2], len, &mut read, &mut |at, b| {
+                    out = Some((at, b.to_vec()));
+                    Ok(())
+                });
+                if let Some((at, b)) = out {
+                    // A failed copy leaves the table replaced, as on Linux.
+                    let _ = m.write(at, &b);
+                }
+                r
+            }
             nr::SETSOCKOPT => {
                 io.fds.get(fd)?;
                 let value = if a[3] != 0 { m.read(a[3], (a[4] as usize).min(1 << 20))?.to_vec() } else { Vec::new() };
@@ -6071,6 +6093,14 @@ impl NetIo<'_> {
                     }
                 }
                 setsockopt_kernel(io, fd, a[1], a[2], &value)
+            }
+            nr::GETSOCKOPT if xt_family(io, fd, a[1]).is_some() => {
+                let family = xt_family(io, fd, a[1]).unwrap();
+                let len = m.read_u32(a[4])? as usize;
+                let buf = m.read(a[3], len.min(1 << 30))?.to_vec();
+                let (out, r) = crate::xtables::get(family, io.creds.capable(12), a[2], &buf, len)?;
+                m.write(a[3], &out)?;
+                Ok(r)
             }
             nr::GETSOCKOPT => getsockopt(io, m, fd, a[1], a[2], a[3], a[4]),
             // A unix socket's directions close as asked, local or in the
@@ -6223,6 +6253,22 @@ impl NetIo<'_> {
         // Without a network stack (the browser with no relay), loopback still
         // works: Wine's in-process server and Winsock use it.
         let net = self.net.cloned().unwrap_or_else(|| Arc::new(net::NoNet) as Arc<dyn net::NetStack>);
+        // A raw socket (`inet_create`: CAP_NET_RAW, a protocol of 0 to
+        // 255): here for iptables' options alone (`crate::xtables`).
+        const SOCK_RAW: u64 = 3;
+        if ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC) == SOCK_RAW {
+            if protocol > 255 {
+                return Err(Errno::EINVAL);
+            }
+            if !io.creds.capable(13) {
+                return Err(Errno::EPERM);
+            }
+            let family = if domain == AF_INET6 { crate::xtables::Family::V6 } else { crate::xtables::Family::V4 };
+            let handle: Arc<dyn crate::vfs::FileHandle> = Arc::new(crate::xtables::RawSocket { family, protocol: protocol as u32 });
+            let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
+            let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+            return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
+        }
         let kind = match ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC) {
             SOCK_STREAM => net::Kind::Tcp,
             SOCK_DGRAM => net::Kind::Udp,
@@ -6682,6 +6728,9 @@ fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     if io.dgram_of(fd).is_ok() {
         return Ok((AF_UNIX, SOCK_DGRAM));
     }
+    if let Some((family, _)) = io.fds.get(fd)?.handle.raw_socket() {
+        return Ok((if family == crate::xtables::Family::V6 { 10 } else { AF_INET }, 3));
+    }
     if let Ok(s) = io.netlink_of(fd) {
         return Ok((16, s.kind()));
     }
@@ -6696,6 +6745,16 @@ fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     match f.handle.metadata() {
         Ok(md) if md.file_type == crate::vfs::FileType::Socket => Ok((AF_UNIX, SOCK_STREAM)),
         _ => Err(Errno::ENOTSOCK),
+    }
+}
+
+/// The family of iptables' options a raw socket at `level` reaches:
+/// `SOL_IP` on an IPv4 one, `SOL_IPV6` on an IPv6 one.
+fn xt_family(io: &FdIo<'_>, fd: i32, level: u64) -> Option<crate::xtables::Family> {
+    let (family, _) = io.fds.get(fd).ok()?.handle.raw_socket()?;
+    match (family, level) {
+        (crate::xtables::Family::V4, crate::xtables::SOL_IP) | (crate::xtables::Family::V6, crate::xtables::SOL_IPV6) => Some(family),
+        _ => None,
     }
 }
 

@@ -1,0 +1,22 @@
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+:bw_INPUT - [0:0]
+:bw_OUTPUT - [0:0]
+:oem_out - [0:0]
+-A INPUT -j bw_INPUT
+-A OUTPUT -j bw_OUTPUT
+-A OUTPUT -j oem_out
+-A bw_INPUT -m mark --mark 0x100000/0x100000 -j RETURN
+-A bw_OUTPUT -m owner --uid-owner 1000 -j RETURN
+-A bw_OUTPUT -p tcp -m tcp --dport 80 -j REJECT --reject-with tcp-reset
+-A bw_OUTPUT -p udp -m udp --dport 53 -j DROP
+-A bw_OUTPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A bw_OUTPUT -m u32 --u32 "0x0>>0x16&0x3c@0xc>>0x1a&0x3c@0x0=0x0" -j DROP
+-A bw_OUTPUT -m comment --comment "hello" -j NFLOG --nflog-group 1
+-A bw_OUTPUT -m limit --limit 5/sec -j ACCEPT
+-A bw_OUTPUT -m quota --quota 1000 -j ACCEPT
+-A bw_OUTPUT -m policy --dir out --pol ipsec -j RETURN
+-A oem_out -p icmp -m icmp --icmp-type 8 -j ACCEPT
+COMMIT
