@@ -1,0 +1,14 @@
+ip rule show; ip -6 rule show
+ip rule add pref 11000 fwmark 0x10063/0x1ffff table 97; ip rule show
+ip -6 rule add pref 11000 fwmark 0x10063/0x1ffff table 97; ip -6 rule show
+ip rule add pref 31000 unreachable; ip -6 rule add pref 31000 unreachable; ip rule show; ip -6 rule show
+ip rule add pref 13000 oif wlan0 uidrange 0-0 lookup 99; ip rule add pref 14000 iif lo lookup 98; ip rule show
+ip rule add pref 15000 from 10.0.0.0/8 to 192.168.1.0/24 lookup 96; ip -6 rule add pref 15000 from 2001:db8::/32 lookup 96; ip rule show; ip -6 rule show
+ip rule add pref 11000 table 97; ip rule add pref 11000 table 97; echo rc=$?; ip rule add pref 11000 table 97; ip rule show
+ip rule add pref 100 table 50; ip rule add table 51; ip rule show
+ip rule add pref 20000 goto 10000; echo rc=$?; ip rule add pref 20000 goto 30000; echo rc=$?; ip rule show
+ip rule add pref 20000 lookup 0; echo rc=$?; ip -6 rule add pref 20000 lookup 0; echo rc=$?
+ip rule add pref 11000 table 97; ip rule del pref 11000; echo rc=$?; ip rule del pref 11000; echo rc=$?; ip rule show
+ip rule add pref 11000 table 97; ip rule add pref 12000 table 98; ip rule flush; ip rule show; ip -6 rule flush; ip -6 rule show
+ip rule add pref 13000 uidrange 10-5 lookup 99; echo rc=$?
+ip rule add pref 21000 sport 1000-2000 dport 53 ipproto udp lookup 90; ip rule show

@@ -201,7 +201,7 @@ fn addrs(out: &mut Vec<u8>, seq: u32) {
 }
 
 /// The reply to one request (`nlmsghdr` + body), if it is owed one.
-fn route_answer(req: &[u8]) -> Option<Vec<u8>> {
+fn route_answer(req: &[u8], net_admin: bool) -> Option<Vec<u8>> {
     let kind = u16::from_le_bytes(req[4..6].try_into().unwrap());
     let flags = u16::from_le_bytes(req[6..8].try_into().unwrap());
     let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
@@ -209,7 +209,39 @@ fn route_answer(req: &[u8]) -> Option<Vec<u8>> {
     let family = req.get(16).copied().unwrap_or(AF_UNSPEC);
     let mut out = Vec::new();
     let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+    // A change, refused or done (`rtnetlink_rcv_msg`: anything but a GET
+    // takes CAP_NET_ADMIN), acknowledged when asked; an error is always
+    // said, with the request after it.
+    let change = |r: Result<(), Errno>| -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        match r {
+            Ok(()) if flags & NLM_F_ACK == 0 => return None,
+            Ok(()) => {
+                let mut b = 0i32.to_le_bytes().to_vec();
+                b.extend_from_slice(&req[..16]);
+                message(&mut out, NLMSG_ERROR, NLM_F_CAPPED, seq, &b);
+            }
+            Err(e) => {
+                let mut b = (-(e.0 as i32)).to_le_bytes().to_vec();
+                b.extend_from_slice(req);
+                message(&mut out, NLMSG_ERROR, 0, seq, &b);
+            }
+        }
+        Some(out)
+    };
+    let ifindex = |name: &str| IFACES.iter().find(|i| i.name == name).map(|i| i.index);
     match kind {
+        crate::fibrules::RTM_NEWRULE | crate::fibrules::RTM_DELRULE if !net_admin => return change(Err(Errno::EPERM)),
+        crate::fibrules::RTM_NEWRULE => {
+            const NLM_F_EXCL: u16 = 0x200;
+            return change(crate::fibrules::add(family, flags & NLM_F_EXCL != 0, &req[16..], &ifindex));
+        }
+        crate::fibrules::RTM_DELRULE => return change(crate::fibrules::delete(family, &req[16..], &ifindex)),
+        crate::fibrules::RTM_GETRULE if dump => {
+            for b in crate::fibrules::dump(family, &ifindex) {
+                message(&mut out, crate::fibrules::RTM_NEWRULE, NLM_F_MULTI, seq, &b);
+            }
+        }
         RTM_GETLINK if dump => links(&mut out, seq),
         // No IPv6 addresses: a dump for AF_INET6 is only its end.
         RTM_GETADDR if dump && (family == AF_UNSPEC || family == AF_INET) => addrs(&mut out, seq),
@@ -719,13 +751,23 @@ impl Socket {
                     }
                     let flags = u16::from_le_bytes(data[at + 6..at + 8].try_into().unwrap());
                     if flags & NLM_F_REQUEST != 0 {
-                        if let Some(r) = route_answer(&data[at..at + len]) {
+                        if let Some(r) = route_answer(&data[at..at + len], who.net_admin) {
                             out.extend_from_slice(&r);
                         }
                     }
                     at += (len + 3) & !3;
                 }
                 if !out.is_empty() {
+                    // Each answer names the socket it answers
+                    // (`nlmsg_pid`, as `netlink_ack` and the dumps fill
+                    // it): iproute2 skips a message that names another.
+                    let portid = self.state().portid;
+                    let mut at = 0;
+                    while at + 16 <= out.len() {
+                        let len = u32::from_le_bytes(out[at..at + 4].try_into().unwrap()) as usize;
+                        out[at + 12..at + 16].copy_from_slice(&portid.to_le_bytes());
+                        at += (len.max(16) + 3) & !3;
+                    }
                     self.from_kernel(out);
                 }
             }
