@@ -1313,9 +1313,9 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             let g = group(c)?;
             let replace = if flags & ALLOW_MULTI != 0 && flags & REPLACE != 0 { Some(prog_of(c, replace_fd as i32, ptype)?) } else { None };
             crate::cgroup::bpf_attach(g, ty, prog, replace, flags, revision)?;
-            // Run where a socket is made (crate::bpfsock); the other hooks
-            // are not here yet.
-            if ty != crate::bpfprog::attach::INET_SOCK_CREATE {
+            // Run where a socket is made and at getsockopt and setsockopt
+            // (crate::bpfsock); the other hooks are not here yet.
+            if !matches!(ty, crate::bpfprog::attach::INET_SOCK_CREATE | crate::bpfprog::attach::GETSOCKOPT | crate::bpfprog::attach::SETSOCKOPT) {
                 note_once(&format!("a program attached to a cgroup at attach type {ty} is kept and runs nowhere yet"));
             }
             Ok(0)

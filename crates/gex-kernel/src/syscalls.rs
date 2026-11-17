@@ -6047,42 +6047,21 @@ impl NetIo<'_> {
             // broken: agreed to without effect, on a descriptor that exists.
             nr::SETSOCKOPT if io.netlink_of(fd).is_ok() => netlink_setsockopt(io, m, &*io.netlink_of(fd)?, a[1], a[2], a[3], a[4]),
             nr::SETSOCKOPT => {
-                const SOL_SOCKET: u64 = 1;
-                const SO_PASSCRED: u64 = 16;
                 io.fds.get(fd)?;
-                // An internet socket's mark (CAP_NET_RAW or CAP_NET_ADMIN)
-                // and priority (above 6, the same): kept.
-                if let (SOL_SOCKET, 36 | 12, Ok(sock)) = (a[1], a[2], io.socket_of(fd)) {
-                    if a[4] < 4 {
-                        return Err(Errno::EINVAL);
-                    }
-                    let v = m.read_u32(a[3])?;
-                    let net = io.creds.capable(13) || io.creds.capable(12);
-                    let mut o = sock.opts.lock().unwrap_or_else(|e| e.into_inner());
-                    if a[2] == 36 {
-                        if !net {
-                            return Err(Errno::EPERM);
-                        }
-                        o.mark = v;
-                    } else {
-                        if v > 6 && !net {
-                            return Err(Errno::EPERM);
-                        }
-                        o.priority = v;
-                    }
-                    return Ok(0);
-                }
-                if a[1] == SOL_SOCKET && a[2] == SO_PASSCRED && a[3] != 0 && a[4] >= 4 {
-                    let on = m.read_u32(a[3])? != 0;
-                    if let Ok(s) = io.unix_of(fd) {
-                        s.set_passcred(on);
-                    } else if let Ok(s) = io.remote_unix_of(fd) {
-                        s.set_passcred(on);
-                    } else if let Ok(s) = io.dgram_of(fd) {
-                        s.set_passcred(on);
+                let value = if a[3] != 0 { m.read(a[3], (a[4] as usize).min(1 << 20))?.to_vec() } else { Vec::new() };
+                // The group's setsockopt programs first: they may refuse
+                // the call, answer it, or change it.
+                if let Some(kind) = socket_kind(io, fd) {
+                    let uid_gid = (io.creds.rgid() as u64) << 32 | io.creds.ruid() as u64;
+                    let handle = Arc::clone(&io.fds.get(fd)?.handle);
+                    match crate::bpfsock::setsockopt(&handle, kind, io.pid, uid_gid, a[1] as i32, a[2] as i32, &value) {
+                        None => {}
+                        Some(Err(e)) => return Err(e),
+                        Some(Ok(crate::bpfsock::SetVerdict::Bypass)) => return Ok(0),
+                        Some(Ok(crate::bpfsock::SetVerdict::Pass(level, name, v))) => return setsockopt_kernel(io, fd, level as u64, name as u64, &v),
                     }
                 }
-                Ok(0)
+                setsockopt_kernel(io, fd, a[1], a[2], &value)
             }
             nr::GETSOCKOPT => getsockopt(io, m, fd, a[1], a[2], a[3], a[4]),
             // A unix socket's directions close as asked, local or in the
@@ -6700,7 +6679,93 @@ fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     }
 }
 
+/// `setsockopt` as the kernel itself answers it, with the value's bytes.
+fn setsockopt_kernel(io: &FdIo<'_>, fd: i32, level: u64, name: u64, value: &[u8]) -> SysResult {
+    const SOL_SOCKET: u64 = 1;
+    const SO_PASSCRED: u64 = 16;
+    let u32_of = |v: &[u8]| v.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    // An internet socket's mark (CAP_NET_RAW or CAP_NET_ADMIN) and
+    // priority (above 6, the same): kept.
+    if let (SOL_SOCKET, 36 | 12, Ok(sock)) = (level, name, io.socket_of(fd)) {
+        let v = u32_of(value).ok_or(Errno::EINVAL)?;
+        let net = io.creds.capable(13) || io.creds.capable(12);
+        let mut o = sock.opts.lock().unwrap_or_else(|e| e.into_inner());
+        if name == 36 {
+            if !net {
+                return Err(Errno::EPERM);
+            }
+            o.mark = v;
+        } else {
+            if v > 6 && !net {
+                return Err(Errno::EPERM);
+            }
+            o.priority = v;
+        }
+        return Ok(0);
+    }
+    if level == SOL_SOCKET && name == SO_PASSCRED {
+        if let Some(v) = u32_of(value) {
+            let on = v != 0;
+            if let Ok(s) = io.unix_of(fd) {
+                s.set_passcred(on);
+            } else if let Ok(s) = io.remote_unix_of(fd) {
+                s.set_passcred(on);
+            } else if let Ok(s) = io.dgram_of(fd) {
+                s.set_passcred(on);
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// What a socket is to a BPF program: family, type, protocol (`None` for
+/// a descriptor that is not a socket).
+fn socket_kind(io: &FdIo<'_>, fd: i32) -> Option<crate::bpfsock::SockKind> {
+    let (family, ty) = socket_family_type(io, fd).ok()?;
+    let protocol = match (family, ty) {
+        (2 | 10, 1) => 6,
+        (2 | 10, 2) => 17,
+        (16, _) => io.netlink_of(fd).map_or(0, |s| s.protocol()),
+        _ => 0,
+    };
+    Some((family as u32, ty, protocol))
+}
+
+/// `getsockopt`: the kernel's own answer, then the group's getsockopt
+/// programs', which may answer otherwise (`BPF_CGROUP_RUN_PROG_GETSOCKOPT`).
 fn getsockopt(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u64, val: u64, optlen: u64) -> SysResult {
+    let user_len = if optlen != 0 { m.read_u32(optlen)? as i32 } else { 0 };
+    let r = getsockopt_kernel(io, m, fd, level, name, val, optlen);
+    let Some(kind) = socket_kind(io, fd) else { return r };
+    let retval = match &r {
+        Ok(_) => 0,
+        Err(e) => -e.0,
+    };
+    let (value, len) = if retval == 0 && optlen != 0 {
+        let l = m.read_u32(optlen)? as i32;
+        (if val != 0 { m.read(val, l.clamp(0, 4096) as usize)?.to_vec() } else { Vec::new() }, l)
+    } else {
+        (Vec::new(), 0)
+    };
+    let uid_gid = (io.creds.rgid() as u64) << 32 | io.creds.ruid() as u64;
+    let handle = Arc::clone(&io.fds.get(fd)?.handle);
+    match crate::bpfsock::getsockopt(&handle, kind, io.pid, uid_gid, level as i32, name as i32, user_len, retval, &value, len) {
+        None => r,
+        Some(Err(e)) => Err(e),
+        Some(Ok(None)) => Ok(0),
+        Some(Ok(Some((v, l)))) => {
+            if val != 0 {
+                m.write(val, &v)?;
+            }
+            if optlen != 0 {
+                m.write_u32(optlen, l as u32)?;
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn getsockopt_kernel(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, name: u64, val: u64, optlen: u64) -> SysResult {
     const SOL_SOCKET: u64 = 1;
     const SO_TYPE: u64 = 3;
     const SO_ERROR: u64 = 4;

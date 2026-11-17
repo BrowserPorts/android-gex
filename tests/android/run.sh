@@ -147,6 +147,7 @@ run() {
     bpfrun) check "$1" "bpfrun ok" 0 root ;;
     sockhook) check "$1" "sockhook ok" 0 root ;;
     cgroup1) check "$1" "cgroup1 ok" 0 root ;;
+    sockopt) check "$1" "sockopt ok" 0 root ;;
     abortmsg)
         # What gexc says of the crash is the test: natively the message is
         # a crash dumper's to find.
@@ -180,7 +181,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt"
     for p in $all; do
         run "$p"
     done

@@ -167,3 +167,168 @@ pub fn created(sock: &Arc<dyn FileHandle>, opts: &Mutex<SockOpts>, pid: i32, rui
     *opts.lock().unwrap_or_else(|e| e.into_inner()) = ctx.opts;
     Ok(())
 }
+
+/// A socket option as a `cgroup/getsockopt` or `cgroup/setsockopt`
+/// program sees it (`struct bpf_sockopt`, `cg_sockopt_is_valid_access`):
+/// its socket, the value (a buffer of at most a page), level and name
+/// (a setsockopt program's to change), the length, and for getsockopt the
+/// answer the kernel gave.
+pub struct SockoptCtx {
+    pub set: bool,
+    pub sock: Arc<dyn FileHandle>,
+    pub family: u32,
+    pub ty: u32,
+    pub protocol: u32,
+    pub level: i32,
+    pub optname: i32,
+    pub optlen: i32,
+    pub retval: i32,
+    pub buf: Vec<u8>,
+    pub uid_gid: u64,
+}
+
+impl Context for SockoptCtx {
+    fn load(&mut self, off: u32, size: u8) -> Option<Field> {
+        Some(match (off, size) {
+            (0, 8) => Field::Sock,
+            (8, 8) => Field::Buf(0),
+            (16, 8) => Field::Buf(self.buf.len() as u64),
+            (24, 4) => Field::Scalar(self.level as u32 as u64),
+            (28, 4) => Field::Scalar(self.optname as u32 as u64),
+            (32, 4) => Field::Scalar(self.optlen as u32 as u64),
+            (36, 4) if !self.set => Field::Scalar(self.retval as u32 as u64),
+            _ => return None,
+        })
+    }
+
+    fn store(&mut self, off: u32, size: u8, value: u64) -> Option<()> {
+        let v = value as u32 as i32;
+        match (off, size) {
+            (24, 4) if self.set => self.level = v,
+            (28, 4) if self.set => self.optname = v,
+            (32, 4) => self.optlen = v,
+            (36, 4) if !self.set => self.retval = v,
+            _ => return None,
+        }
+        Some(())
+    }
+
+    fn sock_load(&mut self, off: u32, size: u8) -> Option<u64> {
+        if size != 4 {
+            return None;
+        }
+        Some(match off {
+            4 => self.family,
+            8 => self.ty,
+            12 => self.protocol,
+            72 => 7,
+            _ => return None,
+        } as u64)
+    }
+
+    fn buf(&mut self) -> Option<&mut Vec<u8>> {
+        Some(&mut self.buf)
+    }
+
+    fn retval(&mut self) -> Option<&mut i32> {
+        Some(&mut self.retval)
+    }
+
+    fn socket_cookie(&mut self) -> u64 {
+        cookie_of(&self.sock)
+    }
+
+    fn current_uid_gid(&mut self) -> u64 {
+        self.uid_gid
+    }
+
+    fn socket(&mut self) -> Option<Arc<dyn FileHandle>> {
+        Some(Arc::clone(&self.sock))
+    }
+}
+
+/// The programs that run for `pid`'s group at `attach`, all of them,
+/// with `retval` as the answer so far (`bpf_prog_run_array_cg`): one
+/// that answers even makes it `EPERM` unless it is an error already.
+fn run_with_retval(pid: i32, attach: u32, ctx: &mut SockoptCtx) -> Option<i32> {
+    let progs = {
+        let t = crate::cgroup::tree();
+        let g = t.group_of(pid);
+        crate::cgroup::bpf_effective(&t, g, attach)
+    };
+    if progs.is_empty() {
+        return None;
+    }
+    for p in progs {
+        let r = crate::bpfrun::run(&p, ctx).unwrap_or(0);
+        if r & 1 == 0 && ctx.retval >= 0 {
+            ctx.retval = -1;
+        }
+    }
+    Some(ctx.retval)
+}
+
+/// What a socket is, as these programs see it: family, type, protocol.
+pub type SockKind = (u32, u32, u32);
+
+/// `__cgroup_bpf_run_filter_getsockopt`: after the kernel's own answer
+/// (`retval`, and what it wrote: `value` and `len`), the group's programs
+/// may answer otherwise. `None` when none are attached. Else the answer,
+/// and the value and length to give the caller (none to write when the
+/// program left the length 0).
+#[allow(clippy::too_many_arguments)]
+pub fn getsockopt(sock: &Arc<dyn FileHandle>, kind: SockKind, pid: i32, uid_gid: u64, level: i32, optname: i32, user_len: i32, retval: i32, value: &[u8], len: i32) -> Option<Result<Option<(Vec<u8>, i32)>, Errno>> {
+    use crate::bpfprog::attach::GETSOCKOPT;
+    // The program's buffer: the caller's length, at most a page.
+    let max = user_len.clamp(0, 4096) as usize;
+    let mut ctx = SockoptCtx { set: false, sock: Arc::clone(sock), family: kind.0, ty: kind.1, protocol: kind.2, level, optname, optlen: user_len, retval, buf: vec![0; max], uid_gid };
+    if retval == 0 {
+        ctx.optlen = len;
+        let n = (len.max(0) as usize).min(max).min(value.len());
+        ctx.buf[..n].copy_from_slice(&value[..n]);
+    }
+    let r = run_with_retval(pid, GETSOCKOPT, &mut ctx)?;
+    if r < 0 {
+        return Some(Err(Errno(if r == -1 { Errno::EPERM.0 } else { -r })));
+    }
+    if ctx.optlen > max as i32 || ctx.optlen < 0 {
+        return Some(Err(Errno::EFAULT));
+    }
+    if ctx.optlen == 0 {
+        return Some(Ok(None));
+    }
+    Some(Ok(Some((ctx.buf[..ctx.optlen as usize].to_vec(), ctx.optlen))))
+}
+
+/// What a setsockopt program made of a call.
+pub enum SetVerdict {
+    /// Done: the kernel is not asked (the program set the length to -1).
+    Bypass,
+    /// The kernel is asked, with this level, name and value.
+    Pass(i32, i32, Vec<u8>),
+}
+
+/// `__cgroup_bpf_run_filter_setsockopt`: before the kernel, the group's
+/// programs may refuse the call, answer it themselves, or change it.
+#[allow(clippy::too_many_arguments)]
+pub fn setsockopt(sock: &Arc<dyn FileHandle>, kind: SockKind, pid: i32, uid_gid: u64, level: i32, optname: i32, value: &[u8]) -> Option<Result<SetVerdict, Errno>> {
+    use crate::bpfprog::attach::SETSOCKOPT;
+    let optlen = value.len() as i32;
+    let max = (optlen.max(16) as usize).min(4096);
+    let mut buf = vec![0; max];
+    let n = value.len().min(max);
+    buf[..n].copy_from_slice(&value[..n]);
+    let mut ctx = SockoptCtx { set: true, sock: Arc::clone(sock), family: kind.0, ty: kind.1, protocol: kind.2, level, optname, optlen, retval: 0, buf, uid_gid };
+    let r = run_with_retval(pid, SETSOCKOPT, &mut ctx)?;
+    if r < 0 {
+        return Some(Err(Errno(if r == -1 { Errno::EPERM.0 } else { -r })));
+    }
+    if ctx.optlen == -1 {
+        return Some(Ok(SetVerdict::Bypass));
+    }
+    if ctx.optlen > max as i32 || ctx.optlen < -1 {
+        return Some(Err(Errno::EFAULT));
+    }
+    let v = if ctx.optlen == 0 { value.to_vec() } else { ctx.buf[..ctx.optlen as usize].to_vec() };
+    Some(Ok(SetVerdict::Pass(ctx.level, ctx.optname, v)))
+}

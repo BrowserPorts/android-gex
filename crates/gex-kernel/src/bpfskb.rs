@@ -178,7 +178,7 @@ impl Context for Skb {
         let (base, fsize, v) = self.value(off)?;
         match v {
             // A pointer is had whole.
-            Field::Packet(_) => (off == base && size == 4).then_some(v),
+            Field::Packet(_) | Field::Sock | Field::Buf(_) => (off == base && size == 4).then_some(v),
             Field::Scalar(x) => {
                 // The field whole, or a narrower part of it.
                 let within = off - base;

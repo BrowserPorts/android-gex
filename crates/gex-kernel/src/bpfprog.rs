@@ -126,6 +126,7 @@ pub const HELPERS: &[(i32, &str, bool)] = &[
     (143, "store_hdr_opt", false),
     (144, "reserve_hdr_opt", false),
     (164, "for_each_map_elem", false),
+    (186, "get_retval", false),
     (187, "set_retval", false),
 ];
 

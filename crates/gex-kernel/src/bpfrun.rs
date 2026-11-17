@@ -50,6 +50,10 @@ pub enum Field {
     Scalar(u64),
     /// A pointer into the packet, at this offset from its start.
     Packet(u64),
+    /// A pointer to the context's socket (`struct bpf_sock`).
+    Sock,
+    /// A pointer into the context's buffer (a socket option's value).
+    Buf(u64),
 }
 
 /// What a program runs on, by its type: the context's fields as the
@@ -86,6 +90,20 @@ pub trait Context {
     fn socket(&mut self) -> Option<Arc<dyn crate::vfs::FileHandle>> {
         None
     }
+    /// A field of the context's socket, as `struct bpf_sock` has it.
+    fn sock_load(&mut self, off: u32, size: u8) -> Option<u64> {
+        let _ = (off, size);
+        None
+    }
+    /// The context's buffer (a socket option's value), writable.
+    fn buf(&mut self) -> Option<&mut Vec<u8>> {
+        None
+    }
+    /// The answer the program's caller will give (`bpf_get_retval`,
+    /// `bpf_set_retval`): a cgroup program's.
+    fn retval(&mut self) -> Option<&mut i32> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -93,6 +111,10 @@ enum Region {
     Stack(Vec<u8>),
     Ctx,
     Packet,
+    /// The context's socket.
+    Sock,
+    /// The context's buffer.
+    Buf,
     Value(Arc<Map>, ValueAt),
     Map(Arc<Map>),
     /// Bytes a helper hands a program to read (a key it walks to).
@@ -128,6 +150,8 @@ struct Machine<'p, 'c> {
 
 const PACKET: usize = 1;
 const CTX: usize = 0;
+const SOCK: usize = 2;
+const BUF: usize = 3;
 
 impl Machine<'_, '_> {
     fn bad(op: u32, a: u64) -> Fault {
@@ -148,9 +172,13 @@ impl Machine<'_, '_> {
             Region::Ctx => match self.ctx.load(off as u32, size) {
                 Some(Field::Scalar(v)) => Some(v),
                 Some(Field::Packet(o)) => Some(addr(PACKET, o)),
+                Some(Field::Sock) => Some(addr(SOCK, 0)),
+                Some(Field::Buf(o)) => Some(addr(BUF, o)),
                 None => None,
             },
             Region::Packet => self.ctx.packet().and_then(|p| get(p)),
+            Region::Sock => self.ctx.sock_load(off as u32, size),
+            Region::Buf => self.ctx.buf().and_then(|b| get(b)),
             Region::Value(m, at) => m.with_value(at, |v| get(v)).flatten(),
             Region::Bytes(b) => get(b),
             Region::Map(_) => None,
@@ -169,7 +197,8 @@ impl Machine<'_, '_> {
             Region::Stack(b) => put(b),
             Region::Ctx => self.ctx.store(off as u32, size, v),
             Region::Packet if self.ctx.packet_writable() => self.ctx.packet().and_then(|p| put(p)),
-            Region::Packet => None,
+            Region::Packet | Region::Sock => None,
+            Region::Buf => self.ctx.buf().and_then(|b| put(b)),
             Region::Value(m, at) => m.with_value(at, |v| put(v)).flatten(),
             Region::Map(_) | Region::Bytes(_) => None,
         };
@@ -254,6 +283,16 @@ impl Machine<'_, '_> {
                 }
             }
             15 => self.ctx.current_uid_gid(),
+            // get_retval, set_retval: the answer a cgroup program's caller
+            // gives.
+            186 => self.ctx.retval().map_or(0, |v| *v as i64 as u64),
+            187 => match self.ctx.retval() {
+                Some(v) => {
+                    *v = r[1] as i32;
+                    0
+                }
+                None => return Err(Fault::Helper(id)),
+            },
             // for_each_map_elem(map, callback, ctx, flags): the callback
             // with each element's key and value until it answers other than
             // 0; how many it was given.
@@ -283,7 +322,7 @@ impl Machine<'_, '_> {
             // (BPF_SK_STORAGE_GET_F_CREATE), from `value` or zeros.
             107 | 108 => {
                 let m = self.map_arg(op, r[1])?;
-                let sock = (r[2] == addr(CTX, 0)).then(|| self.ctx.socket()).flatten();
+                let sock = (r[2] == addr(CTX, 0) || r[2] == addr(SOCK, 0)).then(|| self.ctx.socket()).flatten();
                 let Some(sock) = sock else { return Ok(0) };
                 if id == 108 {
                     return Ok(match m.sk_delete_of(&sock) {
@@ -551,7 +590,7 @@ fn alu32(op: u8, signed: bool, a: u32, b: u32) -> u32 {
 
 /// Run `prog` on `ctx`: its return value, or why it has none.
 pub fn run(prog: &Prog, ctx: &mut dyn Context) -> Result<u64, Fault> {
-    let mut m = Machine { prog, regions: vec![Region::Ctx, Region::Packet], ctx, budget: BUDGET, depth: 0 };
+    let mut m = Machine { prog, regions: vec![Region::Ctx, Region::Packet, Region::Sock, Region::Buf], ctx, budget: BUDGET, depth: 0 };
     let r = m.exec(0, [addr(CTX, 0), 0, 0, 0, 0]);
     if let Err(f) = &r {
         let name = String::from_utf8_lossy(&prog.name).trim_end_matches('\0').to_string();
