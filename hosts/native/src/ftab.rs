@@ -694,6 +694,7 @@ pub(crate) fn publish_bridges(sh: &Arc<Mutex<JitShared>>, entries: &[u64], pages
         table_slots: s.page_table.slots(),
         bridges: slots,
         pages: Default::default(),
+        dense: None,
     });
     s.registry.push(unit);
     crate::REGISTRY_LEN.fetch_max(s.registry.len(), std::sync::atomic::Ordering::Release);

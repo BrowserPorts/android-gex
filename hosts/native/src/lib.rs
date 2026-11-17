@@ -31,6 +31,7 @@ mod stall;
 mod usage;
 pub(crate) mod ftab;
 pub(crate) mod door;
+mod dense;
 pub mod wayland;
 
 /// The most functions wasmtime takes in one module, and what a translated
@@ -467,6 +468,8 @@ struct Jit {
     limits: gex_xlate::BlockLimits,
     /// This store's function table (`ftab`), made at the first need.
     ftab: Option<ftab::Store>,
+    /// This store's `blocks`, when dispatch is dense (`dense`).
+    blocks: Option<dense::Blocks>,
 }
 
 /// At least as long as every process's `JitShared::registry` (raised after
@@ -493,6 +496,8 @@ struct CompiledUnit {
     bridges: Vec<u32>,
     /// The guest pages it has code on or gave slots to ([`CompiledUnit::pages`]).
     pages: std::sync::OnceLock<Vec<u64>>,
+    /// Its dense blocks and their base in `blocks` (`dense`).
+    dense: Option<gex_emit::dense::Section>,
 }
 
 impl CompiledUnit {
@@ -569,6 +574,9 @@ struct JitShared {
     /// space: a fork shares them (its table has their units), an exec starts
     /// empty, so every program that maps an object gets its unit.
     elf_units: Vec<pe_units::ElfPlaced>,
+    /// Dense dispatch's numbering and maps (`dense`): with the address
+    /// space, as `relocated` is.
+    dense: dense::Maps,
     /// Diagnostics, reported under --verbose.
     blocks: usize,
     calls: usize,
@@ -597,6 +605,7 @@ impl JitShared {
             relocated: Arc::new(Mutex::new(self.relocated.lock().unwrap_or_else(|e| e.into_inner()).clone())),
             trampolines: self.trampolines,
             elf_units: self.elf_units.clone(),
+            dense: self.dense.clone(),
             blocks: 0,
             calls: 0,
         }
@@ -644,7 +653,10 @@ fn xlate_identity(xlate: &Options) -> String {
     o.image_elf = None;
     let mut intrinsics: Vec<_> = o.intrinsics.drain().collect();
     intrinsics.sort_by_key(|(a, _)| *a);
-    format!("{o:?} {intrinsics:?}")
+    // Dense dispatch changes the image's bytes (`blocks`, the dispatch
+    // code); said only when on, so the classic keys stay what they were.
+    let dense = if dense::on() { " dense" } else { "" };
+    format!("{o:?} {intrinsics:?}{dense}")
 }
 
 fn cache_key(image: &Image, xlate: &Options, build: &str) -> String {
@@ -1002,6 +1014,7 @@ fn run_program_with(
     let fresh_process = inherited.is_none();
     gex_kernel::syscalls::set_thread_runners(gex_kernel::syscalls::ThreadRunners { take: take_runner, give: give_runner });
     fixed_random();
+    dense::start();
     let image = &program.exe;
     // Before anything is translated: a 32-bit (i386) program's code is
     // decoded in compatibility mode, and the kernel below speaks its ABI.
@@ -1473,6 +1486,7 @@ fn run_program_with(
                 relocated: Default::default(),
                 trampolines: false,
                 elf_units: Vec::new(),
+                dense: Default::default(),
             })),
             engine: engine.clone(),
             linker: linker.clone(),
@@ -1483,7 +1497,14 @@ fn run_program_with(
             deferred: Vec::new(),
             limits: xlate.limits,
             ftab: None,
+            blocks: None,
         });
+        // Dense dispatch's maps, before anything is translated here.
+        if dense::on() {
+            let maps = dense::Maps::make(store.data_mut())?;
+            store.data().jit.as_ref().unwrap().shared.lock().unwrap_or_else(|e| e.into_inner()).dense = maps;
+        }
+        store_blocks(&mut store, &instance)?;
         if let Some(t) = gex_kernel::ftab::translator() {
             let process = store.data().jit.as_ref().map(|j| j.shared.lock().unwrap_or_else(|e| e.into_inner()).ftab.process.0);
             if let Some(process) = process {
@@ -3247,8 +3268,10 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             deferred: Vec::new(),
             limits: cx.limits,
             ftab: None,
+            blocks: None,
         });
     }
+    store_blocks(&mut store, &instance)?;
     replay_into(&mut store, Take::at_start())?;
     if cx.opts.aot_only {
         aot_only::bind_root(&mut store, &instance)?;
@@ -3636,8 +3659,10 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             deferred: Vec::new(),
             limits: cx.limits,
             ftab: None,
+            blocks: None,
         });
     }
+    store_blocks(&mut store, &instance)?;
 
     // This thread's table starts with only what the image module installed,
     // so everything translated since has to be replayed into it before the
@@ -6469,6 +6494,9 @@ fn publish_unit(
         jit_stats::WASM_BYTES.fetch_add(translated.wasm.len() as u64, Relaxed);
         jit_stats::SLOTS.fetch_max(translated.table_slots, Relaxed);
     }
+    // Its range of `blocks`, when dense (the words are written as each
+    // store installs it: `install_unit`).
+    let dense = shared.lock().unwrap_or_else(|e| e.into_inner()).dense.register(&translated.wasm)?;
     let unit = Arc::new(CompiledUnit {
         module: Some(module),
         module_id: translated.module_id,
@@ -6477,6 +6505,7 @@ fn publish_unit(
         table_slots: translated.table_slots,
         bridges: Vec::new(),
         pages: Default::default(),
+        dense,
     });
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     for &(page, base) in &translated.dir_entries {
@@ -6541,7 +6570,7 @@ fn install_unit(
     mut cx: impl wasmtime::AsContextMut<Data = HostState>,
     unit: &CompiledUnit,
 ) -> Result<()> {
-    let (memory, linker, tables) = {
+    let (memory, linker, tables, blocks) = {
         let data = cx.as_context().data();
         let jit = data
             .jit
@@ -6553,6 +6582,7 @@ fn install_unit(
                 .ok_or_else(|| anyhow!("guest memory unavailable"))?,
             jit.linker.clone(),
             jit.tables.clone(),
+            jit.blocks.clone(),
         )
     };
     // Slots are allocated in one space that spans every table, so the figure
@@ -6563,6 +6593,10 @@ fn install_unit(
         .get(cx.as_context_mut(), 0)
         .ok_or_else(|| anyhow!("dispatch table is empty"))?;
     for (i, t) in tables.iter().enumerate() {
+        // A dense table's slots are words in the maps, not this table's.
+        if blocks.is_some() && gex_emit::dense::table(i) {
+            continue;
+        }
         let want = (unit.table_slots as u64)
             .saturating_sub(i as u64 * per)
             .min(per);
@@ -6607,6 +6641,19 @@ fn install_unit(
             exports::dispatch_table(i),
             *t,
         )?;
+    }
+    // Dense: this store's `blocks`, long enough for the module's entries,
+    // and where they go in it.
+    if let Some(b) = &blocks {
+        let (base, span) = unit.dense.as_ref().map_or((0, 0), |d| (d.base, d.span()));
+        b.reach(cx.as_context_mut(), base + span)?;
+        linker.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, gex_emit::dense::TABLE_NAME, b.table)?;
+        let g = wasmtime::Global::new(
+            cx.as_context_mut(),
+            wasmtime::GlobalType::new(wasmtime::ValType::I32, wasmtime::Mutability::Const),
+            Val::I32(base as i32),
+        )?;
+        linker.define(cx.as_context_mut(), gex_abi::IMPORT_MODULE, gex_emit::dense::GLOBAL, g)?;
     }
     // A module of code in the process's other mode reads its directory
     // through this (`gex_abi::imports::ALT_DIR`); the others ignore it.
@@ -6659,6 +6706,10 @@ fn install_unit(
     // idempotent: it lives in shared guest memory.
     // Only entries still current: replaying an old unit into a new store
     // must not point a page retired since back at its abandoned slots.
+    // Its dense slots' words, in this store's process's memory.
+    if let (Some(b), Some(d)) = (&blocks, &unit.dense) {
+        b.write(&memory, d)?;
+    }
     write_current_dir(&cx, memory, unit)?;
     cx.as_context_mut()
         .data_mut()
@@ -7646,7 +7697,25 @@ fn dispatch_tables_capped() -> bool {
 
 /// Where a process's run-time page numbering starts: after the image
 /// module's pages (`next`), in the second table under the debugging cap.
+/// This store's `blocks`, when dispatch is dense (`dense`): the image
+/// instance's, its entry 0 the miss stub made an entry.
+fn store_blocks(store: &mut Store<HostState>, instance: &wasmtime::Instance) -> Result<()> {
+    if !dense::on() {
+        return Ok(());
+    }
+    let Some(jit) = store.data().jit.as_ref() else { return Ok(()) };
+    let (engine, maps, t0) = (jit.engine.clone(), jit.shared.lock().unwrap_or_else(|e| e.into_inner()).dense.clone(), jit.tables[0]);
+    let miss = match t0.get(&mut *store, 0) {
+        Some(Ref::Func(Some(f))) => f,
+        _ => bail!("dispatch table 0 has no miss stub"),
+    };
+    let blocks = dense::Blocks::of(&mut *store, &engine, instance, miss, &maps)?;
+    store.data_mut().jit.as_mut().unwrap().blocks = blocks;
+    Ok(())
+}
+
 fn first_runtime_slot(next: u64) -> u64 {
+    let next = dense::first_slot(next);
     if dispatch_tables_capped() {
         next.max(gex_xlate::PageTable::slots_per_table())
     } else {
@@ -8075,7 +8144,7 @@ fn fill_empty_slot(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, ctx_a
     if gex_abi::X86 {
         return Ok(false);
     }
-    let (memory, tables) = {
+    let (memory, tables, blocks) = {
         let data = cx.as_context().data();
         let Some(jit) = data.jit.as_ref() else { return Ok(false) };
         // A wasm32 program's null call is its own null function pointer,
@@ -8083,7 +8152,7 @@ fn fill_empty_slot(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, ctx_a
         if jit.shared.lock().unwrap_or_else(|e| e.into_inner()).wasm_program {
             return Ok(false);
         }
-        (data.memory.clone(), jit.tables.clone())
+        (data.memory.clone(), jit.tables.clone(), jit.blocks.clone())
     };
     let Some(memory) = memory else { return Ok(false) };
     // The dispatch's target, as the dispatcher recorded it (as for a
@@ -8094,6 +8163,17 @@ fn fill_empty_slot(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, ctx_a
     // The miss span is the stub's from the start.
     if slot.is_miss() {
         return Ok(false);
+    }
+    // A dense slot: its word names an entry of `blocks` this store has
+    // nothing in, or has not got.
+    if let Some(b) = &blocks {
+        if let Some(w) = b.word_at(&memory, slot.table, slot.index) {
+            let filled = dense::fill(cx.as_context_mut(), b, w)?;
+            if filled {
+                jit_stats::FILLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok(filled);
+        }
     }
     let Some(t) = tables.get(slot.table).copied() else { return Ok(false) };
     let size = t.size(cx.as_context_mut());

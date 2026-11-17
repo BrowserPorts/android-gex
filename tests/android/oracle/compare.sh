@@ -34,7 +34,7 @@ fi
 # owners (root.sh), and a gexc that is the host's root says them.
 gexc() {
     sudo env GEX_FIXED_RANDOM="$GEX_FIXED_RANDOM" GEX_CACHE_MAX_BYTES="$GEX_CACHE_MAX_BYTES" \
-        ${GEX_CACHE_BUILD:+GEX_CACHE_BUILD="$GEX_CACHE_BUILD"} ${GEX_TIME_SCALE:+GEX_TIME_SCALE="$GEX_TIME_SCALE"} "$@"
+        ${GEX_CACHE_BUILD:+GEX_CACHE_BUILD="$GEX_CACHE_BUILD"} ${GEX_TIME_SCALE:+GEX_TIME_SCALE="$GEX_TIME_SCALE"} ${GEX_DENSE:+GEX_DENSE="$GEX_DENSE"} "$@"
 }
 ENVS="PATH=/system/bin HOME=/ ANDROID_ROOT=/system ANDROID_DATA=/data TMPDIR=/data/local/tmp"
 ERR=$(mktemp)

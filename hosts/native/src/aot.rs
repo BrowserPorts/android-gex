@@ -306,6 +306,7 @@ pub(crate) fn install_shared(
             table_slots: meta.table_slots,
             bridges: Vec::new(),
             pages: Default::default(),
+            dense: None,
         });
         {
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());

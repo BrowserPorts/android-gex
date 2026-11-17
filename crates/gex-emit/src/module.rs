@@ -902,9 +902,11 @@ impl ModuleBuilder {
             id_global: None,
             alt_dir,
         };
-        // Defined before profiling's global, and only with no global
-        // imported (`Module::add_global` numbers from 0).
-        if linkage == Linkage::Shared && dense_global.is_none() && MODULE_ID_IN_GLOBAL.with(|g| g.get()) {
+        // Defined before profiling's global (`Module::add_global` numbers
+        // after the imported ones, `dense_base` and `alt_dir` among them),
+        // dense or not: without it a dense module's id is in its bytes, and
+        // the native host's cache, keyed by the bytes, never finds it again.
+        if linkage == Linkage::Shared && MODULE_ID_IN_GLOBAL.with(|g| g.get()) {
             let g = b.m.add_global(ValType::I32, true, 0);
             b.m.export(MODULE_ID_GLOBAL, ExportKind::Global, g);
             b.id_global = Some(g);
