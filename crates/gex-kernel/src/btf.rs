@@ -424,6 +424,38 @@ impl Btf {
         }
     }
 
+    /// Whether a value of type `id` holds a field the kernel manages
+    /// (`btf_parse_fields`): a lock, a timer, a work item, a list or tree
+    /// head or node, a reference count, or a pointer tagged as a kernel
+    /// one, as a member of the struct or a struct or array within it, or
+    /// a variable of a datasec. A map with one has a record, which some
+    /// commands refuse.
+    pub fn has_special_fields(&self, id: u32) -> bool {
+        const NAMES: &[&str] = &[
+            "bpf_spin_lock", "bpf_res_spin_lock", "bpf_timer", "bpf_wq", "bpf_task_work", "bpf_list_head", "bpf_list_node",
+            "bpf_rb_root", "bpf_rb_node", "bpf_refcount",
+        ];
+        const TAGS: &[&str] = &["kptr", "kptr_untrusted", "percpu_kptr", "uptr"];
+        fn walk(b: &Btf, id: u32, depth: u32, top: bool) -> bool {
+            if depth > 32 {
+                return false;
+            }
+            let Ok(r) = b.resolve(id) else { return false };
+            let Some(Some(t)) = b.types.get(r as usize) else { return false };
+            match t.kind {
+                kind::STRUCT if NAMES.contains(&t.name.as_str()) => !top,
+                kind::STRUCT | kind::DATASEC => t.refs.iter().any(|&m| walk(b, m, depth + 1, false)),
+                kind::VAR => walk(b, t.size_type, depth + 1, false),
+                kind::ARRAY => !top && walk(b, t.array.unwrap().0, depth + 1, false),
+                kind::PTR if !top => {
+                    matches!(b.types.get(t.size_type as usize), Some(Some(p)) if p.kind == kind::TYPE_TAG && TAGS.contains(&p.name.as_str()))
+                }
+                _ => false,
+            }
+        }
+        walk(self, id, 0, true)
+    }
+
     /// Whether type `id` is a datasec (`btf_type_is_datasec`).
     pub fn is_datasec(&self, id: u32) -> bool {
         matches!(self.types.get(id as usize), Some(Some(t)) if t.kind == kind::DATASEC)

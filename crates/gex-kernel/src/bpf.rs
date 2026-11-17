@@ -37,6 +37,7 @@ pub mod cmd {
     pub const PROG_DETACH: u64 = 9;
     pub const PROG_QUERY: u64 = 16;
     pub const PROG_TEST_RUN: u64 = 10;
+    pub const MAP_FREEZE: u64 = 22;
 }
 
 /// Map types (`enum bpf_map_type`).
@@ -108,6 +109,25 @@ pub struct Map {
     data: Mutex<Data>,
     /// Counted at each change a mapping would show (a mappable array's).
     changes: std::sync::atomic::AtomicU64,
+    /// Frozen (`BPF_MAP_FREEZE`): no longer written through the system
+    /// call or a new mapping. Changed under `writers`' lock.
+    frozen: std::sync::atomic::AtomicBool,
+    /// How many writable mappings there are of it (`bpf_map_write_active`),
+    /// each held by a [`WriteHold`] for as long as it lasts: while any
+    /// does, it cannot be frozen.
+    writers: Mutex<u64>,
+}
+
+/// A writable mapping of a map, for as long as the mapping lasts (and in
+/// a forked child, its copy): what makes the map write-active.
+#[derive(Debug)]
+struct WriteHold(Arc<Map>);
+
+impl Drop for WriteHold {
+    fn drop(&mut self) {
+        let mut n = self.0.writers.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+    }
 }
 
 /// A hash map's elements: in the order they were put there, and where
@@ -262,7 +282,7 @@ impl Map {
                 return Err(Errno::EINVAL);
             }
             let ring = Ring { consumer: vec![0; PAGE as usize], producer: vec![0; PAGE as usize], data: vec![0; max_entries as usize], changes: 1 };
-            return Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(Data::Ringbuf(ring)), changes: std::sync::atomic::AtomicU64::new(1) });
+            return Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(Data::Ringbuf(ring)), changes: std::sync::atomic::AtomicU64::new(1), frozen: Default::default(), writers: Mutex::new(0) });
         }
         // (Socket storage has no number of entries: one a socket.)
         if value_size == 0 || (max_entries == 0) != (ty == map_type::SK_STORAGE) || key_size > MAX_KEY {
@@ -357,7 +377,7 @@ impl Map {
         // A devmap's lookup gives programs the ifindex itself, so they may
         // not write it (`dev_map_init_map`).
         let flags = if ty == map_type::DEVMAP_HASH { flags | RDONLY_PROG } else { flags };
-        Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(data), changes: std::sync::atomic::AtomicU64::new(1) })
+        Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(data), changes: std::sync::atomic::AtomicU64::new(1), frozen: Default::default(), writers: Mutex::new(0) })
     }
 
     pub fn id(&self) -> u32 {
@@ -521,6 +541,10 @@ impl Map {
     /// Something a mapping of the map shows has changed: counted, and, for
     /// a map that can be mapped, said, so that mappings are brought up to
     /// date at their processes' next system calls (`crate::locks`).
+    fn is_frozen(&self) -> bool {
+        self.frozen.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn changed(&self) {
         if self.flags & map_flag::MMAPABLE != 0 {
             self.changes.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -848,11 +872,15 @@ impl FileHandle for MapFile {
         // An array: if it was made mappable, its data's pages
         // (`array_map_mmap`); not to be written for a map programs only
         // read.
+        let writes = prot & crate::mem::prot::WRITE != 0;
         if let Data::Array(v) = &*map.lock() {
             if !shared {
                 return Err(Errno::EINVAL);
             }
-            if prot & crate::mem::prot::WRITE != 0 && map.flags & map_flag::RDONLY_PROG != 0 {
+            if writes && map.is_frozen() {
+                return Err(Errno::EPERM);
+            }
+            if writes && map.flags & map_flag::RDONLY_PROG != 0 {
                 return Err(Errno::EACCES);
             }
             if map.flags & map_flag::MMAPABLE == 0 || offset.checked_add(len).is_none_or(|end| end > v.len() as u64) {
@@ -863,6 +891,9 @@ impl FileHandle for MapFile {
         let Data::Ringbuf(ring) = &*self.map.lock() else { return Err(crate::btf::ENOTSUPP) };
         if !shared {
             return Err(Errno::EINVAL);
+        }
+        if writes && map.is_frozen() {
+            return Err(Errno::EPERM);
         }
         if prot & crate::mem::prot::WRITE != 0 && (offset != 0 || len != PAGE) {
             return Err(Errno::EPERM);
@@ -875,6 +906,21 @@ impl FileHandle for MapFile {
     /// A mapping made read-only stays so (`bpf_map_mmap`).
     fn read_only_mapping_stays(&self) -> bool {
         true
+    }
+    /// A writable mapping makes the map write-active until it ends; one
+    /// asked of a map frozen since [`FileHandle::may_map`] is `EPERM`
+    /// (`bpf_map_mmap` checks and counts under one lock).
+    fn map_hold(&self, prot: u32, shared: bool) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Errno> {
+        if !shared || prot & crate::mem::prot::WRITE == 0 {
+            return Ok(None);
+        }
+        let mut n = self.map.writers.lock().unwrap_or_else(|e| e.into_inner());
+        if self.map.is_frozen() {
+            return Err(Errno::EPERM);
+        }
+        *n += 1;
+        drop(n);
+        Ok(Some(Arc::new(WriteHold(Arc::clone(&self.map)))))
     }
     fn mapped_len(&self) -> Option<u64> {
         match &*self.map.lock() {
@@ -1018,11 +1064,20 @@ fn map_of(c: &Caller<'_>, fd: i32) -> Result<(Arc<Map>, bool, bool), Errno> {
     let file = c.fds.get(fd)?;
     match file.handle.bpf_object() {
         Some(Object::Map(map)) => {
+            // A frozen map is not the system call's to write
+            // (`map_get_sys_perms`), whatever the descriptor may do.
             let (r, w) = file.handle.bpf_access().unwrap_or((true, true));
+            let w = w && !map.is_frozen();
             Ok((map, r, w))
         }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// Whether `map`'s value has fields the kernel manages
+/// (`map->record`, from its BTF).
+fn map_has_record(map: &Map) -> bool {
+    map.btf.as_ref().is_some_and(|(btf, _, value)| btf.has_special_fields(*value))
 }
 
 /// `bpf(cmd, attr, size)`.
@@ -1227,6 +1282,25 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
                     m.write(u64_at(16), &next)?;
                 }
             }
+            Ok(0)
+        }
+        // `map_freeze`: the descriptor must be able to write it, and no
+        // writable mapping of it be left; frozen, the system call and new
+        // mappings no longer write it (programs still may).
+        cmd::MAP_FREEZE => {
+            zero_from(4)?;
+            let (map, _, w) = map_of(c, u32_at(0) as i32)?;
+            if map_has_record(&map) {
+                return Err(crate::btf::ENOTSUPP);
+            }
+            if !w {
+                return Err(Errno::EPERM);
+            }
+            let n = map.writers.lock().unwrap_or_else(|e| e.into_inner());
+            if *n != 0 || map.is_frozen() {
+                return Err(Errno::EBUSY);
+            }
+            map.frozen.store(true, std::sync::atomic::Ordering::Release);
             Ok(0)
         }
         cmd::OBJ_PIN => {

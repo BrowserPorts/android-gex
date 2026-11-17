@@ -141,6 +141,7 @@ run() {
     bpfprog) check "$1" "bpfprog ok" 0 root ;;
     bpfmaps2) check "$1" "bpfmaps2 ok" 0 root ;;
     ringbuf) check "$1" "ringbuf ok" 0 root ;;
+    bpffreeze) check "$1" "bpffreeze ok" 0 root ;;
     bpfinfo) check "$1" "bpfinfo ok" 0 root ;;
     cgroup2) check "$1" "cgroup2 ok" 0 root ;;
     cgroupbpf) check "$1" "cgroupbpf ok" 0 root ;;
@@ -182,7 +183,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze"
     for p in $all; do
         run "$p"
     done

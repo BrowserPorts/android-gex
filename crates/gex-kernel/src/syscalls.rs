@@ -5601,6 +5601,7 @@ impl MapIo<'_> {
             let file = self.fds.get(fd)?;
             let name = file.path.clone();
             file.handle.may_map(offset, len_aligned, prot_bits, flags & crate::mem::flags::SHARED != 0)?;
+            let hold = MapHold(file.handle.map_hold(prot_bits, flags & crate::mem::flags::SHARED != 0)?.into_iter().collect());
             if file.handle.maps_own_memory() {
                 let start = self.mem.lock().mmap(addr, len, prot_bits, flags | mflags::ANONYMOUS, &name)?;
                 file.handle.mapped(start, len);
@@ -5664,6 +5665,7 @@ impl MapIo<'_> {
                     // read from the file the others are written back to.
                     if flags & crate::mem::flags::FIXED == 0 || addr == at {
                         mm.log.shared_maps.alias(i, at, len_aligned);
+                        mm.log.shared_maps.hold(i, hold);
                         return Ok(at);
                     }
                 }
@@ -5752,6 +5754,7 @@ impl MapIo<'_> {
                     pages,
                     changes: Arc::new(std::sync::atomic::AtomicU64::new(changes)),
                     seen: Arc::new(std::sync::atomic::AtomicU64::new(crate::locks::written(&path_of_map))),
+                    hold,
                 });
             }
             return Ok(start);
@@ -11403,6 +11406,20 @@ pub struct SharedMap {
     /// no count (`changes` 0): what [`sync_shared_file`] compares to know
     /// that no other process has written it back since.
     pub seen: Arc<std::sync::atomic::AtomicU64>,
+    /// What the file holds for the mapping ([`crate::vfs::FileHandle::map_hold`]),
+    /// for as long as it lasts: an alias's are added to it, and go when
+    /// the whole does.
+    pub hold: MapHold,
+}
+
+/// [`SharedMap::hold`].
+#[derive(Clone, Default)]
+pub struct MapHold(pub Vec<Arc<dyn std::any::Any + Send + Sync>>);
+
+impl std::fmt::Debug for MapHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MapHold({})", self.0.len())
+    }
 }
 
 /// Page hashes of a file range a shared mapping held, kept past its
@@ -11700,7 +11717,7 @@ impl SharedMaps {
             .collect::<Option<Arc<[std::sync::atomic::AtomicU64]>>>()?;
         // The count is not carried: the child's hashes are taken as unknown
         // against the file's count, and its next mapping hashes afresh.
-        self.push(SharedMap { start, len, file, offset, holders, pages, changes: Default::default(), seen: Default::default() });
+        self.push(SharedMap { start, len, file, offset, holders, pages, changes: Default::default(), seen: Default::default(), hold: MapHold::default() });
         Some(())
     }
 
@@ -11735,6 +11752,15 @@ impl SharedMaps {
     pub fn alias(&mut self, i: usize, at: u64, len: u64) {
         self.list[i].holders.push((at, len));
         self.publish();
+    }
+
+    /// What the file holds for an aliasing `mmap` of mapping `i`, kept
+    /// with the mapping's own ([`SharedMap::hold`]).
+    pub fn hold(&mut self, i: usize, hold: MapHold) {
+        if !hold.0.is_empty() {
+            self.list[i].hold.0.extend(hold.0);
+            self.publish();
+        }
     }
 
     /// What an `munmap` of `[addr, addr + len)` (page-aligned) is to the
@@ -19344,8 +19370,8 @@ mod tests {
         let mut maps = SharedMaps::new();
         let view = Arc::clone(maps.view());
         assert!(view.of(&a).is_none());
-        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x4000]), changes: Default::default(), seen: Default::default() });
-        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default(), seen: Default::default() });
+        maps.push(SharedMap { start: 0x10000, len: 0x4000, file: Arc::clone(&a), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x4000]), changes: Default::default(), seen: Default::default(), hold: MapHold::default() });
+        maps.push(SharedMap { start: 0x20000, len: 0x1000, file: Arc::clone(&b), offset: 0, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default(), seen: Default::default(), hold: MapHold::default() });
         let held = view.get();
         assert_eq!(view.of(&a).map(|m| (m.start, m.len)), Some((0x10000, 0x4000)));
         assert_eq!(view.of(&b).map(|m| m.start), Some(0x20000));
@@ -19364,7 +19390,7 @@ mod tests {
     fn a_pool_is_the_mapping_that_holds_it() {
         let file = |name: &str| OpenFile::new(Arc::new(crate::unix::MemFd::new(name)), name.into(), 0, true, true);
         let a = file("pool");
-        let map = |start, len, offset| SharedMap { start, len, file: Arc::clone(&a), offset, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default(), seen: Default::default() };
+        let map = |start, len, offset| SharedMap { start, len, file: Arc::clone(&a), offset, holders: Vec::new(), pages: page_hashes(&[0; 0x1000]), changes: Default::default(), seen: Default::default(), hold: MapHold::default() };
         let mut maps = SharedMaps::new();
         let view = Arc::clone(maps.view());
         maps.push(map(0xde56000, 0x1000, 0));

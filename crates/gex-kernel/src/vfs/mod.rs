@@ -775,6 +775,15 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// What a mapping of the file holds for as long as it (or a forked
+    /// child's copy of it) lasts, asked after [`FileHandle::may_map`]: a
+    /// BPF map counts its writable mappings so (`bpf_map_write_active`).
+    /// An error refuses the mapping.
+    fn map_hold(&self, prot: u32, shared: bool) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Errno> {
+        let _ = (prot, shared);
+        Ok(None)
+    }
+
     /// Whether a mapping made without writing may be made writable later.
     /// No for a file whose mapping the kernel keeps read-only once it is
     /// (`VM_MAYWRITE` cleared at the mapping: a BPF map, selinuxfs's
