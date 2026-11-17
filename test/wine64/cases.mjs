@@ -350,6 +350,15 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     }
     await w.nt({ want: /mingwguid: ok 7fed806d 00000001/, ...o, name: `${pre}mingwguid`, exe, extra: [`${exe}.wasm`] });
   }
+  if (want('mingwstdio') && mingwInstall) {
+    // mingw-w64's ANSI stdio (__mingw_printf ...) over the UCRT
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'mingwstdio.c'), 'mingwstdio.exe', ['-O2']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}mingwstdio: build`, false, String(e.message));
+    }
+    await w.nt({ want: /mingwstdio: 16 1234567 1 77 4 ab\/5 2\.5 1\.50/, ...o, name: `${pre}mingwstdio`, exe, extra: [`${exe}.wasm`] });
+  }
   if (want('modcase')) {
     // installed under other case than its link (an installer naming the
     // files ModCase.exe and ModCase.exe.wasm): its .wasmref still names

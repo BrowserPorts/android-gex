@@ -74,7 +74,9 @@ if [ -n "${MINGW_W64:-}" ]; then
   for f in "$MW"/mingw-w64-crt/libsrc/wspiapi/*.c "$MW"/mingw-w64-crt/libsrc/ws2tcpip/*.c; do
     "$CC" -O2 -c "$f" -o "$T/ws2_$(basename "$f" .c).o"
   done
-  llvm-ar rs "$L/libgexcc-win.a" "$T"/ucrt_*.o "$T/oldnames.o" "$T"/ws2_*.o
+  # and its ANSI stdio entry points (__mingw_printf ...), over the UCRT's
+  "$CC" -O2 -c "$HERE/rt/mingwstdio.c" -o "$T/mingwstdio.o"
+  llvm-ar rs "$L/libgexcc-win.a" "$T"/ucrt_*.o "$T/oldnames.o" "$T"/ws2_*.o "$T/mingwstdio.o"
   # and its static libraries: the GUIDs (uuid, dxguid, strmiids, locationapi,
   # ksuser's beside its imports ...), in L/mingw, where gexcc-win's -lNAME
   # finds them; the list 'dll' marks those that are a DLL's imports too
