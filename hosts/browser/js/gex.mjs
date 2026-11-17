@@ -2288,12 +2288,14 @@ export class Gex {
         // The shim's own narration, to the console -- never to the guest's
         // output, which shares fd 2 with a terminal a person is reading.
         // Off unless GEX_LOG asks, or this process is traced (`--strace`).
-        debug: (ptr, len) => (this.#traced || logOn('debug')) && debugLine(
-          utf8(
-            this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
-          ).replace(/\n$/, ''),
-          this.#traced,
-        ),
+        debug: (ptr, len) => {
+          const on = this.#traced || logOn('debug');
+          if (!on && !logOn('threads')) return;
+          const line = utf8(this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0))).replace(/\n$/, '');
+          // (GEX_LOG=threads: only the shim's [threads] lines)
+          if (on) debugLine(line, this.#traced);
+          else if (line.startsWith('[threads]')) console.warn(line);
+        },
         warn: (ptr, len) => {
           const text = utf8(
             this.#bytes().subarray(ptr >>> 0, (ptr >>> 0) + (len >>> 0)),
