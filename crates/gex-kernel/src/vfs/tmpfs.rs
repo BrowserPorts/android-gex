@@ -1706,8 +1706,8 @@ impl FileHandle for TmpHandle {
     /// A copy that shares the source's bytes until either is written (the
     /// chunks a write touches are then its own): `copy_file_range` of a
     /// whole file into an empty one, as a file system with reflinks does.
-    /// Not for a file in the block store (whose bytes are not in this
-    /// memory), a lazy or pending one, nor a source already written since
+    /// A source in the block store shares its blocks instead. Not for a
+    /// lazy or pending file, nor a source in memory already written since
     /// it was shared; the caller copies those.
     fn share_from(&self, src: &dyn FileHandle) -> Option<SysResult> {
         let src = src.as_any()?.downcast_ref::<TmpHandle>()?;
@@ -1725,21 +1725,32 @@ impl FileHandle for TmpHandle {
         // them: the store's contents, the bytes, the shared bytes
         let s_first = s.ino < d.ino;
         let (a, b) = if s_first { (s, d) } else { (d, s) };
-        let a_pg = a.pg.lock().unwrap();
+        let mut a_pg = a.pg.lock().unwrap();
         let mut a_data = a.data.lock().unwrap();
         let mut a_cow = a.cow.lock().unwrap();
-        let b_pg = b.pg.lock().unwrap();
+        let mut b_pg = b.pg.lock().unwrap();
         let mut b_data = b.data.lock().unwrap();
         let mut b_cow = b.cow.lock().unwrap();
-        if a_pg.is_some() || b_pg.is_some() {
+        let (s_pg, d_pg, s_data, d_data, s_cow, d_cow) = if s_first {
+            (&mut *a_pg, &mut *b_pg, &mut *a_data, &mut *b_data, &mut *a_cow, &mut *b_cow)
+        } else {
+            (&mut *b_pg, &mut *a_pg, &mut *b_data, &mut *a_data, &mut *b_cow, &mut *a_cow)
+        };
+        if !d_data.is_empty() || d_cow.as_ref().is_some_and(|c| c.len != 0) || d_pg.as_ref().is_some_and(|p| p.size != 0) {
             return None;
         }
-        let (s_data, d_data, s_cow, d_cow) = if s_first {
-            (&mut *a_data, &mut *b_data, &mut *a_cow, &mut *b_cow)
-        } else {
-            (&mut *b_data, &mut *a_data, &mut *b_cow, &mut *a_cow)
-        };
-        if !d_data.is_empty() || d_cow.as_ref().is_some_and(|c| c.len != 0) {
+        // A source in the block store: the copy names the same blocks,
+        // each the file's own once it writes it (blocks.rs)
+        if let Some(sp) = s_pg.as_ref() {
+            let len = sp.size;
+            *d_pg = Some(sp.share());
+            d.changed();
+            drop((b_cow, b_data, b_pg, a_cow, a_data, a_pg));
+            d.touch();
+            self.note_here(crate::inotify::mask::MODIFY);
+            return Some(Ok(len));
+        }
+        if d_pg.is_some() {
             return None;
         }
         let base = match s_cow.as_ref() {
