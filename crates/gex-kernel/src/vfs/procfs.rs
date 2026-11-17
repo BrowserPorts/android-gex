@@ -465,11 +465,16 @@ enum Setting {
     /// `kernel.unprivileged_bpf_disabled`, `net.core.bpf_jit_enable`,
     /// `net.core.bpf_jit_kallsyms` ([`bpf_sysctl`]).
     Bpf(bpf_sysctl::Which),
+    /// A per-interface network setting (`crate::netconf`), by path.
+    NetConf(String),
 }
 
 impl Setting {
     /// The setting at `path` (under `/proc`), if it is one that can be set.
     fn at(path: &str) -> Option<Setting> {
+        if crate::netconf::mode(path).is_some() {
+            return Some(Setting::NetConf(path.to_string()));
+        }
         if path == "sys/vm/mmap_rnd_bits" {
             return Some(Setting::MmapRndBits);
         }
@@ -486,6 +491,7 @@ impl Setting {
             Setting::NetCore(name) => crate::netlink::sysctl::get(name).unwrap_or(0),
             Setting::MmapRndBits => mmap_rnd_bits::get(),
             Setting::Bpf(w) => w.get(),
+            Setting::NetConf(p) => return crate::netconf::read(p).and_then(|r| r.ok()).unwrap_or_default(),
         };
         format!("{value}\n").into_bytes()
     }
@@ -497,6 +503,7 @@ impl Setting {
             Setting::NetCore(_) => 0o644,
             Setting::MmapRndBits => 0o600,
             Setting::Bpf(w) => w.mode(),
+            Setting::NetConf(p) => crate::netconf::mode(p).unwrap_or(0o444),
         }
     }
 }
@@ -639,6 +646,10 @@ pub mod bpf_sysctl {
 /// eight, else ten), ended by the end, a NUL or more space. The space
 /// after it is taken with it and what follows is left: a write of two
 /// numbers is a short write of the first. `EINVAL` for anything else.
+pub(crate) fn sysctl_number_pub(buf: &[u8]) -> Result<(i64, usize), Errno> {
+    sysctl_number(buf)
+}
+
 fn sysctl_number(buf: &[u8]) -> Result<(i64, usize), Errno> {
     let space = |b: &u8| matches!(b, b' ' | b'\t' | b'\n');
     let mut at = buf.iter().take_while(|b| space(b)).count();
@@ -666,14 +677,22 @@ fn sysctl_number(buf: &[u8]) -> Result<(i64, usize), Errno> {
 
 impl FileHandle for Sysctl {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        if let Setting::NetConf(p) = &self.which {
+            let data = crate::netconf::read(p).ok_or(Errno::ENOENT)??;
+            return Generated { data }.read_at(offset, buf);
+        }
         Generated { data: self.which.text() }.read_at(offset, buf)
     }
     fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        if let Setting::NetConf(p) = &self.which {
+            return crate::netconf::write(p, buf).ok_or(Errno::ENOENT)?;
+        }
         let (value, taken) = sysctl_number(buf)?;
         match &self.which {
             Setting::NetCore(name) => crate::netlink::sysctl::set(name, u32::try_from(value).map_err(|_| Errno::EINVAL)?)?,
             Setting::MmapRndBits => mmap_rnd_bits::set(value)?,
             Setting::Bpf(w) => w.set(value)?,
+            Setting::NetConf(_) => unreachable!("written above"),
         }
         Ok(taken as u64)
     }
@@ -962,6 +981,7 @@ impl ProcFs {
             "sys/kernel/random/entropy_avail" | "sys/kernel/random/poolsize" => b"256\n".to_vec(),
             // What a socket's buffers start as and the most a process may
             // ask for without privilege (crate::netlink keeps to them).
+            p if crate::netconf::mode(p).is_some() => crate::netconf::read(p).and_then(|r| r.ok()).unwrap_or_default(),
             p if p.strip_prefix("sys/net/core/").is_some_and(|n| crate::netlink::sysctl::get(n).is_some()) => format!("{}\n", crate::netlink::sysctl::get(&p["sys/net/core/".len()..]).unwrap()).into_bytes(),
             // glibc and musl both consult this before using large mappings.
             "sys/vm/overcommit_memory" => b"0\n".to_vec(),
@@ -1111,7 +1131,14 @@ impl FileSystem for ProcFs {
                 return Ok(Arc::new(GenDir { entries: out }));
             }
             "sys" => vec!["fs", "kernel", "net", "vm"],
-            "sys/net" => vec!["core"],
+            "sys/net" => vec!["core", "ipv4", "ipv6"],
+            p if crate::netconf::is_dir(p) => {
+                let mut out = base_entries();
+                for (name, dir) in crate::netconf::list(p).unwrap_or_default() {
+                    out.push(DirEntry { name, file_type: if dir { FileType::Directory } else { FileType::Regular }, ino: 1 });
+                }
+                return Ok(Arc::new(GenDir { entries: out }));
+            }
             "sys/net/core" => vec!["bpf_jit_enable", "bpf_jit_kallsyms", "rmem_default", "rmem_max", "wmem_default", "wmem_max"],
             "sys/fs" => vec!["nr_open", "pipe-max-size"],
             "sys/kernel" => vec!["kptr_restrict", "osrelease", "pid_max", "random", "unprivileged_bpf_disabled"],
@@ -1123,7 +1150,7 @@ impl FileSystem for ProcFs {
         // `sys` holds directories, the directories under it files (and
         // `sys/kernel` one directory more).
         let file_type = if path == "sys" { FileType::Directory } else { FileType::Regular };
-        let is_dir = |name: &str| (path == "self" && name == "attr") || (path == "sys/kernel" && name == "random") || (path == "sys/net" && name == "core");
+        let is_dir = |name: &str| (path == "self" && name == "attr") || (path == "sys/kernel" && name == "random") || (path == "sys/net" && matches!(name, "core" | "ipv4" | "ipv6"));
         let mut out = base_entries();
         for name in entries {
             out.push(DirEntry {
@@ -1178,6 +1205,7 @@ impl FileSystem for ProcFs {
         }
         match path.as_str() {
             "" | "self" | "self/fd" | "self/fdinfo" | "self/task" | "sys" | "sys/fs" | "sys/kernel" | "sys/kernel/random" | "sys/net" | "sys/net/core" | "sys/vm" | "pressure" => Ok(Metadata::dir()),
+            p if crate::netconf::is_dir(p) => Ok(Metadata::dir()),
             "self/ns" if self.source.mount_ns_id().is_some() => Ok(Metadata { mode: 0o511, ..Metadata::dir() }),
             "self/exe" | "self/cwd" | "self/ns/mnt" => Ok(Metadata {
                 file_type: FileType::Symlink,

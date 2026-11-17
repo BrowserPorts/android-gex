@@ -91,6 +91,16 @@ struct Iface {
     prefix: u8,
 }
 
+/// The interfaces' names, in index order.
+pub fn interface_names() -> Vec<&'static str> {
+    IFACES.iter().map(|i| i.name).collect()
+}
+
+/// An interface's MTU, by name.
+pub fn interface_mtu(name: &str) -> Option<u32> {
+    IFACES.iter().find(|i| i.name == name).map(|i| i.mtu)
+}
+
 /// eth0's address: where a connected socket says it is (`getsockname`).
 pub const ETH0_ADDR: [u8; 4] = [10, 0, 2, 15];
 

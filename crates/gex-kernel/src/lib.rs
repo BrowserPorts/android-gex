@@ -79,6 +79,8 @@ pub mod bpfskb;
 pub mod bpfsock;
 pub mod xtables;
 pub mod fibrules;
+pub mod netconf;
+mod netconf_tables;
 pub mod cgroup;
 pub mod cgroup1;
 /// The x87's extended-precision arithmetic (its own crate, shared with the
