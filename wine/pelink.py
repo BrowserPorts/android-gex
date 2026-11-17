@@ -1339,6 +1339,14 @@ def link(dlls, out, gexrt, others=None):
         with open(mapfile, 'w') as f:
             # its entry point's binding of its static guest imports (winebuild)
             f.write(f'wine_gexw_bind_imports gexw-bind {mod}\n')
+            # an --other DLL's functions and data (a program's own DLL, native
+            # code too): imports named DLL!name, which gex binds to that
+            # DLL's exports, its data through GOT.mem. First, ahead of the
+            # Wine DLLs': MinGW's link takes a program's own libraries before
+            # its default ones (tcl86's crc32 is zlib1's, not ntdll's)
+            if mod in EXTRA:
+                for name, owner in sorted(OTHER_NATIVE.items()):
+                    f.write(f'{name} {owner}\n')
             for name, owners in exporters.items():
                 if fwd_first(mod, imports, name):
                     continue  # bound by its forward, below
@@ -1474,12 +1482,6 @@ def link(dlls, out, gexrt, others=None):
                 sym = guest_sym(mod, f'{gdll}.{gname}' + ('' if name == gname else f'={name}'), have)
                 guest_binds.append((f'gexw-guest!{sym}', have, gdll, gname, grp(mod), mod))
                 f.write(f'{name} gexw-guest {sym}\n')
-            # an --other DLL's functions and data (a program's own DLL, native
-            # code too): imports named DLL!name, which gex binds to that
-            # DLL's exports, its data through GOT.mem
-            if mod in EXTRA:
-                for name, owner in sorted(OTHER_NATIVE.items()):
-                    f.write(f'{name} {owner}\n')
         bound = os.path.join(tmp, mod + '.o')
         subprocess.check_call([sys.executable, os.path.join(here, 'pesym.py'), 'imports', local, bound, mod, mapfile])
         # The ICALL pass's stdcall annotations are for the compiler only;
