@@ -479,7 +479,11 @@ while i < len(args):
             head = f.read(32)
         (ress if head[:8] == b'\0\0\0\0\x20\0\0\0' else objs).append(a)
         at.setdefault(a, i)
-    elif a.startswith(('-I', '-D', '-U', '-O', '-f', '-std', '-m', '-W', '-g')):
+    elif a in ('-include', '-imacros', '-isystem', '-iquote', '-idirafter') and i + 1 < len(args):
+        # (a one-step compile's forced headers, the prelude spliced in above
+        # among them, in their order)
+        extra_cflags += [a, args[i + 1]]; i += 2; continue
+    elif a.startswith(('-I', '-D', '-U', '-O', '-f', '-std', '-m', '-W', '-g', '-include', '-imacros')):
         extra_cflags.append(a)
     i += 1
 if subsys and subsys.startswith('windows'): subsys = 'windows'
@@ -585,7 +589,8 @@ try:
                 f.writelines(lines)
     # A DLL exports what its objects define with default visibility: what
     # it marks dllexport or dllimport (the GexLLP64 plugin's attributes) or
-    # visibility("default"). Without a .def that is its export list; with
+    # visibility("default"); the rest is hidden, clang's wasm default, so a
+    # plain global or a C++ inline or template is not exported. Without a .def that is its export list; with
     # one, the names the .def leaves out are added, as MSVC's link and GNU
     # ld export a .def's entries and every dllexport (nss3's .def leaves
     # NSPR out, which exports itself through PR_IMPLEMENT)
@@ -702,8 +707,15 @@ try:
     # (and beside the module, OUT.wasm.stubs: the names bound to stubs that
     # raise EXCEPTION_WINE_STUB, which a build that hides the link's warnings,
     # mach's, would not show)
-    with open(os.path.join(odir, os.path.basename(out) + '.wasm.stubs'), 'w') as f:
-        f.writelines(l.split('when called: ', 1)[1].replace(' ', '\n') for l in warns if 'when called: ' in l)
+    # (only when there are any, so a clean module's directory, which a
+    # package may be laid out from, holds none; a stale one goes)
+    stubs = [l.split('when called: ', 1)[1].replace(' ', '\n') for l in warns if 'when called: ' in l]
+    sf = os.path.join(odir, os.path.basename(out) + '.wasm.stubs')
+    if stubs:
+        with open(sf, 'w') as f:
+            f.writelines(stubs)
+    elif os.path.exists(sf):
+        os.unlink(sf)
     # (the loader runs an exported __wasm_call_ctors when it installs the
     # module, before the DLLs the constructors call are loaded)
     subprocess.call([sys.executable, here + '/renexp.py', os.path.join(tmp, name + '.wasm'), '__wasm_call_ctors', '__gexw_ctors'])
