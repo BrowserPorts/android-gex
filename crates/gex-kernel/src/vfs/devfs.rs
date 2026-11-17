@@ -81,8 +81,11 @@ impl FileHandle for DevHandle {
                 Ok(buf.len() as u64)
             }
             // A terminal read has to come from the host's stdin, which the
-            // kernel wires up separately; through the VFS it looks empty.
-            Device::Tty => Ok(0),
+            // kernel wires up separately. Through the VFS nothing is ever
+            // typed: a reader waits, as it would at a terminal nobody types
+            // at (it was end of file, and init's console shell, which init
+            // starts again whenever it ends, ended at once, over and over).
+            Device::Tty => Err(Errno::EAGAIN),
         }
     }
 
