@@ -337,6 +337,16 @@ cc = os.path.join(W, 'wcc64++' if cxx else 'wcc64')
 # the SDK headers: mingw-w64's (MINGW_INCLUDE, installed by mingw-headers.py),
 # or Wine's own; before them either way the headers of gexcc-win's own
 # runtime (include-rt: what libmingwex has for MinGW)
+# (a libc++ built against the other SDK's headers is another ABI: Wine's
+# mbstate_t is an int, mingw-w64's UCRT one _Mbstatet; build-cxx.sh records
+# which it was built with)
+try:
+    cxx_sdk = open(CXX + '/sdk').read().strip()
+except OSError:
+    cxx_sdk = None
+if cxx and cxx_sdk and cxx_sdk != ('mingw' if conf.get('MINGW_INCLUDE') else 'wine'):
+    sys.exit('gexcc-win: %s was built against %s headers, this compile uses %s ones (build-cxx.sh for this install)'
+             % (CXX, cxx_sdk, 'mingw-w64' if conf.get('MINGW_INCLUDE') else "Wine's"))
 if conf.get('MINGW_INCLUDE'):
     # (clang defines _GNU_SOURCE for C++ on the wasm target, as on Linux;
     # a MinGW clang doesn't, and with it mingw-w64's stdio.h takes libmingwex's
