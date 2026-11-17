@@ -357,13 +357,19 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     await w.nt({ want: /prelude: ok 1/, ...o, name: `${pre}prelude`, exe, extra: [`${exe}.wasm`] });
   }
   if (want('wkdata')) {
-    // weak undefined data is not the undefined-data link error
-    let exe;
-    try { exe = await w.gexccWin(join(F, 'wkdata.c'), 'wkdata.exe', ['-O2']); } catch (e) {
+    // weak undefined data is not the undefined-data link error, and is
+    // null; weak data a DLL defines is that DLL's
+    let dll, exe;
+    try {
+      dll = await w.gexccWin(join(F, 'wkdll.c'), 'wkdll.dll', ['-O2', '-shared', `-Wl,--out-implib,${join(w.work, 'libwkdll.a')}`]);
+      exe = await w.gexccWin(join(F, 'wkdata.c'), 'wkdata.exe', ['-O2', `-L${w.work}`, '-lwkdll']);
+    } catch (e) {
       if (e instanceof Skip) throw e;
       return t.check(`${pre}wkdata: build`, false, String(e.message));
     }
-    await w.nt({ want: /wkdata: null/, ...o, name: `${pre}wkdata`, exe, extra: [`${exe}.wasm`] });
+    await w.nt({ want: /wkdata: null 42/, ...o, name: `${pre}wkdata`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`] });
+    // and on the page's loader (hosts/browser/src/cgen/wasmdll.rs)
+    await w.nt({ want: /wkdata: null 42/, ...o, name: `${pre}wkdata-page`, exe, extra: [`${exe}.wasm`, dll, `${dll}.wasm`], page: {} });
   }
   const mingwInstall = (() => {
     try { return /^MINGW_INCLUDE=/m.test(readFileSync(join(process.env.GEX_TEST_GEXCC_WIN ?? '', 'lib/gexcc-win/config'), 'utf8')); } catch { return false; }

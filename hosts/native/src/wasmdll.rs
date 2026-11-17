@@ -480,7 +480,7 @@ struct ParsedModule {
     slot_types: Option<Arc<(Vec<u32>, Vec<Option<String>>)>>,
     /// Its weak undefined names (`dylink.0` import info): a data one no
     /// module defines binds to address 0, as a weak symbol does.
-    weak: std::collections::HashSet<String>,
+    weak: gex_dylink::HashSet<String>,
     module: wasmtime::Module,
 }
 
@@ -559,7 +559,7 @@ fn parsed_module(file: &std::path::Path, engine: &wasmtime::Engine, t0: std::tim
         modules,
         dll_slots: Arc::new(dll_slots(&wasm)),
         slot_types,
-        weak: crate::libprov::dylink_weak_imports(&wasm)?,
+        weak: gex_dylink::weak_import_names(&wasm)?,
         module,
     });
     MEMO.lock().unwrap_or_else(|e| e.into_inner()).push((id, engine.clone(), Arc::clone(&pm)));
@@ -1024,10 +1024,6 @@ fn install_module(
                 Some(a) => crate::dylink::NBind::Addr(a),
                 None => bail!("{}: GOT.mem::{name}: no installed module exports it", file.display()),
             }
-        } else if m == "GOT.mem" && pm.weak.contains(&name) {
-            // (weak undefined data nothing defines, `extern int x
-            // __attribute__((weak))`: null; pelink refuses a strong one)
-            crate::dylink::NBind::Addr(0)
         } else if m == "env" && core.is_some() && have_core.contains(&name) {
             crate::dylink::NBind::Export { module: core.as_ref().unwrap().module, name: name.clone() }
         } else if m == "env" && matches!(imp.ty(), wasmtime::ExternType::Func(_)) && !gex_dylink::shim_import(&m, &name) {
@@ -1049,6 +1045,18 @@ fn install_module(
                     crate::dylink::NBind::LateOwn(len - 1)
                 }
             }
+        } else if m == "GOT.mem" && pm.weak.contains(&name) {
+            // weak undefined data, `extern int x __attribute__((weak))`: an
+            // installed module's export of it if one has it, else null, as a
+            // weak symbol nothing defines is (pelink refuses a strong one)
+            let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let a = s
+                .wine_pe
+                .iter()
+                .chain(s.wine_pe_split.iter())
+                .filter(|wp| wp.ptr64 == is64)
+                .find_map(|wp| wp.data_exports.get(&name).map(|&off| wp.data + off as u64));
+            crate::dylink::NBind::Addr(a.unwrap_or(0))
         } else {
             crate::dylink::NBind::Shim
         };

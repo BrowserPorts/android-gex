@@ -36,7 +36,8 @@
 //   files;
 // - prelude: a one-step C++ compile and link gets the program's own
 //   -include, then gexcc-win's prelude;
-// - wkdata: weak undefined data links and its address is null;
+// - wkdata: weak undefined data links and its address is null; weak data
+//   a DLL defines (wkdll) reads the DLL's;
 // - missimp: an import no DLL exports, bound to a stub (listed at the
 //   link): the program runs, and a call of it ends the process as Wine's
 //   stubs do;

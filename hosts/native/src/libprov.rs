@@ -69,38 +69,6 @@ pub struct Extras {
     pub memory_base: u64,
 }
 
-/// The names a PIC module imports weakly (`dylink.0` WASM_DYLINK_IMPORT_INFO
-/// entries with WASM_SYMBOL_BINDING_WEAK).
-pub fn dylink_weak_imports(wasm: &[u8]) -> Result<std::collections::HashSet<String>> {
-    let mut weak = std::collections::HashSet::new();
-    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
-        if let wasmparser::Payload::CustomSection(c) = payload? {
-            if c.name() != "dylink.0" {
-                continue;
-            }
-            let mut r = wasmparser::BinaryReader::new(c.data(), 0);
-            while !r.eof() {
-                let kind = r.read_u8()?;
-                let len = r.read_var_u32()? as usize;
-                let start = r.original_position();
-                if kind == 4 {
-                    // WASM_DYLINK_IMPORT_INFO: count, then module, field, flags
-                    for _ in 0..r.read_var_u32()? {
-                        let _module = r.read_string()?;
-                        let field = r.read_string()?.to_string();
-                        if r.read_var_u32()? & 1 != 0 {
-                            weak.insert(field);
-                        }
-                    }
-                }
-                r.read_bytes(len - (r.original_position() - start))?;
-            }
-            break;
-        }
-    }
-    Ok(weak)
-}
-
 /// Bytes of C stack each guest thread gets for its stateful providers.
 const STACK: u64 = 1 << 20;
 

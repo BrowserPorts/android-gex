@@ -383,6 +383,39 @@ fn kind_of(k: wasmparser::ExternalKind) -> Kind {
     }
 }
 
+/// The field names of a module's weak imports (`dylink.0`'s
+/// WASM_DYLINK_IMPORT_INFO with [`SYM_BINDING_WEAK`]): `env.x`'s weakness is
+/// its `GOT.mem.x`'s and `GOT.func.x`'s too. Reads only `dylink.0`, for a
+/// loader that needs nothing else of [`Info`] (Wine's PE modules).
+pub fn weak_import_names(wasm: &[u8]) -> Result<HashSet<String>> {
+    let mut weak = HashSet::default();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        if let wasmparser::Payload::CustomSection(c) = payload? {
+            if c.name() != "dylink.0" {
+                continue;
+            }
+            let mut r = wasmparser::BinaryReader::new(c.data(), 0);
+            while !r.eof() {
+                let id = r.read_u8()?;
+                let len = r.read_var_u32()? as usize;
+                let start = r.original_position();
+                if id == 4 {
+                    for _ in 0..r.read_var_u32()? {
+                        let _module = r.read_string()?;
+                        let field = r.read_string()?.to_string();
+                        if r.read_var_u32()? & SYM_BINDING_WEAK != 0 {
+                            weak.insert(field);
+                        }
+                    }
+                }
+                r.read_bytes(len - (r.original_position() - start))?;
+            }
+            break;
+        }
+    }
+    Ok(weak)
+}
+
 impl Info {
     /// Whether [`Info::parse`] reads a section (by id, and a custom
     /// section's name): a module of only these parses to the same `Info`.

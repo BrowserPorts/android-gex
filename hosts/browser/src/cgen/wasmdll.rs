@@ -772,7 +772,10 @@ fn install_module(
     // once it has: a DLL Wine maps for this one's imports (`later`) is left
     // to `Late` slots too, and installed as it maps. One its calls reach
     // through another's forward is not mapped for it, and is installed now.
-    if core.is_some() {
+    // (and as natively, a program installed without a core beside it, its
+    // own DLLs beside it: a GOT.mem import of their data has no `Late`
+    // binding)
+    if core.is_some() || name != CORE_MODULE {
         let mut deps = std::collections::BTreeMap::new();
         // (not a DLL it only delay-imports, which it marks `gexw-delay!DLL`:
         // its calls load the DLL first, and then are bound, through `Late`
@@ -818,6 +821,8 @@ fn install_module(
     }
 
     let (size, align) = dylink_memory(wasm)?;
+    // (its weak imports: a weak GOT.mem name no module defines binds to 0)
+    let weak = gex_dylink::weak_import_names(wasm).map_err(|e| e.to_string())?;
     let a = 1u64 << align;
     let data_exports = exported_offsets(wasm)?;
     // (an LLP64 module's above the images when it has data exports, whose
@@ -926,6 +931,12 @@ fn install_module(
                         B::Late(len - 1)
                     }
                 }
+            } else if m == "GOT.mem" && weak.contains(n) {
+                // weak undefined data, `extern int x __attribute__((weak))`:
+                // an installed module's export of it if one has it, else
+                // null, as a weak symbol nothing defines is (pelink refuses a
+                // strong one)
+                B::Addr(g.mods.iter().filter(|w| w.ptr64 == is64).find_map(|w| w.data_exports.get(n).map(|&off| w.data + off as u64)).unwrap_or(0))
             } else {
                 continue;
             };
