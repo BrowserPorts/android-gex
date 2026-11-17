@@ -96,6 +96,12 @@ pub fn interface_names() -> Vec<&'static str> {
     IFACES.iter().map(|i| i.name).collect()
 }
 
+/// What sysfs says of each interface: index, name, `ARPHRD_*` type,
+/// `IFF_*` flags, MTU and hardware address.
+pub fn interfaces_info() -> Vec<(u32, &'static str, u16, u32, u32, [u8; 6])> {
+    IFACES.iter().map(|i| (i.index, i.name, i.kind, i.flags, i.mtu, i.mac)).collect()
+}
+
 /// An interface's MTU, by name.
 pub fn interface_mtu(name: &str) -> Option<u32> {
     IFACES.iter().find(|i| i.name == name).map(|i| i.mtu)

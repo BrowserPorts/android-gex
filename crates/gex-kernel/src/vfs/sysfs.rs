@@ -74,8 +74,17 @@ impl Device {
         self.subsystem == "block"
     }
 
+    /// A network interface: no device number (`net/core/net-sysfs.c`).
+    fn is_net(&self) -> bool {
+        self.subsystem == "net"
+    }
+
     /// Its own variables (`dev_uevent`), in the kernel's order.
     fn vars(&self) -> Vec<(String, String)> {
+        // An interface's are its driver's alone (`netdev_uevent`).
+        if self.is_net() {
+            return self.attrs.as_ref().map(|a| a.vars()).unwrap_or_default();
+        }
         let mut v = vec![("MAJOR".to_string(), self.major.to_string()), ("MINOR".to_string(), self.minor.to_string()), ("DEVNAME".to_string(), self.name.clone())];
         if let Some(mode) = self.mode {
             v.push(("DEVMODE".to_string(), format!("{mode:04o}")));
@@ -84,6 +93,59 @@ impl Device {
             v.extend(attrs.vars());
         }
         v
+    }
+}
+
+/// A network interface's attributes (`net-sysfs.c`), as an interface of
+/// this kernel's has them: its index and link, type, flags, MTU and
+/// address, and the state of a link that is always up.
+#[derive(Debug)]
+struct NetAttrs {
+    index: u32,
+    name: &'static str,
+    kind: u16,
+    flags: u32,
+    mtu: u32,
+    mac: [u8; 6],
+}
+
+impl NetAttrs {
+    const FILES: [&'static str; 12] = ["addr_len", "address", "broadcast", "carrier", "dev_id", "flags", "ifindex", "iflink", "mtu", "operstate", "tx_queue_len", "type"];
+
+    fn mac_text(m: &[u8; 6]) -> String {
+        m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    }
+}
+
+impl Attributes for NetAttrs {
+    fn vars(&self) -> Vec<(String, String)> {
+        vec![("INTERFACE".to_string(), self.name.to_string()), ("IFINDEX".to_string(), self.index.to_string())]
+    }
+    fn list(&self, dir: &str) -> Option<Vec<(String, FileType)>> {
+        (dir.is_empty()).then(|| Self::FILES.iter().map(|f| (f.to_string(), FileType::Regular)).collect())
+    }
+    fn read(&self, path: &str) -> Option<(u32, String)> {
+        const ARPHRD_LOOPBACK: u16 = 772;
+        let loopback = self.kind == ARPHRD_LOOPBACK;
+        let text = match path {
+            "addr_len" => "6".to_string(),
+            "address" => Self::mac_text(&self.mac),
+            "broadcast" => Self::mac_text(&if loopback { [0; 6] } else { [0xff; 6] }),
+            "carrier" => "1".to_string(),
+            "dev_id" => "0x0".to_string(),
+            "flags" => format!("{:#x}", self.flags & 0xffff),
+            "ifindex" | "iflink" => self.index.to_string(),
+            "mtu" => self.mtu.to_string(),
+            // Loopback's driver reports no operational state.
+            "operstate" => (if loopback { "unknown" } else { "up" }).to_string(),
+            "tx_queue_len" => (if loopback { "1000" } else { "1000" }).to_string(),
+            "type" => self.kind.to_string(),
+            _ => return None,
+        };
+        Some((if path == "flags" || path == "mtu" || path == "tx_queue_len" { 0o644 } else { 0o444 }, format!("{text}\n")))
+    }
+    fn write(&self, _path: &str, _data: &[u8]) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
     }
 }
 
@@ -107,7 +169,13 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
             ("misc", "loop-control", 10, 237, None),
             ("misc", "device-mapper", 10, 236, None),
         ];
-        Mutex::new(chars.iter().map(|(s, n, major, minor, mode)| Arc::new(Device { subsystem: s.to_string(), name: n.to_string(), major: *major, minor: *minor, mode: *mode, attrs: None })).collect())
+        let mut all: Vec<Arc<Device>> = chars.iter().map(|(s, n, major, minor, mode)| Arc::new(Device { subsystem: s.to_string(), name: n.to_string(), major: *major, minor: *minor, mode: *mode, attrs: None })).collect();
+        // The network interfaces (`net/core/net-sysfs.c`): no device
+        // number, and their own attributes.
+        for (index, name, kind, flags, mtu, mac) in crate::netlink::interfaces_info() {
+            all.push(Arc::new(Device { subsystem: "net".to_string(), name: name.to_string(), major: 0, minor: 0, mode: None, attrs: Some(Arc::new(NetAttrs { index, name, kind, flags, mtu, mac })) }));
+        }
+        Mutex::new(all)
     })
 }
 
@@ -197,7 +265,7 @@ fn node(path: &str) -> Option<Node> {
         ["class", s] if subsystems().iter().any(|x| x == s) => links(&|d| d.subsystem == *s, &|d| d.name.clone()),
         ["class", s, n] => Node::Link(format!("../..{}", device(s, n)?.devpath())),
         ["dev"] => dirs(&["block", "char"]),
-        ["dev", kind @ ("block" | "char")] => links(&|d| d.is_block() == (*kind == "block"), &number),
+        ["dev", kind @ ("block" | "char")] => links(&|d| !d.is_net() && d.is_block() == (*kind == "block"), &number),
         ["dev", kind @ ("block" | "char"), n] => Node::Link(format!("../..{}", devices().iter().find(|d| d.is_block() == (*kind == "block") && number(d) == *n)?.devpath())),
         ["devices"] => dirs(&["system", "virtual"]),
         ["devices", "system"] => dirs(&["cpu"]),
@@ -206,12 +274,15 @@ fn node(path: &str) -> Option<Node> {
         ["devices", "virtual", s, n] => {
             let d = device(s, n)?;
             let mut entries = vec![("dev".to_string(), FileType::Regular), ("subsystem".to_string(), FileType::Symlink), ("uevent".to_string(), FileType::Regular)];
+            if d.is_net() {
+                entries.remove(0);
+            }
             if let Some(more) = d.attrs.as_ref().and_then(|a| a.list("")) {
                 entries.extend(more);
             }
             Node::Dir(entries)
         }
-        ["devices", "virtual", s, n, "dev"] => Node::Text(0o444, format!("{}\n", number(&*device(s, n)?))),
+        ["devices", "virtual", s, n, "dev"] => Node::Text(0o444, format!("{}\n", number(&*device(s, n).filter(|d| !d.is_net())?))),
         ["devices", "virtual", s, n, "subsystem"] => Node::Link(format!("../../../../class/{}", device(s, n)?.subsystem)),
         ["devices", "virtual", s, n, "uevent"] => Node::Uevent(device(s, n)?),
         // Whatever else is under a device is its driver's.
@@ -544,7 +615,17 @@ mod tests {
         assert_eq!(SysFs.read_link("class/mem/null").unwrap(), "../../devices/virtual/mem/null");
         assert_eq!(SysFs.read_link("dev/char/1:3").unwrap(), "../../devices/virtual/mem/null");
         assert_eq!(SysFs.read_link("dev/char/5:2").unwrap(), "../../devices/virtual/tty/ptmx");
-        assert_eq!(names("class"), ["block", "mem", "misc", "tty"]);
+        assert_eq!(names("class"), ["block", "mem", "misc", "net", "tty"]);
+        // A network interface as Linux 7.0 shows `lo`: a class link to its
+        // directory, its index and type, and an event of its name and
+        // index alone; no device number.
+        assert_eq!(names("class/net"), ["eth0", "lo"]);
+        assert_eq!(SysFs.read_link("class/net/lo").unwrap(), "../../devices/virtual/net/lo");
+        assert_eq!(read("class/net/lo/ifindex"), "1\n");
+        assert_eq!(read("class/net/lo/type"), "772\n");
+        assert_eq!(read("class/net/lo/address"), "00:00:00:00:00:00\n");
+        assert_eq!(read("devices/virtual/net/lo/uevent"), "INTERFACE=lo\nIFINDEX=1\n");
+        assert!(!names("devices/virtual/net/lo").iter().any(|n| n == "dev"));
         assert_eq!(names("class/tty"), ["console", "ptmx", "tty"]);
         assert_eq!(names(""), ["block", "bus", "class", "dev", "devices", "fs", "kernel", "module"]);
         let md = SysFs.metadata("devices/virtual/mem/null/uevent").unwrap();
