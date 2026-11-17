@@ -212,6 +212,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
   await one('cxxcatch', join(F, 'cxxcatch.cpp'), ['-O2']);
   await one('dllimps', join(F, 'dllimps.c'), ['-O2']);
   await one('cxxthr', join(F, 'cxxthr.cpp'), ['-O2']);
+  await one('vtdecl', join(F, 'vtdecl.cpp'), ['-O2', join(F, 'vtdecl2.cpp')], { want: /vtdecl: ok/ });
   await one('timerproc', join(W, 'timerproc.c'), ['-O1', '-municode', '-lcomctl32'], { nullDriver: true });
   await one('lresult', join(F, 'lresult.c'), ['-O1', '-mwindows'], { nullDriver: true });
   await one('cbfault', join(F, 'cbfault.c'), ['-O1'], { nullDriver: true,

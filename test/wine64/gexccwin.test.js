@@ -3,6 +3,10 @@
 // GEX_TEST_GEXCC_WIN (fixtures/wine64, fixtures/wine/src):
 // - cxxcatch: an indirect call inside a catch block, a rethrow, a try in a
 //   catch; cxxthr: throws and thread_local data on several threads;
+// - vtdecl: a vtable emitted in an object where one virtual's result type
+//   is incomplete (clang's placeholder `void ()` declaration), the method
+//   defined in another: it links (no thunk made through the placeholder)
+//   and the virtual call returns the struct;
 // - dllimps: calls of DLL functions Wine's own native modules do not import;
 // - timerproc: timer procedures, the program's own and comctl32's, through
 //   DispatchMessage, a message box's loop and the menu loop;

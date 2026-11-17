@@ -50,6 +50,7 @@
 // (sig64() below). On wasm32 too: winebuild's i386 adapters take a struct
 // by value of one word, which the .spec spells as an int, by reference from
 // it.
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
 #include "llvm/TargetParser/Triple.h"
@@ -337,6 +338,33 @@ struct GexIcall : PassInfoMixin<GexIcall> {
   }
 
   // Is F's address taken by anything other than calls and metadata?
+  // A C++ declaration clang gave its placeholder type: `void ()`, which it
+  // uses for a method whose real type this object cannot lower (a parameter
+  // or result of a type incomplete here, `unique_ptr<LinkEvent>` say), and
+  // only ever taken into a global's initialiser (a vtable), never called or
+  // otherwise used by code here. Its type is not the function's, so nothing
+  // may be made from it: a thunk calling it through `void ()` links to a
+  // trap (wcc64's mismatch check). The address it hands out is the
+  // definition's, which comes with the definition's own thunk and facts.
+  static bool placeholderDecl(Function &F) {
+    if (!F.isDeclaration() || !F.getName().starts_with("_Z")) return false;
+    FunctionType *T = F.getFunctionType();
+    if (!T->getReturnType()->isVoidTy() || T->getNumParams() || T->isVarArg()) return false;
+    SmallVector<const User *, 8> work(F.user_begin(), F.user_end());
+    SmallPtrSet<const User *, 16> seen;
+    while (!work.empty()) {
+      const User *U = work.pop_back_val();
+      if (!seen.insert(U).second) continue;
+      if (isa<GlobalVariable>(U)) continue;
+      // (a constant expression or aggregate the initialiser holds it in;
+      // anything else -- an instruction, an alias, a function's personality
+      // -- is a use this rule does not cover)
+      if (!isa<Constant>(U) || isa<GlobalValue>(U)) return false;
+      for (const User *Y : U->users()) work.push_back(Y);
+    }
+    return true;
+  }
+
   static bool escapes(Function &F) {
     for (const Use &U : F.uses()) {
       const User *Us = U.getUser();
@@ -1071,7 +1099,7 @@ struct GexIcall : PassInfoMixin<GexIcall> {
       if (n.starts_with("__gexw") || n.starts_with("__gexe.") || n.contains("gexp_") || n.starts_with("llvm.")) continue;
       // (a declaration's facts are its definition's; the object handing
       // out a function defined elsewhere still needs its class's adapter)
-      if (escapes(F)) fs.push_back(&F);
+      if (escapes(F) && !placeholderDecl(F)) fs.push_back(&F);
     }
     for (Function *F : fs) {
       FunctionType *CT = nullptr;
@@ -1102,7 +1130,8 @@ struct GexIcall : PassInfoMixin<GexIcall> {
         // own, which gex binds only when no object defining the function
         // gave one (`gexw_entries_decl`): the definition knows its
         // convention, this object may not.
-        if (escapes(F)) decls.push_back(&F);
+        // (not one whose type is clang's placeholder: `placeholderDecl`)
+        if (escapes(F) && !placeholderDecl(F)) decls.push_back(&F);
         continue;
       }
       // (a thiscall method may be referenced only from a vtable written in
