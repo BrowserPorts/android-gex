@@ -72,9 +72,8 @@ async function loadGlue(url) {
 }
 
 /**
- * Mesa from the caller's `source` (`(name) => Promise<Uint8Array|null>`, the
- * eject page's packed files and its Cache Storage, app.js `mesaSource`)
- * instead of three plain fetches: the glue, the module and its cold part
+ * Mesa from the caller's `source` (`(name) => Promise<Uint8Array|null>`,
+ * MesaGl's `source`) instead of three plain fetches: the glue, the module and its cold part
  * (ports/mesa/gex-wgpu-split.js), each fetched once and compressed.
  *
  * The glue is imported from a blob with `import.meta.url` written as its real
@@ -418,8 +417,8 @@ export class MesaGlDevice {
   //
   // Blobs of SPIR-V -> WGSL answers, each refused by Mesa unless this very
   // build made it. Two sources, both before the first compile: the site's
-  // recorded set (`gex-wgsl-cache.bin` beside the Mesa glue, packed by
-  // eject-site from a training run) and the browser's IndexedDB, to which
+  // recorded set (`gex-wgsl-cache.bin` beside the Mesa glue, made by
+  // a training run) and the browser's IndexedDB, to which
   // new translations are saved every few seconds while they keep coming.
   #wgslKey = null;
   #wgslSaved = 0;
@@ -546,7 +545,7 @@ export class MesaGlDevice {
       const bytes = this.capture.toBytes();
       this.capture = null;
       // In the page's own realm (the DOM compositor), the embedder's
-      // `onGlCapture` (app.js) takes it directly.
+      // `onGlCapture` takes it directly.
       const sink = this.#onCapture ?? globalThis.__gexGlCaptureSink;
       if (sink) sink(bytes);
       else fetch('/__gex_capture', { method: 'POST', body: bytes }).catch(() => {});

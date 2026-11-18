@@ -42,9 +42,9 @@ export class Compositor {
    * the scene, or a GL window costs a readback and an upload every frame. The
    * ring is the same shared one the page-side device would have served. */
   async hostGl(channel, opts = {}) {
-    // `opts.source` (runtime.js `glSource`): Mesa's files from the site's
-    // pack and the page's cache, read here (a function does not cross to the
-    // worker) and handed over as bytes; a file it has not is fetched there.
+    // `opts.source` (MesaGl's `source`): Mesa's files from the page, read
+    // here (a function does not cross to the worker) and handed over as
+    // bytes; a file it has not is fetched there.
     const { source, ...rest } = opts;
     const sources = typeof source === 'function' ? await mesaSources(source) : null;
     opts = sources ? { ...rest, sources } : rest;
@@ -136,7 +136,7 @@ export class Compositor {
         this.#pending.delete(m.id);
       } else if (m.kind === 'gl-capture') {
         // `?glcapture=BYTES`'s recording, full: to the embedder's
-        // `onGlCapture` (app.js), else POSTed to the server, as a test
+        // `onGlCapture`, else POSTed to the server, as a test
         // harness serving the page takes it.
         const sink = globalThis.__gexGlCaptureSink;
         if (sink) sink(m.bytes);
@@ -166,7 +166,7 @@ export class Compositor {
         channel, stats: this.#stats, present, direct, glLimits, desktop },
       [offscreen],
     );
-    // start()'s background image (app.js decodes it): drawn once it is here.
+    // The background image, decoded by the page: drawn once it is here.
     (background ? background.wallpaper : globalThis.GEX_WALLPAPER)?.then((wp) => {
       if (wp) worker.postMessage({ kind: 'wallpaper', bitmap: wp.bitmap, anchor: wp.anchor }, [wp.bitmap]);
     });
