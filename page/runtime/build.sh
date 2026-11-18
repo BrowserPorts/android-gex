@@ -140,11 +140,7 @@ export default {
   // A Worker's build lists none of them (src/runtime-files.js as it is): the
   // system Worker takes the page's list (runtime.js pageGlobals), and a
   // second list would be a second copy of every file.
-  // Nor any Worker runProgram's preset (run-program.js), which is the page's:
-  // through it a Worker's build would take in System and its Workers again,
-  // a cycle vite refuses (the single-thread system Worker takes in runtime.js).
-  worker: { ...base.worker, plugins: () => [mode, { name: 'gex-runtime-files', enforce: 'pre', load: (id) => id === '$STAGE/runtime-files.js' ? 'export default null;'
-              : id === '$WEB/src/run-program.js' ? 'export function runPreset() { throw new Error("runProgram runs on the page"); }' : null }],
+  worker: { ...base.worker, plugins: () => [mode, { name: 'gex-runtime-files', enforce: 'pre', load: (id) => id === '$STAGE/runtime-files.js' ? 'export default null;' : null }],
             // Each Worker one file, with no imports: a page's bundler builds a
             // Worker as a classic script by default (vite's iife), which
             // cannot import a chunk.

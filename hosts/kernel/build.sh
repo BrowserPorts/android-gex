@@ -109,7 +109,3 @@ if [ -n "$ARCH_FEATURES" ]; then
 fi
 
 node page/build-inputs.mjs stamp page/public/gex "gex_kernel$INFIX=$INPUTS_KEY"
-
-# And the site, which is a copy of public/ and will otherwise keep serving
-# the module that was here a moment ago.
-page/refresh-dist.sh

@@ -1,23 +1,15 @@
 #!/bin/sh
-# Build the page for the multi-process build (MP, the default), the
-# single-thread build (SP), or both, from one tree.
+# Build the runtime's files into page/public for the multi-process build
+# (MP, the default), the single-thread build (SP), or both, from one tree.
+# page/runtime/build.sh makes the npm package from them.
 #
-#   page/build.sh [--mp | --sp | --both] [--debug]
-#                    [--no-assets] [--no-gl] [--no-x] [--dist-only] [--x-only] [--gl-only]
-#
-# Each flavour gets its own dist:
-#
-#   MP  page/dist      served with COOP/COEP; threaded Mesa and Xwayland
-#   SP  page/dist-sp   served without them; non-pthread Mesa and Xwayland
-#
-# Neither dist holds the other flavour's Mesa or Xwayland. They are about
-# 35 MB a flavour (Mesa 20 MB, Xwayland and its bridge the rest).
+#   page/build.sh [--mp | --sp | --both] [--no-assets] [--no-gl] [--no-x] [--x-only] [--gl-only]
 #
 # THE STEPS
 #
 # 1. The runtime both flavours run, built once into page/public by
 #    page/build-assets.sh:
-#    - the shim, kernel and seed, which the page loads as
+#    - the shim, kernel and seed, which the runtime loads as
 #      gex_browser.shared.wasm, gex_kernel.wasm and seed.shared.wasm;
 #    - the providers, rootfs and guest GL libraries.
 #    SP loads the same three files and clears their memories' `shared` flag
@@ -33,44 +25,26 @@
 #    Mesa rebuilds incrementally through ninja. The Xwayland script always
 #    builds from scratch, so it is skipped while a stamp of its inputs
 #    matches.
-# 3. For each flavour, a staged public tree in $CACHE/public-<flavour>:
-#    - hard links to page/public;
-#    - without the other flavour's Mesa and Xwayland;
-#    - without the files no page loads: the plain shim, seed and kernel,
-#      which run-node.mjs and the check scripts use from page/public.
-#    Its large wasm files are stripped of custom sections (DWARF, names) unless
-#    --debug is given. The unstripped files stay in page/public and are
-#    linked into target/web-debug/<flavour>/ for symbolizing. vite then
-#    builds the flavour's dist from that tree.
 #
 # $CACHE is GEX_WEB_BUILD, by default target/web-build.
-#
-# To serve both at once:
-#
-#   node page/serve.mjs 8088 --sp-port 8089
-#
-# This serves page/dist (MP) on 8088 and page/dist-sp (SP) on 8089.
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 CACHE="${GEX_WEB_BUILD:-$ROOT/target/web-build}"
-DEBUGDIR="$ROOT/target/web-debug"
-MP=1 SP=0 ASSETS=1 GL=1 X=1 DEBUG=0 DISTS=1
+MP=1 SP=0 ASSETS=1 GL=1 X=1
 for a in "$@"; do
     case $a in
     --mp) MP=1 SP=0 ;;
     --sp) MP=0 SP=1 ;;
     --both) MP=1 SP=1 ;;
-    --debug) DEBUG=1 ;;
     --no-assets) ASSETS=0 ;;
     --no-gl) GL=0 ;;
     --no-x) X=0 ;;
-    --dist-only) ASSETS=0 GL=0 X=0 ;;
     # Only Xwayland into page/public.
-    --x-only) ASSETS=0 GL=0 X=1 DISTS=0 ;;
+    --x-only) ASSETS=0 GL=0 X=1 ;;
     # Only Mesa into page/public.
-    --gl-only) ASSETS=0 GL=1 X=0 DISTS=0 ;;
-    *) echo "usage: page/build.sh [--mp | --sp | --both] [--debug] [--no-assets] [--no-gl] [--no-x] [--dist-only] [--x-only] [--gl-only]" >&2; exit 2 ;;
+    --gl-only) ASSETS=0 GL=1 X=0 ;;
+    *) echo "usage: page/build.sh [--mp | --sp | --both] [--no-assets] [--no-gl] [--no-x] [--x-only] [--gl-only]" >&2; exit 2 ;;
     esac
 done
 mkdir -p "$CACHE"
@@ -79,9 +53,7 @@ say() { printf '\n== %s\n' "$*"; }
 # -- 1. shared by both: shim, kernel, seeds, providers, rootfs ----------------
 if [ "$ASSETS" = 1 ]; then
     say "runtime and assets"
-    # build-assets.sh ends by refreshing page/dist through refresh-dist.sh,
-    # which would call back into this script.
-    GEX_NO_REFRESH_DIST=1 "$HERE/build-assets.sh"
+    "$HERE/build-assets.sh"
 fi
 
 # -- 2. Mesa and Xwayland, per flavour ----------------------------------------
@@ -155,62 +127,4 @@ xwl() { # xwl <mt|st>
 [ "$SP" = 1 ] && [ "$GL" = 1 ] && mesa st
 [ "$MP" = 1 ] && [ "$X" = 1 ] && xwl mt
 [ "$SP" = 1 ] && [ "$X" = 1 ] && xwl st
-[ "$DISTS" = 1 ] || exit 0
-
-# -- 3. one dist per flavour ---------------------------------------------------
-# What the bundle is built from, taken before it is: written as the dist's
-# .inputs (page/build-inputs.mjs). Its gex/.inputs comes from page/public.
-PAGE_KEY=$(node "$HERE/build-inputs.mjs" key page)
-dist() { # dist <mp|sp>
-    f=$1
-    out=$HERE/dist; [ "$f" = sp ] && out=$HERE/dist-sp
-    stage=$CACHE/public-$f
-    say "page/${out##*/} ($f)"
-    rm -rf "$stage" "$DEBUGDIR/$f"
-    cp -al "$HERE/public" "$stage"
-    # Only what this flavour's page loads (runtime.js: the shared shim, the
-    # shared seed, gex_kernel.wasm), and only its own Mesa and Xwayland.
-    rm -f "$stage"/gex/gex_kernel*.plain.wasm
-    for w in "$stage"/gex/gex_browser*.wasm "$stage"/gex/seed*.wasm; do
-        case $w in *.shared.wasm) ;; *) rm -f "$w" ;; esac
-    done
-    if [ "$f" = mp ]; then
-        rm -rf "$stage/gex/st" "$stage/gex/xwayland-st"
-    else
-        rm -rf "$stage/gex/xwayland" "$stage"/gex/gex-wgpu-replay.*
-    fi
-    if [ "$DEBUG" = 0 ]; then
-        # Custom sections out: DWARF, and the name section, which nothing in
-        # the runtime reads (a trap then names wasm-function[N]; symbolize
-        # with the copies in target/web-debug). Not the seed or the providers,
-        # whose gex.* sections the runtime does read.
-        mkdir -p "$DEBUGDIR/$f"
-        for w in "$stage"/gex/gex_browser*.shared.wasm "$stage"/gex/gex_kernel*.wasm \
-                 "$stage"/gex/gex-wgpu-replay.wasm "$stage"/gex/st/gex-wgpu-replay.wasm \
-                 "$stage"/gex/xwayland*/Xwayland.wasm "$stage"/gex/xwayland*/gexhostwl.wasm; do
-            [ -f "$w" ] || continue
-            rel=${w#"$stage"/}
-            mkdir -p "$DEBUGDIR/$f/$(dirname "$rel")"
-            ln -f "$w" "$DEBUGDIR/$f/$rel" 2>/dev/null || cp "$w" "$DEBUGDIR/$f/$rel"
-            # A new file, not a write through the hard link into page/public.
-            wasm-tools strip -a "$w" -o "$w.strip" && mv -f "$w.strip" "$w"
-        done
-    fi
-    # The compositor bridge also zstd'd, which the X server's Worker asks for
-    # first (hostx.js moduleBytes).
-    for w in "$stage"/gex/xwayland*/gexhostwl.wasm; do
-        if [ -f "$w" ]; then zstd -q -f -19 "$w" -o "$w.zst"; fi
-    done
-    (cd "$HERE" && GEX_PAGE_MODE="$f" GEX_PUBLIC_DIR="$stage" GEX_OUT_DIR="$out" npm run --silent build > "$CACHE/vite-$f.log" 2>&1) ||
-        { tail -20 "$CACHE/vite-$f.log"; exit 1; }
-    node "$HERE/build-inputs.mjs" stamp "$out" "page=$PAGE_KEY"
-    rm -rf "$stage"
-    echo "  page/${out##*/}: $(du -sh "$out" | cut -f1)"
-}
-if [ "$DEBUG" = 0 ] && ! command -v wasm-tools >/dev/null 2>&1; then
-    echo "need wasm-tools to strip the dists (cargo install wasm-tools), or pass --debug" >&2
-    exit 1
-fi
-[ "$MP" = 1 ] && dist mp
-[ "$SP" = 1 ] && dist sp
 exit 0

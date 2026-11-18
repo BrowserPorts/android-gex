@@ -260,7 +260,3 @@ if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEAT" ]; then
 fi
 
 node page/build-inputs.mjs stamp page/public/gex "gex_browser$INFIX=$INPUTS_KEY"
-
-# And the site, which is a copy of public/ and will otherwise keep serving
-# the shim that was here a moment ago.
-page/refresh-dist.sh

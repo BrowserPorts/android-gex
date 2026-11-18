@@ -35,5 +35,5 @@ MUSL_CROSS_X86_64_URL     := https://musl.cc/x86_64-linux-musl-cross.tgz
 MUSL_CROSS_X86_64_SHA256  := c5d410d9f82a4f24c549fe5d24f988f85b2679b452413a9f7e5f7b956f2fe7ea
 
 # The emsdk the page's Mesa and Xwayland are built with (EMSDK, default
-# ~/emsdk): make page checks its upstream/emscripten/emscripten-version.txt.
+# ~/emsdk): make mesa and make xwayland check its upstream/emscripten/emscripten-version.txt.
 EMSCRIPTEN_VERSION := 6.0.1
