@@ -1539,7 +1539,7 @@ impl ProcTable {
         }
         let mut t = self.lock();
         let (code, pid, uid, value) = t.procs.iter_mut().find(|p| p.pid == pid)?.child_end.take()?;
-        Some(crate::signal::Source { code, pid, uid, value: value as u64 })
+        Some(crate::signal::Source { code, pid, uid, value: value as u64, errno: 0 })
     }
 
     /// Of the signals in `taken` (what [`ProcTable::take_signals`] just

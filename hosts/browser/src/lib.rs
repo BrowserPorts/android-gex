@@ -14512,6 +14512,11 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>, compat
     if slot_nr == SNAP_SYSCALL && SNAP_PENDING.0.borrow().1 != 0 {
         return None;
     }
+    // A thread under seccomp makes every call through the kernel, where
+    // its filters are run (`Kernel::syscall`).
+    if sigs::seccomp_on() {
+        return None;
+    }
     let call = gex_kernel::syscalls::free_class_of(&gm, regs, compat)?;
     // Its process has exited under it (as the full call): the thread goes,
     // without the call.

@@ -424,8 +424,10 @@ pub fn call(cx: &Cx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> Option<SysResult>
             }
         }
         // No filter is installed, and none can be: no CONFIG_SECCOMP.
-        pr::GET_SECCOMP => Ok(0),
-        pr::SET_SECCOMP => refuse(cx, 1, "PR_SET_SECCOMP"),
+        pr::GET_SECCOMP => Ok(cx.thread.seccomp_mode() as u64),
+        // The kernel's own (`Kernel::seccomp_call`): it needs the
+        // process's threads.
+        pr::SET_SECCOMP => Err(Errno::EINVAL),
         // Whether reading the time stamp counter faults: x86's rdtsc, and
         // since Linux 6.12 arm64's counter registers too (`get_tsc_mode`
         // in arch/arm64/kernel/process.c). Reads never fault here.

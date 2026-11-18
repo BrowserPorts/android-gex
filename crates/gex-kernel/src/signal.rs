@@ -15,7 +15,7 @@ use crate::errno::Errno;
 use crate::GuestMem;
 use gex_abi::ctx;
 use crate::sync::{Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Signal numbers.
@@ -412,7 +412,7 @@ impl ProcSig {
         let mut sources = [None; NSIG];
         for (signo, pid) in procs.take_kill_senders(pid, inbox) {
             if let Some(slot) = sources.get_mut(signo as usize) {
-                *slot = Some(Source { code: SI_USER, pid, uid, value: 0 });
+                *slot = Some(Source { code: SI_USER, pid, uid, value: 0, errno: 0 });
             }
         }
         // A child's end, with which child and how it ended.
@@ -528,6 +528,11 @@ pub struct ThreadSig {
     /// What the thread has set about itself with `prctl`
     /// ([`crate::prctl::Task`]).
     prctl: Mutex<crate::prctl::Task>,
+    /// Its seccomp mode, which every system call reads, and its mode and
+    /// filters together ([`crate::seccomp::State`]). Inherited on `clone`
+    /// and `fork`, kept across `execve`.
+    seccomp_mode: AtomicU8,
+    seccomp: Mutex<crate::seccomp::State>,
 }
 
 impl std::fmt::Debug for ThreadSig {
@@ -551,7 +556,27 @@ impl ThreadSig {
             clear_child_tid: AtomicU64::new(0),
             tagged_addr: AtomicBool::new(false),
             prctl: Mutex::new(crate::prctl::Task::default()),
+            seccomp_mode: AtomicU8::new(crate::seccomp::MODE_DISABLED),
+            seccomp: Mutex::new(crate::seccomp::State::default()),
         }
+    }
+
+    /// Its seccomp mode (`SECCOMP_MODE_*`), without a lock.
+    pub fn seccomp_mode(&self) -> u8 {
+        self.seccomp_mode.load(Ordering::Acquire)
+    }
+
+    /// Its seccomp mode and filters.
+    pub fn seccomp(&self) -> crate::seccomp::State {
+        self.seccomp.lock().clone()
+    }
+
+    /// Set them: the thread itself, or `SECCOMP_FILTER_FLAG_TSYNC` from
+    /// another of its process's threads.
+    pub fn set_seccomp(&self, s: crate::seccomp::State) {
+        let mode = s.mode;
+        *self.seccomp.lock() = s;
+        self.seccomp_mode.store(mode, Ordering::Release);
     }
 
     /// What the thread has set with `prctl`.
@@ -569,6 +594,7 @@ impl ThreadSig {
     pub fn inherit(&self, creator: &ThreadSig) {
         self.set_tagged_addr(creator.tagged_addr());
         *self.prctl.lock() = creator.prctl().child();
+        self.set_seccomp(creator.seccomp());
     }
 
     /// Whether the thread has the tagged address ABI on
@@ -991,15 +1017,19 @@ impl Signals {
         // The saved auxiliary vector: a fork child's is its parent's, and a
         // new program's is set when its stack is built.
         v.extend_from_slice(&self.proc.saved_auxv());
+        // Then seccomp, which a fork child and a new program both keep.
+        v.extend_from_slice(&self.cur.seccomp().to_bytes());
         v
     }
 
     /// A process's signal state from [`Signals::to_bytes`], or `None` for
     /// bytes that are not one.
     pub fn from_bytes(b: &[u8]) -> Option<Signals> {
-        if b.len() != STATE_BYTES {
+        if b.len() < STATE_BYTES {
             return None;
         }
+        let seccomp = crate::seccomp::State::from_bytes(&b[STATE_BYTES..])?;
+        let b = &b[..STATE_BYTES];
         let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
         let mut actions = [SigAction::default(); NSIG];
         for (i, a) in actions.iter_mut().enumerate() {
@@ -1011,6 +1041,7 @@ impl Signals {
         cur.pending.store(w(o + 4), Ordering::Release);
         cur.set_tagged_addr(w(o + 8) & 1 != 0);
         *cur.prctl.lock() = crate::prctl::Task::from_words(w(o + 6), w(o + 7), w(o + 8) >> 1);
+        cur.set_seccomp(seccomp);
         let proc = ProcSig::with_actions(actions);
         proc.shared.store(w(o + 5), Ordering::Release);
         *proc.prctl.lock() = crate::prctl::Proc::from_word(w(o + 9));
@@ -1051,7 +1082,30 @@ pub struct Source {
     pub pid: i32,
     pub uid: u32,
     /// `si_value`, which `sigqueue` sends with the signal; zero otherwise.
+    /// For seccomp's `SIGSYS` (`SYS_SECCOMP`) the three fields are its
+    /// `_sigsys` instead ([`Source::seccomp`]).
     pub value: u64,
+    /// `si_errno`: what `rt_sigqueueinfo`'s caller put there, or the data
+    /// of the seccomp filter's answer.
+    pub errno: i32,
+}
+
+/// `si_code` of seccomp's `SIGSYS`.
+pub const SYS_SECCOMP: i32 = 1;
+
+impl Source {
+    /// `force_sig_seccomp`'s siginfo, kept in the sender's fields: the
+    /// call's address in `pid` and `uid` (low and high halves), its
+    /// number and architecture in `value` ([`Source::sigsys`]).
+    pub fn seccomp(call_addr: u64, syscall: i32, arch: u32, errno: u32) -> Source {
+        Source { code: SYS_SECCOMP, pid: call_addr as i32, uid: (call_addr >> 32) as u32, value: (arch as u64) << 32 | syscall as u32 as u64, errno: errno as i32 }
+    }
+
+    /// The call's address, number and architecture, for seccomp's
+    /// `SIGSYS` ([`Source::seccomp`]).
+    pub fn sigsys(&self, signal: u32) -> Option<(u64, u32, u32)> {
+        (signal == sig::SIGSYS && self.code == SYS_SECCOMP).then(|| (self.pid as u32 as u64 | (self.uid as u64) << 32, self.value as u32, (self.value >> 32) as u32))
+    }
 }
 
 /// `si_code` for a signal sent by `kill`.
@@ -2005,7 +2059,22 @@ fn write_siginfo(
         Taken::Claimed(source) => source,
     };
     if let Some(src) = source {
+        m.write_u32(info + 4, src.errno as u32)?;
         m.write_u32(info + 8, src.code as u32)?;
+        // `_sigsys`: the call's address at a pointer's width, then its
+        // number and the architecture.
+        if let Some((addr, nr, arch)) = src.sigsys(signal) {
+            if wide {
+                m.write_u64(fields, addr)?;
+                m.write_u32(fields + 8, nr)?;
+                m.write_u32(fields + 12, arch)?;
+            } else {
+                m.write_u32(fields, addr as u32)?;
+                m.write_u32(fields + 4, nr)?;
+                m.write_u32(fields + 8, arch)?;
+            }
+            return Ok(());
+        }
         m.write_u32(fields, src.pid as u32)?;
         m.write_u32(fields + 4, src.uid)?;
         // `si_value` follows the sender: a pointer's width.
@@ -2160,9 +2229,9 @@ mod tests {
         let (mut buf, mut s) = setup();
         let mut m = GuestMem::new(&mut buf);
         assert_eq!(s.process().fatal(), None);
-        s.raise_from(sig::SIGSEGV, Source { code: SI_TKILL, pid: 92, uid: 0, value: 0 });
+        s.raise_from(sig::SIGSEGV, Source { code: SI_TKILL, pid: 92, uid: 0, value: 0, errno: 0 });
         assert!(matches!(dispatch(&mut s, &mut m, CTX, false).unwrap(), Delivery::Terminate { signal: sig::SIGSEGV, .. }));
-        assert_eq!(s.process().fatal(), Some((sig::SIGSEGV, Some(Source { code: SI_TKILL, pid: 92, uid: 0, value: 0 }), true)));
+        assert_eq!(s.process().fatal(), Some((sig::SIGSEGV, Some(Source { code: SI_TKILL, pid: 92, uid: 0, value: 0, errno: 0 }), true)));
     }
 
     #[test]

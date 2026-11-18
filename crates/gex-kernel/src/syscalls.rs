@@ -96,6 +96,7 @@ pub mod nr {
     pub const CLOCK_SETTIME: u64 = 112;
     pub const USERFAULTFD: u64 = 282;
     pub const BPF: u64 = 280;
+    pub const SECCOMP: u64 = 277;
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_GETRES: u64 = 114;
     pub const CLOCK_NANOSLEEP: u64 = 115;
@@ -8822,6 +8823,7 @@ pub fn sigqueue_call(to: &KillTo<'_>, m: &GuestMem<'_>, n: u64, a: [u64; 6], wid
         pid: m.read_u32(fields).map_err(|_| Errno::EFAULT)? as i32,
         uid: m.read_u32(fields + 4).map_err(|_| Errno::EFAULT)?,
         value: if wide { m.read_u64(fields + 8) } else { m.read_u32(fields + 8).map(u64::from) }.map_err(|_| Errno::EFAULT)?,
+        errno: m.read_u32(info + 4).map_err(|_| Errno::EFAULT)? as i32,
     };
     if thread && (tid <= 0 || tgid <= 0) {
         return Err(Errno::EINVAL);
@@ -8921,7 +8923,7 @@ pub fn kill_call(to: &KillTo<'_>, n: u64, a: [u64; 6]) -> SysResult {
         return Err(Errno::ESRCH);
     }
     if signo > 0 {
-        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: to.pid, uid: to.creds.ruid(), value: 0 };
+        let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: to.pid, uid: to.creds.ruid(), value: 0, errno: 0 };
         match target {
             Some(t) => t.raise_from(signo, source),
             None => to.signals.raise_from(signo, source),
@@ -9605,6 +9607,11 @@ pub fn call_regs(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> CallRegs {
 /// [`free_class`] of a call already read ([`call_regs`] of the same
 /// context and ABI).
 pub fn free_class_of(m: &GuestMem<'_>, regs: CallRegs, compat: bool) -> Option<FreeCall> {
+    // seccomp's calls are the kernel's: TSYNC reaches every thread.
+    let canonical = regs.canonical(compat);
+    if canonical == nr::SECCOMP || (canonical == nr::PRCTL && regs.a[0] == crate::prctl::pr::SET_SECCOMP) {
+        return None;
+    }
     let CallRegs { raw, mut a } = regs;
     // i386's `socketcall` is classed as the call it makes, with that call's
     // arguments; `raw` stays the number the guest used, which a restart
@@ -10049,7 +10056,7 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
     };
     if r == Err(Errno::EPIPE) && raises_sigpipe(n, &a) {
         // Linux sends it as the writer itself sending it (SI_USER).
-        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.creds.ruid(), value: 0 });
+        f.signals.raise_from(signal::sig::SIGPIPE, signal::Source { code: signal::SI_USER, pid: f.pid, uid: f.creds.ruid(), value: 0, errno: 0 });
     }
     // `_llseek` answers through memory (`i386::Post`).
     let ret = match r {
@@ -12027,6 +12034,53 @@ impl ThreadState {
     }
 }
 
+/// What [`crate::seccomp`] needs of the calling thread's kernel.
+struct SeccompCx<'k, 'm, 'g> {
+    k: &'k Kernel,
+    m: std::cell::RefCell<&'m mut GuestMem<'g>>,
+}
+
+impl crate::seccomp::Threads for SeccompCx<'_, '_, '_> {
+    fn mine(&self) -> crate::seccomp::State {
+        self.k.signals.thread().seccomp()
+    }
+    fn set_mine(&self, s: crate::seccomp::State) {
+        self.k.signals.thread().set_seccomp(s);
+    }
+    fn others(&self) -> Vec<(i32, crate::seccomp::State)> {
+        let me = self.k.signals.thread();
+        let ts = &self.k.thread_signals;
+        ts.tids().into_iter().filter_map(|tid| ts.get(tid).filter(|t| !Arc::ptr_eq(t, &me)).map(|t| (tid, t.seccomp()))).collect()
+    }
+    fn set_other(&self, tid: i32, s: crate::seccomp::State, nnp: bool) {
+        if let Some(t) = self.k.thread_signals.get(tid) {
+            if nnp {
+                t.update_prctl(|p| p.no_new_privs = true);
+            }
+            t.set_seccomp(s);
+        }
+    }
+    fn no_new_privs(&self) -> bool {
+        self.k.signals.thread().prctl().no_new_privs
+    }
+    fn admin(&self) -> bool {
+        const CAP_SYS_ADMIN: u64 = 21;
+        self.k.creds.capable(CAP_SYS_ADMIN)
+    }
+    fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
+        self.m.borrow().read(addr, len).map(|b| b.to_vec()).map_err(|_| Errno::EFAULT)
+    }
+    fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
+        self.m.borrow_mut().write(addr, bytes).map(|_| ()).map_err(|_| Errno::EFAULT)
+    }
+    fn compat(&self) -> bool {
+        self.k.compat
+    }
+    fn pid(&self) -> i32 {
+        self.k.pid
+    }
+}
+
 impl Kernel {
     /// What a process lets go of as it ends, before its parent can see it
     /// gone: its descriptors, and what files hold for its mappings.
@@ -12827,6 +12881,108 @@ impl Kernel {
         out
     }
 
+    /// A call's return to the program, its result written: a pending
+    /// signal is delivered here, the context being complete.
+    fn at_return(&mut self, m: &mut GuestMem<'_>) -> SyscallOutcome {
+        match self.deliver_pending(m) {
+            Delivery::None => SyscallOutcome::Continue,
+            Delivery::Resume(_) if self.wasm32 => SyscallOutcome::Continue,
+            Delivery::Resume(pc) => SyscallOutcome::Resume(pc),
+            Delivery::Terminate { signal, core } => SyscallOutcome::Killed { signal, core },
+        }
+    }
+
+    /// This thread ends and the process goes on (`exit` from one of
+    /// several threads, `do_exit`).
+    fn end_thread(&mut self, m: &mut GuestMem<'_>) -> SyscallOutcome {
+        let end = ThreadEnd {
+            thread: self.signals.thread(),
+            threads: &self.thread_signals,
+            thread_fs: &self.thread_fs,
+            futexes: &self.futexes,
+            procs: &self.procs,
+        };
+        end.end(m, self.ctx_addr, self.tid);
+        self.thread_calls.remove(&self.tid);
+        SyscallOutcome::ThreadExit
+    }
+
+    /// The calling thread's seccomp, at a call's entry
+    /// (`__secure_computing`): `None` to make the call, or what becomes of
+    /// it instead. `raw` and `a` are as the program left them.
+    fn seccomp_entry(&mut self, m: &mut GuestMem<'_>, raw: u64, a: &[u64; 6], pc: u64) -> Option<SyscallOutcome> {
+        use crate::seccomp as sc;
+        let thread = self.signals.thread();
+        let mode = thread.seccomp_mode();
+        if mode == sc::MODE_DISABLED {
+            return None;
+        }
+        let arch = if self.compat {
+            sc::AUDIT_ARCH_I386
+        } else if gex_abi::X86 {
+            sc::AUDIT_ARCH_X86_64
+        } else {
+            sc::AUDIT_ARCH_AARCH64
+        };
+        // A question only: `one_of_several` counts the thread out.
+        let last = self.live_threads.load(std::sync::atomic::Ordering::Acquire) <= 1;
+        if mode == sc::MODE_STRICT {
+            if sc::strict_allows(raw, arch) {
+                return None;
+            }
+            // `do_exit(SIGKILL)`: the thread, which for the last one is
+            // the process.
+            if self.trace {
+                eprintln!("[gex:{}.{}] seccomp: strict mode refuses call {raw}", self.pid, self.tid);
+            }
+            return Some(if one_of_several(&self.live_threads) { self.end_thread(m) } else { SyscallOutcome::Killed { signal: signal::sig::SIGKILL, core: false } });
+        }
+        let filter = thread.seccomp().filter?;
+        let nr = if self.compat { raw as u32 as i32 } else { raw as i32 };
+        let data = sc::Data { nr, arch, ip: pc, args: *a };
+        let verdict = sc::verdict(sc::run(&filter, &data), last);
+        if self.trace && verdict != sc::Verdict::Allow {
+            eprintln!("[gex:{}.{}] seccomp: call {raw}: {verdict:?}", self.pid, self.tid);
+        }
+        match verdict {
+            sc::Verdict::Allow => None,
+            sc::Verdict::Fail(e) => {
+                let _ = set_result(m, self.ctx_addr, crate::errno::encode(Err(Errno(e as i32))));
+                Some(self.at_return(m))
+            }
+            sc::Verdict::Trap(data) => {
+                // `force_sig_seccomp` with the current handler: SIGSYS is
+                // unblocked, and its default action if ignored; the
+                // registers are left as they were.
+                let sys = signal::sig::SIGSYS;
+                if self.signals.action(sys).handler == signal::SIG_IGN {
+                    let _ = self.signals.set_action(sys, signal::SigAction::default());
+                }
+                let bit = 1u64 << (sys - 1);
+                if self.signals.blocked() & bit != 0 {
+                    self.signals.set_blocked(self.signals.blocked() & !bit);
+                }
+                thread.raise(sys, Some(signal::Source::seccomp(pc, nr, arch, data)));
+                Some(self.at_return(m))
+            }
+            sc::Verdict::KillThread if one_of_several(&self.live_threads) => Some(self.end_thread(m)),
+            // The others ended meanwhile: this is the last, and the process
+            // goes with it.
+            sc::Verdict::KillThread => Some(SyscallOutcome::Killed { signal: signal::sig::SIGSYS, core: true }),
+            sc::Verdict::KillProcess => Some(SyscallOutcome::Killed { signal: signal::sig::SIGSYS, core: true }),
+        }
+    }
+
+    /// `seccomp(2)`, and `prctl(PR_SET_SECCOMP)`.
+    fn seccomp_call(&mut self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+        let cx = SeccompCx { k: self, m: std::cell::RefCell::new(m) };
+        if n == nr::SECCOMP {
+            crate::seccomp::call(&cx, a[0], a[1], a[2])
+        } else {
+            crate::seccomp::prctl_set(&cx, a[1], a[2])
+        }
+    }
+
     fn syscall_inner(&mut self, m: &mut GuestMem<'_>, pc: u64) -> SyscallOutcome {
         self.syscall_pc = pc;
         // An i386-ABI process has its number in eax (`x(0)`) in every build:
@@ -12851,6 +13007,10 @@ impl Kernel {
                 self.arg(m, 5),
             ]
         };
+        // seccomp first, on the registers as the program left them.
+        if let Some(out) = self.seccomp_entry(m, raw, &a, pc) {
+            return out;
+        }
         if a64_thread(self.compat, self.wasm32) {
             untag_mapping_args(raw, &mut a);
             if self.signals.thread().tagged_addr() {
@@ -12938,6 +13098,14 @@ impl Kernel {
         // commands are ordinary settings, and busybox init issues `CAD_OFF`
         // as its first act. Treating that as a shutdown ends the boot on line
         // one, which is exactly what it did.
+        if n == nr::SECCOMP || (n == nr::PRCTL && a[0] == crate::prctl::pr::SET_SECCOMP) {
+            let r = self.seccomp_call(m, n, a);
+            if self.trace {
+                eprintln!("[gex:{}.{}] seccomp({:#x}, {:#x}, {:#x}) = {:?}", self.pid, self.tid, a[0], a[1], a[2], r);
+            }
+            let _ = set_result(m, self.ctx_addr, crate::errno::encode(r));
+            return self.at_return(m);
+        }
         if n == nr::REBOOT {
             let Some(what) = reboot_halts(a[2]) else {
                 let _ = set_result(m, self.ctx_addr, 0);
@@ -13067,16 +13235,7 @@ impl Kernel {
             if self.trace {
                 eprintln!("[gex:{}] exit({}) (thread {})", self.pid, a[0] as i32, self.tid);
             }
-            let end = ThreadEnd {
-                thread: self.signals.thread(),
-                threads: &self.thread_signals,
-                thread_fs: &self.thread_fs,
-                futexes: &self.futexes,
-                procs: &self.procs,
-            };
-            end.end(m, self.ctx_addr, self.tid);
-            self.thread_calls.remove(&self.tid);
-            return SyscallOutcome::ThreadExit;
+            return self.end_thread(m);
         }
 
         // `epoll_pwait`, `ppoll` and `pselect6` with a signal mask: it is the
@@ -13199,7 +13358,7 @@ impl Kernel {
                 self.signals.raise_from(
                     crate::signal::sig::SIGPIPE,
                     // Linux sends it as the writer itself sending it (SI_USER).
-                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid(), value: 0 },
+                    crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid(), value: 0, errno: 0 },
                 );
             }
         }
@@ -13589,7 +13748,7 @@ impl Kernel {
             self.signals.raise_from(
                 crate::signal::sig::SIGPIPE,
                 // Linux sends it as the writer itself sending it (SI_USER).
-                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid(), value: 0 },
+                crate::signal::Source { code: crate::signal::SI_USER, pid: self.pid, uid: self.creds.ruid(), value: 0, errno: 0 },
             );
         }
         let ret = encode(r);
@@ -13881,7 +14040,7 @@ impl Kernel {
         if self.procs.has_signals(self.pid) {
             let mut other = false;
             for (tid, signo, from) in self.procs.take_thread_signals(self.pid, 0) {
-                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.ruid(), value: 0 };
+                let source = crate::signal::Source { code: crate::signal::SI_TKILL, pid: from, uid: self.creds.ruid(), value: 0, errno: 0 };
                 if tid == self.sig_tid || (self.sig_tid == 0 && tid == self.tid) {
                     self.signals.raise_from(signo, source);
                 } else if let Some(t) = self.thread_signals.get(tid) {
@@ -15878,6 +16037,7 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::CLOCK_SETTIME => "clock_settime",
         nr::USERFAULTFD => "userfaultfd",
         nr::BPF => "bpf",
+        nr::SECCOMP => "seccomp",
         nr::GETPID => "getpid",
         nr::GETPPID => "getppid",
         nr::SETSID => "setsid",
@@ -17361,7 +17521,7 @@ mod tests {
         }
         let names = |v: &[u64]| v.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>();
         assert_eq!(wrong, Vec::<u64>::new(), "answered ENOSYS, but the kernel makes {:?}", names(&wrong));
-        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE, nr::CLONE3], "{:?}", names(&locked));
+        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE, nr::SECCOMP, nr::CLONE3], "{:?}", names(&locked));
     }
 
     /// i386's `socketcall`, as Debian's i386 glibc makes every socket call,
@@ -18668,7 +18828,7 @@ mod tests {
 
         // A blocked signal raised is pending, read lock-free.
         k.signals.set_blocked(1 << (SIGUSR1 - 1));
-        k.signals.raise_from(SIGUSR1 as u32, signal::Source { code: signal::SI_USER, pid: k.pid, uid: k.creds.uid(), value: 0 });
+        k.signals.raise_from(SIGUSR1 as u32, signal::Source { code: signal::SI_USER, pid: k.pid, uid: k.creds.uid(), value: 0, errno: 0 });
         set_args(&mut m, at, nr::RT_SIGPENDING, &[0x22000, 8]);
         assert!(done(free(&k, &mut m, at)));
         assert_eq!(m.read_bits64(0x22000).unwrap() & (1 << (SIGUSR1 - 1)), 1 << (SIGUSR1 - 1));

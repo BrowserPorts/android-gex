@@ -302,6 +302,7 @@ pub mod raw {
     pub const FUTEX_TIME64: u64 = 422;
     pub const PIDFD_SEND_SIGNAL: u64 = 424;
     pub const PIDFD_OPEN: u64 = 434;
+    pub const SECCOMP: u64 = 354;
     pub const CLONE3: u64 = 435;
     pub const CLOSE_RANGE: u64 = 436;
     pub const OPENAT2: u64 = 437;
@@ -474,6 +475,7 @@ pub fn translate(
         }
         x::CLOSE_RANGE => nr::CLOSE_RANGE,
         x::PIDFD_OPEN => nr::PIDFD_OPEN,
+        x::SECCOMP => nr::SECCOMP,
         x::PIDFD_SEND_SIGNAL => {
             a[0] = sext(a[0]);
             nr::PIDFD_SEND_SIGNAL

@@ -437,7 +437,7 @@ fn gather(home: &Home) {
         MINE.with(|m| {
             if let Some((tid, t)) = m.borrow().as_ref() {
                 for (_, signo, from) in home.procs.take_thread_signals(home.pid, *tid) {
-                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.creds.ruid(), value: 0 });
+                    t.raise_from(signo, signal::Source { code: signal::SI_TKILL, pid: from, uid: home.creds.ruid(), value: 0, errno: 0 });
                 }
             }
         });
@@ -566,7 +566,7 @@ pub(crate) fn finish(gm: &mut GuestMem<'_>, ctx_addr: u64, suspended: Option<u64
         // Linux sends it as the writer itself sending it (SI_USER).
         view.raise_from(
             signal::sig::SIGPIPE,
-            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.creds.ruid(), value: 0 },
+            signal::Source { code: signal::SI_USER, pid: home.pid, uid: home.creds.ruid(), value: 0, errno: 0 },
         );
     }
     if suspended.is_some() {
@@ -600,6 +600,11 @@ pub(crate) fn catch_up_shared(gm: &mut GuestMem<'_>) {
 /// The call of the lock-free class `call` (`syscalls::free_class`) for this
 /// Worker's thread, whose context is at `ctx_addr`: the whole call, its park
 /// and its signal included, without the kernel.
+/// Whether the calling thread is under seccomp, a strict mode or filters.
+pub(crate) fn seccomp_on() -> bool {
+    home().and_then(view).is_some_and(|v| v.thread().seccomp_mode() != gex_kernel::seccomp::MODE_DISABLED)
+}
+
 pub(crate) fn free_call(gm: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCall, compat: bool, pc: u64) -> FreeOutcome {
     let home = home().expect("a syscall before its process was published");
     let view = view(home).expect("a syscall from a Worker with no thread bound");

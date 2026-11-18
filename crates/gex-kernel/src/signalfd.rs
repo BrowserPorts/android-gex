@@ -110,6 +110,14 @@ pub fn siginfo(signal: u32, source: Option<Source>) -> [u8; SIGINFO_SIZE] {
     let code = source.map_or(SI_KERNEL, |s| s.code);
     b[8..12].copy_from_slice(&code.to_le_bytes());
     if let Some(s) = source {
+        b[4..8].copy_from_slice(&s.errno.to_le_bytes());
+        // Seccomp's: ssi_syscall, ssi_call_addr, ssi_arch, and no sender.
+        if let Some((addr, nr, arch)) = s.sigsys(signal) {
+            b[84..88].copy_from_slice(&nr.to_le_bytes());
+            b[88..96].copy_from_slice(&addr.to_le_bytes());
+            b[96..100].copy_from_slice(&arch.to_le_bytes());
+            return b;
+        }
         // ssi_pid, ssi_uid
         b[12..16].copy_from_slice(&(s.pid as u32).to_le_bytes());
         b[16..20].copy_from_slice(&s.uid.to_le_bytes());
@@ -206,7 +214,7 @@ mod tests {
         assert_eq!(fd.read_at(0, &mut buf[..SIGINFO_SIZE - 1]), Err(Errno::EINVAL));
 
         signals.raise(SIGUSR2);
-        signals.raise_from(SIGUSR1, Source { code: SI_QUEUE, pid: 42, uid: 7, value: 0x1_0000_0005 });
+        signals.raise_from(SIGUSR1, Source { code: SI_QUEUE, pid: 42, uid: 7, value: 0x1_0000_0005, errno: 0 });
         signals.raise(15);
         assert!(fd.poll_readable());
         assert_eq!(fd.read_at(0, &mut buf), Ok(2 * SIGINFO_SIZE as u64));
@@ -218,7 +226,7 @@ mod tests {
         assert!(!fd.poll_readable());
         assert_eq!(signals.pending_raw(), bit(15));
         // A child's end says which child and how.
-        let chld = siginfo(17, Some(Source { code: 1, pid: 99, uid: 7, value: 3 }));
+        let chld = siginfo(17, Some(Source { code: 1, pid: 99, uid: 7, value: 3, errno: 0 }));
         assert_eq!((word_of(&chld, 0), word_of(&chld, 8), word_of(&chld, 12), word_of(&chld, 40), word_of(&chld, 44)), (17, 1, 99, 3, 0));
 
         // Another thread's view on this host thread: its signals, not the

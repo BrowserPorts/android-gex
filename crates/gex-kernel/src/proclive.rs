@@ -303,13 +303,16 @@ impl ProcSource for KernelProcSource {
         let (size, rss, anon) = l.mm.lock().vm_counters();
         let (size, rss, anon) = (size >> 10, rss >> 10, anon >> 10);
         let (uid, gid, caps) = crate::vfs::procfs::status_ids(&l.creds.save());
-        // The task's own flag; no seccomp filter can be installed.
-        let nnp = l.threads.get(tid).unwrap_or_else(|| Arc::clone(&l.thread)).prctl().no_new_privs as u8;
+        // The task's own flag, and its own seccomp.
+        let task_sig = l.threads.get(tid).unwrap_or_else(|| Arc::clone(&l.thread));
+        let nnp = task_sig.prctl().no_new_privs as u8;
+        let seccomp = task_sig.seccomp();
+        let (sc_mode, sc_filters) = (seccomp.mode, seccomp.filters());
         format!(
             "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{uid}{gid}\
              VmPeak:\t{size:8} kB\nVmSize:\t{size:8} kB\nVmHWM:\t{rss:8} kB\nVmRSS:\t{rss:8} kB\n\
              RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\n{caps}\
-             NoNewPrivs:\t{nnp}\nSeccomp:\t0\nSeccomp_filters:\t0\n",
+             NoNewPrivs:\t{nnp}\nSeccomp:\t{sc_mode}\nSeccomp_filters:\t{sc_filters}\n",
             task.and_then(|t| t.own_name()).unwrap_or_else(|| l.exe.rsplit('/').next().unwrap_or("gex").to_string()),
             l.pid,
             tid,
