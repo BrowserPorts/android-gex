@@ -65,7 +65,7 @@ help:
 	@echo 'make wine          64-bit Wine with WoW64, and a prefix (prints WINE64_DIST=, WINE64_PREFIX=)'
 	@echo 'make gexcc         the wasm32 C/C++ compiler, from pins (out/gexcc; GEXCC_PREFIX= elsewhere)'
 	@echo 'make mesa          Mesa for the page alone'
-	@echo 'make test          the runtime tests: node test/run.mjs (ARGS="..." passes options)'
+	@echo 'make test          the runtime tests: node test/run.mjs on the package make runtime builds (ARGS="..." passes options)'
 	@echo 'make help-all      every target'
 
 help-all: help
@@ -251,9 +251,9 @@ eject-site:
 	@echo $(SITE)
 
 # ---- tests and checks ----
-test:
+test: runtime
 	@[ -x $(GEXC_A64) ] || $(MAKE) gexc
-	$(if $(wildcard $(BUSYBOX)),BUSYBOX=$(BUSYBOX)) node $(ROOT)/test/run.mjs $(ARGS)
+	$(if $(wildcard $(BUSYBOX)),BUSYBOX=$(BUSYBOX)) node $(ROOT)/test/run.mjs --package $(PKG) $(ARGS)
 check:
 	cargo test --release --workspace --exclude gex-kmem --exclude gex-kernel-wasm --exclude gex-browser \
 	  $(if $(X86),--features gex-kernel/x86$(,)gex-xlate/x86$(,)gexc/x86$(,)gex-native/x86$(,)gex-eject/x86 --target-dir target/x86t)
