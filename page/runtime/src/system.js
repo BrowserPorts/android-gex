@@ -750,7 +750,8 @@ export class System extends EventTarget {
   /** Every crash the kernel records (gex_kernel::proc::Crash: a program
    *  that a crash signal ended, or one that said it crashed, as Wine does
    *  for a Windows program's unhandled exception), as a `crash` event:
-   *  `{ pid, name, reason, code, signal }`. */
+   *  `{ pid, name, reason, code, signal, cmdline }` (`cmdline` its arguments
+   *  joined by spaces, as a `notice` event's). */
   async #watchCrashes(k) {
     const queue = (await k.r('k_crash_queue')) >>> 0;
     if (!queue) return;
@@ -772,7 +773,7 @@ export class System extends EventTarget {
           // a running program's notice (why it cannot work as it should)
           // (its line is the shim's, said as it was made)
           if (c.notice) {
-            this.dispatchEvent(Object.assign(new Event('notice'), { pid: c.pid, name: c.name, text: c.reason }));
+            this.dispatchEvent(Object.assign(new Event('notice'), { pid: c.pid, name: c.name, text: c.reason, cmdline: c.cmdline ?? '' }));
             continue;
           }
           this.#say(`[gex] pid ${c.pid}${c.name ? ` (${c.name})` : ''} crashed: ${c.reason}\n`);
@@ -991,6 +992,17 @@ export class System extends EventTarget {
       throw new Error(`spawn: this system has an init (${this.#init[0][0]}), which owns the processes; the page reaches programs through what it starts`);
     }
     return this.#spawn(argv, opts, false, false);
+  }
+
+  /** Send `sig` (a name like 'SIGUSR1', or a number) to every running
+   *  process named `name`: the name it gave itself, or its program's file
+   *  name. A process the page did not start (a daemon one of its programs
+   *  started) is reached this way. Resolves to how many were signalled; 0
+   *  before boot or when none is running. */
+  async signal(name, sig) {
+    if (typeof name !== 'string' || !name) throw new TypeError('signal(name, sig): name is a process name');
+    if (!this.#programs) return 0;
+    return this.#programs.killNamed(name, signalNumber(sig));
   }
 
   /** The init (`boot(argv, opts)`) as a Process, null without one. */

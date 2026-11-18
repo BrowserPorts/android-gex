@@ -364,6 +364,14 @@ export class Programs {
     if (r < 0 && r !== -3) throw errno(r, `kill ${pid}`);
   }
 
+  /** Signal every live process named `name` (its published name, or its
+   *  program's file name): how many were signalled. */
+  async killNamed(name, signal) {
+    const r = await this.#k.r('k_kill_named', INIT, { in: name }, signal);
+    if (r < 0) throw errno(r, `kill ${name}`);
+    return r;
+  }
+
   /** Handles done with: ends closed. */
   async release(h) {
     const e = await this.#ends.get(h);
