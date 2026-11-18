@@ -25,8 +25,20 @@ export interface SystemOptions {
   baseUrl?: string;
   /** Compiled function-tier units for the tree's images (`gexc cgen-image`'s
    *  cache): a URL, or `{ url, require }`, where `require` fails an image
-   *  that has none. */
-  units?: string | URL | { url: string | URL; require?: boolean };
+   *  that has none; `jit: false` translates nothing at run time; `providers`
+   *  C sources built into the units in place of a library's exports;
+   *  `stateful` stateful providers in place of Windows libraries (`{ 'x.dll':
+   *  file }`, files under `url`). */
+  units?: string | URL | {
+    url: string | URL;
+    require?: boolean;
+    jit?: boolean;
+    providers?: { name: string; source: string }[];
+    stateful?: Record<string, string>;
+  };
+  /** Every program starts in a 64-bit memory (by default a program moves to
+   *  one at its next start once it needs one). */
+  mem64?: boolean;
   /** Keep translated code across loads (the origin's private file system). */
   /** Keep translated code across loads; a string names the cache, apart from other names'. */
   xcache?: boolean | string;

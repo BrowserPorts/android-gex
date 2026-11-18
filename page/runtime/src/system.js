@@ -190,28 +190,52 @@ export class System extends EventTarget {
    * ...); default beside the package. `units`: a directory of compiled
    * function-tier units (`gexc cgen-image`'s cache), each used for the image
    * it was built for where one is mapped at its base; `{ url, require }`
-   * with `require` makes a program image without one fail. `xcache`: keep
+   * with `require` makes a program image without one fail; `jit: false`
+   * translates nothing at run time (the images run from units alone);
+   * `providers: [{ name, source }]` C sources built into the units in place
+   * of a library's exports, by name; `stateful: { 'x.dll': 'file' }`
+   * stateful providers in place of Windows libraries, modules under `url`.
+   * `mem64`: every program starts in a 64-bit memory. `xcache`: keep
    * the translated code across loads (in the origin's private storage, a
    * directory under Node: GEX_XCACHE_DIR); a string names the cache, kept
    * apart from other names' on the same page. `debug`: the runtime's switches,
    * `{name: value}` as gex's test pages take `?name=value`; unstable, for
    * debugging only.
    */
-  constructor({ baseUrl, units, xcache = false, arch, debug = {} } = {}) {
+  constructor({ baseUrl, units, xcache = false, arch, mem64 = false, debug = {} } = {}) {
     super();
     for (const k of Object.keys(arguments[0] ?? {})) {
-      if (!['baseUrl', 'units', 'xcache', 'arch', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
+      if (!['baseUrl', 'units', 'xcache', 'arch', 'mem64', 'debug'].includes(k)) throw new TypeError(`System: no option ${k}`);
     }
     if (arch !== undefined && !ARCHES[arch]) throw new TypeError(`System: arch is one of ${Object.keys(ARCHES).join(', ')}`);
+    const u = typeof units === 'object' && units && !(units instanceof URL) ? units : units ? { url: units } : null;
+    if (u) {
+      for (const k of Object.keys(u)) {
+        if (!['url', 'require', 'jit', 'providers', 'stateful'].includes(k)) throw new TypeError(`System: units has no option ${k}`);
+      }
+      if (u.url == null) throw new TypeError('System: units needs a url');
+      if (u.providers !== undefined && (!Array.isArray(u.providers) || u.providers.some((p) => typeof p?.name !== 'string' || !p.name || /[\n\0]/.test(p.name) || typeof p.source !== 'string' || p.source.includes('\0')))) {
+        throw new TypeError('System: units.providers is [{ name, source }], each a string (a name without newlines)');
+      }
+      if (u.stateful !== undefined && (typeof u.stateful !== 'object' || Object.entries(u.stateful).some(([d, f]) => !d || /[=,]/.test(d) || typeof f !== 'string' || !f || f.includes(',')))) {
+        throw new TypeError("System: units.stateful is { 'library.dll': 'file' }, the file under units' url");
+      }
+    }
     // The page runtime keeps its state in the page's globals.
     if (made) throw new Error('System: a page runs one system; this page already made one');
     made = true;
-    const u = typeof units === 'object' && units && !(units instanceof URL) ? units : units ? { url: units } : null;
     this.#opts = {
       baseUrl: String(baseUrl ?? DEFAULT_BASE()),
       // The package's own list of its files, unless the page names a place.
       files: baseUrl == null ? files : null,
-      units: u && { url: new URL(String(u.url).replace(/\/*$/, ''), globalThis.location?.href).href, require: !!u.require },
+      units: u && {
+        url: new URL(String(u.url).replace(/\/*$/, ''), globalThis.location?.href).href,
+        require: !!u.require,
+        jit: u.jit !== false,
+        providers: u.providers ?? [],
+        stateful: u.stateful ?? {},
+      },
+      mem64: !!mem64,
       xcache: typeof xcache === 'string' && xcache ? xcache : !!xcache,
       arch: arch === undefined ? undefined : ARCHES[arch],
       debug: { ...debug },
@@ -380,7 +404,13 @@ export class System extends EventTarget {
     if (this.#opts.units) {
       q.set('cgen', this.#opts.units.require ? '2' : '1');
       q.set('cgenurl', this.#opts.units.url);
+      if (!this.#opts.units.jit) q.set('aot', '1');
+      // (runtime.js reads these two at its start, as gex's own pages set them)
+      if (this.#opts.units.providers.length) globalThis.GEX_PROVIDER_SOURCES = this.#opts.units.providers.map((p) => `${p.name}\n${p.source}`).join('\0');
+      const st = Object.entries(this.#opts.units.stateful);
+      if (st.length) globalThis.GEX_STATEFUL = st.map(([d, f]) => `${d}=${f}`).join(',');
     }
+    if (this.#opts.mem64) q.set('mem64', '1');
     if (this.#opts.xcache) q.set('xcache', this.#opts.xcache === true ? '1' : this.#opts.xcache);
     globalThis.GEX_PAGE_SEARCH = `?${q}`;
     globalThis.GEX_ASSET_BASE = new URL(this.#opts.baseUrl, globalThis.location?.href).href;
