@@ -464,7 +464,7 @@ struct Jit {
     /// Units of the registry this store has passed over without taking
     /// them, in the registry's order ([`replay_into`]): what a thread that
     /// takes code only as it needs it has not needed yet.
-    deferred: Vec<Arc<CompiledUnit>>,
+    deferred: Deferred,
     limits: gex_xlate::BlockLimits,
     /// This store's function table (`ftab`), made at the first need.
     ftab: Option<ftab::Store>,
@@ -1558,7 +1558,7 @@ fn run_program_with(
             cache: jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
-            deferred: Vec::new(),
+            deferred: Deferred::default(),
             limits: xlate.limits,
             ftab: None,
             blocks: None,
@@ -3349,7 +3349,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             cache: cx.jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
-            deferred: Vec::new(),
+            deferred: Deferred::default(),
             limits: cx.limits,
             ftab: None,
             blocks: None,
@@ -3746,7 +3746,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             cache: cx.jit_cache.clone(),
             instances: Vec::new(),
             replayed: 0,
-            deferred: Vec::new(),
+            deferred: Deferred::default(),
             limits: cx.limits,
             ftab: None,
             blocks: None,
@@ -3883,7 +3883,10 @@ impl Take {
 /// thread of Android's apexd had all 1,500 modules of the process.
 fn replay_into(mut cx: impl wasmtime::AsContextMut<Data = HostState>, take: Take) -> Result<bool> {
     let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::REPLAY);
-    let (pending, deferred) = {
+    // The units to install, in the order the registry has them: the
+    // deferred ones the take wants (found by page, not by a walk of all of
+    // them), and of the new ones those it wants, the rest deferred.
+    let wanted = {
         let mut store = cx.as_context_mut();
         let Some(jit) = store.data_mut().jit.as_mut() else {
             return Ok(false);
@@ -3893,29 +3896,104 @@ fn replay_into(mut cx: impl wasmtime::AsContextMut<Data = HostState>, take: Take
             sh.registry[jit.replayed.min(sh.registry.len())..].to_vec()
         };
         jit.replayed += pending.len();
-        (pending, std::mem::take(&mut jit.deferred))
-    };
-    let mut installed = false;
-    let mut keep = Vec::new();
-    for unit in deferred.into_iter().chain(pending) {
-        let wanted = unit.module.is_none()
-            || match take {
-                Take::All => true,
-                Take::Page(page) => unit.pages().binary_search(&page).is_ok(),
-                Take::Nothing => false,
-            };
-        if wanted {
-            install_unit(cx.as_context_mut(), &unit)?;
-            installed = true;
-        } else {
-            keep.push(unit);
+        for unit in pending {
+            jit.deferred.push(unit, matches!(take, Take::All));
         }
-    }
-    let mut store = cx.as_context_mut();
-    if let Some(jit) = store.data_mut().jit.as_mut() {
-        jit.deferred = keep;
+        match take {
+            Take::All => jit.deferred.take_all(),
+            Take::Page(page) => jit.deferred.take_page(page),
+            Take::Nothing => jit.deferred.take_always(),
+        }
+    };
+    let installed = !wanted.is_empty();
+    for unit in wanted {
+        install_unit(cx.as_context_mut(), &unit)?;
     }
     Ok(installed)
+}
+
+/// A store's deferred units ([`Jit::deferred`]): in the registry's order,
+/// and found by page, so that a miss on one page looks at the units with
+/// code there and not at every unit the store has passed over (a forked
+/// family's registry, tens of thousands in a booting Android, at every
+/// miss of every thread).
+#[derive(Default)]
+struct Deferred {
+    /// In the registry's order; `None` once taken.
+    units: Vec<Option<Arc<CompiledUnit>>>,
+    /// Each page's units, by their place in `units`, ascending.
+    by_page: std::collections::HashMap<u64, Vec<usize>>,
+    /// Units with no module (the function table's bridges), always taken
+    /// at the next replay, by their place in `units`.
+    always: Vec<usize>,
+    /// How many of `units` are taken.
+    taken: usize,
+}
+
+impl Deferred {
+    fn is_empty(&self) -> bool {
+        self.taken == self.units.len()
+    }
+
+    /// A unit passed over (or, `all`, about to be taken with the rest).
+    fn push(&mut self, unit: Arc<CompiledUnit>, all: bool) {
+        let at = self.units.len();
+        if unit.module.is_none() {
+            self.always.push(at);
+        } else if !all {
+            for &p in unit.pages() {
+                self.by_page.entry(p).or_default().push(at);
+            }
+        }
+        self.units.push(Some(unit));
+    }
+
+    /// The units at `places` not yet taken, taken, in the registry's order.
+    fn take_at(&mut self, mut places: Vec<usize>) -> Vec<Arc<CompiledUnit>> {
+        places.sort_unstable();
+        places.dedup();
+        let mut out = Vec::with_capacity(places.len());
+        for i in places {
+            if let Some(u) = self.units.get_mut(i).and_then(Option::take) {
+                out.push(u);
+                self.taken += 1;
+            }
+        }
+        self.compact();
+        out
+    }
+
+    /// The units with code on `page`, and those always taken.
+    fn take_page(&mut self, page: u64) -> Vec<Arc<CompiledUnit>> {
+        let mut places = self.by_page.remove(&page).unwrap_or_default();
+        places.append(&mut self.always);
+        self.take_at(places)
+    }
+
+    /// Only those always taken.
+    fn take_always(&mut self) -> Vec<Arc<CompiledUnit>> {
+        let places = std::mem::take(&mut self.always);
+        self.take_at(places)
+    }
+
+    /// All of them.
+    fn take_all(&mut self) -> Vec<Arc<CompiledUnit>> {
+        let out: Vec<_> = self.units.drain(..).flatten().collect();
+        *self = Deferred::default();
+        out
+    }
+
+    /// Once most are taken, the rest moved down and indexed again.
+    fn compact(&mut self) {
+        if self.taken < 1024 || self.taken * 2 < self.units.len() {
+            return;
+        }
+        let rest: Vec<_> = self.units.drain(..).flatten().collect();
+        *self = Deferred::default();
+        for u in rest {
+            self.push(u, false);
+        }
+    }
 }
 
 /// What `--busybox` presents (the applets toolchain/busybox/busybox.config
