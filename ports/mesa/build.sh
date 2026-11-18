@@ -102,31 +102,39 @@ fi
 # directory compiled with other ones is cleaned below.
 export EMCC_CFLAGS="${EMCC_CFLAGS:+$EMCC_CFLAGS }-ffile-prefix-map=${WINK_CACHE:-$(dirname "$TINT_OUT")}=/tint -ffile-prefix-map=$ROOT=/gex"
 
-# A build directory set up from files that are no longer there (its cross or
-# native file, or the source tree, at an old path, as after the tree's files
-# moved) cannot be reconfigured: it is set up afresh.
+# A build directory set up from other files than this build's -- its source
+# tree or cross file gone (the tree's files moved), or another checkout's (a
+# build directory copied from another worktree, whose Mesa and gex sources it
+# then went on compiling, under this tree's cache key) -- cannot be
+# reconfigured: it is set up afresh.
 if [ -f "$BUILD/build.ninja" ]; then
-    gone=$(python3 -I - "$BUILD" <<'PY'
+    other=$(python3 -I - "$BUILD" "$MESA" "$CROSS" <<'PY'
 import ast, configparser, json, os, sys
-b = sys.argv[1]
-paths = []
+b, mesa, cross = sys.argv[1:4]
+real = lambda p: os.path.realpath(p)
+out = []
 try:
-    paths.append(json.load(open(os.path.join(b, 'meson-info', 'meson-info.json')))['directories']['source'])
+    src = json.load(open(os.path.join(b, 'meson-info', 'meson-info.json')))['directories']['source']
+    if not os.path.exists(src) or real(src) != real(mesa):
+        out.append(f'source {src}')
 except (OSError, ValueError, KeyError):
-    paths.append(os.path.join(b, 'meson-info', 'meson-info.json'))
+    out.append('no meson-info.json')
 c = configparser.ConfigParser()
 c.read(os.path.join(b, 'meson-private', 'cmd_line.txt'))
 for k in ('cross_file', 'native_file'):
     v = c.get('properties', k, fallback='[]')
     try:
-        paths += ast.literal_eval(v)
+        ps = ast.literal_eval(v)
     except (ValueError, SyntaxError):
-        paths.append(v)
-print(' '.join(p for p in paths if not os.path.exists(p)))
+        ps = [v]
+    for p in ps:
+        if not os.path.exists(p) or (k == 'cross_file' and real(p) != real(cross)):
+            out.append(f'{k} {p}')
+print('; '.join(out))
 PY
 )
-    if [ -n "$gone" ]; then
-        echo "$BUILD was set up from files no longer there ($gone): setting it up again" >&2
+    if [ -n "$other" ]; then
+        echo "$BUILD was set up from other files than this build's ($other): setting it up again" >&2
         rm -rf "${BUILD:?}"
     fi
 fi
