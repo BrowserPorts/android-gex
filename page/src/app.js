@@ -718,7 +718,12 @@ async function begin(opts, base, at, state, meter, lets) {
   if (!env.some((e) => e.startsWith('GEX_WIN_STRICT='))) env.push('GEX_WIN_STRICT=1');
   // The wineserver's periodic registry saves only for a prefix the visit
   // keeps (wine-env.js).
+  const regKnob = !env.some((e) => e.startsWith('WINEGEX_NO_REGSAVE='));
   noRegSave(env, filesystemValue(filesystem).kind !== 'memory');
+  // (the knob this page added, not the caller's: a session recorded on a
+  // memory filesystem must not carry it into a build whose visitors keep
+  // their prefix -- their registry was never saved)
+  const pageRegKnob = regKnob && env.includes('WINEGEX_NO_REGSAVE=1') ? 'WINEGEX_NO_REGSAVE=1' : null;
   pageUser(env);
   // The browser's time zone, unless the caller names one: without TZ the
   // guest's libc is on UTC (no /etc/localtime), and Wine's clock with it.
@@ -747,8 +752,9 @@ async function begin(opts, base, at, state, meter, lets) {
   const cwd = opts.cwd ?? b.cwd ?? (exe.replace(/\/[^/]*$/, '') || '/');
   const mtimes = opts.mtimes ?? b.mtimes;
   // How it was started (gex-eject's 32-bit Wine recorder keeps this), less
-  // the viewer's time zone.
-  state.session = { exe, argv: args.slice(1), env: env.filter((e) => e !== pageTz && e !== pageTzName), cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, d3d: !!b.d3d, params: Object.fromEntries(sq) };
+  // the viewer's time zone and the registry-save knob this page chose for
+  // its own filesystem.
+  state.session = { exe, argv: args.slice(1), env: env.filter((e) => e !== pageTz && e !== pageTzName && e !== pageRegKnob), cwd, mtimes: !!mtimes, size: `${w}x${h}`, tar: b.tar, d3d: !!b.d3d, params: Object.fromEntries(sq) };
   // The files the run has opened so far: the recorder's read set.
   globalThis.__ntOpened = async () => openedFiles(await globalKernel());
   if (!streamed && meter.p.compile.done < meter.p.compile.total) meter.phase('compile');
