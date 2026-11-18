@@ -179,7 +179,7 @@ export class System extends EventTarget {
   #init = null;
   #initProcess = null;
   /** What a preset over the system adds that the API does not offer
-   *  (page/src/run-program.js): the processes' host's options (an ejected
+   *  (a test page's runProgram): the processes' host's options (an ejected
    *  build's units, fill and lazy cache, a closure), each exec's (the
    *  recompile and link switches), the Workers' messages, and whether the
    *  runtime keeps its routine lines. */

@@ -223,7 +223,7 @@ export class Filesystem extends EventTarget {
       /** The paths the store does not keep (system.js `#start`). */
       exclude: () => [...ALWAYS_EXCLUDED, ...this.#exclude, ...[...this.#mounts.keys()]],
       /** A program's image as an untarred bundle has it (kfs.js
-       *  `layImage`): a preset's (page/src/run-program.js), not the API's. */
+       *  `layImage`): a preset's (a test page's runProgram), not the API's. */
       addImage: (layer) => this.#add(Promise.resolve({ image: true, ...layer })),
       /** `{ module, data }` (setLazySource), or null; boot's owner of the lazy files imports it. */
       lazySource: () => this.#lazySource,

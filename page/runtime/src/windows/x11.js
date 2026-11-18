@@ -4,7 +4,7 @@
 // waits.
 
 /** Arm it for a system's internals `i`, once the system runs. `x`: what a
- *  preset asks of the server (page/src/run-program.js): `rootful`, one
+ *  preset asks of the server (a test page's runProgram): `rootful`, one
  *  fullscreen X screen under the session's own window manager (hostx.js). */
 export function xOnDemand(i, x = {}) {
   i.afterBoot(async (sys) => {

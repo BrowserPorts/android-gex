@@ -23,7 +23,7 @@ export class SingleCanvas extends EventTarget {
     const i = internals(sys, 'SingleCanvas');
     this.#container = container;
     i.attach('windows', this, { beforeBoot: true });
-    // What a preset asks (page/src/run-program.js): the X server's kind, and
+    // What a preset asks (a test page's runProgram): the X server's kind, and
     // `onDesktop(desktop, bare)` when the desktop is made.
     const x = {};
     i.devices(async (dev) => {
