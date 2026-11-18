@@ -937,6 +937,18 @@ fn new_engine() -> Result<Engine> {
     // (`classify_trap` reports the trap's kind). GEX_WASM_BACKTRACE=1 keeps
     // them, for debugging.
     config.wasm_backtrace(std::env::var("GEX_WASM_BACKTRACE").as_deref() == Ok("1"));
+    // No native unwind tables on macOS: each compiled module's are
+    // registered with the system's unwinder and taken out again when the
+    // module goes, by a search of a list there, so a process that ends
+    // with tens of thousands of instances (a booting Android's apexd, sixty
+    // threads of them) spent half an hour in `CodeMemory::drop`. Nothing
+    // here unwinds natively through wasm frames: wasmtime walks its own
+    // by frame pointer, and a host panic is caught at the host call.
+    // (Linux's unwinder keeps them in a tree; the tables stay there for
+    // profilers.)
+    if cfg!(target_os = "macos") {
+        config.native_unwind_info(false);
+    }
     // Tail calls are load-bearing: the whole block-per-function design
     // depends on them.
     config.wasm_tail_call(true);
