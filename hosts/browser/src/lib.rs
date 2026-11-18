@@ -3021,6 +3021,43 @@ pub extern "C" fn gex_ctx_exited(ctx: u32) -> i32 {
     }) as i32
 }
 
+/// What the thread whose context is at `ctx` waits on, as a code the page's
+/// wait split names (gex.mjs `WAIT_KINDS`, `GEX_LOG=waits`): 0 runnable,
+/// 1 futex, 2 futex with a timeout, 3 sleep, 4 a stream read, 5 a stream
+/// write, 6 accept, 7 wait4, 8 poll or connect, 9 poll with a timeout,
+/// 10 sigsuspend, 11 sigtimedwait, 12 a file lock, 13 a priority-inheritance
+/// lock, 14 exited, 15 in another Worker; -1 with no such thread. Read only
+/// when that log is on, without the kernel lock (the thread table).
+#[no_mangle]
+pub extern "C" fn gex_wait_code(ctx: u32) -> i32 {
+    let Some(home) = sigs::home() else { return -1 };
+    let Some((_, t)) = home.table().iter().filter(|(_, t)| t.ctx_addr() == ctx as u64).last() else { return -1 };
+    let r = t.run();
+    wait_code(&r.waiting)
+}
+
+/// [`gex_wait_code`]'s code for `w`.
+pub(crate) fn wait_code(w: &Waiting) -> i32 {
+    match w {
+        Waiting::Runnable => 0,
+        Waiting::Futex { deadline: None, .. } => 1,
+        Waiting::Futex { .. } => 2,
+        Waiting::Sleep(_) => 3,
+        Waiting::Read(_) => 4,
+        Waiting::Write(_) => 5,
+        Waiting::Accept(_) => 6,
+        Waiting::Child => 7,
+        Waiting::Net(None) => 8,
+        Waiting::Net(Some(_)) => 9,
+        Waiting::Signal => 10,
+        Waiting::SigWait(_) => 11,
+        Waiting::Lock => 12,
+        Waiting::Pi { .. } => 13,
+        Waiting::Exited => 14,
+        Waiting::Elsewhere => 15,
+    }
+}
+
 /// How many of an object's stored units one dispatch miss may take, merged
 /// into a single module. See the use site in the miss path.
 const PER_MISS_N: usize = 16;
@@ -9176,6 +9213,7 @@ fn syscall_entry(ctx: i32, pc: i64) {
         // kernel's `FutexTable::wake`, which recorded them.
         if unsafe { k_present() } != 0 {
             for addr in h.kernel.futexes.take_woken() {
+                waitq::split_woke(addr);
                 unsafe { k_futex_wake(addr) };
             }
         }
@@ -14803,6 +14841,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>, compat
         if unsafe { k_present() } != 0 {
             if let Some(home) = sigs::home() {
                 for addr in home.futexes.take_woken() {
+                    waitq::split_woke(addr);
                     unsafe { k_futex_wake(addr) };
                 }
             }

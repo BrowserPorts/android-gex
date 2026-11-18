@@ -35,6 +35,37 @@ function post(m) {
  *  if not known), `owner` the fetching process's .exe ('' if not known yet).
  *  Returns the end call: `done(bytesGot)`, which says it once. */
 export function noteFetch(what, bytes = 0, owner = '') {
+  if (waitedOn) return timed(noteFetchSay(what, bytes, owner), what, bytes);
+  return noteFetchSay(what, bytes, owner);
+}
+
+// GEX_LOG=waits (gex.mjs `#wsSay`): how long this realm's fetches took in all,
+// timed only once a thread asked (`fetchWaited`).
+let waitedOn = false, waitedMs = 0, say = null;
+function timed(done, what, bytes) {
+  const t = performance.now();
+  let ended = false;
+  return (got) => {
+    if (!ended) {
+      ended = true;
+      const ms = performance.now() - t;
+      waitedMs += ms;
+      say?.(what, got || bytes, ms);
+    }
+    done(got);
+  };
+}
+/** Where each timed fetch is said as it ends: `f(what, bytes, ms)`. */
+export function setFetchSay(f) {
+  say = f;
+}
+/** The ms this realm's fetches have taken so far, and from now on timed. */
+export function fetchWaited() {
+  waitedOn = true;
+  return waitedMs;
+}
+
+function noteFetchSay(what, bytes, owner) {
   if (!sink && typeof BroadcastChannel !== 'function') return () => {};
   const id = `${globalThis.name ?? ''}:${next++}:${Math.random().toString(36).slice(2, 8)}`;
   try { post({ id, what, bytes, owner, phase: 'start' }); } catch {}
