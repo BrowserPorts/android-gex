@@ -1071,6 +1071,10 @@ extern "C" fn r_add_task_cpu(tid: i32, ns: u64) {
     unsafe { k_proc_add_task_cpu(tid, ns) }
 }
 extern "C" fn r_set_task_name(tid: i32, at: gex_kernel::PAddr, len: u32) {
+    // (GEX_LOG=threads: the page's live threads by name, with the exits below)
+    // (`at` is this shim's own: `ProcTable::set_task_name` passes its slice)
+    let name = unsafe { std::slice::from_raw_parts(at as usize as *const u8, len.min(15) as usize) };
+    trace_line(&format!("[threads] {} {tid} name {}", my_pid(), String::from_utf8_lossy(name)));
     unsafe { k_proc_set_task_name(tid, at, len) }
 }
 extern "C" fn r_cpu_total() -> u64 {
@@ -14846,6 +14850,7 @@ fn free_syscall(ctx: i32, pc: i64, mapped: &mut Vec<gex_kernel::CodeMap>, compat
         // `exit` from one of several threads: this thread is over;
         // the last one out of the thread table ends the process.
         FreeOutcome::ThreadExit => {
+            trace_line(&format!("[threads] {} {} exit", my_pid(), my_tid()));
             if let Some(run) = MY_RUN.with(|c| c.borrow().clone()) {
                 run.lock().unwrap_or_else(|e| e.into_inner()).waiting = Waiting::Exited;
             }
