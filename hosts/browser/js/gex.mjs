@@ -4406,6 +4406,9 @@ export class Gex {
     // Before the thread exists: from its first install it may publish
     // indices past what this Worker has replayed.
     this.#threaded();
+    // A program that starts threads gets spares for the next ones, however
+    // few modules it had when it was served (a Wine process has one then).
+    this.#offerSpare(0, true);
     await this.#env.spawnThread(thread);
   }
 
@@ -7939,6 +7942,9 @@ export class Gex {
   /** The `gex_exec_gen` a spare was last offered for (or, in a fork's
    *  child, of the program it was forked running). */
   #spareGen = -1;
+  /** The `gex_exec_gen` this Worker last offered spares for at a thread's
+   *  start (`#postThread`). */
+  #spareThreadGen = -1;
 
   /**
    * A program just published with many modules (`n` installs to come): a
@@ -7948,15 +7954,22 @@ export class Gex {
    * every module to be instantiated again. Once per program; none in the
    * single-thread build, whose threads are fibers of this realm.
    */
-  #offerSpare(n) {
+  #offerSpare(n, atThread = false) {
     const e = this.#shim.exports;
     const gen = e.gex_exec_gen?.() ?? 0;
-    const why = gen === this.#spareGen ? 'its parent\'s program' : (SP_CODE && single.on) ? 'single-thread build'
-      : typeof this.#env.offerSpare !== 'function' ? 'no offerSpare' : n < spareModules() ? 'few modules'
-      : !isShared(this.#memory?.buffer) ? 'memory not shared' : '';
-    if (logNamed('spare')) console.warn(`[spare] pid ${e.gex_my_pid?.() ?? '?'}: program ${gen} with ${n} modules, ${why ? `no spare (${why})` : 'offered'}`);
-    this.#spareGen = gen;
-    if (why) return;
+    if (atThread) {
+      // Once per program from each Worker that starts threads; the host
+      // keeps the first and starts spares only as threads come.
+      if (gen === this.#spareThreadGen) return;
+      this.#spareThreadGen = gen;
+    }
+    const why = atThread ? '' : gen === this.#spareGen ? 'its parent\'s program' : n < spareModules() ? 'few modules' : '';
+    const cant = why || ((SP_CODE && single.on) ? 'single-thread build'
+      : typeof this.#env.offerSpare !== 'function' ? 'no offerSpare'
+      : !isShared(this.#memory?.buffer) ? 'memory not shared' : '');
+    if (logNamed('spare') && (!atThread || cant)) console.warn(`[spare] pid ${e.gex_my_pid?.() ?? '?'}: program ${gen} with ${n} modules, ${cant ? `no spare (${cant})` : 'offered'}`);
+    if (!atThread) this.#spareGen = gen;
+    if (cant) return;
     this.#programStore(true);
     this.#env.offerSpare({
       memory: this.#memory,
@@ -7964,6 +7977,7 @@ export class Gex {
       compat: e.gex_compat?.() ?? 0,
       procOpts: this.#opts,
       execGen: gen,
+      atThread,
     });
   }
 
