@@ -40,13 +40,23 @@
 //                        program's output with its native run)
 
 // The page's own `?log=` (a Worker's `location` is its script's, so Workers
-// are handed it in their start message instead).
-let fromQuery;
+// are handed it in their start message instead): GEX_PAGE_SEARCH when the
+// page set it, as every other switch is read (page-env.mjs `pageSearch`).
+// An ejected page sets it from the build's switches and its caller's
+// start({ debug }), not from the URL, which is its caller's; reading
+// `location.search` here as well made `?log=` turn on the page's own lines
+// and none of its Workers'.
+let fromQuery, fromSearch;
 function query() {
-  if (fromQuery === undefined) {
+  let search = null;
+  try {
+    search = globalThis.GEX_PAGE_SEARCH ?? (typeof window !== 'undefined' ? window.location?.search : null) ?? null;
+  } catch {}
+  if (search !== fromSearch) {
+    fromSearch = search;
     fromQuery = null;
     try {
-      if (typeof window !== 'undefined' && window.location?.search) fromQuery = new URLSearchParams(window.location.search).get('log');
+      if (search) fromQuery = new URLSearchParams(search).get('log');
     } catch {}
   }
   return fromQuery;
