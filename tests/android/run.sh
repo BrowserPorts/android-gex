@@ -23,14 +23,18 @@ mkdir -p "$ERR/low"
 
 fail=0
 
-# check <program> <its last line> <its exit status> [root]
+# check <program> <its last line> <its exit status> [root|mem64]
 # With "root", gexc runs it as uid 0; run as it is, it says for itself
-# when it lacks the right (exit 77).
+# when it lacks the right (exit 77). With "mem64", in a 64-bit memory, as
+# Android's processes run (an address space past what a lowered 32-bit
+# memory can give).
 check() {
     if [ "$GEXC" = native ]; then
         out=$("$HERE/bin/$1" 2>"$ERR/$1.err")
     elif [ "${4:-}" = root ]; then
         out=$("$GEXC" run --uid 0 "$HERE/bin/$1" 2>"$ERR/$1.err")
+    elif [ "${4:-}" = mem64 ]; then
+        out=$("$GEXC" run --mem64 "$HERE/bin/$1" 2>"$ERR/$1.err")
     else
         out=$("$GEXC" run "$HERE/bin/$1" 2>"$ERR/$1.err")
     fi
@@ -119,6 +123,7 @@ run() {
     rss) check "$1" "rss ok" 0 ;;
     seccomp) check "$1" "seccomp ok" 0 ;;
     procstatus) check "$1" "procstatus ok" 0 ;;
+    mmaphint) check "$1" "mmaphint ok" 0 mem64 ;;
     mountns) check "$1" "mountns ok" 0 root ;;
     uevent) check "$1" "uevent ok" 0 root ;;
     rlimit) check "$1" "rlimit ok" 0 root ;;
@@ -188,7 +193,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint"
     for p in $all; do
         run "$p"
     done

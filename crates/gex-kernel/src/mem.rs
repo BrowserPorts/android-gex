@@ -1851,6 +1851,7 @@ impl MemoryMap {
                 self.insert_mapped(addr, end, prot, name, origin);
                 return Ok(addr);
             }
+            self.say_hint_refused(addr, end, name);
         }
 
         // Anonymous data in an M64 process goes to the high arena; code
@@ -2029,6 +2030,26 @@ impl MemoryMap {
         let dst = self.mmap(0, new_len, v.prot, 0, &v.name)?;
         self.unmap(addr, old_len)?;
         Ok((dst, true))
+    }
+
+    /// `GEX_MMAP_HINTS=1`: why a hint was not honoured, with the first
+    /// mapping in its way, on standard error.
+    fn say_hint_refused(&self, addr: u64, end: u64, name: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("GEX_MMAP_HINTS").is_some_and(|v| v == "1")) {
+            return;
+        }
+        let i = self.vmas.partition_point(|v| v.end <= addr);
+        let why = if end > self.limit() {
+            format!("past the limit {:#x}", self.limit())
+        } else if hits_runtime(addr, end) {
+            "the runtime's range".to_string()
+        } else if let Some(v) = self.vmas.get(i).filter(|v| v.start < end) {
+            format!("taken by {:#x}-{:#x} {:?}", v.start, v.end, v.name)
+        } else {
+            "not claimable".to_string()
+        };
+        eprintln!("[gex] mmap hint {addr:#x}-{end:#x} ({name}) not honoured: {why}");
     }
 
     fn is_free(&self, start: u64, end: u64) -> bool {
