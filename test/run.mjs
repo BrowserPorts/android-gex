@@ -48,7 +48,7 @@ const { values: o, positionals } = parseArgs({
 const log = (s) => process.stderr.write(`[test] ${s}\n`);
 // `--package DIR`: the runtime as page/runtime/build.sh built it into DIR, the
 // npm package, which the browser host runs (there is no other: no bundler, no
-// runtime from source in a page). The tests' imports of the runtime's entry
+// runtime from source in a page). The node host runs the sources. The tests' imports of the runtime's entry
 // modules go to the package's, which find their files themselves.
 const PACKAGE = o.package ? resolve(o.package) : null;
 if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--package: no ${PACKAGE}/index.mjs (page/runtime/build.sh DIR)`);
@@ -178,9 +178,6 @@ process.exit(bad ? 1 : 0);
 async function runJob({ test, host, arch }) {
   const t0 = Date.now();
   const out = { test: test.name, host, arch, result: 'FAIL', ms: 0, checks: 0, fail: [], skip: null, times: {} };
-  // The package is built for the browser: its Workers are bundled for a
-  // page, and under Node it would reach for its sources.
-  if (PACKAGE && host === 'node') return { ...out, result: 'skip', skip: '--package runs on the browser host only' };
   if (o.single && test.meta.single) return { ...out, result: 'skip', skip: `single-thread build: ${test.meta.single}` };
   const why = test.meta.images.map((n) => missing.get(n)).find(Boolean);
   if (why) return { ...out, result: 'skip', skip: why };
