@@ -2766,13 +2766,34 @@ fn grow_memory_to(end: u64) -> bool {
     // Worker grew the SharedArrayBuffer (the "OOB after syscall 222/mmap"
     // signature). Off by default; on, the memory reaches the floor once.
     let target = if pregrow() { end.max(768 * 1024 * 1024) } else { end };
-    if target <= have {
+    ASKED_TOP.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
+    // Headroom: the memory is grown ahead of what is asked for, by
+    // `headroom(have)`, and grown again once a request comes within that
+    // of its end. So a small request lands in pages an earlier grow made,
+    // which every Worker has had a whole grow's interval to take the
+    // length of. That covers a thread that takes no call into the kernel
+    // (`grow_settle` waits for the others). Shared memory pages are given
+    // only when touched, so this costs address space, not resident memory.
+    // The exit line says it (`gex_headroom_mib`).
+    let room = headroom(have);
+    if target.saturating_add(room) <= have {
         return true;
     }
-    // A megabyte at a time past what was asked for: `memory.grow` may copy, so
-    // a guest mapping a page at a time should not pay per page.
-    let want = (target - have).div_ceil(PAGE).max(16);
-    let prev = warch::memory_grow(0, want as usize);
+    // At least a megabyte past what was asked for: `memory.grow` may copy,
+    // so a guest mapping a page at a time should not pay per page.
+    let need = if target > have { (target - have).div_ceil(PAGE).max(16) } else { 0 };
+    let mut want = (target + 2 * room).saturating_sub(have).div_ceil(PAGE).max(need);
+    let mut prev = warch::memory_grow(0, want as usize);
+    if prev == usize::MAX {
+        if need == 0 {
+            // Only headroom was wanted, and the memory is at its maximum.
+            return true;
+        }
+        // Near the maximum: the headroom gives way, and what was asked for
+        // is grown alone, as before there was any.
+        want = need;
+        prev = warch::memory_grow(0, want as usize);
+    }
     if prev == usize::MAX {
         grow_failed(have, have + want * PAGE);
         return false;
@@ -2786,6 +2807,32 @@ fn grow_memory_to(end: u64) -> bool {
     GROW_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     GREW.with(|c| c.set(true));
     true
+}
+
+/// The headroom a memory of `have` bytes is grown ahead by: an eighth of
+/// it, at least 64 MiB and at most 512 MiB.
+/// None without shared memory: one Worker, so no length to go stale.
+fn headroom(have: u64) -> u64 {
+    if cfg!(feature = "shared-memory") {
+        (have / 8).clamp(64 << 20, 512 << 20) & !0xffff
+    } else {
+        0
+    }
+}
+
+/// The highest end anyone has asked the memory to cover ([`grow_memory_to`]).
+static ASKED_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// MiB of the memory grown ahead of what was asked for (the headroom of
+/// [`grow_memory_to`]): part of its size, not of its use.
+#[no_mangle]
+pub extern "C" fn gex_headroom_mib() -> u32 {
+    let have = warch::memory_size(0) as u64 * 65536;
+    let asked = ASKED_TOP.load(std::sync::atomic::Ordering::Relaxed);
+    if asked == 0 {
+        return 0;
+    }
+    (have.saturating_sub(asked) >> 20) as u32
 }
 
 /// A grow the engine refused, said (the first few): a failed `memory.grow`
@@ -8662,10 +8709,11 @@ fn growth_note() {
     let spent: Vec<u64> = ARENA_SPENT.iter().map(|b| b.load(Ordering::Relaxed) >> 20).collect();
     let map = with_exec_lock(|h| h.kernel.mem.lock().growth_summary());
     warn_line(&format!(
-        "[gex] growth pid {} {}: memory {} MiB; shim heap reach {} MiB, live {} MiB (by size {:?}), arena taken maps/heap/stacks/largest {:?} MiB in {} refills; {map}\n",
+        "[gex] growth pid {} {}: memory {} MiB (headroom {} MiB); shim heap reach {} MiB, live {} MiB (by size {:?}), arena taken maps/heap/stacks/largest {:?} MiB in {} refills; {map}\n",
         my_pid(),
         crate::sigs::proc_home().exe(),
         have >> 20,
+        gex_headroom_mib(),
         HEAP_REACH.load(Ordering::Relaxed) >> 20,
         live >> 20,
         classes,
@@ -19154,7 +19202,28 @@ fn kuser_unfolded(arg: i64, resumable: bool) {
 /// [`gex_guest_trap`] with `SIGSEGV`.
 #[no_mangle]
 pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
+    stale_bound_note();
     gex_guest_trap(ctx_addr, 11)
+}
+
+/// An access out of bounds in a Worker that has not taken the memory's
+/// length since another Worker grew it ([`GROW_GEN`]): very likely the
+/// engine's stale bound on memory that is there, not the guest's fault.
+/// The engine gives no address, so it is said as likely (the first few),
+/// and the fault goes on as the guest's.
+fn stale_bound_note() {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let g = GROW_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    let seen = GROW_SEEN.with(|c| c.get());
+    if g == seen || SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4 {
+        return;
+    }
+    warn_line(&format!(
+        "[gex] pid {}: an access out of bounds in a Worker {} grows behind the memory's length; likely the engine's stale bound on a shared memory, not the program's fault (memory {} MiB)\n",
+        my_pid(),
+        g.wrapping_sub(seen),
+        warch::memory_size(0) as u64 * 65536 >> 20,
+    ));
 }
 
 /// A trap in guest code the run loop caught (gex.mjs `guestTrapSignal`), as

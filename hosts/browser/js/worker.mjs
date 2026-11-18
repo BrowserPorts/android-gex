@@ -1598,6 +1598,9 @@ async function handle(msg) {
       // What this process's memory grew to -- the question is whether a forked
       // child pays the same again.
       memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)),
+      // Of that, what was grown ahead of what was asked for (lib.rs
+      // `grow_memory_to`'s headroom): address space, not use.
+      headroomMib: gex.shim.exports.gex_headroom_mib?.(),
       // And what of it holds anything: its pages not all zero, MiB, which is
       // what the browser keeps resident for it (a memory's size is not: a
       // memory64 is 8 GiB from its first instruction). Only where the exit

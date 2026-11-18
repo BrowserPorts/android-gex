@@ -763,7 +763,7 @@ const host = new ProcessHost({
     }
     if (pid !== 1) {
       if (process.env.GEX_DEBUG_EXIT) {
-        const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB`;
+        const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB${m.headroomMib ? ` (headroom ${m.headroomMib} MiB)` : ''}`;
         process.stderr.write(`[gex] process ${pid} exited ${m.status}${mem}${arenaSaid(m)}\n`);
       }
       return;
@@ -776,7 +776,7 @@ const host = new ProcessHost({
     }
     // What this process's memory grew to; a run costs this times its process count.
     if (process.env.GEX_DEBUG_EXIT && m.memoryMib !== undefined) {
-      process.stderr.write(`[gex] memory ${m.memoryMib} MiB${arenaSaid(m)}\n`);
+      process.stderr.write(`[gex] memory ${m.memoryMib} MiB${m.headroomMib ? ` (headroom ${m.headroomMib} MiB)` : ''}${arenaSaid(m)}\n`);
     }
     if (process.env.GEX_HOT) {
       // An empty answer is a question about the run, not a crash.
