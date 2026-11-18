@@ -13374,9 +13374,9 @@ impl Kernel {
                 return SyscallOutcome::Exit(*exit);
             }
         };
-        if self.trace || strace_only(n) {
+        if self.trace || (strace_only(n) && strace_exe(&self.exe_path)) {
             eprintln!(
-                "[gex:{}{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}){} = {}",
+                "[gex:{}{}] pc=0x{pc:x} {}({:#x}, {:#x}, {:#x}{}){} = {}",
                 self.pid,
                 // The thread, when it is not the process's first.
                 if self.tid != self.pid { format!(".{}", self.tid) } else { String::new() },
@@ -13384,6 +13384,8 @@ impl Kernel {
                 a[0],
                 a[1],
                 a[2],
+                // mmap's flags, descriptor and offset too.
+                if n == nr::MMAP { format!(", {:#x}, {}, {:#x}", a[3], a[4] as i32, a[5]) } else { String::new() },
                 traced_path(m, n, a),
                 ret as i64
             );
@@ -15824,6 +15826,14 @@ fn strace_only(n: u64) -> bool {
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let only = ONLY.get_or_init(|| std::env::var("GEX_STRACE_ONLY").map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default());
     !only.is_empty() && only.iter().any(|s| s == syscall_name(n))
+}
+
+/// `GEX_STRACE_EXE=app_process64`: [`strace_only`]'s calls only for the
+/// processes whose program's path holds that text (all when unset): one
+/// program's calls out of a whole boot's.
+fn strace_exe(exe: &str) -> bool {
+    static EXE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| std::env::var("GEX_STRACE_EXE").ok().filter(|v| !v.is_empty())).as_deref().is_none_or(|want| exe.contains(want))
 }
 
 /// `prlimit64(pid, resource, new, old)`, for the calling process (gex's
