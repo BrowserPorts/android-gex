@@ -5828,7 +5828,11 @@ impl MapIo<'_> {
         // Only what this mapping claims (another caller's claim may since
         // have been written).
         let _ = self.mem.lock().take_fresh();
-        let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.pc);
+        // (An AArch64 process in a 64-bit memory places its code high, as
+        // Linux does (`MemoryMap::mmap`), so its loader's reservations go
+        // where everything else does.)
+        let from_loader = (gex_abi::INTERP_BASE..gex_abi::STACK_TOP - gex_abi::STACK_SIZE).contains(&self.pc)
+            && !(!gex_abi::X86 && gex_abi::mem64());
         let low32 = cfg!(feature = "x86") && flags & mflags::MAP_32BIT != 0;
         let start = if from_loader || low32 {
             let mut mm = self.mem.lock();

@@ -57,3 +57,4 @@ ls /system/framework/*.jar | wc -l
 cat /proc/self/maps | grep toybox | awk "{print \$2, \$3, \$6}"
 cat /proc/self/maps | grep linker64 | awk "{print \$2, \$6}" | sort -u
 cat /proc/sys/fs/pipe-max-size
+grep libc.so /proc/self/maps | grep -c "^[0-9a-f]\{1,8\}-"
