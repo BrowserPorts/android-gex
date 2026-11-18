@@ -16281,7 +16281,7 @@ mod tests {
         let mut bytes = vec![0u8; (b + 0x3000) as usize];
         bytes[b as usize..(b + 0x2000) as usize].iter_mut().enumerate().for_each(|(i, b)| *b = i as u8);
         let pm = Arc::new(BufPeer(std::sync::Mutex::new(bytes)));
-        let vm = crate::proc::PeerVm { mm: peer.mem.shared(), mem: pm.clone() };
+        let vm = crate::proc::PeerVm { mm: peer.mem.shared(), mem: pm.clone(), fs: None };
         k.procs.set_vm(peer.pid, Some(Arc::new(vm)));
         let mut m = GuestMem::new(&mut mem);
         // Local iovec at 0x100, remote at 0x200: (base, len) pairs.

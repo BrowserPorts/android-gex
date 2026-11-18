@@ -293,6 +293,10 @@ impl ProcSource for KernelProcSource {
     fn mount_changes(&self) -> (u64, u32) {
         self.0.get().and_then(|l| l.vfs.upgrade()).map_or((0, 0), |v| (v.mounts(), v.mounts_queue()))
     }
+    fn umask_of(&self, pid: i32) -> Option<u32> {
+        let vm = self.0.get()?.procs.vm(pid).ok()?;
+        Some(vm.fs.as_ref()?.upgrade()?.umask())
+    }
     fn task_owner(&self, id: i32) -> Option<i32> {
         self.0.get()?.procs.task_owner(id)
     }
@@ -308,8 +312,9 @@ impl ProcSource for KernelProcSource {
         let nnp = task_sig.prctl().no_new_privs as u8;
         let seccomp = task_sig.seccomp();
         let (sc_mode, sc_filters) = (seccomp.mode, seccomp.filters());
+        let umask = l.fs.upgrade().map_or(0o022, |f| f.umask());
         format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{uid}{gid}\
+            "Name:\t{}\nUmask:\t{umask:04o}\nState:\tR (running)\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\n{uid}{gid}\
              VmPeak:\t{size:8} kB\nVmSize:\t{size:8} kB\nVmHWM:\t{rss:8} kB\nVmRSS:\t{rss:8} kB\n\
              RssAnon:\t{anon:8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\n{caps}\
              NoNewPrivs:\t{nnp}\nSeccomp:\t{sc_mode}\nSeccomp_filters:\t{sc_filters}\n",

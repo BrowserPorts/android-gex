@@ -74,6 +74,10 @@ pub trait ProcSource: Send + Sync {
     fn stat(&self, tid: i32, threads: usize, task: Option<&TaskUsage>) -> String;
     /// `status` for task `tid`, as [`Self::stat`].
     fn status(&self, tid: i32, threads: usize, task: Option<&TaskUsage>) -> String;
+    /// Another process's umask, where this kernel can see it.
+    fn umask_of(&self, _pid: i32) -> Option<u32> {
+        None
+    }
     /// Every process on the system, this one included, for `/proc/<pid>`
     /// and the listing of `/proc` (what `ps` and `htop` read). Empty where
     /// the kernel knows only this process.
@@ -268,12 +272,15 @@ pub fn stat_line_at(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid:
 
 /// `/proc/<pid>/status`, the fields programs look for: task `id` of process
 /// `tgid`, which has `threads`.
-pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threads: usize, creds: &[u8], u: &Usage) -> String {
+/// `umask`: the process's, where it is known; the usual 022 where the
+/// host keeps no way to it (the page's other processes).
+pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threads: usize, creds: &[u8], u: &Usage, umask: Option<u32>) -> String {
+    let umask = umask.unwrap_or(0o022);
     let st = if state == 'Z' { "Z (zombie)" } else { "R (running)" };
     let (uid, gid, caps) = status_ids(creds);
     let (size, rss) = (u.vsize >> 10, u.rss >> 10);
     format!(
-        "Name:\t{comm}\nUmask:\t0022\nState:\t{st}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{id}\n\
+        "Name:\t{comm}\nUmask:\t{umask:04o}\nState:\t{st}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{id}\n\
          PPid:\t{ppid}\nTracerPid:\t0\n{uid}{gid}FDSize:\t64\n\
          Groups:\t\nVmSize:\t{size:8} kB\nVmRSS:\t{rss:8} kB\nThreads:\t{threads}\n{caps}voluntary_ctxt_switches:\t0\n\
          nonvoluntary_ctxt_switches:\t0\n"
@@ -872,7 +879,7 @@ impl ProcFs {
         };
         Some(match rest {
             "stat" => stat_line(id, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid), threads, &usage).into_bytes(),
-            "status" => status_text(id, e.pid, &comm, state, e.ppid, threads, &e.creds, &usage).into_bytes(),
+            "status" => status_text(id, e.pid, &comm, state, e.ppid, threads, &e.creds, &usage, self.source.umask_of(e.pid)).into_bytes(),
             "cgroup" => crate::cgroup::proc_file(e.pid),
             "statm" => statm_text(&e.usage).into_bytes(),
             "cmdline" => e.cmdline().to_vec(),
@@ -1395,7 +1402,7 @@ mod tests {
             stat_line(tid, "prog", 'R', 7, 42, 1, None, threads, &Usage::default())
         }
         fn status(&self, tid: i32, threads: usize, _task: Option<&TaskUsage>) -> String {
-            status_text(tid, 42, "prog", 'R', 7, threads, &[], &Usage::default())
+            status_text(tid, 42, "prog", 'R', 7, threads, &[], &Usage::default(), None)
         }
         fn task_owner(&self, id: i32) -> Option<i32> {
             self.others().into_iter().find(|e| e.tasks().contains(&id)).map(|e| e.pid)
@@ -1512,7 +1519,7 @@ mod tests {
         assert_eq!(&f[13..17], ["234", "0", "5", "0"]);
         assert_eq!(&f[21..24], ["1200", "67108864", "2048"]);
         assert_eq!(statm_text(&u), "16384 2048 0 0 0 0 0\n");
-        assert!(status_text(9, 9, "btop", 'R', 1, 2, &[], &u).contains("VmRSS:\t    8192 kB\n"));
+        assert!(status_text(9, 9, "btop", 'R', 1, 2, &[], &u, None).contains("VmRSS:\t    8192 kB\n"));
     }
 
     #[test]

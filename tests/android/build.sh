@@ -41,7 +41,7 @@ POLICIES="-DTEST_POLICY=\"$DATA/test.33\" -DLABELS_POLICY=\"$DATA/labels.33\""
 # And the ext4 image the mount test mounts: the kernel crate's fixture.
 POLICIES="$POLICIES -DEXT4_IMAGE=\"$HERE/../../crates/gex-kernel/src/vfs/testdata/ext4/apex.img\""
 
-for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx binderhost selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp smcall firststage svcrun; do
+for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx binderhost selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus smcall firststage svcrun; do
     "$CC" --target="$TARGET" -O2 -Wall -Werror -static $POLICIES -Wl,--image-base=0x400000 -o "$OUT/$p" "$HERE/src/$p.c"
     "$CC" --target="$TARGET" -O2 -Wall -Werror -static $POLICIES -o "$OUT/low/$p" "$HERE/src/$p.c"
 done

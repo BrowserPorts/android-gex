@@ -420,6 +420,9 @@ pub trait PeerMem: Send + Sync {
 pub struct PeerVm {
     pub mm: crate::mem::Mm,
     pub mem: Arc<dyn PeerMem>,
+    /// Its fs_struct, for the umask its `status` says; `None` where the
+    /// host has not given it.
+    pub fs: Option<std::sync::Weak<crate::syscalls::FsCwd>>,
 }
 
 /// `prctl` option gex adds: the calling process has crashed (`arg2` the
