@@ -36,7 +36,7 @@ const WAIT_KINDS = ['runnable', 'futex', 'futex+timeout', 'sleep', 'read', 'writ
  *  renderer's trusted range, which all its isolates share (1 GiB), so the
  *  room is kept small. */
 const FTAB_SPARE_ALONE = 4096;
-const FTAB_SPARE_THREADED = 8192;
+const FTAB_SPARE_THREADED = 16384;
 // GEX_TEST_KEEP_PROBE (a test-only switch): a retirement leaves the probe
 // cache's entries (cgen.rs `gex_test_keep_probe`).
 const TEST_KEEP_PROBE = !!(globalThis.process?.env?.GEX_TEST_KEEP_PROBE);
@@ -5296,10 +5296,18 @@ export class Gex {
     return st.alt;
   }
 
-  /** Grow this Worker's function table past every index handed out, with
-   *  room over (`#ftabSpare`), so an index another Worker published to the
-   *  probe cache is in range here (holding `resolve`) before this one
-   *  replays it. */
+  /** Grow this Worker's function table, when it is short of an index handed
+   *  out, past every one with room over (`#ftabSpare`), so an index another
+   *  Worker published to the probe cache is in range here (holding
+   *  `resolve`) before this one replays it. Only when short: V8 reallocates
+   *  a table grown past its capacity at about twice that, and the old copy
+   *  stays in the renderer's trusted range until the isolate collects it (a
+   *  Worker parked in a wait never does), so topping the room up again on
+   *  every catch-up cost each late thread Worker of a big process about
+   *  three tables (Firefox: 41 of 91 Workers, grown 1-8k past ~265k). An
+   *  index past this Worker's end is never published (cgen.rs
+   *  `fcache_publish`): a table without room costs a `lookup`, never a
+   *  trap. */
   #cgenGrow() {
     const st = this.#cgen;
     const e = this.#shim.exports;
@@ -5307,7 +5315,7 @@ export class Gex {
     for (;;) {
       const want = size + this.#ftabSpare;
       const have = Number(st.ftab.length);
-      if (have < want) {
+      if (have < size || have === 0) {
         st.ftab.grow(tIdx(this.#wide, want - have), st.resolve);
         this.#tallyTables('ftab grew');
       }
@@ -5337,13 +5345,11 @@ export class Gex {
    *  takes the full room when it gets its second Worker (`#threaded`). */
   #ftabSpare = ftabSpareTest() || FTAB_SPARE_ALONE;
 
-  /** This Worker's process has more than one Worker from now on: grow to the
-   *  full room before any other Worker can publish an index. */
+  /** This Worker's process has more than one Worker from now on: the full
+   *  room at its next grow (not a grow now: a second reallocation of the
+   *  whole table, see `#cgenGrow`). */
   #threaded() {
-    const want = ftabSpareTest() || FTAB_SPARE_THREADED;
-    if (this.#ftabSpare === want) return;
-    this.#ftabSpare = want;
-    if (this.#cgen) this.#cgenGrow();
+    this.#ftabSpare = ftabSpareTest() || FTAB_SPARE_THREADED;
   }
 
   /** Install unit `u` into this Worker: instantiate it with `__table_base` =
