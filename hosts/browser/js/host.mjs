@@ -207,9 +207,8 @@ const SPARE_IDLE_MS = 5000;
  *  next threads (`park`), within SPARE_MAX. A program that starts short
  *  threads one after another needs one. */
 const PARKED_MAX = 2;
-/** How many spares one process keeps ready at most (`#topUpSpares`), within
- *  SPARE_MAX: one per thread it started in the last SPARE_RATE_MS past the
- *  first. Firefox starts ~120 threads in 18 s, in bursts; with one spare at a
+/** How many spares one process keeps ready in a burst of thread starts
+ *  (`#topUpSpares`: two within SPARE_RATE_MS), within SPARE_MAX. Firefox starts ~120 threads in 18 s, in bursts; with one spare at a
  *  time nearly every start found it taken and waited ~0.65 s for a fresh
  *  Worker. */
 const SPARES_PER_PROC = 4;
@@ -1556,17 +1555,18 @@ export class ProcessHost {
     while (this.#spares.length > SPARE_MAX) this.#letSpareGo(this.#spares.shift());
   }
 
-  /** Process `proc` has started a thread, `before` before it: spares
-   *  started so it has one per thread started in the last SPARE_RATE_MS past
-   *  the first (one from its second thread on), at most SPARES_PER_PROC,
-   *  parked Workers counted. */
+  /** Process `proc` has started a thread, `before` before it: from its
+   *  second thread on it keeps a spare, and once it starts two within
+   *  SPARE_RATE_MS (a burst) SPARES_PER_PROC of them, all started at once,
+   *  since a spare takes longer to come up than a burst's next start; parked
+   *  Workers counted. */
   #topUpSpares(proc, before) {
     const now = Date.now();
     const starts = (this.#startsOf.get(proc) ?? []).filter((t) => now - t < SPARE_RATE_MS);
     starts.push(now);
     this.#startsOf.set(proc, starts);
     if (before < 1) return;
-    const want = Math.min(SPARES_PER_PROC, Math.max(1, starts.length - 1));
+    const want = starts.length >= 2 ? SPARES_PER_PROC : 1;
     let have = this.#spares.filter((x) => x.proc === proc).length;
     for (; have < want && this.#spareRec.has(proc); have++) this.#startSpare(proc);
   }
@@ -1625,8 +1625,10 @@ export class ProcessHost {
   /** Process `proc`'s spare for a thread of its program `gen`, taken; null
    *  with none (one caught up with an earlier program is let go). */
   #takeSpare(proc, gen) {
-    // A ready one first: a parked Worker, or a spare that has started.
-    let i = this.#spares.findIndex((x) => x.proc === proc && (x.parked || !this.#pending.has(x.ref.key)));
+    // A ready one first: a parked Worker, or a spare caught up and waiting
+    // (`spareWaiting`); then one still catching up; then one still starting.
+    let i = this.#spares.findIndex((x) => x.proc === proc && (x.parked || x.waiting));
+    if (i < 0) i = this.#spares.findIndex((x) => x.proc === proc && !this.#pending.has(x.ref.key));
     if (i < 0) i = this.#spares.findIndex((x) => x.proc === proc);
     if (i < 0) return null;
     const [sp] = this.#spares.splice(i, 1);
@@ -2138,7 +2140,7 @@ export class ProcessHost {
             this.#pending.set(key, held);
           }
           spare.ref.key = key;
-          if (logNamed('spare')) console.warn(`[spare] ${key}: on ${spare.key}, ${held ? 'still starting' : 'ready'}`);
+          if (logNamed('spare')) console.warn(`[spare] ${key}: on ${spare.key}, ${spare.parked || spare.waiting ? 'ready' : held ? 'still starting' : 'catching up'}`);
           const { tid, ctx, pc, procOpts, cloneAt } = m.thread;
           spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts, cloneAt } });
         } else {
@@ -2146,6 +2148,12 @@ export class ProcessHost {
         }
         // The next spares, for a process that starts more than one thread.
         if (before !== undefined) this.#topUpSpares(proc, before);
+        break;
+      }
+      case 'spareWaiting': {
+        // A spare has caught up with its process and waits for a thread.
+        const sp = this.#spares.find((x) => x.w === w);
+        if (sp) sp.waiting = true;
         break;
       }
       case 'park': {
