@@ -230,6 +230,75 @@ export function packExports(bytes, extra, base) {
   for (const b of parts) { r.set(b, o); o += b.length; }
   return r;
 }
+/**
+ * win32u's session reads (`gex.session_copy`, `gex.session_seq`) as wasm,
+ * not JS: a module importing the guest's memory (`wide`: a memory64) and the
+ * door server's, whose two exports win32u's imports bind to directly, so a
+ * read is a wasm call and the copy one `memory.copy` between the memories.
+ * A seqlock's acquire and release each read the live seq, and a message
+ * loop reads the queue's shared object several times per message: through
+ * JS (`#sessionSeq`, `#sessionCopy`) that was about 5% of a cross-thread
+ * SendMessage's time on the page. The session's place (`base`, `len`) and
+ * the door area's poisoned word (`dead`) are constants of the module: a
+ * door that died midway reads as no session (-1, 0), as `#doorLive` does.
+ * `null` where the engine has no multi-memory.
+ */
+function sessionReader(guest, server, base, len, dead, wide) {
+  const u = (v) => { const o = []; do { let b = v % 128; v = Math.floor(v / 128); if (v) b |= 0x80; o.push(b); } while (v); return o; };
+  const sl = (v) => { const o = []; for (;;) { const b = v & 0x7f; v >>= 7; if ((v === 0 && !(b & 0x40)) || (v === -1 && (b & 0x40))) { o.push(b); return o; } o.push(b | 0x80); } };
+  const sec = (id, body) => [id, ...u(body.length), ...body];
+  const vec = (items) => [...u(items.length), ...items.flat()];
+  const name = (t) => [...u(t.length), ...[...t].map((c) => c.charCodeAt(0))];
+  const I32 = 0x7f, I64 = 0x7e, D = wide ? I64 : I32;
+  const i32c = (v) => [0x41, ...sl(v | 0)];
+  // memarg with a memory index: align | 0x40, the index, offset 0
+  const mem1 = (align) => [align | 0x40, 1, 0];
+  // Hand-assembled bodies (locals declared first).
+  const seqBody = [1, 1, I32, // one i32 local: the address
+    0x20, 0, ...i32c(len - 8), 0x4b,
+    ...i32c(dead), 0x28, ...mem1(2), 0x72,
+    0x04, I64, 0x42, 0x00,
+    0x05,
+    0x20, 0, ...i32c(base), 0x6a, 0x22, 1,
+    ...i32c(7), 0x71, // addr & 7
+    0x04, I64, 0x20, 1, 0x29, ...mem1(0), // unaligned: i64.load
+    0x05, 0x20, 1, 0xfe, 0x11, ...mem1(3), // i64.atomic.load
+    0x0b,
+    0x0b, 0x0b];
+  // copy(dst, off, size): size 0 -> len; off >= len or dead -> -1; else n = min(size, len - off) bytes
+  const copyBody = [1, 1, I32, // local 3: n
+    0x20, 2, 0x45, 0x04, 0x40, ...i32c(len), 0x0f, 0x0b,
+    0x20, 1, ...i32c(len), 0x4f, // i32.ge_u
+    ...i32c(dead), 0x28, ...mem1(2), 0x72,
+    0x04, 0x40, ...i32c(-1), 0x0f, 0x0b,
+    0x20, 2, ...i32c(len), 0x20, 1, 0x6b, 0x22, 3, 0x20, 2, 0x20, 3, 0x49, 0x1b, // select(size, len-off, size < len-off)
+    0x21, 3,
+    0x20, 0, 0x20, 1, ...i32c(base), 0x6a, 0x20, 3, 0xfc, 0x0a, 0, 1, // memory.copy guest <- server
+    0x20, 3, 0x0b];
+  const types = vec([[0x60, 1, I32, 1, I64], [0x60, 3, D, I32, I32, 1, I32]]);
+  // (an imported memory's maximum may not exceed the import's: declared as
+  // the most a memory of its kind can be, 4 GiB, and for a memory64 the
+  // largest the engine takes)
+  const memImport = (field, w, max) => [...name('m'), ...name(field), 0x02, w ? 0x07 : 0x03, 0, ...u(max)];
+  const build = (gmax) => new Uint8Array([0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+    ...sec(1, types),
+    ...sec(2, vec([memImport('g', wide, gmax), memImport('s', false, 65536)])),
+    ...sec(3, vec([[0], [1]])),
+    ...sec(7, vec([[...name('seq'), 0, 0], [...name('copy'), 0, 1]])),
+    ...sec(10, vec([[...u(seqBody.length), ...seqBody], [...u(copyBody.length), ...copyBody]])),
+  ]);
+  let err;
+  for (const gmax of wide ? [2 ** 48, 2 ** 34, 2 ** 28, 2 ** 24, 2 ** 18] : [65536]) {
+    try {
+      return new WebAssembly.Instance(new WebAssembly.Module(build(gmax)), { m: { g: guest, s: server } }).exports;
+    } catch (e) {
+      err = e;
+    }
+  }
+  if (globalThis.GEX_SESSION_TRACE) console.error(`[session] no wasm reader: ${err?.message}`);
+  return null;
+}
+
 const lebLen = (v) => { let n = 1; while (v >= 128) { v = Math.floor(v / 128); n++; } return n; };
 
 /** An index into the function table: a table64 (BigInt indices) beside a 64-bit memory. */
@@ -5530,6 +5599,12 @@ export class Gex {
         } : {}),
       },
     };
+    // win32u's session reads straight from the server's memory, in wasm
+    // (`sessionReader`), when the door's session is there to read
+    if (wasmprog && imports.gex.session_copy) {
+      const r = this.#sessionReaderNow();
+      if (r) Object.assign(imports.gex, { session_copy: r.copy, session_seq: r.seq });
+    }
     // A unit split by function (gex_split): its cold clusters' loader,
     // or the recorder's hit map of an instrumented unit.
     if (prov < 0 && jit < 0) this.#splitImports(mod, this.#cgenStr(e.gex_cgen_key, u), imports);
@@ -7597,6 +7672,19 @@ export class Gex {
     return this.#sess = s;
   }
 
+  /** This Worker's wasm session reader for the current door (`sessionReader`),
+   *  or null: no door session yet, or no multi-memory (the JS reads serve). */
+  #sessReader = null;
+  #sessionReaderNow() {
+    if (globalThis.GEX_SESSION_JS ?? globalThis.process?.env?.GEX_SESSION_JS) return null;
+    const s = this.#session();
+    if (!s) return null;
+    if (this.#sessReader?.door === s.door) return this.#sessReader.r;
+    const r = sessionReader(this.#memory, s.door.memory, s.base, s.len, s.door.area + 124, this.#wide);
+    this.#sessReader = { door: s.door, r };
+    return r;
+  }
+
   #sessionCopy(dst, off, size) {
     if (globalThis.GEX_SESSION_TRACE && !(++this.#sessTr % 20000)) console.error(`[session] copy ${this.#sessTr} off ${off} size ${size}`);
     const s = this.#session();
@@ -7918,9 +8006,21 @@ export class Gex {
         // The time, as set_current_time would read it (gettimeofday,
         // CLOCK_BOOTTIME, both `env.now()`), in 100 ns: two clock calls out
         // of the door saved.
-        const ns = this.#env.now(), c = this.#guestClock();
-        const wall = ns - c.shift * 1000000000n, mono = c.scale === 1 ? ns - di.bootNs : this.#guestMono(ns);
-        r = di.dispatch(pid, tid, wall / 100n + 116444736000000000n, mono / 100n) >>> 0;
+        const c = this.#guestClock();
+        if (c.scale === 1 && this.#env.now === Env.prototype.now) {
+          // One clock read and one conversion: in 100 ns from this
+          // realm's origin, plus each clock's base in 100 ns (the BigInt
+          // sums and divisions per call, with two of them divisions, were
+          // a door call's clock).
+          let b = di.base100;
+          if (!b) b = di.base100 = { wall: (ORIGIN_NS - c.shift * 1000000000n) / 100n + 116444736000000000n, mono: (ORIGIN_NS - di.bootNs) / 100n };
+          const t = BigInt(Math.floor(perf.now() * 1e4));
+          r = di.dispatch(pid, tid, t + b.wall, t + b.mono) >>> 0;
+        } else {
+          const ns = this.#env.now();
+          const wall = ns - c.shift * 1000000000n, mono = c.scale === 1 ? ns - di.bootNs : this.#guestMono(ns);
+          r = di.dispatch(pid, tid, wall / 100n + 116444736000000000n, mono / 100n) >>> 0;
+        }
       }
       if (st) { const T2 = performance.now(); st.tPre += T1 - T; st.tDisp += T2 - T1; st.T2 = T2; }
       if (r === 0xffffffff) { if (st) st.fallbacks++; r = 1; }
