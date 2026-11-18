@@ -68,6 +68,7 @@ const PROBES = {
   'rt-truncate': [],
   'rt-sockpass': [],
   'rt-clonecopy': [],
+  'rt-stalebound': ['-pthread'],
   'rt-repaint': [],
   'rt-deadclient': [],
   'rt-unix': [],

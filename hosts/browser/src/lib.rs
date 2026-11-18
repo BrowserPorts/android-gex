@@ -2783,6 +2783,8 @@ fn grow_memory_to(end: u64) -> bool {
         foreign(have.max(OWN_TOP.load(std::sync::atomic::Ordering::Relaxed)), prev);
     }
     OWN_TOP.fetch_max(prev + want * PAGE, std::sync::atomic::Ordering::AcqRel);
+    GROW_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    GREW.with(|c| c.set(true));
     true
 }
 
@@ -2848,6 +2850,7 @@ fn foreign(start: u64, end: u64) {
         return;
     }
     FOREIGN_BYTES.fetch_add(end - start, std::sync::atomic::Ordering::Relaxed);
+    GROW_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     memmap::claim(memmap::Kind::Foreign, 0, start, end, "grown outside the arena (std's System allocator?)");
     static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -3999,6 +4002,9 @@ pub(crate) struct ThreadCell {
     /// and before it first runs. A fork does not wait for it: it parks at
     /// its return to guest code.
     out: std::sync::atomic::AtomicBool,
+    /// The [`GROW_GEN`] this thread's Worker last took the memory's length
+    /// at ([`grow_refresh`]): a grower waits for it ([`grow_settle`]).
+    grow_seen: std::sync::atomic::AtomicU32,
 }
 
 impl ThreadCell {
@@ -4010,6 +4016,7 @@ impl ThreadCell {
             hold: Default::default(),
             held: Default::default(),
             out: std::sync::atomic::AtomicBool::new(true),
+            grow_seen: Default::default(),
         }
     }
 
@@ -8616,6 +8623,9 @@ pub extern "C" fn gex_syscall(ctx: i32, pc: i64) {
             None => {
                 snap_carry_end();
                 growth_note();
+                if GREW.with(|c| c.replace(false)) {
+                    grow_settle();
+                }
                 enter_guest();
                 return;
             }
@@ -8867,6 +8877,9 @@ fn syscall_entry(ctx: i32, pc: i64) {
     gex_kernel::phase::mark(0);
     // The clock calls, which never take the kernel lock (`clock_syscall`).
     if !IN_PROVIDER.with(|c| c.get()) && clock_syscall(ctx) {
+        // Not through `enter_guest`: a loop that reads the clock takes a
+        // sibling's grow here.
+        MY_RUN.with(|c| grow_refresh(c.borrow().as_deref()));
         // A wasm32 program has no safepoints of its own: its loops reach
         // the kernel through a call like these (gexcc's `__gex_poll` makes a
         // `getpid`), so a signal is delivered here, as at any call's return
@@ -11399,6 +11412,85 @@ pub(crate) fn leave_guest() {
     });
 }
 
+/// Grows of the memory so far, by any Worker ([`grow_memory_to`], [`foreign`]).
+///
+/// A Worker's engine checks accesses to a shared memory against the length
+/// that Worker last took. After another Worker grows the memory, it takes
+/// the new length only at its own next interrupt, or when it grows the
+/// memory itself (a grow by nothing). On engines that bounds-check
+/// explicitly, and for atomics anywhere, a thread that is given a pointer
+/// into the new pages before then traps out of bounds on memory that is
+/// there. That was FL Studio's FastMM `lock cmpxchg` on arm64, and
+/// fixtures/native/stale-bound on x86-64.
+static GROW_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+thread_local! {
+    /// The [`GROW_GEN`] this Worker last took the memory's length at.
+    static GROW_SEEN: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+    /// Set when this Worker grew the memory in the call it is in: before the
+    /// call returns, the other threads take the new length ([`grow_settle`]).
+    static GREW: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// This Worker takes the memory's present length if anyone has grown it
+/// since it last did. A grow by nothing makes the engine refresh this
+/// Worker's bound on the memory, for all of its instances. `t`, this Worker's
+/// thread, if it has one, says so for [`grow_settle`].
+fn grow_refresh(t: Option<&ThreadCell>) {
+    let g = GROW_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    if GROW_SEEN.with(|c| c.replace(g)) != g {
+        warch::memory_grow(0, 0);
+    }
+    if let Some(t) = t {
+        t.grow_seen.store(g, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The longest a grower waits for a thread to take the new length. A
+/// translated guest gets there at its next back-edge. Native wasm code
+/// has no safepoints, so it gets there at its next call into the kernel;
+/// meanwhile its engine's own interrupt, which comes within microseconds,
+/// gives it the length.
+const GROW_SETTLE_MAX_NS: u64 = 1_000_000;
+
+/// After a call that grew the memory, before it returns what lies in the new
+/// pages: every other thread running guest code takes the new length first.
+/// Each one's safepoint counter is run out, as [`gex_fork_hold`] does, and
+/// the grower waits for each to pass [`enter_guest`] (or be out of guest
+/// code). A thread out of guest code takes the length at its return.
+fn grow_settle() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let g = GROW_GEN.load(SeqCst);
+    let me = cur();
+    let cells: Vec<(Arc<ThreadCell>, u64)> = with_exec_lock(|h| {
+        h.threads.iter().filter(|(i, _)| *i != me).map(|(_, t)| (t.state_arc(), t.ctx_addr())).collect()
+    });
+    let behind = |c: &ThreadCell| {
+        !(c.out.load(SeqCst) || c.held.load(SeqCst) || c.halted.load(SeqCst)) && (c.grow_seen.load(SeqCst).wrapping_sub(g) as i32) < 0
+    };
+    if !cells.iter().any(|(c, _)| behind(c)) {
+        return;
+    }
+    {
+        let mut mem = guest();
+        for (c, at) in &cells {
+            if behind(c) {
+                if let Some(w) = mem.word_mut(at.wrapping_add(ctx::SAFEPOINT_COUNTER as u64)) {
+                    gex_atomic::store_u32(w, 0, 0);
+                }
+            }
+        }
+    }
+    let until = now_ns() + GROW_SETTLE_MAX_NS;
+    let nap = std::sync::atomic::AtomicI32::new(0);
+    while cells.iter().any(|(c, _)| behind(c)) && now_ns() < until {
+        #[cfg(feature = "shared-memory")]
+        unsafe {
+            warch::memory_atomic_wait32(nap.as_ptr(), 0, 20_000)
+        };
+    }
+}
+
 /// The longest a thread stays parked at a fork's hold: past it, the fork that
 /// raised it is taken to have ended without saying so.
 const HOLD_MAX_NS: u64 = 10_000_000_000;
@@ -11411,6 +11503,9 @@ pub(crate) fn enter_guest() {
         let b = c.borrow();
         let t = b.as_ref()?;
         t.out.store(false, SeqCst);
+        // After `out` falls: a grower that read it still set sees to it
+        // that this thread takes the new length here.
+        grow_refresh(Some(t));
         (t.hold.load(SeqCst) != 0).then(|| t.clone())
     });
     let Some(t) = held else { return };
