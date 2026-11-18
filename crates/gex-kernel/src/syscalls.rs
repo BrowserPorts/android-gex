@@ -97,6 +97,11 @@ pub mod nr {
     pub const USERFAULTFD: u64 = 282;
     pub const BPF: u64 = 280;
     pub const SECCOMP: u64 = 277;
+    pub const TIMER_CREATE: u64 = 107;
+    pub const TIMER_GETTIME: u64 = 108;
+    pub const TIMER_GETOVERRUN: u64 = 109;
+    pub const TIMER_SETTIME: u64 = 110;
+    pub const TIMER_DELETE: u64 = 111;
     pub const CLOCK_GETTIME: u64 = 113;
     pub const CLOCK_GETRES: u64 = 114;
     pub const CLOCK_NANOSLEEP: u64 = 115;
@@ -9616,6 +9621,10 @@ pub fn free_class_of(m: &GuestMem<'_>, regs: CallRegs, compat: bool) -> Option<F
     if canonical == nr::SECCOMP || (canonical == nr::PRCTL && regs.a[0] == crate::prctl::pr::SET_SECCOMP) {
         return None;
     }
+    // So are POSIX timers': one may name a thread of the process.
+    if is_ptimer(canonical) {
+        return None;
+    }
     let CallRegs { raw, mut a } = regs;
     // i386's `socketcall` is classed as the call it makes, with that call's
     // arguments; `raw` stays the number the guest used, which a restart
@@ -12977,6 +12986,112 @@ impl Kernel {
         }
     }
 
+    /// The POSIX timer calls ([`crate::ptimer`]).
+    fn ptimer_call(&mut self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+        use crate::ptimer as pt;
+        let now = self.now_nanos();
+        // A `struct itimerspec`: the interval, then the value, each a
+        // pair of 64-bit words (an i386 process's 64-bit-time forms too).
+        let read_its = |m: &GuestMem<'_>, at: u64| -> Result<[i64; 4], Errno> {
+            let mut w = [0i64; 4];
+            for (i, x) in w.iter_mut().enumerate() {
+                *x = m.read_u64(at + 8 * i as u64).map_err(|_| Errno::EFAULT)? as i64;
+            }
+            Ok(w)
+        };
+        let write_its = |m: &mut GuestMem<'_>, at: u64, (left, interval): (u128, u128)| -> Result<(), Errno> {
+            for (i, v) in [interval / 1_000_000_000, interval % 1_000_000_000, left / 1_000_000_000, left % 1_000_000_000].iter().enumerate() {
+                m.write_u64(at + 8 * i as u64, *v as u64).map_err(|_| Errno::EFAULT)?;
+            }
+            Ok(())
+        };
+        let id = a[0] as i32;
+        match n {
+            nr::TIMER_CREATE => {
+                const CAP_WAKE_ALARM: u64 = 35;
+                let clock = a[0] as i32;
+                pt::clock_ok(clock, self.creds.capable(CAP_WAKE_ALARM), self.pid)?;
+                let (value, notify) = if a[1] == 0 {
+                    (None, pt::Notify::Process(signal::sig::SIGALRM))
+                } else {
+                    let len = if self.compat { 16 } else { 20 };
+                    let b = m.read(a[1], len).map_err(|_| Errno::EFAULT)?.to_vec();
+                    let (value, signo, notify, tid) = pt::parse_sigevent(&b, self.compat);
+                    let ts = &self.thread_signals;
+                    (Some(value), pt::notify_of(signo, notify, tid, |t| ts.get(t))?)
+                };
+                // The id is written before the timer is the process's, so a
+                // bad place for it leaves none behind.
+                let id = self.signals.process().with_posix(|t| t.add(clock as u32, notify, value));
+                if m.write_u32(a[2], id as u32).is_err() {
+                    let _ = self.signals.process().with_posix(|t| t.delete(id));
+                    return Err(Errno::EFAULT);
+                }
+                Ok(0)
+            }
+            nr::TIMER_SETTIME => {
+                let flags = a[1];
+                let new = if a[2] == 0 { return Err(Errno::EINVAL) } else { read_its(m, a[2])? };
+                if !pt::valid(new[0], new[1]) || !pt::valid(new[2], new[3]) {
+                    return Err(Errno::EINVAL);
+                }
+                let interval = new[0] as u128 * 1_000_000_000 + new[1] as u128;
+                let value = new[2] as u128 * 1_000_000_000 + new[3] as u128;
+                let mono = {
+                    let (secs, nanos) = monotonic_from((self.clock)());
+                    secs as u128 * 1_000_000_000 + nanos as u128
+                };
+                let old = self.signals.process().with_posix(|t| -> Result<(u128, u128), Errno> {
+                    let timer = t.get_mut(id)?;
+                    let old = timer.remaining(now);
+                    timer.next = if value == 0 {
+                        None
+                    } else if flags & pt::TIMER_ABSTIME != 0 {
+                        // On the timer's clock; deadlines here are on the
+                        // guest's wall clock.
+                        Some(match timer.clock {
+                            pt::CLOCK_REALTIME | pt::CLOCK_REALTIME_ALARM | pt::CLOCK_TAI => value.max(now),
+                            _ => now + value.saturating_sub(mono),
+                        })
+                    } else {
+                        Some(now + value)
+                    };
+                    timer.interval = interval;
+                    timer.overrun = 0;
+                    timer.overrun_last = 0;
+                    timer.queued = false;
+                    Ok(old)
+                })?;
+                if a[3] != 0 {
+                    write_its(m, a[3], old)?;
+                }
+                Ok(0)
+            }
+            nr::TIMER_GETTIME => {
+                let cur = self.signals.process().with_posix(|t| t.get_mut(id).map(|x| x.remaining(now)))?;
+                write_its(m, a[1], cur)?;
+                Ok(0)
+            }
+            nr::TIMER_GETOVERRUN => {
+                // A queued signal seen delivered since gives its overruns.
+                self.signals.process().fire_timers(now);
+                let proc = self.signals.process();
+                let queued_delivered = proc.with_posix(|t| t.get_mut(id).map(|x| (x.queued, x.overrun)))?;
+                let still = proc.timer_queued(id);
+                proc.with_posix(|t| {
+                    let x = t.get_mut(id)?;
+                    if queued_delivered.0 && !still {
+                        x.overrun_last = queued_delivered.1;
+                        x.queued = false;
+                        x.overrun = 0;
+                    }
+                    Ok(x.overrun_last as u64)
+                })
+            }
+            _ => self.signals.process().with_posix(|t| t.delete(id)).map(|_| 0),
+        }
+    }
+
     /// `seccomp(2)`, and `prctl(PR_SET_SECCOMP)`.
     fn seccomp_call(&mut self, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
         let cx = SeccompCx { k: self, m: std::cell::RefCell::new(m) };
@@ -13102,6 +13217,14 @@ impl Kernel {
         // commands are ordinary settings, and busybox init issues `CAD_OFF`
         // as its first act. Treating that as a shutdown ends the boot on line
         // one, which is exactly what it did.
+        if is_ptimer(n) {
+            let r = self.ptimer_call(m, n, a);
+            if self.trace || (strace_only(n) && strace_exe(&self.exe_path)) {
+                eprintln!("[gex:{}.{}] {}({:#x}, {:#x}, {:#x}) = {:?}", self.pid, self.tid, syscall_name(n), a[0], a[1], a[2], r);
+            }
+            let _ = set_result(m, self.ctx_addr, crate::errno::encode(r));
+            return self.at_return(m);
+        }
         if n == nr::SECCOMP || (n == nr::PRCTL && a[0] == crate::prctl::pr::SET_SECCOMP) {
             let r = self.seccomp_call(m, n, a);
             if self.trace {
@@ -15832,6 +15955,11 @@ fn strace_only(n: u64) -> bool {
     !only.is_empty() && only.iter().any(|s| s == syscall_name(n))
 }
 
+/// The POSIX timer calls, canonical.
+fn is_ptimer(n: u64) -> bool {
+    matches!(n, nr::TIMER_CREATE | nr::TIMER_GETTIME | nr::TIMER_GETOVERRUN | nr::TIMER_SETTIME | nr::TIMER_DELETE)
+}
+
 /// `GEX_STRACE_EXE=app_process64`: [`strace_only`]'s calls only for the
 /// processes whose program's path holds that text (all when unset): one
 /// program's calls out of a whole boot's.
@@ -16052,6 +16180,11 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::USERFAULTFD => "userfaultfd",
         nr::BPF => "bpf",
         nr::SECCOMP => "seccomp",
+        nr::TIMER_CREATE => "timer_create",
+        nr::TIMER_GETTIME => "timer_gettime",
+        nr::TIMER_GETOVERRUN => "timer_getoverrun",
+        nr::TIMER_SETTIME => "timer_settime",
+        nr::TIMER_DELETE => "timer_delete",
         nr::GETPID => "getpid",
         nr::GETPPID => "getppid",
         nr::SETSID => "setsid",
@@ -17535,7 +17668,12 @@ mod tests {
         }
         let names = |v: &[u64]| v.iter().map(|&n| syscall_name(n)).collect::<Vec<_>>();
         assert_eq!(wrong, Vec::<u64>::new(), "answered ENOSYS, but the kernel makes {:?}", names(&wrong));
-        assert_eq!(locked, vec![nr::CLONE, nr::EXECVE, nr::SECCOMP, nr::CLONE3], "{:?}", names(&locked));
+        assert_eq!(
+            locked,
+            vec![nr::TIMER_CREATE, nr::TIMER_GETTIME, nr::TIMER_GETOVERRUN, nr::TIMER_SETTIME, nr::TIMER_DELETE, nr::CLONE, nr::EXECVE, nr::SECCOMP, nr::CLONE3],
+            "{:?}",
+            names(&locked)
+        );
     }
 
     /// i386's `socketcall`, as Debian's i386 glibc makes every socket call,

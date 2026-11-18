@@ -303,6 +303,13 @@ pub mod raw {
     pub const PIDFD_SEND_SIGNAL: u64 = 424;
     pub const PIDFD_OPEN: u64 = 434;
     pub const SECCOMP: u64 = 354;
+    pub const TIMER_CREATE: u64 = 259;
+    pub const TIMER_GETOVERRUN: u64 = 262;
+    pub const TIMER_DELETE: u64 = 263;
+    // (the 32-bit `timer_settime` and `timer_gettime`, 260 and 261, are not
+    // here: only their 64-bit-time forms)
+    pub const TIMER_GETTIME64: u64 = 408;
+    pub const TIMER_SETTIME64: u64 = 409;
     pub const CLONE3: u64 = 435;
     pub const CLOSE_RANGE: u64 = 436;
     pub const OPENAT2: u64 = 437;
@@ -476,6 +483,11 @@ pub fn translate(
         x::CLOSE_RANGE => nr::CLOSE_RANGE,
         x::PIDFD_OPEN => nr::PIDFD_OPEN,
         x::SECCOMP => nr::SECCOMP,
+        x::TIMER_CREATE => nr::TIMER_CREATE,
+        x::TIMER_GETOVERRUN => nr::TIMER_GETOVERRUN,
+        x::TIMER_DELETE => nr::TIMER_DELETE,
+        x::TIMER_GETTIME64 => nr::TIMER_GETTIME,
+        x::TIMER_SETTIME64 => nr::TIMER_SETTIME,
         x::PIDFD_SEND_SIGNAL => {
             a[0] = sext(a[0]);
             nr::PIDFD_SEND_SIGNAL

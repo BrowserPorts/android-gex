@@ -163,6 +163,9 @@ pub struct ProcSig {
     shared_sources: Mutex<[Option<Source>; NSIG]>,
     /// The interval timers, indexed by `which`.
     timers: Mutex<[Option<Itimer>; 3]>,
+    /// The POSIX timers ([`crate::ptimer`]). Taken after `timers` where
+    /// both are held.
+    posix: Mutex<crate::ptimer::Timers>,
     /// The earliest armed timer's deadline, clamped to `u64`; [`NO_TIMER`]
     /// when none is armed. Written under `timers`.
     timer_next: AtomicU64,
@@ -207,6 +210,7 @@ impl ProcSig {
             shared: AtomicU64::new(0),
             shared_sources: Mutex::new([None; NSIG]),
             timers: Mutex::new([None; 3]),
+            posix: Mutex::new(crate::ptimer::Timers::default()),
             collecting: Mutex::new(()),
             timer_next: AtomicU64::new(NO_TIMER),
             fatal: Mutex::new(None),
@@ -323,7 +327,61 @@ impl ProcSig {
         if let Some(slot) = timers.get_mut(which) {
             *slot = t;
         }
-        self.timer_next.store(earliest(&timers), Ordering::Release);
+        let posix = self.posix.lock();
+        self.timer_next.store(earliest(&timers, &posix), Ordering::Release);
+    }
+
+    /// Work on the POSIX timers; their earliest deadline is taken again
+    /// after.
+    pub fn with_posix<R>(&self, f: impl FnOnce(&mut crate::ptimer::Timers) -> R) -> R {
+        let timers = self.timers.lock();
+        let mut posix = self.posix.lock();
+        let r = f(&mut posix);
+        self.timer_next.store(earliest(&timers, &posix), Ordering::Release);
+        r
+    }
+
+    /// Whether POSIX timer `id`'s signal is still queued (not delivered).
+    pub fn timer_queued(&self, id: i32) -> bool {
+        let posix = self.posix.lock();
+        let Some(t) = posix.list.iter().find(|t| t.id == id) else { return false };
+        t.queued && self.timer_still_queued(t, t.overrun)
+    }
+
+    /// Whether a timer's signal is still queued to its target, and if so
+    /// its siginfo made to say `overrun` (Linux's `si_overrun` is read at
+    /// delivery, so a queued signal carries the overruns since queued).
+    fn timer_still_queued(&self, t: &crate::ptimer::Timer, overrun: i32) -> bool {
+        use crate::ptimer::Notify;
+        let (signo, pending, sources) = match &t.notify {
+            Notify::None => return false,
+            Notify::Process(s) => (*s, self.shared(), &self.shared_sources),
+            Notify::Thread(s, w) => {
+                let Some(th) = w.upgrade() else { return false };
+                if th.pending() & bit(*s) == 0 {
+                    return false;
+                }
+                let mut src = th.sources.lock();
+                return match &mut src[*s as usize] {
+                    Some(x) if x.code == crate::ptimer::SI_TIMER && x.pid == t.id => {
+                        x.uid = overrun as u32;
+                        true
+                    }
+                    _ => false,
+                };
+            }
+        };
+        if pending & bit(signo) == 0 {
+            return false;
+        }
+        let mut src = sources.lock();
+        match &mut src[signo as usize] {
+            Some(x) if x.code == crate::ptimer::SI_TIMER && x.pid == t.id => {
+                x.uid = overrun as u32;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Whether any interval timer is armed.
@@ -355,6 +413,41 @@ impl ProcSig {
             return;
         }
         let mut timers = self.timers.lock();
+        let mut posix = self.posix.lock();
+        // The POSIX timers: each due one's expiries since it was last seen.
+        for i in 0..posix.list.len() {
+            let Some(next) = posix.list[i].next else { continue };
+            if now < next {
+                continue;
+            }
+            let t = &mut posix.list[i];
+            let expiries = if t.interval == 0 { 1 } else { (now - next) / t.interval + 1 };
+            t.next = (t.interval > 0).then(|| next + expiries * t.interval);
+            let expiries = expiries.min(i32::MAX as u128) as i32;
+            if t.queued {
+                let overrun = t.overrun.saturating_add(expiries);
+                if self.timer_still_queued(&posix.list[i], overrun) {
+                    posix.list[i].overrun = overrun;
+                    continue;
+                }
+                // Its last signal was delivered with what it carried.
+                let t = &mut posix.list[i];
+                t.overrun_last = t.overrun;
+            }
+            let t = &mut posix.list[i];
+            t.overrun = expiries - 1;
+            t.queued = !matches!(t.notify, crate::ptimer::Notify::None);
+            let source = Source { code: crate::ptimer::SI_TIMER, pid: t.id, uid: t.overrun as u32, value: t.value, errno: 0 };
+            match &t.notify {
+                crate::ptimer::Notify::None => {}
+                crate::ptimer::Notify::Process(s) => self.raise(*s, Some(source)),
+                crate::ptimer::Notify::Thread(s, w) => {
+                    if let Some(th) = w.upgrade() {
+                        th.raise(*s, Some(source));
+                    }
+                }
+            }
+        }
         for which in 0..3 {
             let Some(timer) = timers[which] else {
                 continue;
@@ -383,7 +476,7 @@ impl ProcSig {
                 None,
             );
         }
-        self.timer_next.store(earliest(&timers), Ordering::Release);
+        self.timer_next.store(earliest(&timers, &posix), Ordering::Release);
     }
 
     /// Move signals other processes have sent this one (`pid`) into its
@@ -428,11 +521,13 @@ impl ProcSig {
     }
 }
 
-fn earliest(timers: &[Option<Itimer>; 3]) -> u64 {
+fn earliest(timers: &[Option<Itimer>; 3], posix: &crate::ptimer::Timers) -> u64 {
     timers
         .iter()
         .flatten()
-        .map(|t| t.next.min(NO_TIMER as u128 - 1) as u64)
+        .map(|t| t.next)
+        .chain(posix.earliest())
+        .map(|n| n.min(NO_TIMER as u128 - 1) as u64)
         .min()
         .unwrap_or(NO_TIMER)
 }
@@ -754,6 +849,8 @@ impl Signals {
         // `flush_thread` -> `flush_tagged_addr_state`: the new program
         // starts without the tagged address ABI.
         self.cur.set_tagged_addr(false);
+        // `exit_itimers`: the POSIX timers go (the interval timers stay).
+        self.proc.with_posix(|t| t.clear());
         // A new address space ([`crate::prctl::Proc::exec`]). What the
         // thread set about itself stays.
         let after = self.proc.prctl().exec();

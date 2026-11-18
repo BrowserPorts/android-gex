@@ -315,6 +315,11 @@ pub mod raw {
     pub const USERFAULTFD: u64 = 323;
     pub const BPF: u64 = 321;
     pub const SECCOMP: u64 = 317;
+    pub const TIMER_CREATE: u64 = 222;
+    pub const TIMER_SETTIME: u64 = 223;
+    pub const TIMER_GETTIME: u64 = 224;
+    pub const TIMER_GETOVERRUN: u64 = 225;
+    pub const TIMER_DELETE: u64 = 226;
     pub const CLOCK_GETTIME: u64 = 228;
     pub const CLOCK_GETRES: u64 = 229;
     pub const CLOCK_NANOSLEEP: u64 = 230;
@@ -595,6 +600,11 @@ pub fn translate(
         x::USERFAULTFD => nr::USERFAULTFD,
         x::BPF => nr::BPF,
         x::SECCOMP => nr::SECCOMP,
+        x::TIMER_CREATE => nr::TIMER_CREATE,
+        x::TIMER_SETTIME => nr::TIMER_SETTIME,
+        x::TIMER_GETTIME => nr::TIMER_GETTIME,
+        x::TIMER_GETOVERRUN => nr::TIMER_GETOVERRUN,
+        x::TIMER_DELETE => nr::TIMER_DELETE,
         x::GETRLIMIT => {
             *a = [0, a[0], 0, a[1], 0, 0];
             nr::PRLIMIT64
