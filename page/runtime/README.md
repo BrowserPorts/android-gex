@@ -244,7 +244,7 @@ Where the contents are kept is the subclass the page makes:
 | Class | Keeps file contents |
 | --- | --- |
 | `new MemoryFilesystem(sys, { max })` | In the system's memory. `max` (bytes, optional): writes past it fail with `ENOSPC`; without it, as much as the memory holds. |
-| `new OPFSFilesystem(sys, { name, cache, writeback, exclude })` | In the page's origin private file system (OPFS), in a store named `name` (letters, digits, `.`, `_`, `-`), kept across loads (Persistence below). Memory holds a cache of `cache` MiB (default 256, 16 to 4096) and the files' contents live in the store, so the tree may be far larger than memory. A written block reaches the store within `writeback` ms (default 5000, 100 to 600000) or at a sync. Small files (16 KiB or less) stay in memory, and so do the files `addTar` and `addFiles` lay until a program writes one (boot writes nothing to the store); lazy files are fetched as before. A full store (the origin's quota) fails writes with `ENOSPC`, a failing one with `EIO`. |
+| `new OPFSFilesystem(sys, { name, cache, writeback, exclude, wait })` | In the page's origin private file system (OPFS), in a store named `name` (letters, digits, `.`, `_`, `-`), kept across loads (Persistence below). Memory holds a cache of `cache` MiB (default 256, 16 to 4096) and the files' contents live in the store, so the tree may be far larger than memory. A written block reaches the store within `writeback` ms (default 5000, 100 to 600000) or at a sync. Small files (16 KiB or less) stay in memory, and so do the files `addTar` and `addFiles` lay until a program writes one (boot writes nothing to the store); lazy files are fetched as before. A full store (the origin's quota) fails writes with `ENOSPC`, a failing one with `EIO`. |
 | A subclass of the page's own | Wherever its methods keep them (below). |
 
 `new Filesystem(sys)` throws. A `MemoryFilesystem` keeps nothing across
@@ -437,8 +437,10 @@ a boot, a file reads what was last written into the blocks it had.
 One page holds an `OPFSFilesystem`'s store at a time: a Web Lock named for
 it, taken at boot and let go at `shutdown()` or when the page is left. A
 system booted on a store another tab of the site holds fails at once with
-`EBUSY`. (The eject library's `start()` asks first, and lets the page
-offer to run without keeping files: its `onStoreBusy` option.)
+`EBUSY`, or, made with `wait` (`true`, or an `AbortSignal` whose abort ends
+the wait and rejects boot with its reason), waits until that tab lets it go.
+`OPFSFilesystem.busy(name)` says beforehand whether another tab holds it, so
+a page can offer something else first (a `MemoryFilesystem`, say).
 
 ```js
 import { System } from '@gexemu/runtime';
@@ -454,6 +456,7 @@ await sys.boot();
 | --- | --- |
 | `exclude` (constructor) | More absolute paths never kept, beside the ones above. |
 | `sys.sync()` | Writes a generation now. |
+| `OPFSFilesystem.busy(name)` | Whether another tab or window of the site holds the store now. This page's own systems never make it busy to itself. |
 | `OPFSFilesystem.erase(name)`, `fs.erase()` | Forget what the store keeps: the next boot is the sources alone. Before boot, or once the system has stopped. |
 
 A tree's sources must be the same at every load: what is kept is laid over

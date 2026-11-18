@@ -1048,9 +1048,14 @@ export class System extends EventTarget {
     const check = !!this.#opts.debug.blockscheck;
     if (st.kind !== 'page') {
       // One page per store: a second tab of the site is told so (EBUSY), at
-      // once, not after the handle's retries (the page's start() asks
-      // first, and may have offered a MemoryFilesystem instead).
-      const claim = await claimStore(st.name);
+      // once, not after the handle's retries; or, with the filesystem's
+      // `wait`, once the other page lets it go.
+      let claim = await claimStore(st.name);
+      if (!claim && st.wait) {
+        const signal = st.wait === true ? undefined : st.wait;
+        signal?.throwIfAborted();
+        claim = await claimStore(st.name, { wait: true, signal });
+      }
       if (!claim) throw storeBusy(st.name);
       this.#sys.onStop(() => claim.release());
       this.#claim = claim;

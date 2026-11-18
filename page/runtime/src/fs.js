@@ -17,6 +17,7 @@
 // default build only).
 
 import { INTERNAL, internals, bytesOf } from './internal.js';
+import { claimStore } from '../../../hosts/browser/js/blocks.mjs';
 
 const norm = (p) => {
   if (typeof p !== 'string' || !p.startsWith('/')) throw new TypeError(`not an absolute guest path: ${p}`);
@@ -603,15 +604,33 @@ const CHUNK = 1 << 20;
  *  uses them while no system holds it. */
 export class OPFSFilesystem extends Filesystem {
   #name;
+  #wait;
 
-  constructor(sys, { name, cache, writeback } = {}) {
+  /** `wait`: when another tab or window of the site has the store open,
+   *  boot waits until it lets it go (true, or an AbortSignal, whose abort
+   *  ends the wait and rejects boot with its reason) instead of failing at
+   *  once with EBUSY. */
+  constructor(sys, { name, cache, writeback, wait = false } = {}) {
     name = String(name ?? '');
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) throw new TypeError('OPFSFilesystem: name the store ({ name }: letters, digits, . _ -)');
+    if (wait !== true && wait !== false && !(typeof AbortSignal === 'function' && wait instanceof AbortSignal)) throw new TypeError('OPFSFilesystem: wait is true, false or an AbortSignal');
     super(sys, { cache, writeback });
     this.#name = name;
+    this.#wait = wait;
   }
 
-  [FAST]() { return { kind: 'opfs', name: this.#name, cache: this[INTERNAL].cache(), writeback: this[INTERNAL].writeback(), block: BLOCK, inline: INLINE }; }
+  [FAST]() { return { kind: 'opfs', name: this.#name, cache: this[INTERNAL].cache(), writeback: this[INTERNAL].writeback(), block: BLOCK, inline: INLINE, wait: this.#wait }; }
+
+  /** Whether another tab or window of the site has the store `name` open
+   *  now (a boot on it would fail with EBUSY, or wait with `wait`): a page
+   *  asks first to offer something else, a MemoryFilesystem say. This
+   *  page's own systems never make it busy to itself. */
+  static async busy(name) {
+    const c = await claimStore(String(name));
+    if (!c) return true;
+    c.release();
+    return false;
+  }
 
   async #file() {
     const root = await navigator.storage.getDirectory();

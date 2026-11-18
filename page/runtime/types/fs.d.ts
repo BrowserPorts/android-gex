@@ -138,7 +138,11 @@ export declare class MemoryFilesystem extends Filesystem {
 
 /** The root kept in the page's OPFS, in the store `name`, with a cache of `cache` MiB in memory (default 256). */
 export declare class OPFSFilesystem extends Filesystem {
-  constructor(sys: System, options: { name: string; cache?: number; writeback?: number; exclude?: string[] });
+  /** `wait`: when another tab holds the store, boot waits for it (an AbortSignal's abort ends
+   *  the wait) instead of failing with EBUSY. */
+  constructor(sys: System, options: { name: string; cache?: number; writeback?: number; exclude?: string[]; wait?: boolean | AbortSignal });
+  /** Whether another tab or window of the site holds the store `name` now. */
+  static busy(name: string): Promise<boolean>;
   /** Forget what the store `name` keeps (not while a system holds it). */
   static erase(name: string): Promise<void>;
   /** Forget what this filesystem's store keeps: before boot, or once its system stopped. */

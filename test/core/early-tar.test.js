@@ -5,7 +5,7 @@
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
-export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
+export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120, single: 'laid whole before the program starts (no early start: a read cannot wait in the one Worker)' };
 
 const enc = new TextEncoder();
 
