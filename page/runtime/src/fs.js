@@ -181,6 +181,8 @@ export class Filesystem extends EventTarget {
   /** The page's own source of the lazy files' bytes (`setLazySource`), or null. */
   #lazySource = null;
   #lazyPort = null;
+  /** Whether an early tar (`addTar(src, { early })`) was added. */
+  #early = false;
 
   /** Abstract: a page makes a `MemoryFilesystem`, an `OPFSFilesystem`, or
    *  a subclass of its own that implements the store's methods. `cache`:
@@ -301,8 +303,24 @@ export class Filesystem extends EventTarget {
    * `base`, itself relative to the list. With a lazy source
    * (`setLazySource`), each url is the file's key for the source instead,
    * and the list is the array or the URL of one.
+   *
+   * `early: true`: laid as it downloads (`src` a stream, a Response, a Blob
+   * or a URL), and boot does not wait for its end when its first entry is
+   * its index (`/.gex-index`, the kernel's seed records: every directory,
+   * file, link, mode and time the archive holds): the programs start once
+   * the index is in, a use of a file's bytes not yet come waits for them,
+   * and a file that never comes (the download failed) is EIO. Without an
+   * index it is laid part by part, boot waiting for its end. At the root,
+   * without `lazy`; one per filesystem, before boot.
    */
-  addTar(src, { at = '/', lazy } = {}) {
+  addTar(src, { at = '/', lazy, early = false } = {}) {
+    if (early) {
+      if (norm(at) !== '/' || lazy) throw new TypeError('addTar early: at the root, without lazy (add the lazy list in an addTar of its own)');
+      if (this.#sys.phase !== 'new') throw new Error(`addTar early: before boot (the system is ${this.#sys.phase})`);
+      if (this.#early) throw new Error('addTar early: one per filesystem');
+      this.#early = true;
+      return this.#add(import('./early-tar.js').then(({ earlyLayer }) => earlyLayer(src)));
+    }
     const keyed = !!this.#lazySource;
     const p = (async () => {
       if (keyed && lazy) {

@@ -19,6 +19,12 @@ export function isZstd(b) {
   return b.length > 4 && b[0] === 0x28 && b[1] === 0xb5 && b[2] === 0x2f && b[3] === 0xfd;
 }
 
+/** The shared decoder (zstddec's streaming build): its `stream()` decodes
+ *  pieces as they arrive. */
+export function zstdDecoder() {
+  return zstd();
+}
+
 /** Decode zstd bytes (the shared decoder, initialised once per realm). */
 export async function unzstd(bytes) {
   return (await zstd()).decode(bytes);

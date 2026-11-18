@@ -101,7 +101,9 @@ export declare abstract class Filesystem extends EventTarget {
   setLazySource(module: string | URL, options?: { data?: unknown }): void;
   /** The page's end of the line to its lazy source, once the system runs; else null. */
   get lazyPort(): MessagePort | null;
-  addTar(src: Source | null, options?: { at?: string; lazy?: LazyList }): Promise<unknown>;
+  /** `early`: laid as it downloads, the programs started once its index (its first entry,
+   *  `/.gex-index`) is in; at the root, without `lazy`, one per filesystem, before boot. */
+  addTar(src: Source | null, options?: { at?: string; lazy?: LazyList; early?: boolean }): Promise<unknown>;
   addFiles(files: Record<string, Source>, options?: { mode?: number }): Promise<unknown>;
   mount(path: string, provider: MountProvider): Mount;
   unmount(path: string): Promise<void>;
