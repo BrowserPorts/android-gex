@@ -154,6 +154,18 @@ pub mod op {
     /// it -- the page notices the process is gone and says so instead (see
     /// `gex_gl_forget_client`).
     pub const SURFACE_DETACH: u32 = 7;
+    /// `{ context, api, major, minor, profile }` -- run what follows in this
+    /// context of the client's, made now if it is new. Context 0 is the one
+    /// `CONTEXT_CREATE` made; every other is in its share group (textures,
+    /// buffers, programs, shaders, renderbuffers, samplers are the group's),
+    /// with its own state and its own vertex arrays, framebuffers, queries,
+    /// transform feedbacks and program pipelines. A guest that never sends it
+    /// has the one context it always had. The version words are what the
+    /// guest asked for; the host makes it like context 0.
+    pub const CONTEXT_CURRENT: u32 = 9;
+    /// `{ context }` -- that context (not 0) is gone, and its own objects
+    /// with it; context 0 is current after it if it was.
+    pub const CONTEXT_DROP: u32 = 10;
 
     // -- state ------------------------------------------------------------
     pub const CLEAR_COLOR: u32 = 16; // { r, g, b, a } as floats

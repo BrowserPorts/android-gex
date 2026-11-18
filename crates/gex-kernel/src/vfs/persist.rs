@@ -667,7 +667,7 @@ fn take(pre: &Pre) -> Rec {
                 let pg = node.paged_for(len);
                 match pg.as_ref() {
                     Some(p) => Body::Blocks(p.size, p.blocks().to_vec()),
-                    None => Body::Inline(node.data.lock().unwrap().clone()),
+                    None => Body::Inline(node.inline_bytes()),
                 }
             };
             Rec::File { ino: node.ino, mode: *mode, mtime, body, xattrs: xattrs.clone() }
@@ -812,6 +812,10 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
             if used.len() <= i {
                 used.resize(i + 1, false);
             }
+            // named by a file before: a copy that shares it
+            if used[i] {
+                blocks::add_ref(i as u32);
+            }
             used[i] = true;
         }
     };
@@ -924,6 +928,7 @@ pub fn start(fs: &TmpFs, exclude: Vec<String>) -> Found {
     let mut found = if any { Found::Unreadable } else { Found::Fresh };
     let mut st = State { fs, exclude, seed, committed: HashMap::new(), sb: Sb { gen: max_gen, ..Default::default() }, chain: Vec::new(), seen: 0, since: None };
     let mut used = vec![true];
+    blocks::clear_refs();
     for (i, sb) in ok.iter().enumerate() {
         let Ok((stream, chain)) = read_chain(sb) else { continue };
         let Ok(recs) = replay(&stream) else { continue };
@@ -1068,6 +1073,52 @@ mod tests {
 
     fn big(n: usize, k: u8) -> Vec<u8> {
         (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(k)).collect()
+    }
+
+    /// A copy that shares its source's blocks (copy_file_range of a whole
+    /// file in the store) is kept across boots as such: both read back, the
+    /// blocks counted as shared again, so a write to one after the boot
+    /// leaves the other as it was, and a block freed with one is still the
+    /// other's.
+    #[test]
+    #[ignore]
+    fn a_copy_sharing_blocks_is_kept_across_boots() {
+        STORE_FILE.lock().unwrap().clear();
+        let fs = boot();
+        assert_eq!(start(&fs, vec!["tmp".into()]), Found::Fresh);
+        fs.mkdir("home", 0o755).unwrap();
+        write(&fs, "home/src", &big(40000, 9));
+        let src = fs.open("home/src", O_RDWR, 0).unwrap();
+        let dst = fs.open_mode("home/dst", O_CREAT | O_RDWR, 0o644).unwrap();
+        assert_eq!(dst.share_from(&*src).unwrap().unwrap(), 40000);
+        drop((src, dst));
+        assert!(blocks::shared_counts().0 > 0);
+        sync().unwrap();
+        let shared = blocks::shared_counts();
+
+        let fs = boot();
+        assert_eq!(start(&fs, vec!["tmp".into()]), Found::Restored);
+        assert_eq!(blocks::shared_counts(), shared, "counted again at the load");
+        assert_eq!(read(&fs, "home/src").unwrap(), big(40000, 9));
+        assert_eq!(read(&fs, "home/dst").unwrap(), big(40000, 9));
+        fs.open("home/dst", O_RDWR, 0).unwrap().write_at(5, b"dst").unwrap();
+        let mut want = big(40000, 9);
+        want[5..8].copy_from_slice(b"dst");
+        assert_eq!(read(&fs, "home/dst").unwrap(), want);
+        assert_eq!(read(&fs, "home/src").unwrap(), big(40000, 9), "the source keeps its bytes");
+        fs.unlink("home/src").unwrap();
+        sync().unwrap();
+        // the source's blocks reused by a new file: the copy's are not
+        write(&fs, "home/new", &big(40000, 1));
+        sync().unwrap();
+        assert_eq!(read(&fs, "home/dst").unwrap(), want);
+        assert_eq!(blocks::shared_counts(), (0, 0));
+
+        let fs = boot();
+        assert_eq!(start(&fs, vec!["tmp".into()]), Found::Restored);
+        assert_eq!(read(&fs, "home/dst").unwrap(), want);
+        assert_eq!(read(&fs, "home/new").unwrap(), big(40000, 1));
+        assert_eq!(blocks::shared_counts(), (0, 0));
     }
 
     /// A tree's changes kept across boots: files small and large, a mode,

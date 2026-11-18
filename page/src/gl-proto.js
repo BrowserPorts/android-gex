@@ -12,6 +12,8 @@ export const op = {
     SURFACE_CURRENT: 6,
     CONTEXT_DESTROY: 8,
     SURFACE_DETACH: 7,
+    CONTEXT_CURRENT: 9,
+    CONTEXT_DROP: 10,
     CLEAR_COLOR: 16,
     CLEAR: 17,
     VIEWPORT: 18,

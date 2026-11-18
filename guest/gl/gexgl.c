@@ -44,6 +44,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -64,6 +65,42 @@
    definitions, because writing them twice is writing them differently. */
 #define RING_MAGIC GEXGL_MAGIC
 #define GEX_GL_SUBMIT GEXGL_SUBMIT
+
+/* Threads. Each thread records into a ring of its own, and what is context
+ * state here -- the shadows, the bindings, the pixel stores -- is the
+ * thread's, swapped with the context's saved copy when it makes a context
+ * current (context_switch): GL's current context is per thread, and Wine's
+ * opengl32 does not serialise gl* calls. One ring for the process let a Qt
+ * Quick render thread's commands land in the middle of the GUI thread's and
+ * take its replies. What the contexts share (buffer objects, vertex array
+ * slots, the EGL tables, the string caches) is under group_lock; a submit
+ * is under submit_lock, which starts a batch in its thread's context
+ * (submit_begin). A program with one thread takes an uncontended lock per
+ * submit and sends nothing more. */
+#define GEXGL_TLS __thread
+static pthread_mutex_t group_mutex;
+static pthread_once_t group_mutex_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t submit_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void group_mutex_make(void) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&group_mutex, &a);
+    pthread_mutexattr_destroy(&a);
+}
+static void group_lock(void) {
+    pthread_once(&group_mutex_once, group_mutex_make);
+    pthread_mutex_lock(&group_mutex);
+}
+static void group_unlock(void) { pthread_mutex_unlock(&group_mutex); }
+#define GEXGL_NO_CONTEXT 0xffffffffu
+/* The host's context and surface after the last batch submitted, of any
+   thread (submit_lock). */
+static unsigned host_ctx_now, host_surface_now;
+/* This thread's: the host context and surface the next command it records
+   runs in, and the ones its batch in the ring started in. */
+static GEXGL_TLS unsigned ring_ctx = GEXGL_NO_CONTEXT, ring_surface;
+static GEXGL_TLS unsigned batch_ctx = GEXGL_NO_CONTEXT, batch_surface;
 #define HEADER_BYTES 32
 #define CMD_CAPACITY (32u * 1024 * 1024)
 #define REPLY_CAPACITY (32u * 1024 * 1024)
@@ -84,27 +121,44 @@ static int gl_fd = -1;
 static int host_context_made;
 static int host_deferred;
 static void host_realize(void);
-static struct header *ring;
-static uint8_t *cmds;   /* the command area, just past the header */
-static uint8_t *replies;
+static GEXGL_TLS struct header *ring;
+static GEXGL_TLS uint8_t *cmds;   /* the command area, just past the header */
+static GEXGL_TLS uint8_t *replies;
 /* How much of the reply the caller has read, so several return values from
    one batch come back in order. */
-static uint32_t reply_at;
-static struct gexgl_pixel_store pack_store = {4, 0, 0, 0, 0, 0};
-static struct gexgl_pixel_store unpack_store = {4, 0, 0, 0, 0, 0};
+static GEXGL_TLS uint32_t reply_at;
+static GEXGL_TLS struct gexgl_pixel_store pack_store = {4, 0, 0, 0, 0, 0};
+static GEXGL_TLS struct gexgl_pixel_store unpack_store = {4, 0, 0, 0, 0, 0};
+
+static pthread_key_t ring_key;
+static pthread_once_t ring_key_once = PTHREAD_ONCE_INIT;
+static void ring_thread_exit(void *unused);
+static void ring_key_make(void) { pthread_key_create(&ring_key, ring_thread_exit); }
 
 static int ring_open(void) {
     if (ring) {
         return 0;
     }
-    gl_fd = open("/dev/gex-gl", O_RDWR);
-    if (gl_fd < 0) {
+    /* (a process without the device, gexc run without --gl, does not have it
+       later either: tried and said once, not on every EGL entry) */
+    static int open_errno;
+    pthread_mutex_lock(&submit_mutex);
+    int first = 0;
+    if (gl_fd < 0 && !open_errno) {
+        gl_fd = open("/dev/gex-gl", O_RDWR | O_CLOEXEC);
+        if (gl_fd < 0) { open_errno = errno ? errno : ENODEV; first = 1; }
+    }
+    const int fd = gl_fd, err = open_errno;
+    pthread_mutex_unlock(&submit_mutex);
+    if (fd < 0) {
         /* Said out loud. A silent failure here is indistinguishable, from the
            application's side, from a GL that simply reports nothing: every
            later glGetString answers from the empty string cache and the app
            selects a fallback renderer, many screens away from the cause. */
-        fprintf(stderr, "gexgl: open(/dev/gex-gl) failed: %s\n",
-                strerror(errno));
+        if (first)
+            fprintf(stderr, "gexgl: open(/dev/gex-gl) failed: %s\n",
+                    strerror(err));
+        errno = err;
         return -1;
     }
     size_t total = HEADER_BYTES + CMD_CAPACITY + REPLY_CAPACITY;
@@ -119,12 +173,10 @@ static int ring_open(void) {
     if (p == MAP_FAILED)
         p = mmap(NULL, total, PROT_READ | PROT_WRITE,
                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) {
-        close(gl_fd);
-        gl_fd = -1;
-        return -1;
-    }
+    if (p == MAP_FAILED) return -1;
     ring = p;
+    pthread_once(&ring_key_once, ring_key_make);
+    pthread_setspecific(ring_key, p);
     ring->magic = RING_MAGIC;
     ring->capacity = CMD_CAPACITY;
     ring->tail = 0;
@@ -146,7 +198,7 @@ static int ring_open(void) {
  * hundred of them a frame, and nothing in the transport said which call was
  * asking. GEXGL_SUBMIT_TRACE=1 prints the tally at exit. */
 #define GEXGL_MAX_TRACED_OPCODE 4096
-static unsigned submit_trace_last_opcode;
+static GEXGL_TLS unsigned submit_trace_last_opcode;
 static unsigned submit_trace_counts[GEXGL_MAX_TRACED_OPCODE];
 static unsigned submit_trace_total;
 static int submit_trace_enabled = -1;
@@ -193,6 +245,52 @@ static int gexgl_debug_wants_errors(void);
 static void gexgl_debug_folded_error(unsigned error);
 
 /* Hand everything recorded so far to the host and wait for it. */
+/* Room begin() leaves at the end of the command area, for what a submit puts
+   in front of the batch (submit_begin) and the folded GET_ERROR. */
+#define PREFIX_ROOM 64u
+static unsigned egl_api;
+static int egl_context_major, egl_context_minor, egl_context_profile;
+
+/* Taken around every submit. A batch was recorded for the context and
+   surface its thread had when it began; if another thread's batch has left
+   the host in its own, saying them again goes first. One thread alone never
+   finds them different. */
+static void submit_begin(void) {
+    pthread_mutex_lock(&submit_mutex);
+    uint32_t pre[10];
+    size_t n = 0;
+    if (batch_ctx != GEXGL_NO_CONTEXT && batch_ctx != host_ctx_now) {
+        pre[n++] = GEXGL_CONTEXT_CURRENT;
+        pre[n++] = 28u;
+        pre[n++] = batch_ctx;
+        pre[n++] = egl_api == 0x30A2u ? 1u : 0u;
+        pre[n++] = (uint32_t)egl_context_major;
+        pre[n++] = (uint32_t)egl_context_minor;
+        pre[n++] = (uint32_t)egl_context_profile;
+    }
+    if (batch_surface && batch_surface != host_surface_now) {
+        pre[n++] = GEXGL_SURFACE_CURRENT;
+        pre[n++] = 12u;
+        pre[n++] = batch_surface;
+    }
+    const size_t bytes = n * 4u;
+    if (bytes && ring->tail <= ring->capacity && bytes <= ring->capacity - ring->tail) {
+        memmove(cmds + bytes, cmds, ring->tail);
+        memcpy(cmds, pre, bytes);
+        ring->tail += (uint32_t)bytes;
+    }
+}
+
+/* The batch went: the host is in this thread's context and surface now. */
+static void submit_end(void) {
+    if (ring_ctx == GEXGL_NO_CONTEXT) ring_ctx = host_ctx_now;
+    else host_ctx_now = ring_ctx;
+    if (ring_surface) host_surface_now = ring_surface;
+    batch_ctx = ring_ctx;
+    batch_surface = ring_surface;
+    pthread_mutex_unlock(&submit_mutex);
+}
+
 static void flush(void) {
     if (!ring || ring->tail == 0) {
         reply_at = 0;
@@ -214,7 +312,9 @@ static void flush(void) {
         ring->tail += 8u;
         folded = 1;
     }
+    submit_begin();
     const int failed = ioctl(gl_fd, GEX_GL_SUBMIT, ring) != 0;
+    submit_end();
     if (!failed && folded && ring->reply_len >= 4u) {
         uint32_t error;
         memcpy(&error, replies + ring->reply_len - 4u, 4);
@@ -276,10 +376,10 @@ struct fbq_entry {
     unsigned pname, draw, read;
     int value;
 };
-static struct fbq_entry fbq_cache[16];
-static unsigned fbq_count;
-static unsigned fbq_draw, fbq_read;
-static int fbq_known;
+static GEXGL_TLS struct fbq_entry fbq_cache[16];
+static GEXGL_TLS unsigned fbq_count;
+static GEXGL_TLS unsigned fbq_draw, fbq_read;
+static GEXGL_TLS int fbq_known;
 
 static void fbq_forget(void) { fbq_count = 0; }
 
@@ -371,8 +471,12 @@ static void flush_async(void) {
         return;
     }
     gexgl_note_submit();
-    if (ioctl(gl_fd, GEXGL_SUBMIT_ASYNC, ring) != 0) {
-        if (errno == ENOTTY || errno == EINVAL || errno == ENOSYS) {
+    submit_begin();
+    const int r = ioctl(gl_fd, GEXGL_SUBMIT_ASYNC, ring);
+    const int why = errno;
+    submit_end();
+    if (r != 0) {
+        if (why == ENOTTY || why == EINVAL || why == ENOSYS) {
             /* Refused before anything ran (an older host): the batch is still
                in the ring, so submit it the waiting way and stop trying. */
             async_refused = 1;
@@ -403,9 +507,12 @@ static int present_async_refused;
 static int present_async(uint32_t *shown) {
     if (present_async_refused || !ring) return 0;
     gexgl_note_submit();
+    submit_begin();
     const int r = ioctl(gl_fd, GEXGL_PRESENT_ASYNC, ring);
+    const int why = errno;
+    submit_end();
     if (r < 0) {
-        if (errno == ENOTTY || errno == EINVAL || errno == ENOSYS) {
+        if (why == ENOTTY || why == EINVAL || why == ENOSYS) {
             present_async_refused = 1;
             return 0;
         }
@@ -482,15 +589,20 @@ static uint32_t *begin(uint32_t opcode, size_t arg_words, size_t tail_bytes) {
     if (padded > SIZE_MAX - 8u - args_bytes) return NULL;
     size_t len = 8u + args_bytes + padded;
     if (len > UINT32_MAX) return NULL;
-    if (ring->tail > ring->capacity || len > ring->capacity - ring->tail) {
+    const uint32_t room = ring->capacity - PREFIX_ROOM;
+    if (ring->tail > room || len > room - ring->tail) {
         flush();
-        if (len > ring->capacity) {
+        if (len > room) {
             too_big(opcode, len);
             return NULL; /* one command larger than the whole buffer */
         }
     }
     if ((fbq_count || fbq_known) && fbq_invalidates(opcode)) fbq_forget();
     shadow_opcode(opcode);
+    if (ring->tail == 0) {
+        batch_ctx = ring_ctx;
+        batch_surface = ring_surface;
+    }
     uint32_t *at = (uint32_t *)(cmds + ring->tail);
     at[0] = opcode;
     at[1] = (uint32_t)len;
@@ -554,10 +666,10 @@ static uint32_t as_bits(float f) {
 /* One counter for every kind. GL keeps separate namespaces, but nothing
    requires them to be dense or to start at one, so a single counter is
    simplest and cannot collide with itself. */
-static uint32_t next_name = 1;
+static _Atomic uint32_t next_name = 1;
 
 static uint32_t take_name(void) {
-    return next_name++;
+    return atomic_fetch_add(&next_name, 1);
 }
 
 /* -------------------------------------------------------------------- GLES */
@@ -770,7 +882,7 @@ struct buffer_object_state {
 };
 static size_t persistent_live;
 #define MIRROR_MAX ((size_t)1 << 20)
-static struct buffer_target_state buffer_targets[16];
+static GEXGL_TLS struct buffer_target_state buffer_targets[16];
 static struct buffer_object_state *buffer_objects;
 static size_t mirrors_live, mirrors_small;
 
@@ -785,10 +897,12 @@ static void mirror_drop(struct buffer_object_state *object) {
 /* Called first by every command that may change a buffer's contents other
    than glBufferData/glBufferSubData (scripts/gl/gl_buffer_writers.py). */
 static void buffer_contents_unknown(void) {
+    group_lock();
     for (struct buffer_object_state *o = buffer_objects; o; o = o->next) {
         if (o->map) o->host_wrote = 1;
         mirror_drop(o);
     }
+    group_unlock();
 }
 
 static struct buffer_target_state *buffer_target(unsigned target) {
@@ -807,17 +921,18 @@ static unsigned bound_buffer(unsigned target) {
 }
 
 static struct buffer_object_state *buffer_object(unsigned name, int create) {
+    group_lock();
     struct buffer_object_state *object = buffer_objects;
     while (object) {
-        if (object->name == name) return object;
+        if (object->name == name) break;
         object = object->next;
     }
-    if (!create || !name) return NULL;
-    object = calloc(1, sizeof(*object));
-    if (!object) return NULL;
-    object->name = name;
-    object->next = buffer_objects;
-    buffer_objects = object;
+    if (!object && create && name && (object = calloc(1, sizeof(*object)))) {
+        object->name = name;
+        object->next = buffer_objects;
+        buffer_objects = object;
+    }
+    group_unlock();
     return object;
 }
 
@@ -825,6 +940,7 @@ static void forget_buffer_object(unsigned name) {
     for (size_t i = 0; i < sizeof(buffer_targets) / sizeof(buffer_targets[0]); ++i) {
         if (buffer_targets[i].name == name) buffer_targets[i].name = 0;
     }
+    group_lock();
     struct buffer_object_state **link = &buffer_objects;
     while (*link) {
         struct buffer_object_state *object = *link;
@@ -834,10 +950,11 @@ static void forget_buffer_object(unsigned name) {
             free(object->map);
             if (object->sent) { free(object->sent); persistent_live--; }
             free(object);
-            return;
+            break;
         }
         link = &object->next;
     }
+    group_unlock();
 }
 
 void glBindBuffer(unsigned target, unsigned name) {
@@ -919,7 +1036,8 @@ static void buffer_copy(unsigned read_target, unsigned write_target, long read_o
    with the map access flags and buffer sizes behind the unmaps, and what
    explicit flushes hashed and sent. Said every 2 GiB or 20000 uploads. */
 enum { UP_APP, UP_UNMAP_WHOLE, UP_UNMAP_CHANGED, UP_FLUSH, UP_PERSIST, UP_SPLIT, UP_N };
-static int upload_origin = UP_APP, upload_trace = -1;
+static GEXGL_TLS int upload_origin = UP_APP;
+static int upload_trace = -1;
 static unsigned long long upload_bytes[UP_N], upload_calls[UP_N], upload_total;
 static unsigned long long unmap_n, unmap_mirror, unmap_whole_bytes, unmap_map_bytes;
 static unsigned long long flush_hashed, flush_sent, flush_whole, flush_deferred;
@@ -1227,6 +1345,7 @@ static void persistent_settle(void) {
     size_t hashed = 0, sent = 0;
     unsigned was = bound_buffer(0x8F37u); /* GL_COPY_WRITE_BUFFER */
     int bound = 0;
+    group_lock();
     for (struct buffer_object_state *o = buffer_objects; o; o = o->next) {
         if (!o->sent || !o->map || (!all && !(o->map_access & 0x80u))) continue;
         size_t n = o->map_length, start = SIZE_MAX;
@@ -1246,6 +1365,7 @@ static void persistent_settle(void) {
         }
         if (start != SIZE_MAX) { persistent_send(o, start, n); sent += n - start; bound = 1; }
     }
+    group_unlock();
     if (bound) glBindBuffer(0x8F37u, was);
     if (t0) persist_ns += persistent_clock() - t0;
     if (persistent_tracing()) persistent_trace(hashed, sent);
@@ -1589,12 +1709,32 @@ void glGetAttachedShaders(unsigned program, int max_count, int *count,
     if (count) *count = (int)n;
 }
 
+/* A reply longer than the caller's buffer can hold by GL's rules: said
+   once a query, and cut to what fits (written whole, it went past the
+   buffer into whatever the caller's heap put after it). */
+static void reply_too_long(const char *what, size_t got, size_t fits) {
+    static const char *said[8];
+    for (int i = 0; i < 8; i++) {
+        if (said[i] == what) return;
+        if (!said[i]) { said[i] = what; break; }
+    }
+    fprintf(stderr, "gexgl: %s: the host answered %zu bytes where the caller's buffer holds %zu; only those are written\n",
+            what, got, fits);
+}
+
 static void get_uniform(uint32_t opcode, unsigned program, int location,
                         void *out) {
     CMD2(opcode, program, location);
     flush();
     uint32_t bytes = 0;
     const uint8_t *values = reply_blob(&bytes);
+    /* One uniform's value: at most a dmat4's 128 bytes (GL sizes the
+       caller's buffer by the uniform's type, which only the host knows; a
+       longer reply is not one value, and is not written past it). */
+    if (bytes > 128) {
+        reply_too_long("glGetUniform*v", bytes, 128);
+        bytes = 128;
+    }
     if (out && values && bytes) memcpy(out, values, bytes);
 }
 void glGetUniformfv(unsigned program, int location, float *out) {
@@ -1640,7 +1780,7 @@ void glUniformMatrix4fv(int l, int count, unsigned char transpose, const float *
 /* The offsets handed to glVertexAttribPointer. Only this side ever knew them:
    the host is told an offset into the bound buffer, not a guest pointer. */
 #define GEXGL_MAX_VERTEX_ATTRIB_POINTERS 32
-static void *vertex_attrib_pointers[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
+static GEXGL_TLS void *vertex_attrib_pointers[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
 
 static void get_active(uint32_t opcode, unsigned program, unsigned index,
                        int max, int *length, int *size, unsigned *type,
@@ -1717,20 +1857,37 @@ void glGetActiveUniformBlockName(unsigned program, unsigned index, int max,
 
 /* However many integers the query yields; the host knows the count from the
    pname, so the reply carries it. */
-static void reply_ints(int *params) {
+/* The integers a query yields, at most `max` of them: what the caller's
+   array holds by GL's rules (its own count, or one), however many the host
+   sent. */
+static void reply_ints(const char *what, int *params, size_t max) {
     uint32_t n = 0;
     const uint8_t *p = reply_blob(&n);
+    n -= n % 4;
+    if (n / 4 > max) {
+        reply_too_long(what, n, max * 4);
+        n = (uint32_t)(max * 4);
+    }
     if (params && p && n)
-        memcpy(params, p, n - (n % 4));
+        memcpy(params, p, n);
 }
 
 void glGetActiveUniformBlockiv(unsigned program, unsigned index,
                                unsigned pname, int *params) {
+    /* One integer, but for the active uniforms' indices: as many as the
+       block's active uniforms, which the caller asked for to size its array
+       (asked here first, so its reply is not this one's). */
+    size_t max = 1;
+    if (pname == 0x8A43u) { /* GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES */
+        int count = 0;
+        glGetActiveUniformBlockiv(program, index, 0x8A42u, &count); /* GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS */
+        max = count > 0 ? (size_t)count : 0;
+    }
     uint32_t *p = begin(GEXGL_GET_ACTIVE_UNIFORM_BLOCKIV, 3, 0);
     if (!p) return;
     p[0] = program; p[1] = index; p[2] = pname;
     flush();
-    reply_ints(params);
+    reply_ints("glGetActiveUniformBlockiv", params, max);
 }
 
 void glGetActiveUniformsiv(unsigned program, int count,
@@ -1745,7 +1902,7 @@ void glGetActiveUniformsiv(unsigned program, int count,
     p[0] = program; p[1] = pname;
     put_blob(p + 2, indices, len);
     flush();
-    reply_ints(params);
+    reply_ints("glGetActiveUniformsiv", params, (size_t)count);
 }
 
 void glGetUniformIndices(unsigned program, int count,
@@ -1773,8 +1930,14 @@ void glGetUniformIndices(unsigned program, int count,
     flush();
     uint32_t n = 0;
     const uint8_t *r = reply_blob(&n);
+    n -= n % 4;
+    /* one index a name */
+    if (n / 4 > (uint32_t)count) {
+        reply_too_long("glGetUniformIndices", n, (size_t)count * 4);
+        n = (uint32_t)count * 4;
+    }
     if (indices && r && n)
-        memcpy(indices, r, n - (n % 4));
+        memcpy(indices, r, n);
 }
 
 /* Answered from the guest's own state: the host never saw a guest pointer, so
@@ -1853,8 +2016,8 @@ struct vertex_attrib_state {
     unsigned char client;  /* set with no array buffer bound */
     unsigned char enabled;
 };
-static struct vertex_attrib_state vertex_attribs[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
-static int vertex_attrib_client_count;
+static GEXGL_TLS struct vertex_attrib_state vertex_attribs[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
+static GEXGL_TLS int vertex_attrib_client_count;
 
 /* Bytes one attribute occupies, ignoring stride. */
 static size_t attrib_element_bytes(int size, unsigned type) {
@@ -1943,9 +2106,9 @@ struct ff_array_state {
     unsigned char client;
     unsigned char enabled;
 };
-static struct ff_array_state ff_arrays[GEXGL_FF_ARRAYS];
-static int ff_client_count;
-static unsigned client_active_texture;
+static GEXGL_TLS struct ff_array_state ff_arrays[GEXGL_FF_ARRAYS];
+static GEXGL_TLS int ff_client_count;
+static GEXGL_TLS unsigned client_active_texture;
 
 static void gexgl_upload_ff_arrays(size_t vertices);
 
@@ -2566,38 +2729,49 @@ struct pv_vao {
     unsigned element;
     struct pv_attrib a[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
 };
-static struct pv_vao pv_default = { 0, 1, 0, 0, { { 0 } } };
+static GEXGL_TLS struct pv_vao pv_default = { 0, 1, 0, 0, { { 0 } } };
 static struct pv_vao pv_overflow = { 0, 1, 1, 0, { { 0 } } };
 static struct pv_vao pv_vaos[PV_VAOS];
-static struct pv_vao *pv_cur = &pv_default;
+/* The bound vertex array; NULL for the thread's pv_default, whose address is
+   no constant to start it with. */
+static GEXGL_TLS struct pv_vao *pv_cur_at;
+static inline struct pv_vao **pv_cur_ref(void) {
+    if (!pv_cur_at) pv_cur_at = &pv_default;
+    return &pv_cur_at;
+}
+#define pv_cur (*pv_cur_ref())
 /* Buffers a draw may read other than its vertices and indices: indexed
    bindings (uniform, storage, atomic counter) and texture buffers. */
 struct pv_binding { unsigned target, index, buffer; size_t offset, size; };
-static struct pv_binding pv_bindings[PV_BINDINGS];
-static int pv_bindings_unknown;
+static GEXGL_TLS struct pv_binding pv_bindings[PV_BINDINGS];
+static GEXGL_TLS int pv_bindings_unknown;
 
 static void pv_bind_element(unsigned name) { pv_cur->element = name; }
 static void pv_bind_vao(unsigned name) {
     if (!name) { pv_cur = &pv_default; return; }
     struct pv_vao *free_slot = NULL;
+    group_lock();
     for (int i = 0; i < PV_VAOS; i++) {
-        if (pv_vaos[i].used && pv_vaos[i].name == name) { pv_cur = &pv_vaos[i]; return; }
+        if (pv_vaos[i].used && pv_vaos[i].name == name) { pv_cur = &pv_vaos[i]; group_unlock(); return; }
         if (!pv_vaos[i].used && !free_slot) free_slot = &pv_vaos[i];
     }
-    if (!free_slot) { pv_cur = &pv_overflow; return; }
+    if (!free_slot) { pv_cur = &pv_overflow; group_unlock(); return; }
     /* First bound here: GL creates it now, in its default state. */
     memset(free_slot, 0, sizeof(*free_slot));
     free_slot->name = name;
     free_slot->used = 1;
     pv_cur = free_slot;
+    group_unlock();
 }
 static void pv_delete_vao(unsigned name) {
     if (!name) return;
+    group_lock();
     for (int i = 0; i < PV_VAOS; i++) {
         if (!pv_vaos[i].used || pv_vaos[i].name != name) continue;
         if (pv_cur == &pv_vaos[i]) pv_cur = &pv_default;
         pv_vaos[i].used = 0;
     }
+    group_unlock();
 }
 static void pv_attrib(unsigned index, unsigned buffer, const void *pointer, int stride, size_t element) {
     if (index >= GEXGL_MAX_VERTEX_ATTRIB_POINTERS) return;
@@ -2615,7 +2789,9 @@ static void pv_divisor(unsigned index, unsigned divisor) {
 }
 static void persistent_vao_unknown(void) {
     pv_default.unknown = 1;
+    group_lock();
     for (int i = 0; i < PV_VAOS; i++) pv_vaos[i].unknown = 1;
+    group_unlock();
 }
 
 static void persistent_indexed(unsigned target, unsigned index, unsigned buffer, long offset, long size) {
@@ -3100,7 +3276,7 @@ static int egl_contexts_live;
 static int host_deferred;
 static void host_realize(void);
 /* The current draw surface (eglMakeCurrent, below). */
-static void *egl_current_draw;
+static GEXGL_TLS void *egl_current_draw;
 
 /* Defined below, next to the list it builds. */
 static const char *gexgl_extension_string(void);
@@ -3131,7 +3307,9 @@ const unsigned char *glGetString(unsigned name) {
         return (const unsigned char *)gexgl_extension_string();
     }
     unsigned slot = name & 7u;
+    group_lock();
     if (cached_strings[slot]) {
+        group_unlock();
         return (const unsigned char *)cached_strings[slot];
     }
     CMD1(GEXGL_GET_STRING, name);
@@ -3139,10 +3317,11 @@ const unsigned char *glGetString(unsigned name) {
     uint32_t n = 0;
     const uint8_t *p = reply_blob(&n);
     char *s = malloc(n + 1);
-    if (!s) return (const unsigned char *)"";
+    if (!s) { group_unlock(); return (const unsigned char *)""; }
     if (p) memcpy(s, p, n);
     s[n] = 0;
     cached_strings[slot] = s;
+    group_unlock();
     return (const unsigned char *)s;
 }
 
@@ -3210,7 +3389,14 @@ static char **extension_names;
 static int extension_count = -1;
 static char *extension_string;
 
+static void gexgl_build_extensions_locked(void);
 static void gexgl_build_extensions(void) {
+    if (__atomic_load_n(&extension_count, __ATOMIC_ACQUIRE) >= 0) return;
+    group_lock();
+    gexgl_build_extensions_locked();
+    group_unlock();
+}
+static void gexgl_build_extensions_locked(void) {
     if (extension_count >= 0) return;
     const int local = (int)(sizeof(gexgl_local_extensions) /
                             sizeof(gexgl_local_extensions[0]));
@@ -3247,7 +3433,7 @@ static void gexgl_build_extensions(void) {
         names[n++] = name;
     }
     extension_names = names;
-    extension_count = n;
+    __atomic_store_n(&extension_count, n, __ATOMIC_RELEASE);
     if (getenv("GEXGL_EXTENSION_TRACE"))
         fprintf(stderr, "gexgl: %d of %d host extensions claimed\n",
                 n - local, host);
@@ -3818,10 +4004,10 @@ static uint64_t gexgen_call(uint32_t opcode, const char *plan, const uint64_t *v
 #define EGL_FALSE 0
 
 static int egl_ready;
-static void *egl_current_display;
-static void *egl_current_context;
-static void *egl_current_draw;
-static void *egl_current_read;
+static GEXGL_TLS void *egl_current_display;
+static GEXGL_TLS void *egl_current_context;
+static GEXGL_TLS void *egl_current_draw;
+static GEXGL_TLS void *egl_current_read;
 /* The window surfaces this process has, and which one is current.
  *
  * `eglCreateWindowSurface` used to return the same made-up handle to every
@@ -3855,16 +4041,22 @@ struct gexgl_egl_surface {
        attached to. */
     unsigned x_swaps;
     unsigned long x_top;
+    /* Not attached on the host yet: attaching binds the surface to the host's
+       current context, so it waits for the make-current that means it
+       (egl_surface_use). Done at creation, it was charged to whichever
+       context was current then -- the window default of a context already
+       drawing elsewhere was reset to the new window's size. */
+    unsigned char attach_pending;
 };
 static struct gexgl_egl_surface egl_surfaces[GEXGL_MAX_SURFACES];
 static unsigned egl_next_surface_handle = 1;
-static struct gexgl_egl_surface *egl_surface;   /* the current drawable */
+static GEXGL_TLS struct gexgl_egl_surface *egl_surface;   /* this thread's drawable */
 
 /* The current surface's size, which is what eglQuerySurface answers and what
  * the pbuffer path sets. Kept beside the table rather than inside it because
  * a query can arrive before anything has been created. */
-static int egl_surface_width = 256;
-static int egl_surface_height = 256;
+static GEXGL_TLS int egl_surface_width = 256;
+static GEXGL_TLS int egl_surface_height = 256;
 
 static int gexgl_x11_window_size(void *win, int *width, int *height);
 
@@ -3895,8 +4087,9 @@ static void egl_surface_reap(void) {
         if (!s->handle || s->kind != GEXGL_SURFACE_X) continue;
         int w = 0, h = 0;
         if (gexgl_x11_window_size(s->native, &w, &h)) continue;
-        CMD1(GEXGL_SURFACE_DETACH, s->handle);
+        if (!s->attach_pending) CMD1(GEXGL_SURFACE_DETACH, s->handle);
         if (egl_surface == s) egl_surface = NULL;
+        if (ring_surface == s->handle) ring_surface = 0;
         *s = (struct gexgl_egl_surface){ .kind = -1 };
     }
 }
@@ -3936,11 +4129,24 @@ static struct gexgl_egl_surface *egl_surface_of(void *handle) {
  * only when it has: a SURFACE_CURRENT per frame would be harmless but is
  * noise in a trace. */
 static void egl_surface_use(struct gexgl_egl_surface *s) {
-    if (!s || s == egl_surface) return;
-    egl_surface = s;
-    egl_surface_width = s->width > 0 ? s->width : egl_surface_width;
-    egl_surface_height = s->height > 0 ? s->height : egl_surface_height;
-    CMD1(GEXGL_SURFACE_CURRENT, s->handle);
+    if (!s) return;
+    if (s != egl_surface) {
+        egl_surface = s;
+        egl_surface_width = s->width > 0 ? s->width : egl_surface_width;
+        egl_surface_height = s->height > 0 ? s->height : egl_surface_height;
+    }
+    /* Another thread's may be the host's (ring_surface 0: not known). */
+    if (s->handle == ring_surface && !s->attach_pending) return;
+    if (s->attach_pending) {
+        s->attach_pending = 0;
+        const unsigned kind = s->kind == GEXGL_SURFACE_X ? GEXGL_SURFACE_X : GEXGL_SURFACE_WAYLAND;
+        CMD4(GEXGL_SURFACE_ATTACH, kind, kind == GEXGL_SURFACE_X ? (unsigned)s->x_top : s->id,
+             (unsigned)getpid(), s->handle);
+        if (s->width > 0 && s->height > 0) CMD2(GEXGL_SURFACE_RESIZE, s->width, s->height);
+    } else {
+        CMD1(GEXGL_SURFACE_CURRENT, s->handle);
+    }
+    ring_surface = s->handle;
 }
 static int egl_context_major = 3;
 static int egl_context_minor;
@@ -4159,7 +4365,7 @@ static int gexgl_x11_default_visual(void) {
    it is for.  A real EGL implementation creates it in eglCreateContext, and so
    does this one now. */
 static void context_create(void) {
-    if (host_context_made || !ring) {
+    if (host_context_made || ring_open() != 0) {
         /* Still a context as far as the application is concerned: what is
            latched is the *host's*, and the count is what tells
            eglDestroyContext whether the last one has gone. */
@@ -4172,8 +4378,16 @@ static void context_create(void) {
     host_deferred = 1;
 }
 
+static void context_host_made(void);
+static void host_realize_locked(void);
 static void host_realize(void) {
-    if (host_context_made || !host_deferred || !ring) return;
+    if (host_context_made || !host_deferred) return;
+    group_lock();
+    host_realize_locked();
+    group_unlock();
+}
+static void host_realize_locked(void) {
+    if (host_context_made || !host_deferred || ring_open() != 0) return;
     host_context_made = 1;
     host_deferred = 0;
     shadow_context_made();
@@ -4185,6 +4399,7 @@ static void host_realize(void) {
     /* Additive: a host that predates this reads the first three words and
        skips the rest, which is the behaviour it had before. */
     p[3] = (uint32_t)egl_context_profile;
+    ring_ctx = 0; /* the host's context 0, current from here */
     flush();
     /* Vendor, renderer and version come back; they are what glGetString
        would have said, and asking now saves three round trips later. */
@@ -4209,12 +4424,13 @@ static void host_realize(void) {
             }
         }
     }
+    context_host_made();
 }
 
 /* eglGetError's answer: the last failure's code, EGL_SUCCESS once read. A
    failing call must leave one, or a caller that asks why (khronos-egl's
    Err(get_error().unwrap())) has nothing to report. */
-static int egl_error = 0x3000; /* EGL_SUCCESS */
+static GEXGL_TLS int egl_error = 0x3000; /* EGL_SUCCESS */
 static unsigned egl_fail(int error) { egl_error = error; return EGL_FALSE; }
 static void *egl_fail_null(int error) { egl_error = error; return NULL; }
 #define EGL_NOT_INITIALIZED 0x3001
@@ -4562,9 +4778,20 @@ static void gexgl_wl_commit(struct gexgl_egl_surface *s) {
     if (get_display && flush) flush(get_display(s->wl_proxy));
 }
 
+static void *egl_create_window_surface(void *win);
 void *eglCreateWindowSurface(void *dpy, void *config, void *win,
                              const int *attrs) {
     (void)dpy; (void)config; (void)attrs;
+    /* (no surface from a display eglInitialize refused: wined3d's adapter
+       probe goes on after it, and each probe window became a host surface
+       nothing draws) */
+    if (!egl_ready) return egl_fail_null(EGL_NOT_INITIALIZED);
+    group_lock();
+    void *r = egl_create_window_surface(win);
+    group_unlock();
+    return r;
+}
+static void *egl_create_window_surface(void *win) {
     /* One surface per window. EGL says a second request for the same window
        is an error; answering with the one that exists is what a GLX caller
        needs, since making a drawable current twice is ordinary there -- and
@@ -4591,14 +4818,9 @@ void *eglCreateWindowSurface(void *dpy, void *config, void *win,
            what allows a second window at the same time -- the host keeps a
            drawable per handle. Attaching also makes it current. */
         s->x_top = gexgl_x11_toplevel(win);
-        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_X,
-             (unsigned)s->x_top, (unsigned)getpid(), s->handle);
-        egl_surface = s;
-        egl_surface_width = w;
-        egl_surface_height = h;
-        /* The host's drawable is what reaches the screen, so the size the
-           application's window has is the size to draw at. */
-        CMD2(GEXGL_SURFACE_RESIZE, w, h);
+        /* Attached, and sized to the application's window (the host's
+           drawable is what reaches the screen), when it is made current. */
+        s->attach_pending = 1;
     } else if (gexgl_wl_surface_id_into(win, s)) {
         s->native = win;
         const struct gexgl_wl_egl_window *ww = win;
@@ -4606,13 +4828,10 @@ void *eglCreateWindowSurface(void *dpy, void *config, void *win,
             s->width = ww->width;
             s->height = ww->height;
         }
-        CMD4(GEXGL_SURFACE_ATTACH, GEXGL_SURFACE_WAYLAND, s->id,
-             (unsigned)getpid(), s->handle);
-        egl_surface = s;
+        s->attach_pending = 1;
         if (s->width > 0 && s->height > 0) {
             egl_surface_width = s->width;
             egl_surface_height = s->height;
-            CMD2(GEXGL_SURFACE_RESIZE, s->width, s->height);
         }
         /* And tell this process's own compositor, which is a different thing
            from telling the host: nothing will ever be attached to this
@@ -4621,11 +4840,11 @@ void *eglCreateWindowSurface(void *dpy, void *config, void *win,
         unsigned args[4] = { GEXGL_SURFACE_WAYLAND, s->id,
                              (unsigned)egl_surface_width,
                              (unsigned)egl_surface_height };
-        const int marked = ioctl(gl_fd, GEXGL_SURFACE, args);
-        fprintf(stderr, "gex-gl: wl_surface %u is drawn on the host,"
-                        " %dx%d (%s)\n",
-                s->id, egl_surface_width, egl_surface_height,
-                marked == 0 ? "ok" : strerror(errno));
+        if (ioctl(gl_fd, GEXGL_SURFACE, args) != 0)
+            fprintf(stderr, "gex-gl: wl_surface %u is drawn on the host,"
+                            " %dx%d, but its compositor was not told (%s)\n",
+                    s->id, egl_surface_width, egl_surface_height,
+                    strerror(errno));
     } else {
         fprintf(stderr, "gex-gl: eglCreateWindowSurface: %p is neither an X"
                         " window nor a wl_egl_window\n", win);
@@ -4637,8 +4856,16 @@ void *eglCreateWindowSurface(void *dpy, void *config, void *win,
     return (void *)(uintptr_t)s->handle;
 }
 
+static void *egl_create_pbuffer_surface(const int *attrs);
 void *eglCreatePbufferSurface(void *dpy, void *config, const int *attrs) {
     (void)dpy; (void)config;
+    if (!egl_ready) return egl_fail_null(EGL_NOT_INITIALIZED);
+    group_lock();
+    void *r = egl_create_pbuffer_surface(attrs);
+    group_unlock();
+    return r;
+}
+static void *egl_create_pbuffer_surface(const int *attrs) {
     /* A drawable of its own, with no window attached to it: offscreen is
        exactly what a pbuffer is, and a client that has one as well as a
        window must not have them share. */
@@ -4662,8 +4889,15 @@ void *eglCreatePbufferSurface(void *dpy, void *config, const int *attrs) {
     return (void *)(uintptr_t)s->handle;
 }
 
+static unsigned egl_destroy_surface(void *surface);
 unsigned eglDestroySurface(void *dpy, void *surface) {
     (void)dpy;
+    group_lock();
+    const unsigned r = egl_destroy_surface(surface);
+    group_unlock();
+    return r;
+}
+static unsigned egl_destroy_surface(void *surface) {
     struct gexgl_egl_surface *s = egl_surface_of(surface);
     if (!s) return EGL_TRUE;
     /* The host holds a drawable, a colour buffer and a depth buffer for this
@@ -4671,7 +4905,8 @@ unsigned eglDestroySurface(void *dpy, void *surface) {
        drawing. Saying it is gone is what frees them; a client that exits
        without saying so is cleaned up by the page instead, which notices the
        process has gone. */
-    CMD1(GEXGL_SURFACE_DETACH, s->handle);
+    if (!s->attach_pending) CMD1(GEXGL_SURFACE_DETACH, s->handle);
+    if (ring_surface == s->handle) ring_surface = 0;
     flush();
     /* A Wayland surface's compositor is told too, unless another EGL surface
        still draws for the same wl_surface: from here the client may attach
@@ -4696,8 +4931,188 @@ unsigned eglDestroySurface(void *dpy, void *surface) {
     return EGL_TRUE;
 }
 
+/* Contexts. The host keeps one for each of a process's EGL contexts, all
+ * in one share group (op::CONTEXT_CURRENT): objects are the group's, state is
+ * each context's own. Two contexts used to be one host context under two
+ * names, so what one set -- its framebuffer, viewport, bound texture, enables
+ * -- was set in the other: a Qt Quick panel, drawn in a context of its own and
+ * composited from the window's, came out black.
+ *
+ * What this library keeps a copy of that is context state goes with the
+ * context too: it is swapped into the thread's state when the context is
+ * made current there. The first context is the host's context 0, made by
+ * CONTEXT_CREATE as before; a process that has only ever one context never
+ * sends CONTEXT_CURRENT at all. */
+#define GEXGL_MAX_CONTEXTS 16
+struct gexgl_context_state {
+    __typeof__(shadow) shadow;
+    struct gexgl_pixel_store pack_store, unpack_store;
+    struct buffer_target_state buffer_targets[16];
+    void *vertex_attrib_pointers[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
+    struct vertex_attrib_state vertex_attribs[GEXGL_MAX_VERTEX_ATTRIB_POINTERS];
+    int vertex_attrib_client_count;
+    struct ff_array_state ff_arrays[GEXGL_FF_ARRAYS];
+    int ff_client_count;
+    unsigned client_active_texture;
+    struct pv_vao pv_default;
+    struct pv_vao *pv_at; /* NULL for its own pv_default */
+    struct pv_binding pv_bindings[PV_BINDINGS];
+    int pv_bindings_unknown;
+};
+static struct gexgl_egl_context {
+    int used;
+    int live; /* not destroyed (context 0 stays used while the host has it) */
+    int fresh; /* the host has not made it yet */
+    struct gexgl_context_state saved;
+} egl_contexts[GEXGL_MAX_CONTEXTS];
+/* The context whose state this thread has; GEXGL_MAX_CONTEXTS for none. */
+static GEXGL_TLS unsigned egl_wire_context = GEXGL_MAX_CONTEXTS; /* this thread's; none */
+static struct gexgl_context_state egl_context_template;
+static int egl_context_template_taken;
+static struct gexgl_context_state egl_context_template_copy;
+
+#define SWAP_FIELD(a, b) do { __typeof__(a) t_; memcpy(&t_, &(a), sizeof t_); \
+    memcpy(&(a), &(b), sizeof t_); memcpy(&(b), &t_, sizeof t_); } while (0)
+
+static void context_state_swap(struct gexgl_context_state *c) {
+    struct pv_vao *cur = pv_cur == &pv_default ? NULL : pv_cur;
+    SWAP_FIELD(shadow, c->shadow);
+    SWAP_FIELD(pack_store, c->pack_store);
+    SWAP_FIELD(unpack_store, c->unpack_store);
+    SWAP_FIELD(buffer_targets, c->buffer_targets);
+    SWAP_FIELD(vertex_attrib_pointers, c->vertex_attrib_pointers);
+    SWAP_FIELD(vertex_attribs, c->vertex_attribs);
+    SWAP_FIELD(vertex_attrib_client_count, c->vertex_attrib_client_count);
+    SWAP_FIELD(ff_arrays, c->ff_arrays);
+    SWAP_FIELD(ff_client_count, c->ff_client_count);
+    SWAP_FIELD(client_active_texture, c->client_active_texture);
+    SWAP_FIELD(pv_default, c->pv_default);
+    SWAP_FIELD(pv_bindings, c->pv_bindings);
+    SWAP_FIELD(pv_bindings_unknown, c->pv_bindings_unknown);
+    pv_cur = c->pv_at ? c->pv_at : &pv_default;
+    c->pv_at = cur;
+}
+
+static unsigned egl_context_index(void *ctx) {
+    if (ctx == (void *)3) return 0;
+    const uintptr_t v = (uintptr_t)ctx;
+    if (v >= 0x1000 && v < 0x1000 + GEXGL_MAX_CONTEXTS * 16 && (v & 15) == 3)
+        return (unsigned)((v - 0x1000) >> 4);
+    return GEXGL_MAX_CONTEXTS; /* not one of ours (GLX's, or none) */
+}
+static void *egl_context_handle(unsigned i) {
+    return i == 0 ? (void *)3 : (void *)(uintptr_t)(0x1000 + i * 16 + 3);
+}
+
+static void context_wire_say(unsigned i) {
+    uint32_t *a = begin(GEXGL_CONTEXT_CURRENT, 5, 0);
+    if (!a) return;
+    a[0] = i;
+    a[1] = egl_api == 0x30A2u ? 1u : 0u;
+    a[2] = (uint32_t)egl_context_major;
+    a[3] = (uint32_t)egl_context_minor;
+    a[4] = (uint32_t)egl_context_profile;
+    ring_ctx = i;
+}
+
+/* The host runs what this thread records next in context i: said when it
+ * would not already (a thread's first, from whatever the host has). */
+static void context_wire_follow(unsigned i) {
+    if (!host_context_made || i >= GEXGL_MAX_CONTEXTS) return;
+    if (ring_ctx == GEXGL_NO_CONTEXT) ring_ctx = __atomic_load_n(&host_ctx_now, __ATOMIC_RELAXED);
+    if (ring_ctx != i) context_wire_say(i);
+    if (egl_contexts[i].fresh) {
+        egl_contexts[i].fresh = 0;
+        shadow_context_made();
+    }
+}
+
+/* This thread's context is i from here (GEXGL_MAX_CONTEXTS: none): the state
+ * of the one it had goes back to that context's slot, and i's comes in.
+ * EGL lets a context be current in one thread at a time, so a slot's saved
+ * state is never in two threads. Under group_lock. */
+static void context_switch(unsigned i) {
+    if (i > GEXGL_MAX_CONTEXTS || (i < GEXGL_MAX_CONTEXTS && !egl_contexts[i].used)) return;
+    if (i == egl_wire_context) {
+        if (i < GEXGL_MAX_CONTEXTS) context_wire_follow(i);
+        return;
+    }
+    fbq_forget();
+    fbq_known = 0;
+    if (egl_wire_context < GEXGL_MAX_CONTEXTS)
+        context_state_swap(&egl_contexts[egl_wire_context].saved);
+    egl_wire_context = i;
+    if (i == GEXGL_MAX_CONTEXTS) return;
+    context_state_swap(&egl_contexts[i].saved);
+    context_wire_follow(i);
+}
+
+/* Context 0 has just been made on the host: the one this thread's commands
+ * are for, if it is another, is made now too. */
+static void context_host_made(void) {
+    for (unsigned i = 0; i < GEXGL_MAX_CONTEXTS; i++) egl_contexts[i].fresh = i != 0;
+    if (egl_wire_context < GEXGL_MAX_CONTEXTS && egl_contexts[egl_wire_context].used)
+        context_wire_follow(egl_wire_context);
+}
+
+/* A new EGL context: its slot, with the state a new context has. Under
+ * group_lock. */
+static void *context_slot_new(void) {
+    if (!egl_context_template_taken) {
+        /* Before any context drew: this thread's state is a new context's. */
+        egl_context_template_taken = 1;
+        context_state_swap(&egl_context_template);
+        egl_context_template_copy = egl_context_template;
+        context_state_swap(&egl_context_template);
+        egl_context_template = egl_context_template_copy;
+        egl_context_template.pv_at = NULL;
+    }
+    int any = 0;
+    for (unsigned i = 0; i < GEXGL_MAX_CONTEXTS; i++) any |= egl_contexts[i].used;
+    if (!any) {
+        /* The first: the host's context 0. */
+        egl_contexts[0] = (struct gexgl_egl_context){ .used = 1, .live = 1,
+                                                       .saved = egl_context_template };
+        return egl_context_handle(0);
+    }
+    for (unsigned i = 1; i < GEXGL_MAX_CONTEXTS; i++) {
+        if (egl_contexts[i].used) continue;
+        egl_contexts[i] = (struct gexgl_egl_context){ .used = 1, .live = 1, .fresh = 1,
+                                                       .saved = egl_context_template };
+        return egl_context_handle(i);
+    }
+    /* Past the table: the last one, shared, as every context once was. */
+    return egl_context_handle(GEXGL_MAX_CONTEXTS - 1);
+}
+
+/* Every context gone and the host's with them. */
+static void context_slots_reset(void) {
+    if (egl_wire_context < GEXGL_MAX_CONTEXTS)
+        context_state_swap(&egl_contexts[egl_wire_context].saved);
+    for (unsigned i = 0; i < GEXGL_MAX_CONTEXTS; i++) egl_contexts[i].used = 0;
+    egl_wire_context = GEXGL_MAX_CONTEXTS;
+}
+
+/* A thread that ends with a context current gives its state back to it, and
+ * its ring goes, after what is still in it. */
+static void ring_thread_exit(void *unused) {
+    (void)unused;
+    if (!ring) return;
+    if (ring->tail) flush();
+    group_lock();
+    if (egl_wire_context < GEXGL_MAX_CONTEXTS && egl_contexts[egl_wire_context].used)
+        context_state_swap(&egl_contexts[egl_wire_context].saved);
+    egl_wire_context = GEXGL_MAX_CONTEXTS;
+    group_unlock();
+    munmap(ring, HEADER_BYTES + CMD_CAPACITY + REPLY_CAPACITY);
+    ring = NULL;
+    cmds = replies = NULL;
+}
+
 void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
     (void)dpy; (void)config; (void)share;
+    if (!egl_ready) return egl_fail_null(EGL_NOT_INITIALIZED);
+    group_lock();
     /* EGL's defaults: version 1.0, which for desktop GL means a context of
        whatever version the implementation offers that is backward compatible
        with 1.0 -- the compatibility profile, since a core one is defined only
@@ -4719,7 +5134,9 @@ void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
         }
     }
     context_create();
-    return (void *)3;
+    void *ctx = context_slot_new();
+    group_unlock();
+    return ctx;
 }
 
 /* Really destroy it, so the next context is created rather than latched.
@@ -4732,14 +5149,32 @@ void *eglCreateContext(void *dpy, void *config, void *share, const int *attrs) {
  *
  * Only the last one: an application that keeps two contexts and destroys one
  * is not asking for the other's to go. */
-unsigned eglDestroyContext(void *dpy, void *ctx) {
-    (void)dpy; (void)ctx;
+static unsigned egl_destroy_context(void *ctx) {
+    const unsigned i = egl_context_index(ctx);
+    const int ours = i < GEXGL_MAX_CONTEXTS && egl_contexts[i].used && egl_contexts[i].live;
     if (!host_context_made || egl_contexts_live > 1) {
         if (egl_contexts_live) egl_contexts_live--;
+        if (ours && i != 0) {
+            /* Its host context and its own objects go; context 0 stays, the
+               share group's. */
+            if (i == egl_wire_context) context_switch(GEXGL_MAX_CONTEXTS);
+            if (host_context_made && !egl_contexts[i].fresh) {
+                CMD1(GEXGL_CONTEXT_DROP, i);
+                if (ring_ctx == i) ring_ctx = 0;
+            }
+            egl_contexts[i].used = 0;
+            if (egl_current_context == ctx) egl_current_context = NULL;
+        } else if (ours) {
+            egl_contexts[0].live = 0;
+        }
         /* The last of them gone before any drew: the host never made one. */
-        if (!egl_contexts_live) host_deferred = 0;
+        if (!egl_contexts_live) {
+            host_deferred = 0;
+            context_slots_reset();
+        }
         return EGL_TRUE;
     }
+    context_slots_reset();
     egl_contexts_live = 0;
     host_context_made = 0;
     egl_current_context = NULL;
@@ -4747,14 +5182,24 @@ unsigned eglDestroyContext(void *dpy, void *ctx) {
     shadow_forget_matrices();
     shadow_forget_enables();
     CMD0(GEXGL_CONTEXT_DESTROY);
+    ring_ctx = 0;
     flush();
     return EGL_TRUE;
+}
+
+unsigned eglDestroyContext(void *dpy, void *ctx) {
+    (void)dpy;
+    group_lock();
+    const unsigned r = egl_destroy_context(ctx);
+    group_unlock();
+    return r;
 }
 
 unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
     fbq_forget();
     fbq_known = 0;
     if (!egl_ready) return egl_fail(EGL_NOT_INITIALIZED);
+    group_lock();
     /* A safety net for callers that reach a current context without going
        through this library's eglCreateContext. The latch inside makes it a
        no-op once the host context exists. */
@@ -4763,6 +5208,9 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
        alive after its last eglDestroyContext (SDL's throwaway GLX context
        then stood in for the one it really wanted). */
     if (ctx && !host_context_made && !host_deferred) context_create();
+    /* Its own state from here, and on the host its own context; none, and
+       the state goes back to the context it was. */
+    context_switch(ctx ? egl_context_index(ctx) : GEXGL_MAX_CONTEXTS);
     /* Drawing into a surface: the host's context is needed now. */
     if (ctx && draw) host_realize();
     egl_current_display = ctx ? dpy : NULL;
@@ -4774,6 +5222,7 @@ unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
        both: without it the host drew everything into whichever surface was
        created last. */
     if (ctx && draw) egl_surface_use(egl_surface_of(draw));
+    group_unlock();
     return EGL_TRUE;
 }
 
@@ -4786,6 +5235,7 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     (void)dpy;
     /* The surface named here, not the one that happens to be current: a
        client that draws two windows in one frame swaps each in turn. */
+    group_lock();
     struct gexgl_egl_surface *s = egl_surface_of(surface);
     if (s) egl_surface_use(s);
     else s = egl_surface;
@@ -4801,6 +5251,7 @@ unsigned eglSwapBuffers(void *dpy, void *surface) {
     CMD0(GEXGL_PRESENT);
     gexgl_wl_follow_size(s);
     gexgl_x11_follow_size(s);
+    group_unlock();
     /* Nothing is paced on the reply at swap interval 0 (Unity with vsync
        off), so the frame goes without waiting for it. */
     if (egl_swap_interval == 0) {
@@ -4892,11 +5343,18 @@ unsigned eglQueryContext(void *dpy, void *ctx, int attr, int *value) {
 }
 
 unsigned eglQuerySurface(void *dpy, void *surface, int attr, int *value) {
-    (void)dpy; (void)surface;
+    (void)dpy;
     if (!value) return egl_fail(EGL_BAD_PARAMETER);
+    /* The surface asked about: the current one's size is the one kept up to
+       date (a resize, a swap); another's, the size it was made with -- a
+       window surface not yet made current (its attach waits for that) has
+       its window's size, not the last current one's or the default. */
+    const struct gexgl_egl_surface *q = egl_surface_of(surface);
+    const int qw = q && q != egl_surface && q->width > 0 ? q->width : egl_surface_width;
+    const int qh = q && q != egl_surface && q->height > 0 ? q->height : egl_surface_height;
     switch (attr) {
-    case 0x3057: *value = egl_surface_width; break;  /* EGL_WIDTH */
-    case 0x3056: *value = egl_surface_height; break; /* EGL_HEIGHT */
+    case 0x3057: *value = qw; break;  /* EGL_WIDTH */
+    case 0x3056: *value = qh; break; /* EGL_HEIGHT */
     case 0x3028: *value = 1; break;                  /* EGL_CONFIG_ID */
     default: *value = 0; break;
     }
@@ -4904,6 +5362,9 @@ unsigned eglQuerySurface(void *dpy, void *surface, int attr, int *value) {
 }
 
 unsigned eglReleaseThread(void) {
+    group_lock();
+    context_switch(GEXGL_MAX_CONTEXTS);
+    group_unlock();
     egl_current_display = egl_current_context = NULL;
     egl_current_draw = egl_current_read = NULL;
     return EGL_TRUE;

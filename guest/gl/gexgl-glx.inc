@@ -57,9 +57,9 @@ static const struct gexgl_glx_config gexgl_glx_configs[] = {
 static const int gexgl_glx_context_token = 0;
 #define GEXGL_GLX_CONTEXT ((void *)&gexgl_glx_context_token)
 
-static void *glx_current_display;
-static unsigned long glx_current_drawable;
-static void *glx_current_context;
+static GEXGL_TLS void *glx_current_display;
+static GEXGL_TLS unsigned long glx_current_drawable;
+static GEXGL_TLS void *glx_current_context;
 
 /* A context made by glXCreateContextAttribsARB: what it asked for, kept until
  * glXMakeCurrent makes the host context. The host context is made there, not
