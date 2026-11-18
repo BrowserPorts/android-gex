@@ -6,7 +6,6 @@
 // here; its `@gexemu/runtime` imports are the runtime's modules; its trees are the
 // slim Debian image (bash, uname). A block the README gains or loses fails
 // the block count, so a new example is never left unrun.
-import readme from '../../page/runtime/README.md?raw';
 import * as index from '../../page/runtime/src/index.js';
 import * as fsMod from '../../page/runtime/src/fs.js';
 import * as host from '../../page/runtime/src/windows/host.js';
@@ -29,6 +28,7 @@ const M = {
 };
 // The single-thread build (system.js `SINGLE`).
 const SINGLE = !MP_CODE || (SP_CODE && typeof SharedArrayBuffer !== 'function');
+const readme = await (await fetch(new URL('../../page/runtime/README.md', import.meta.url))).text();
 const BLOCKS = [...readme.matchAll(/```js\n([\s\S]*?)```/g)].map((m) => m[1]);
 
 /** Each phase: the blocks it runs (indices into BLOCKS), what it makes

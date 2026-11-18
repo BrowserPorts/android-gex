@@ -13,7 +13,7 @@ export const meta = {
 export default async function (t) {
   const { say, check, eq, until, timeout } = t;
   const { arch, ...switches } = t.debug();
-  const zstd = new URL('../vendor/zstddec/zstddec-stream.mjs', new URL(t.baseUrl, location.href)).href;
+  const zstd = new URL('/tree/page/vendor/zstddec/zstddec-stream.mjs', location.href).href;
   const build = (argv) => ({
     arch: arch ?? 'aarch64',
     tar: [t.work('bb.tar')],
@@ -34,7 +34,7 @@ export default async function (t) {
     container: document.getElementById('app'),
     filesystem: 'memory',
     size: { w: 640, h: 480 },
-    baseUrl: t.baseUrl,
+    baseUrl: '/',
     build: build(['-c', 'echo "ppid $PPID"; cat /proc/1/comm; rt-x11 demo & sleep 600']),
   }), 60000, 'start');
   say(`started in ${(performance.now() - t0).toFixed(0)} ms`);

@@ -13,12 +13,12 @@ export default async function (t) {
   const adapter = await navigator.gpu?.requestAdapter().catch(() => null);
   if (!adapter) return t.skip('no WebGPU adapter here');
   const { arch, ...switches } = t.debug();
-  const zstd = new URL('../vendor/zstddec/zstddec-stream.mjs', new URL(t.baseUrl, location.href)).href;
+  const zstd = new URL('/tree/page/vendor/zstddec/zstddec-stream.mjs', location.href).href;
   const app = await timeout(start({
     container: document.getElementById('app'),
     filesystem: 'memory',
     size: { w: 640, h: 480 },
-    baseUrl: t.baseUrl,
+    baseUrl: '/',
     build: {
       arch: arch ?? 'aarch64', tar: [t.work('bb.tar')], zstd, exe: '/bin/sh', argv: ['-c', 'echo up; sleep 600'],
       env: ['PATH=/bin:/usr/bin', 'HOME=/root'], cwd: '/', featuresOff: [], compositor: true, jitFallback: true, gl: false, switches,

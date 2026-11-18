@@ -14,11 +14,11 @@ export default async function (t) {
     container: document.getElementById('app'),
     filesystem: 'memory',
     size: { w: 320, h: 240 },
-    baseUrl: t.baseUrl,
+    baseUrl: '/',
     onLog: (s) => { logged += s; },
     onExit: (st) => { exitSaid = st; },
     build: {
-      arch: arch ?? 'aarch64', tar: [t.work('bb.tar')], zstd: new URL('../vendor/zstddec/zstddec-stream.mjs', new URL(t.baseUrl, location.href)).href,
+      arch: arch ?? 'aarch64', tar: [t.work('bb.tar')], zstd: new URL('/tree/page/vendor/zstddec/zstddec-stream.mjs', location.href).href,
       exe: '/bin/sh', argv: ['-c', 'echo to-stdout; echo to-stderr >&2; exit 5'], env: ['PATH=/bin'], cwd: '/',
       featuresOff: [], compositor: false, jitFallback: true, gl: false, switches,
     },

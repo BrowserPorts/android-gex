@@ -14,7 +14,7 @@ export const meta = {
 export default async function (t) {
   const { say, check, until, timeout } = t;
   const { arch, ...switches } = t.debug();
-  const zstd = new URL('../vendor/zstddec/zstddec-stream.mjs', new URL(t.baseUrl, location.href)).href;
+  const zstd = new URL('/tree/page/vendor/zstddec/zstddec-stream.mjs', location.href).href;
   // phase 1 without it, phase 2 (a fresh page) with it
   {
     const ahead = t.phase >= 2;
@@ -24,7 +24,7 @@ export default async function (t) {
       container: document.getElementById('app'),
       filesystem: 'memory',
       size: { w: 320, h: 240 },
-      baseUrl: t.baseUrl,
+      baseUrl: '/',
       ...(ahead ? { restAhead: true } : {}),
       build: {
         arch: arch ?? 'aarch64', tar: [t.work('bb.tar')], lazy: t.work(`${dir}/lazy.json`), zstd,

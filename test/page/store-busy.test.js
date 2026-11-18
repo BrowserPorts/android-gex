@@ -41,14 +41,14 @@ export default async function (t) {
   const { arch, ...switches } = t.debug();
   const STORE = `gex-test-busy-${t.arch}`;
   if (t.phase === 1) await OPFSFilesystem.erase(STORE);
-  const zstd = new URL('../vendor/zstddec/zstddec-stream.mjs', new URL(t.baseUrl, location.href)).href;
+  const zstd = new URL('/tree/page/vendor/zstddec/zstddec-stream.mjs', location.href).href;
   const build = (cmd) => ({
     arch: arch ?? 'aarch64', tar: [t.work('bb.tar')], zstd, exe: '/bin/sh', argv: ['-c', cmd],
     env: ['PATH=/bin:/usr/bin', 'HOME=/root'], cwd: '/', featuresOff: [], compositor: false,
     jitFallback: true, gl: false, switches,
   });
   const run = (cmd, more) => start({
-    container: document.getElementById('app'), size: { w: 320, h: 240 }, baseUrl: t.baseUrl,
+    container: document.getElementById('app'), size: { w: 320, h: 240 }, baseUrl: '/',
     filesystem: { kind: 'opfs', name: STORE }, build: build(cmd), ...more,
   });
 
