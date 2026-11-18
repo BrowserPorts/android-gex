@@ -157,7 +157,8 @@ if [ -n "$page" ]; then
   fi
   # The run tree, at one path per program, so the box's copy updates by difference.
   rt=$pg/tree-$name; rm -rf "$rt"; mkdir -p "$rt/page" "$rt/hosts/browser" "$rt/wine/page" "$rt/test/lib"
-  for d in page/nt.html page/vite.config.js page/package.json page/src page/runtime/src wine/page/browser-harness.mjs test/lib/cdp.mjs page/node_modules page/public page/vendor/zstddec hosts/browser/js; do
+  for d in page/nt.html page/vite.config.js page/vite.config.mjs page/package.json page/src page/runtime/src wine/page/browser-harness.mjs test/lib/cdp.mjs page/node_modules page/public page/vendor/zstddec hosts/browser/js; do
+    [ -e "$page/$d" ] || continue
     mkdir -p "$rt/$(dirname "$d")"; cp -al "$page/$d" "$rt/$(dirname "$d")/" 2>/dev/null || cp -a "$page/$d" "$rt/$(dirname "$d")/"
   done
   rm -rf "$rt/page/public/gex/nt"; mkdir -p "$rt/page/public/gex/nt"
