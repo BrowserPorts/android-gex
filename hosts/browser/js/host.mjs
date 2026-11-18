@@ -461,7 +461,7 @@ export class ProcessHost {
     }, OUTPUT_GAP_MS);
     this.#outputGap.unref?.();
   }
-  #onOutput; #onFork; #onExit; #readStdin; #onOther;
+  #onOutput; #onFork; #onExit; #readStdin; #onOther; #onNote;
   #workers = new Map();
   /** The wineserver's door, once published (`doorPublish`). */
   #door = null;
@@ -758,6 +758,9 @@ export class ProcessHost {
     // is fetched and compiled, when not with fetch and WebAssembly.compile
     // here (a compressed one, decoded elsewhere).
     unitModule = null,
+    // `(note, pid)`: each note a process's Worker says (fetch-note.mjs: a
+    // fetch, an image installed), besides the page's channel.
+    onNote = null,
   }) {
     this.#other = other;
     if (typeof other === 'function' && typeof SharedArrayBuffer === 'function') this.#otherGate = new Int32Array(new SharedArrayBuffer(4));
@@ -774,6 +777,7 @@ export class ProcessHost {
     this.#readStdin = readStdin;
     this.#extra = extra;
     this.#onOther = onMessage;
+    this.#onNote = onNote;
   }
 
   /**
@@ -1872,6 +1876,7 @@ export class ProcessHost {
       }
       case 'note':
         relayNote(m.note, pid);
+        this.#onNote?.(m.note, pid);
         break;
       case 'loadOther':
         // An exec waits on the gate (`#otherGate`) for the answer.

@@ -478,6 +478,7 @@ export class System extends EventTarget {
       },
       // No program reads the page's console: each has its own pipes or pty.
       readStdin: () => new Promise(() => {}),
+      onNote: (note, pid) => this.#note(note, pid),
       onMessage: (m) => {
         if (m.kind === 'wl-memory') compositor?.addMemory(m.token, m.memory, m.kernel);
         else if (m.kind === 'wl-pixels') compositor?.addPixels?.(m.token, m.id, m.buffer, m.replaces);
@@ -761,6 +762,29 @@ export class System extends EventTarget {
       if (this.#early.size > 4096) this.#early.delete(this.#early.keys().next().value);
     }
   }
+
+  /** What a process's Worker reached (fetch-note.mjs `noteStatus`), for a
+   *  page's start-up status: an exec (`exec`: `pid`, `path`), and each image
+   *  installed in a process once (`image`: `pid`, `path`, `program` when it
+   *  is the process's own program, a Windows .exe). */
+  #note(note, from) {
+    const st = note?.status;
+    if (st?.kind === 'exec') {
+      this.dispatchEvent(Object.assign(new Event('exec'), { pid: st.pid ?? from, path: st.path }));
+      this.#imagesSeen.delete(st.pid ?? from);
+      return;
+    }
+    if (!st || (st.kind !== 'module' && st.kind !== 'unit') || !st.path) return;
+    const path = String(st.path).replace(/^wasm(dll|prog):/, '');
+    const pid = from;
+    const seen = this.#imagesSeen.get(pid) ?? this.#imagesSeen.set(pid, new Set()).get(pid);
+    if (seen.has(path)) return;
+    seen.add(path);
+    if (this.#imagesSeen.size > 4096) this.#imagesSeen.delete(this.#imagesSeen.keys().next().value);
+    this.dispatchEvent(Object.assign(new Event('image'), { pid, path, program: st.program !== undefined }));
+  }
+  /** pid -> the images and programs said for it (`#note`). */
+  #imagesSeen = new Map();
 
   #event(ev, m) {
     for (const fn of this.#listeners.get(ev) ?? []) fn(m);

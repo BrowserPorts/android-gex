@@ -76,6 +76,22 @@ export interface SystemState {
   init?: { code: number; signal: string | null } | { error: string };
 }
 
+/** A process's exec (System's `exec` event). */
+export interface ExecEvent extends Event {
+  readonly pid: number;
+  /** The file it runs. */
+  readonly path: string;
+}
+
+/** An image a process installed, said once per process (System's `image` event): a native
+ *  wasm32 module (a Wine builtin) or a translated image's unit. */
+export interface ImageEvent extends Event {
+  readonly pid: number;
+  readonly path: string;
+  /** Whether it is the process's own program (a Windows .exe). */
+  readonly program: boolean;
+}
+
 /** A program that crashed (System's `crash` event): one a crash signal
  *  ended, or a Windows program Wine ended for an unhandled exception. It
  *  has ended by the time the event comes. */

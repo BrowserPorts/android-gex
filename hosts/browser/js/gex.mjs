@@ -2383,6 +2383,10 @@ export class Gex {
           // starting, log.mjs): information, not a warning.
           if (text.startsWith('[gex-info] ')) {
             if (logRoutine()) console.info(`[gex] ${text.slice(11)}`);
+            // A process's exec, for the page (fetch-note.mjs: the System's
+            // `exec` event).
+            const run = /^pid (\d+): exec (\S+)/.exec(text.slice(11));
+            if (run) this.#env.noteStatus?.({ kind: 'exec', pid: Number(run[1]), path: run[2] });
             // `?straceexe=NAME`: narrate the process that execs a program
             // of that name, whatever its pid
             const ex = this.#opts?.straceExe && /^pid \d+: exec (\S+)/.exec(text.slice(11));
