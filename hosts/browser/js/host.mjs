@@ -2381,7 +2381,9 @@ export class ProcessHost {
         }
         // Before the release: releasing terminates the Worker.
         this.#onExit(m, pid);
-        forgetMemory(pid);
+        // A thread's Worker ending (a thread's end, a spare let go) is not
+        // its process's: the process's memory stays where a harness reads it.
+        if (!String(pid).includes(':')) forgetMemory(pid);
         this.#release(pid, w, !!m.giveBack);
         resolve(m.status);
         break;
