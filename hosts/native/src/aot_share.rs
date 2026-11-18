@@ -39,8 +39,19 @@ pub fn set_sampler(f: Sampler) {
     let _ = SAMPLER.set(f);
 }
 
-/// Register a module's compiled code.
+/// Whether anything will classify samples: only then is a module's code
+/// worth registering (a booting Android publishes tens of thousands of
+/// modules, each a sorted insertion under one global lock, kept for good).
+pub fn wanted() -> bool {
+    SAMPLER.get().is_some()
+}
+
+/// Register a module's compiled code, where a sampler is set
+/// ([`set_sampler`], which gexc's profiler sets before anything runs).
 pub fn note(module: &wasmtime::Module, kind: Kind) {
+    if !wanted() {
+        return;
+    }
     let r = module.image_range();
     let (lo, hi) = (r.start as usize, r.end as usize);
     if lo < hi {

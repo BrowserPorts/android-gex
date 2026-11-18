@@ -6635,7 +6635,8 @@ fn publish_unit(
         }
     }
     sh.stale_blocks += stale;
-    {
+    // Only for a profiled run: every publish took this global lock.
+    if aot_share::wanted() {
         let mut by = TIER1_PAGES.lock().unwrap_or_else(|e| e.into_inner());
         let by = by.get_or_insert_with(Default::default);
         for (a, _) in &translated.exported_blocks {
