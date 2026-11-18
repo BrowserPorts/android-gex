@@ -24,6 +24,15 @@
 # build properties do not set it.
 on early-init
     setprop ro.hw_timeout_multiplier 30
+    # No JIT: the zygote's JIT keeps its code and data in a memfd mapped
+    # twice in the one process, a view to write and a view to run, which
+    # are the same memory on Linux ("Zygote memory only works with dual
+    # mappings"). gex's shared mappings are copies kept in step at system
+    # calls, so the two views of one memfd differ between them, and the
+    # zygote aborted in forkSystemServer (debugger_interface.cc: "Expected
+    # invalid entry"; boot b81). Interpreted until mappings of one file
+    # in one process are one memory here.
+    setprop dalvik.vm.usejit false
 
 on post-fs
     start gex_logcat
