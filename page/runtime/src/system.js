@@ -932,6 +932,17 @@ export class System extends EventTarget {
     return this.#spawn(argv, opts, false, false);
   }
 
+  /** Send `sig` (a name like 'SIGUSR1', or a number) to every running
+   *  process named `name`: the name it gave itself, or its program's file
+   *  name. A process the page did not start (a daemon one of its programs
+   *  started) is reached this way. Resolves to how many were signalled; 0
+   *  before boot or when none is running. */
+  async signal(name, sig) {
+    if (typeof name !== 'string' || !name) throw new TypeError('signal(name, sig): name is a process name');
+    if (!this.#programs) return 0;
+    return this.#programs.killNamed(name, signalNumber(sig));
+  }
+
   /** The init (`boot(argv, opts)`) as a Process, null without one. */
   get init() {
     return this.#initProcess;

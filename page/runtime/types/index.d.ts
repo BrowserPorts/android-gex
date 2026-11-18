@@ -121,6 +121,10 @@ export declare class System extends EventTarget {
   boot(argv?: string[], options?: SpawnOptions): Promise<void>;
   /** Throws when the system has an init. */
   spawn(argv: string[], options?: SpawnOptions): Process;
+  /** Send `sig` to every running process named `name` (the name it gave
+   *  itself, or its program's file name); resolves to how many were
+   *  signalled, 0 before boot or when none runs. */
+  signal(name: string, sig: SignalName | number): Promise<number>;
   /** The init's Process, or null without one. */
   get init(): Process | null;
   run(argv: string[], options?: RunOptions & { encoding?: string }): Promise<RunResult<string>>;

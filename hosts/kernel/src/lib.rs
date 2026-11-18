@@ -2107,6 +2107,49 @@ pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
     }
 }
 
+/// Send signal `signo` to every live process named the `len` bytes at `at`:
+/// the name it published (its info's first line) or its program's file name
+/// (the last `/`-part of its first argument). The number signalled, or a
+/// negative errno. A page asks a daemon it did not start by name this way
+/// (sys.signal), since it knows no pid.
+#[no_mangle]
+pub extern "C" fn k_kill_named(caller: i32, at: gex_kmem::PAddr, len: u32, signo: u32) -> i32 {
+    let len = len.min(256);
+    let mut name = vec![0u8; len as usize];
+    if len > 0 {
+        unsafe { gex_kmem::pull_checked(name.as_mut_ptr(), at, len) };
+    }
+    if name.is_empty() {
+        return -22;
+    }
+    let mut n = 0;
+    for e in procs().entries() {
+        if e.zombie || !named(&e.info, &name) {
+            continue;
+        }
+        if signo != 0 {
+            note_kill(caller, e.pid, signo);
+        }
+        if let Ok(k) = procs().kill(caller, e.pid, signo) {
+            n += k as i32;
+        }
+    }
+    n
+}
+
+/// Whether a process's published info (`name\nargs`, NUL-separated) names
+/// `want`: as its name, or as its first argument's file name.
+fn named(info: &[u8], want: &[u8]) -> bool {
+    let nl = info.iter().position(|&b| b == b'\n').unwrap_or(info.len());
+    if &info[..nl] == want {
+        return true;
+    }
+    let args = info.get(nl + 1..).unwrap_or(&[]);
+    let argv0 = &args[..args.iter().position(|&b| b == 0).unwrap_or(args.len())];
+    let base = &argv0[argv0.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1)..];
+    base == want
+}
+
 /// The last signal this kernel handed to anyone: caller, target, number.
 ///
 /// "Killed by signal 1" says nothing about who decided that, and the senders
