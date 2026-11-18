@@ -836,7 +836,7 @@ export function glOnFirstRequest(glChannel, start) {
  * scene compositor) or an element (DomDesktop: windows as DOM elements,
  * decorations in the page's own HTML). `{ wlChannel, compositor, dom }`.
  */
-export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop = null, say = () => {} }) {
+export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop = null, background = null, say = () => {} }) {
   if (!globalThis.crossOriginIsolated) {
     throw new Error('the Wayland compositor needs a cross-origin isolated page (SharedArrayBuffer bridge).');
   }
@@ -863,7 +863,7 @@ export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop =
   if (!GEX_COMPOSITOR) throw new Error('this build has no compositor: give `wl` an element (bare-desktop.js)');
   setOutputSize(wlChannel, wl.width, wl.height, Math.max(1, Math.round(wlScale)));
   const { Compositor } = await import('./compositor.js');
-  const compositor = await Compositor.create(wl, wlChannel, wlInput || wl, { scale: wlScale });
+  const compositor = await Compositor.create(wl, wlChannel, wlInput || wl, { scale: wlScale, background });
   globalThis.__gexCompositor = compositor;
   return { wlChannel, compositor, dom: false };
 }

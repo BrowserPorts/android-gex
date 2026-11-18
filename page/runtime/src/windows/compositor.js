@@ -10,7 +10,7 @@ import { xOnDemand } from './x11.js';
  *  the single-thread build's system Worker `k`: what it would post to its
  *  Worker goes as `{ comp }`, what comes back arrives as `comp-out` events
  *  (`listeners`), and its counters, which it cannot share, as copies. */
-async function relayed(canvas, scale, k, listeners) {
+async function relayed(canvas, scale, k, listeners, background) {
   // gex-eject's `"compositor": false` builds drop it (runtime.js `openWayland`).
   if (!(typeof __GEX_COMPOSITOR__ === 'undefined' || __GEX_COMPOSITOR__)) throw new Error('this build has no compositor: give `wl` an element (bare-desktop.js)');
   const { Compositor } = await import('../../../src/compositor.js');
@@ -29,7 +29,27 @@ async function relayed(canvas, scale, k, listeners) {
     removeEventListener(type, f) { mine.delete(f); },
     terminate() {},
   };
-  return Compositor.create(canvas, null, canvas, { makeWorker: () => port, scale });
+  return Compositor.create(canvas, null, canvas, { makeWorker: () => port, scale, background });
+}
+
+/** `background` as the compositor takes it: the colour as fractions, the
+ *  image decoded (an ImageBitmap) once it has loaded. */
+function backgroundOf(bg) {
+  if (bg == null) return null;
+  const { color = null, image = null, anchor = 'center' } = typeof bg === 'string' ? { color: bg } : bg;
+  if (color !== null && !/^#[0-9a-fA-F]{6}$/.test(color)) throw new TypeError(`CompositorWindows: background colour ${color} (#rrggbb)`);
+  if (!['top', 'center', 'bottom'].includes(anchor)) throw new TypeError(`CompositorWindows: background anchor ${anchor} (top, center or bottom)`);
+  const desktop = color ? [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16) / 255) : null;
+  const wallpaper = image ? (async () => {
+    try {
+      const blob = typeof Blob === 'function' && image instanceof Blob ? image : await (await fetch(new URL(image, globalThis.location?.href))).blob();
+      return { bitmap: await createImageBitmap(blob), anchor };
+    } catch (e) {
+      console.warn('gex: the background image did not load:', e);
+      return null;
+    }
+  })() : null;
+  return { desktop, wallpaper };
 }
 
 export class CompositorWindows extends EventTarget {
@@ -42,12 +62,17 @@ export class CompositorWindows extends EventTarget {
    * compositor's Worker. `x11`: 'rootless' (the default), each X window a
    * window of the desktop, placed by the runtime's window manager; or
    * 'rootful', one X screen filling the output, run by the session's own
-   * window manager (kwin_x11 and the like).
+   * window manager (kwin_x11 and the like). `background`: the desktop
+   * behind the windows, a colour ('#rrggbb') or `{ color, image, anchor }`:
+   * `image` a URL or a Blob, covering the output, `anchor` the edge that
+   * always shows ('top', 'center', the default, or 'bottom'); the colour
+   * shows until the image is in.
    */
-  constructor(sys, { canvas, scale, x11 = 'rootless' } = {}) {
+  constructor(sys, { canvas, scale, x11 = 'rootless', background = null } = {}) {
     super();
     if (typeof canvas?.getContext !== 'function') throw new TypeError('CompositorWindows: a canvas');
     if (x11 !== 'rootless' && x11 !== 'rootful') throw new TypeError("CompositorWindows: x11 is 'rootless' or 'rootful'");
+    const bg = backgroundOf(background);
     const i = internals(sys, 'CompositorWindows');
     i.attach('windows', this, { beforeBoot: true });
     i.devices(async (dev) => {
@@ -59,11 +84,11 @@ export class CompositorWindows extends EventTarget {
           width: canvas.width,
           height: canvas.height,
           scale: wlScale,
-          attach: async (k, listeners) => ({ compositor: (this.#c = await relayed(canvas, wlScale, k, listeners)) }),
+          attach: async (k, listeners) => ({ compositor: (this.#c = await relayed(canvas, wlScale, k, listeners, bg)) }),
         };
         return;
       }
-      Object.assign(dev, await dev.rt.openWayland({ wl: canvas, wlScale, say: (t) => dev.say(`${t}\n`) }));
+      Object.assign(dev, await dev.rt.openWayland({ wl: canvas, wlScale, background: bg, say: (t) => dev.say(`${t}\n`) }));
       this.#c = dev.compositor;
     });
     const x = { rootful: x11 === 'rootful' };

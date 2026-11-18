@@ -774,13 +774,16 @@ program (a game, a Win32 program that draws its own frames). `env`,
 
 ### CompositorWindows (`@gexemu/runtime/windows/compositor`)
 
-`new CompositorWindows(sys, { canvas, scale, x11 })`: the whole desktop in one
+`new CompositorWindows(sys, { canvas, scale, x11, background })`: the whole desktop in one
 canvas, drawn by gex's scene compositor on WebGPU in a Worker: frames, title
 bars, stacking, the cursor. `x11` is `'rootless'` (the default: each X window
 is a desktop window, placed by the runtime's window manager) or `'rootful'`
 (one X screen fills the canvas and the session runs its own window manager,
-as a KDE or Xfce session does). `env`, `resize(width, height)` (device
-pixels), `describe()`.
+as a KDE or Xfce session does). `background` is the desktop behind the
+windows: a colour (`'#rrggbb'`) or `{ color, image, anchor }`, `image` a URL
+or a `Blob` covering the canvas, `anchor` the edge that always shows
+(`'top'`, `'center'`, the default, or `'bottom'`); the colour shows until the
+image is in. `env`, `resize(width, height)` (device pixels), `describe()`.
 
 `process.windows()` is for HostWindows; the other two keep their windows to
 themselves.

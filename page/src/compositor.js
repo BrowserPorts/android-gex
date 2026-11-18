@@ -26,9 +26,13 @@ export class Compositor {
    *  `scale`: the page's devicePixelRatio when the canvas's backing store is
    *  in device pixels (the frames and titles the compositor draws are scaled
    *  by it). */
-  static async create(canvas, channel, inputTarget = canvas, { makeWorker = null, scale = 1 } = {}) {
+  /** `background`: the desktop behind the windows, `{ desktop: [r, g, b]
+   *  (0 to 1), wallpaper: a promise of { bitmap, anchor } or null }` (the
+   *  runtime's CompositorWindows); without it, start()'s (`?desktopbg`,
+   *  GEX_WALLPAPER). */
+  static async create(canvas, channel, inputTarget = canvas, { makeWorker = null, scale = 1, background = null } = {}) {
     const c = new Compositor();
-    await c.#start(canvas, channel, inputTarget, makeWorker, { scale });
+    await c.#start(canvas, channel, inputTarget, makeWorker, { scale, background });
     return c;
   }
 
@@ -75,7 +79,7 @@ export class Compositor {
     });
   }
 
-  async #start(canvas, channel, inputTarget, makeWorker, { scale = 1 } = {}) {
+  async #start(canvas, channel, inputTarget, makeWorker, { scale = 1, background = null } = {}) {
     this.#channel = channel;
     const sameTarget = inputTarget === canvas;
     // A canvas can be handed to a worker once and never again, and a page
@@ -156,14 +160,14 @@ export class Compositor {
     const glLimits = pq?.has('gllimits') ? Number(pq.get('gllimits')) || 0 : null;
     // start()'s `background`: the desktop's colour, rrggbb.
     const bg = /^[0-9a-fA-F]{6}$/.test(pq?.get('desktopbg') ?? '') ? pq.get('desktopbg') : null;
-    const desktop = bg ? [0, 2, 4].map((i) => parseInt(bg.slice(i, i + 2), 16) / 255) : null;
+    const desktop = background ? background.desktop ?? null : bg ? [0, 2, 4].map((i) => parseInt(bg.slice(i, i + 2), 16) / 255) : null;
     worker.postMessage(
       { kind: 'init', canvas: offscreen, width: canvas.width, height: canvas.height, scale,
         channel, stats: this.#stats, present, direct, glLimits, desktop },
       [offscreen],
     );
     // start()'s background image (app.js decodes it): drawn once it is here.
-    globalThis.GEX_WALLPAPER?.then((wp) => {
+    (background ? background.wallpaper : globalThis.GEX_WALLPAPER)?.then((wp) => {
       if (wp) worker.postMessage({ kind: 'wallpaper', bitmap: wp.bitmap, anchor: wp.anchor }, [wp.bitmap]);
     });
     await ready;
