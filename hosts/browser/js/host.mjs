@@ -207,6 +207,12 @@ const SPARE_IDLE_MS = 5000;
  *  next threads (`park`), within SPARE_MAX. A program that starts short
  *  threads one after another needs one. */
 const PARKED_MAX = 2;
+/** How many spares one process keeps ready in a burst of thread starts
+ *  (`#topUpSpares`: two within SPARE_RATE_MS), within SPARE_MAX. Firefox starts ~120 threads in 18 s, in bursts; with one spare at a
+ *  time nearly every start found it taken and waited ~0.65 s for a fresh
+ *  Worker. */
+const SPARES_PER_PROC = 4;
+const SPARE_RATE_MS = 2000;
 /// How many threads a Worker has run (`park`), the last included.
 const THREADS_RUN = Symbol('gex.threadsRun');
 /** A test-only switch: whether a running fork child's
@@ -683,6 +689,9 @@ export class ProcessHost {
   #spareRec = new Map();
   /** How many threads each process with a spare record has started. */
   #threadsOf = new Map();
+  /** When each process with a spare record started its recent threads
+   *  (`#topUpSpares`), oldest first. */
+  #startsOf = new Map();
   // The global kernel's per-Worker stacks, as the first Worker reported them.
   // Each Worker's kernel instance has its own `__stack_pointer` global, all
   // pointing into the shared memory, so each needs its own slice or two Workers
@@ -1546,6 +1555,22 @@ export class ProcessHost {
     while (this.#spares.length > SPARE_MAX) this.#letSpareGo(this.#spares.shift());
   }
 
+  /** Process `proc` has started a thread, `before` before it: from its
+   *  second thread on it keeps a spare, and once it starts two within
+   *  SPARE_RATE_MS (a burst) SPARES_PER_PROC of them, all started at once,
+   *  since a spare takes longer to come up than a burst's next start; parked
+   *  Workers counted. */
+  #topUpSpares(proc, before) {
+    const now = Date.now();
+    const starts = (this.#startsOf.get(proc) ?? []).filter((t) => now - t < SPARE_RATE_MS);
+    starts.push(now);
+    this.#startsOf.set(proc, starts);
+    if (before < 1) return;
+    const want = starts.length >= 2 ? SPARES_PER_PROC : 1;
+    let have = this.#spares.filter((x) => x.proc === proc).length;
+    for (; have < want && this.#spareRec.has(proc); have++) this.#startSpare(proc);
+  }
+
   /** Spare `sp` let go when SPARE_IDLE_MS passes without a thread for it. */
   #spareIdle(sp) {
     const { key } = sp;
@@ -1600,8 +1625,10 @@ export class ProcessHost {
   /** Process `proc`'s spare for a thread of its program `gen`, taken; null
    *  with none (one caught up with an earlier program is let go). */
   #takeSpare(proc, gen) {
-    // A ready one first: a parked Worker, or a spare that has started.
-    let i = this.#spares.findIndex((x) => x.proc === proc && (x.parked || !this.#pending.has(x.ref.key)));
+    // A ready one first: a parked Worker, or a spare caught up and waiting
+    // (`spareWaiting`); then one still catching up; then one still starting.
+    let i = this.#spares.findIndex((x) => x.proc === proc && (x.parked || x.waiting));
+    if (i < 0) i = this.#spares.findIndex((x) => x.proc === proc && !this.#pending.has(x.ref.key));
     if (i < 0) i = this.#spares.findIndex((x) => x.proc === proc);
     if (i < 0) return null;
     const [sp] = this.#spares.splice(i, 1);
@@ -1626,6 +1653,7 @@ export class ProcessHost {
   #dropSpares(proc) {
     this.#spareRec.delete(proc);
     this.#threadsOf.delete(proc);
+    this.#startsOf.delete(proc);
     const mine = this.#spares.filter((x) => x.proc === proc);
     if (!mine.length) return;
     this.#spares = this.#spares.filter((x) => x.proc !== proc);
@@ -1646,6 +1674,7 @@ export class ProcessHost {
     if (left.length && left.every((k) => this.#spares.some((x) => x.ref.key === k))) {
       this.#spareRec.delete(proc);
       this.#threadsOf.delete(proc);
+      this.#startsOf.delete(proc);
       for (const sp of this.#spares.filter((x) => x.proc === proc)) {
         this.#workers.delete(sp.ref.key);
         this.#pending.delete(sp.ref.key);
@@ -2111,14 +2140,20 @@ export class ProcessHost {
             this.#pending.set(key, held);
           }
           spare.ref.key = key;
-          if (logNamed('spare')) console.warn(`[spare] ${key}: on ${spare.key}, ${held ? 'still starting' : 'ready'}`);
-          const { tid, ctx, pc, procOpts } = m.thread;
-          spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts } });
+          if (logNamed('spare')) console.warn(`[spare] ${key}: on ${spare.key}, ${spare.parked || spare.waiting ? 'ready' : held ? 'still starting' : 'catching up'}`);
+          const { tid, ctx, pc, procOpts, cloneAt } = m.thread;
+          spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts, cloneAt } });
         } else {
           this.#threadWorker(pid, key, { kind: 'thread', ...m.thread, park: !this.#foreign(proc) && !!this.#extra?.shared && !(SP_CODE && single.on) });
         }
-        // The next spare, for a process that starts more than one thread.
-        if (before >= 1 && !this.#spares.some((x) => x.proc === proc)) this.#startSpare(proc);
+        // The next spares, for a process that starts more than one thread.
+        if (before !== undefined) this.#topUpSpares(proc, before);
+        break;
+      }
+      case 'spareWaiting': {
+        // A spare has caught up with its process and waits for a thread.
+        const sp = this.#spares.find((x) => x.w === w);
+        if (sp) sp.waiting = true;
         break;
       }
       case 'park': {
@@ -2132,11 +2167,16 @@ export class ProcessHost {
         // A program with many modules has started (`Gex#offerSpare`): a
         // Worker for its first thread, caught up with them meanwhile.
         const proc = String(pid).split(':')[0];
+        // Offered again at a thread's start (`atThread`) by each Worker
+        // that starts threads: the record the process has is kept.
+        if (m.spare.atThread && this.#spareRec.get(proc)?.execGen === m.spare.execGen) break;
         this.#dropSpares(proc);
         if (this.#foreign(proc) || !this.#extra?.shared || (SP_CODE && single.on)) break;
         this.#spareRec.set(proc, m.spare);
         this.#threadsOf.set(proc, 0);
-        this.#startSpare(proc);
+        // A program served with many modules: one for its first thread. At
+        // a thread's start, spares come as its next threads do.
+        if (!m.spare.atThread) this.#startSpare(proc);
         break;
       }
       case 'stdin': {

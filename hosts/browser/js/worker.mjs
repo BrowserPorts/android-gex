@@ -1177,7 +1177,12 @@ async function handle(msg) {
       const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${msg.tid}] ${s}`); };
       _t(`adopt start pc=0x${(msg.pc??0n).toString(16)} ctx=0x${(msg.ctx??0n).toString(16)}`);
       if (msg.spare) {
-        msg.spareGo = () => (spareGot ? Promise.resolve(spareGot.thread ?? null) : new Promise((r) => { spareWaiter = r; }));
+        // Caught up and waiting from here: the host counts it ready (`spareWaiting`).
+        msg.spareGo = () => {
+          if (spareGot) return Promise.resolve(spareGot.thread ?? null);
+          port.post({ kind: 'spareWaiting' });
+          return new Promise((r) => { spareWaiter = r; });
+        };
       }
       ({ entry, ctx, gone } = await (msg.snap ? gex.snapThread(msg.shim, msg.guest, msg) : gex.adoptThread(msg.shim, msg.guest, msg)));
       if (msg.snap) {

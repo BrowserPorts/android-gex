@@ -19,10 +19,14 @@ import { xcEnter, xcLeave, xcRead, xcSleep, xcWrite } from "./xcache.mjs";
 import { single, sched } from "./single.mjs";
 import { logNamed, logOn, logRoutine } from "./log.mjs";
 import { frameOf } from './dgram-frames.mjs';
-import { noteFetch } from './fetch-note.mjs';
+import { noteFetch, fetchWaited, setFetchSay } from './fetch-note.mjs';
 
 /** The longest an exec waits for the other memory flavour's runtime. */
 const OTHER_WAIT_MS = 300_000;
+/** The shim's wait codes (`gex_wait_code`), named for GEX_LOG=waits. */
+const WAIT_KINDS = ['runnable', 'futex', 'futex+timeout', 'sleep', 'read', 'write', 'accept', 'wait4', 'poll', 'poll+timeout', 'sigsuspend', 'sigtimedwait', 'file lock', 'pi lock', 'exited', 'another worker',
+  // the shim's parks name a stream read by what it reads (waitq.rs `split_begin`)
+  'read pipe', 'read socket', 'read other'];
 
 /** Function-table room past the indices handed out (`Gex#ftabSpare`): for a
  *  process with one Worker, and for one with threads. Room is only how soon
@@ -4355,6 +4359,8 @@ export class Gex {
     this.#programStore(true);
     const thread = {
       tid,
+      // GEX_LOG=waits: when it was made (an epoch ms every Worker reads alike), for its start's latency
+      cloneAt: this.#ws ? performance.timeOrigin + performance.now() : undefined,
       ctx: e.gex_thread_ctx(),
       pc: e.gex_thread_pc(),
       memory: this.#memory,
@@ -4402,6 +4408,9 @@ export class Gex {
     // Before the thread exists: from its first install it may publish
     // indices past what this Worker has replayed.
     this.#threaded();
+    // A program that starts threads gets spares for the next ones, however
+    // few modules it had when it was served (a Wine process has one then).
+    this.#offerSpare(0, true);
     await this.#env.spawnThread(thread);
   }
 
@@ -4463,6 +4472,7 @@ export class Gex {
       }
     }
     this.#threadTid = thread.tid;
+    this.#cloneAt = thread.cloneAt;
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
@@ -4496,6 +4506,7 @@ export class Gex {
   async snapThread(shimWasm, guestWasm, thread) {
     this.#threaded();
     this.#threadTid = thread.tid;
+    this.#cloneAt = thread.cloneAt;
     this.#promise = false;
     // The first of a process's Workers: the memory's shim slots are the
     // snapshot's Workers', none of which runs now (as a fork child's).
@@ -7699,6 +7710,15 @@ export class Gex {
     if (this.#doorStatsOn) return this.#doorCallStats(req, pid, tid, lp64);
     const d = this.#door;
     if (!d || (SP_CODE && single.on)) return 1;
+    if (this.#ws) {
+      const t = performance.now();
+      try { return this.#doorRun(d, req, pid, tid, null, lp64); } finally {
+        const ws = this.#ws;
+        ws.door += performance.now() - t;
+        ws.doorN++;
+        if (performance.now() - ws.said >= 5000) this.#wsSay(ws, 'so far');
+      }
+    }
     return this.#doorRun(d, req, pid, tid, null, lp64);
   }
 
@@ -7927,6 +7947,9 @@ export class Gex {
   /** The `gex_exec_gen` a spare was last offered for (or, in a fork's
    *  child, of the program it was forked running). */
   #spareGen = -1;
+  /** The `gex_exec_gen` this Worker last offered spares for at a thread's
+   *  start (`#postThread`). */
+  #spareThreadGen = -1;
 
   /**
    * A program just published with many modules (`n` installs to come): a
@@ -7936,15 +7959,22 @@ export class Gex {
    * every module to be instantiated again. Once per program; none in the
    * single-thread build, whose threads are fibers of this realm.
    */
-  #offerSpare(n) {
+  #offerSpare(n, atThread = false) {
     const e = this.#shim.exports;
     const gen = e.gex_exec_gen?.() ?? 0;
-    const why = gen === this.#spareGen ? 'its parent\'s program' : (SP_CODE && single.on) ? 'single-thread build'
-      : typeof this.#env.offerSpare !== 'function' ? 'no offerSpare' : n < spareModules() ? 'few modules'
-      : !isShared(this.#memory?.buffer) ? 'memory not shared' : '';
-    if (logNamed('spare')) console.warn(`[spare] pid ${e.gex_my_pid?.() ?? '?'}: program ${gen} with ${n} modules, ${why ? `no spare (${why})` : 'offered'}`);
-    this.#spareGen = gen;
-    if (why) return;
+    if (atThread) {
+      // Once per program from each Worker that starts threads; the host
+      // keeps the first and starts spares only as threads come.
+      if (gen === this.#spareThreadGen) return;
+      this.#spareThreadGen = gen;
+    }
+    const why = atThread ? '' : gen === this.#spareGen ? 'its parent\'s program' : n < spareModules() ? 'few modules' : '';
+    const cant = why || ((SP_CODE && single.on) ? 'single-thread build'
+      : typeof this.#env.offerSpare !== 'function' ? 'no offerSpare'
+      : !isShared(this.#memory?.buffer) ? 'memory not shared' : '');
+    if (logNamed('spare') && (!atThread || cant)) console.warn(`[spare] pid ${e.gex_my_pid?.() ?? '?'}: program ${gen} with ${n} modules, ${cant ? `no spare (${cant})` : 'offered'}`);
+    if (!atThread) this.#spareGen = gen;
+    if (cant) return;
     this.#programStore(true);
     this.#env.offerSpare({
       memory: this.#memory,
@@ -7952,6 +7982,7 @@ export class Gex {
       compat: e.gex_compat?.() ?? 0,
       procOpts: this.#opts,
       execGen: gen,
+      atThread,
     });
   }
 
@@ -8399,7 +8430,12 @@ export class Gex {
     const limit = Error.stackTraceLimit;
     if (!globalThis.__gexKeepTrace && !globalThis.GEX_TRAP_STACK) Error.stackTraceLimit = 0;
     try {
-      return await this.#runLoop(entry, startCtx);
+      try {
+        return await this.#runLoop(entry, startCtx);
+      } finally {
+        if (this.#ws) this.#wsSay(this.#ws, 'at its end');
+        this.#ws = null;
+      }
     } finally {
       // An instrumented unit's hits, before a short-lived process is gone.
       if (this.#cov.size) this.covFlush();
@@ -8417,6 +8453,8 @@ export class Gex {
     // A fault for the process's hook, taken at the last trap (`#faultTake`):
     // called at the next entry.
     let hook = null;
+    // GEX_LOG=waits: this thread's wall time split by what it waited on.
+    this.#ws = logNamed('waits') ? this.#wsStart() : false;
     // Units for what booting mapped (the exe, ntdll), before the guest runs.
     this.#cgenServe();
     // A program the shim refused there (a 32-bit Wine built for another probe
@@ -8808,6 +8846,7 @@ export class Gex {
         // loop matters: one event-loop turn is no promise the wait is over.
         if (e.gex_paused_for_net() || e.gex_paused_for_input()) {
           let woke = 0;
+          const ws = this.#ws, wt = ws ? performance.now() : 0, wk = ws ? (e.gex_wait_code?.(ctx) ?? -1) : 0;
           let snap = this.#netSnap();
           while (e.gex_paused_for_net() || e.gex_paused_for_input()) {
             // Another Worker can execute exit_group while this one is parked.
@@ -8878,6 +8917,7 @@ export class Gex {
             woke = e.gex_wake();
             if (woke === 1) break;
           }
+          if (ws) this.#wsAdd(ws, wk, performance.now() - wt);
           if (e.gex_exited?.()) return e.gex_exit_code();
           if (woke !== 1) {
             // Every thread is waiting and nothing woke them. Two cases, told
@@ -11151,6 +11191,64 @@ export class Gex {
   #denseFillWorst = 0;
   /** The thread this Worker runs, when it was spawned for one (`adoptThread`). */
   #threadTid = 0;
+  /** GEX_LOG=waits (`#runLoop`): this thread's waits, by `WAIT_KINDS` (the
+   *  last entry the codes the shim did not give), as ms and counts; its
+   *  server requests made in this Worker (`#doorCall`) and its waits for
+   *  lazy files' bytes (`fetchWaited`). False when off, null before. */
+  #ws = null;
+  /** GEX_LOG=waits: when this Worker's thread was made (`#takeThread`), epoch ms. */
+  #cloneAt = undefined;
+
+  /** The wait split for the thread starting here: the shim's parks of this
+   *  Worker so far (`gex_wait_split_ms`), which its waits are counted from. */
+  #wsStart() {
+    const e = this.#shim.exports, now = performance.now(), K = WAIT_KINDS.length + 1;
+    // On, and this Worker's counts started afresh.
+    e.gex_wait_split_on?.();
+    const ws = { t0: now, said: now, ms: new Float64Array(K), n: new Uint32Array(K), door: 0, doorN: 0, fetch0: fetchWaited() };
+    // Each lazy file's fetch, said as it ends: the files a thread waited for.
+    // Its start: made at the clone, its first instruction now (the run loop's start).
+    const at = performance.timeOrigin + now;
+    if (this.#cloneAt) console.warn(`[waits] ${e.gex_my_pid?.() ?? 0}:${this.#threadTid} started: made at ${(this.#cloneAt / 1000).toFixed(3)}, first instruction at ${(at / 1000).toFixed(3)} (${(at - this.#cloneAt).toFixed(1)} ms later)`);
+    setFetchSay((what, bytes, ms) => console.warn(`[waits] ${e.gex_my_pid?.() ?? 0}:${this.#threadTid || e.gex_my_pid?.() || 0} fetched ${what}: ${bytes} bytes in ${ms.toFixed(1)} ms`));
+    return ws;
+  }
+
+  /** A wait of kind `code` (`gex_wait_code`) that took `ms`; every 5 s, said. */
+  #wsAdd(ws, code, ms) {
+    const k = code >= 0 && code < WAIT_KINDS.length ? code : WAIT_KINDS.length;
+    ws.ms[k] += ms;
+    ws.n[k]++;
+    if (performance.now() - ws.said >= 5000) this.#wsSay(ws, 'so far');
+  }
+
+  /** One `[waits]` line: wall time since the thread started, then where it went. */
+  #wsSay(ws, when) {
+    const now = performance.now();
+    ws.said = now;
+    const all = now - ws.t0, fetch = fetchWaited() - ws.fetch0;
+    let waited = 0;
+    const parts = [];
+    // Two kinds of wait: the stack given back to the run loop (`#wsAdd`),
+    // and parks inside the shim's syscall (a thread of a process with
+    // several Workers: `waitq::park`).
+    const e = this.#shim?.exports;
+    for (let k = 0; k <= WAIT_KINDS.length; k++) {
+      const ms = ws.ms[k] + (e?.gex_wait_split_ms?.(k) ?? 0);
+      const n = ws.n[k] + (e?.gex_wait_split_n?.(k) ?? 0);
+      waited += ms;
+      if (n) parts.push(`${WAIT_KINDS[k] ?? 'other'} ${(ms / 1000).toFixed(2)} s (${n})`);
+    }
+    const pid = this.#shim?.exports?.gex_my_pid?.() ?? 0;
+    // Its futex waits by the thread whose wake ended them, the longest first.
+    const by = [];
+    for (let i = 0, n = e?.gex_wait_wakers?.() ?? 0; i < n; i++) by.push([e.gex_wait_waker_tid(i), e.gex_wait_waker_ms(i), e.gex_wait_waker_n(i)]);
+    by.sort((x, y) => y[1] - x[1]);
+    const wakers = by.length ? ` futex waits ended by ${by.slice(0, 5).map(([t, ms, n]) => `${t ? `${pid}:${t}` : 'their timeout'} ${(ms / 1000).toFixed(2)} s (${n})`).join(', ')};` : '';
+    console.warn(`[waits] ${pid}:${this.#threadTid || pid} ${when}, ${(all / 1000).toFixed(1)} s since its start: waiting ${parts.join(', ') || 'none'};`
+      + `${wakers} server requests ${(ws.door / 1000).toFixed(2)} s (${ws.doorN}); lazy file bytes ${(fetch / 1000).toFixed(2)} s;`
+      + ` the rest (its code, installs, other host calls) ${((all - waited - ws.door - fetch) / 1000).toFixed(2)} s`);
+  }
   /** A thread's: how many `execve`s its process had made when it was
    *  adopted (`adoptThread`). */
   adoptGen = undefined;

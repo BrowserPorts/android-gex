@@ -24,6 +24,13 @@
 //   GEX_LOG=dlpack       a line per wasm32 library whose exports the page packs
 //                        (gex.mjs `packExports`): its size and time (only when named)
 //   GEX_LOG=nodlpack     no packing: every export kept, as before (only when named)
+//   GEX_LOG=waits        per thread every 5 s (and when its Worker takes the next
+//                        thread): its wall time since it started, split into its
+//                        waits by kind (futex, read, poll, ...), its wineserver
+//                        requests made in its Worker and its waits for lazy files'
+//                        bytes; a stream read by what it reads, futex waits by the
+//                        thread whose wake ended them, and a line per lazy file
+//                        each thread fetched (only when named)
 //   GEX_LOG=bridges      the unit entries each Worker entered through a bridge
 //                        (only when named: it puts a call on every such entry)
 //   GEX_LOG=traps        per process at its end, how its Worker's traps went on:
