@@ -42,6 +42,12 @@ fi
 # the build as init.sh names it.
 export XDG_CACHE_HOME=${XDG_CACHE_HOME:-/Volumes/T7 APFS/gex-cache-mac}
 mkdir -p "$XDG_CACHE_HOME"
+# macOS's allocator keeps freed large blocks and, handing one back to
+# calloc, zeroes it by writing it: every dispatch table a thread reserves
+# (calloc of 80 MB, untouched) would cost all of its pages once a block is
+# recycled. Without the large cache it is fresh zero memory each time (a
+# small threaded test: 1.0-1.5 GB of footprint at peak, 331 MB without).
+export MallocLargeCache=0
 export GEX_DENSE=1 GEX_HEAP_STATS=${GEX_HEAP_STATS:-300} GEX_LAZY_CATCH_UP=1 GEX_TIME_SCALE=8
 export GEX_CACHE_MAX_BYTES=${GEX_CACHE_MAX_BYTES:-8589934592} GEX_FIXED_RANDOM=1
 if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then

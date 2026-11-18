@@ -41,6 +41,21 @@ fn main() -> ExitCode {
     if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
         unsafe { libc::mallopt(libc::M_ARENA_MAX, 4) };
     }
+    // macOS's allocator keeps freed large blocks and, handing one back to
+    // calloc, zeroes it by writing it: every dispatch table a guest thread
+    // reserves (an 80 MB calloc, nearly all of it never touched) costs all
+    // of its pages once its block is a recycled one, and a booting Android
+    // reached tens of GB that way. The cache is read from the environment
+    // when the process starts, so gexc starts itself again without it,
+    // once, unless the environment chose.
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("MallocLargeCache").is_none() {
+        use std::os::unix::process::CommandExt;
+        if let Ok(me) = std::env::current_exe() {
+            let err = std::process::Command::new(me).args(std::env::args_os().skip(1)).env("MallocLargeCache", "0").exec();
+            eprintln!("gexc: could not start again without the large-block cache: {err}");
+        }
+    }
     match real_main() {
         Ok(code) => code,
         Err(e) => {
