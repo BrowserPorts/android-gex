@@ -85,6 +85,8 @@ export interface CrashEvent extends Event {
   readonly code: number;
   /** The signal that ended it, 0 for none. */
   readonly signal: number;
+  /** Its command line, its arguments joined by spaces (a Wine program's: the loader, then the .exe's path). */
+  readonly cmdline: string;
 }
 
 export interface HostCalls {

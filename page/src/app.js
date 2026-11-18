@@ -115,7 +115,7 @@ const PIECES = {
  *   build      the launch, already read (gex's test page; see `fromLaunch`)
  *   onLog(text)     the program's terminal output
  *   onExit(status)  called when it exits
- *   onCrash({ pid, name, reason, code, signal })
+ *   onCrash({ pid, name, reason, code, signal, cmdline })
  *              a program of the run crashed (the System's `crash` event,
  *              page/runtime README): it has ended and its windows are gone
  *   onGlCapture(bytes)
@@ -123,7 +123,7 @@ const PIECES = {
  *              asked for with `debug: { glcapture: BYTES }`, once it is that
  *              long: for the page to save. Without it the recording is POSTed
  *              to /__gex_capture.
- *   onNotice({ pid, name, text })
+ *   onNotice({ pid, name, text, cmdline })
  *              why a running program cannot work as it should (the System's
  *              `notice` event): once per program and text
  *   onStoreBusy({ name, signal })
@@ -970,10 +970,10 @@ async function begin(opts, base, at, state, meter, lets) {
       });
       if (opts.onGlCapture) globalThis.__gexGlCaptureSink = opts.onGlCapture;
       if (opts.onCrash) {
-        s.system.addEventListener('crash', ({ pid, name, reason, code, signal }) => opts.onCrash({ pid, name, reason, code, signal }));
+        s.system.addEventListener('crash', ({ pid, name, reason, code, signal, cmdline }) => opts.onCrash({ pid, name, reason, code, signal, cmdline: cmdline ?? '' }));
       }
       if (opts.onNotice) {
-        s.system.addEventListener('notice', ({ pid, name, text }) => opts.onNotice({ pid, name, text }));
+        s.system.addEventListener('notice', ({ pid, name, text, cmdline }) => opts.onNotice({ pid, name, text, cmdline: cmdline ?? '' }));
       }
     },
     // `hostx: 'rootful'` (or the build's default): one X screen, fullscreen,

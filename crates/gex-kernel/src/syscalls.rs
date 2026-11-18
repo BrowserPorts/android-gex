@@ -17506,7 +17506,7 @@ mod tests {
             assert_eq!(&v[..1], b"1");
             (k.pid, k.procs.take_crashes())
         };
-        let notice = |pid, name: &str| Crash { pid, name: name.into(), reason: LINE.into(), code: 0, signal: 0, notice: true };
+        let notice = |pid, name: &str| Crash { pid, name: name.into(), reason: LINE.into(), code: 0, signal: 0, notice: true, cmdline: name.into() };
         // a nonzero exit
         let (pid, got) = end("exits", None, false, 1 << 8);
         assert_eq!(got, vec![notice(pid, "exits")]);
@@ -17516,10 +17516,10 @@ mod tests {
         assert_eq!(got, vec![Crash { reason, ..notice(pid, "asks") }]);
         // SIGSEGV: a crash
         let (pid, got) = end("faults", None, false, 11);
-        assert_eq!(got, vec![Crash { pid, name: "faults".into(), reason: format!("SIGSEGV; {LINE}"), code: 139, signal: 11, notice: false }]);
+        assert_eq!(got, vec![Crash { pid, name: "faults".into(), reason: format!("SIGSEGV; {LINE}"), code: 139, signal: 11, notice: false, cmdline: "faults".into() }]);
         // a Windows program's own crash, then a nonzero exit
         let (pid, got) = end("said", Some(b"app.exe\0page fault on read access to 00000000\03221225477"), false, 5 << 8);
-        assert_eq!(got, vec![Crash { pid, name: "app.exe".into(), reason: format!("page fault on read access to 00000000; {LINE}"), code: 0xc0000005, signal: 0, notice: false }]);
+        assert_eq!(got, vec![Crash { pid, name: "app.exe".into(), reason: format!("page fault on read access to 00000000; {LINE}"), code: 0xc0000005, signal: 0, notice: false, cmdline: "said".into() }]);
     }
 
     /// Extended attributes (`user.` only) on the root tmpfs, through the

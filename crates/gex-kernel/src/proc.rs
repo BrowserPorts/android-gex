@@ -463,6 +463,20 @@ pub struct Crash {
     /// A notice of a process that is still running ([`ProcTable::notice`]),
     /// `reason` its text, not a crash.
     pub notice: bool,
+    /// Its command line (`/proc`'s `cmdline`, its arguments joined by
+    /// spaces): what a page names the program by when `name` is its loader's
+    /// (a Wine process's notice comes before Wine names it).
+    pub cmdline: String,
+}
+
+/// `/proc`'s `info` (its name, a newline, its NUL-separated arguments)'s
+/// arguments, joined by spaces.
+fn cmdline_of(info: &[u8]) -> String {
+    let args = match info.iter().position(|&b| b == b'\n') {
+        Some(i) => &info[i + 1..],
+        None => &[][..],
+    };
+    args.split(|&b| b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect::<Vec<_>>().join(" ")
 }
 
 /// The signals whose default action dumps core: a program's crash.
@@ -509,6 +523,7 @@ impl Crash {
             code,
             signal: if signaled { sig } else { 0 },
             notice: false,
+            cmdline: cmdline_of(info),
         })
     }
 
@@ -529,7 +544,8 @@ impl Crash {
             o
         }
         let notice = if self.notice { r#","notice":true"# } else { "" };
-        format!(r#"{{"pid":{},"name":{},"reason":{},"code":{},"signal":{}{notice}}}"#, self.pid, q(&self.name), q(&self.reason), self.code, self.signal)
+        let cmdline = if self.cmdline.is_empty() { String::new() } else { format!(r#","cmdline":{}"#, q(&self.cmdline)) };
+        format!(r#"{{"pid":{},"name":{},"reason":{},"code":{},"signal":{}{notice}{cmdline}}}"#, self.pid, q(&self.name), q(&self.reason), self.code, self.signal)
     }
 }
 
@@ -592,7 +608,7 @@ impl Table {
         }
         p.noticed.push(text.clone());
         let end = p.info.iter().position(|&b| b == b'\n').unwrap_or(p.info.len());
-        let c = Crash { pid, name: String::from_utf8_lossy(&p.info[..end]).into_owned(), reason: text, code: 0, signal: 0, notice: true };
+        let c = Crash { pid, name: String::from_utf8_lossy(&p.info[..end]).into_owned(), reason: text, code: 0, signal: 0, notice: true, cmdline: cmdline_of(&p.info) };
         if let Some(f) = CRASH_HOOK.get() {
             f(&c);
         }
@@ -1728,8 +1744,8 @@ mod tests {
         t.exit(d, 15);
         let got = t.take_crashes();
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0], Crash { pid: a, name: "prog".into(), reason: "SIGSEGV at 0x1234".into(), code: 139, signal: 11, notice: false });
-        assert_eq!(got[1], Crash { pid: b, name: "app.exe".into(), reason: "page fault on read access to 00000000".into(), code: 0xc0000005, signal: 0, notice: false });
+        assert_eq!(got[0], Crash { pid: a, name: "prog".into(), reason: "SIGSEGV at 0x1234".into(), code: 139, signal: 11, notice: false, cmdline: "prog".into() });
+        assert_eq!(got[1], Crash { pid: b, name: "app.exe".into(), reason: "page fault on read access to 00000000".into(), code: 0xc0000005, signal: 0, notice: false, cmdline: String::new() });
         assert_eq!(got[1].json(), format!(r#"{{"pid":{b},"name":"app.exe","reason":"page fault on read access to 00000000","code":3221225477,"signal":0}}"#));
         assert!(t.take_crashes().is_empty());
     }
@@ -1744,8 +1760,8 @@ mod tests {
         t.notice(a, "another");
         let got = t.take_crashes();
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0], Crash { pid: a, name: "big.exe".into(), reason: "needs more than 16 GiB of address space".into(), code: 0, signal: 0, notice: true });
-        assert_eq!(got[0].json(), format!(r#"{{"pid":{a},"name":"big.exe","reason":"needs more than 16 GiB of address space","code":0,"signal":0,"notice":true}}"#));
+        assert_eq!(got[0], Crash { pid: a, name: "big.exe".into(), reason: "needs more than 16 GiB of address space".into(), code: 0, signal: 0, notice: true, cmdline: "big.exe".into() });
+        assert_eq!(got[0].json(), format!(r#"{{"pid":{a},"name":"big.exe","reason":"needs more than 16 GiB of address space","code":0,"signal":0,"notice":true,"cmdline":"big.exe"}}"#));
         assert_eq!(got[1].reason, "another");
         // it ends normally afterwards: no crash
         t.exit(a, 0);
