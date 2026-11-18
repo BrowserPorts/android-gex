@@ -38,6 +38,10 @@
 //   -include, then gexcc-win's prelude;
 // - wkdata: weak undefined data links and its address is null; weak data
 //   a DLL defines (wkdll) reads the DLL's;
+// - wkfunc: weak undefined functions are null, not stubs (C's weak
+//   declaration, C++'s thread_local init function, a DLL's weak reference);
+//   a strong reference to the same name in another module still fails to
+//   link, and a stubbed strong one is never null, natively or on the page;
 // - fficall: libffi (-lffi): ffi_call to a DLL's functions as native values
 //   and as GetProcAddress's guest ones, mixed scalars and structs by value,
 //   a variadic call; closures refused (FFI_BAD_ABI);

@@ -905,7 +905,13 @@ fn install_module(
                     (None, None, Some(v)) => B::Abs(v),
                     // a weak name nothing defines (the C mains Wine's crt_main
                     // names): JS's null
-                    (None, None, None) if !n.contains('!') && !funcs.contains(n) && others(n).is_none() => continue,
+                    (None, None, None) if !n.contains('!') && !funcs.contains(n) && others(n).is_none() && MAIN_NAMES.contains(&n.as_str()) => continue,
+                    // any other, in a module other than the core (`if (&f)`,
+                    // C++'s thread_local init functions): null, as natively;
+                    // the core's stay late slots
+                    (None, None, None) if !n.contains('!') && !funcs.contains(n) && others(n).is_none() && weak.contains(n) && std::path::Path::new(name).file_name().is_some_and(|f| f != CORE_MODULE) => B::Abs(0),
+                    // (a strong one: a slot filled when a module defining it is
+                    // installed, as natively, never a silent null)
                     (None, None, None) => {
                         let off = len;
                         len += 1;
