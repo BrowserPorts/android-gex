@@ -77,7 +77,7 @@ async function forkBulkIn(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { setFill, fillFile, lazyReady, kernelThread, lazyFetch, lazyStats, processMemories } from './lazy-fetch.mjs';
+import { lazyReady, kernelThread, lazyFetch, lazyStats, processMemories } from './lazy-fetch.mjs';
 import { blockIo } from './blocks.mjs';
 import { lateZstd } from './zstd-late.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
@@ -807,10 +807,6 @@ async function handle(msg) {
       // Fetched by the page ahead of time (an ejected page's preload list).
       const pre = preFiles.get(rel);
       if (pre) return pre.slice(); // an unshared copy: Module and TextDecoder refuse shared views
-      // A late unit's (eject-site.mjs --late), in the fill: a Worker started
-      // before the page had compiled it waits for its bytes there.
-      const late = fillFile(`unit:${rel}`);
-      if (late) return late;
       if (preClosed) return null;
       if (unitFiles.has(rel)) {
         const b = unitFiles.get(rel);
@@ -888,10 +884,7 @@ async function handle(msg) {
   if (msg.testUd2Entry) globalThis.GEX_TEST_UD2_ENTRY = 1;
   if (msg.fillTime) globalThis.GEX_FILL_TIME = 1;
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
-  // Lazy files the page is filling in the background (app.js `fill`): their
-  // reads wait for the bytes there, not a request of their own (lazy-fetch.mjs).
-  if (msg.fill) setFill(msg.fill);
-  // The page's cache of lazy files (app.js `lazyCache`, lazy-cache.mjs).
+  // The page's lazy source (fs.js setLazySource, lazy-cache.mjs).
   if (msg.lazyCache) setLazyCache(msg.lazyCache);
   // The directories the page serves (page/runtime fs.mount, page-fs.mjs).
   if (msg.pageFs) setPageFs(msg.pageFs);

@@ -175,14 +175,12 @@ install's (the compact space; the native modules' host-data views),
 `units` with function-tier units built from a first run, and `mem64` the
 memory64 flavour (GEX_TEST_WINE64_M64_DIST and _PREFIX, wine/dist.sh with
 WINE64_MEM64=1). wine64/cases.mjs holds the cases both groups share.
-`site/eject-page-files` builds an ejected page and checks it carries the
-page's runtime and X server.
 
 ## Images
 
 fixtures/images.mjs:
 
-- `busybox`: `bb.tar.zst`. This is BUSYBOX and its applets, the probe programs (fixtures/probe/*.c, built with gexcc), and an `/etc/xattr` with an extended attribute. It also holds `lazy.bin` and `lazy-program.bin`, a lazy file's bytes (core/dir-times's and core/runprogram's), and `rt-side.so`, the side module core/dlopen-static's static program loads.
+- `busybox`: `bb.tar.zst`. This is BUSYBOX and its applets, the probe programs (fixtures/probe/*.c, built with gexcc), and an `/etc/xattr` with an extended attribute. It also holds `lazy.bin`, `lazy-program.bin` and `lazy-plain.bin` and `lazy-plain2.bin`, lazy files' bytes (core/dir-times's, core/spawn-layers' and core/lazy-plain's), and `rt-side.so`, the side module core/dlopen-static's static program loads.
 - `slim`: GEX_TEST_SLIM's image and repository, with `slim-repo.json` listing the repository.
 - `package`: `pkg/`, the runtime package (page/runtime/build.sh).
 - `wine64`: `wine64.tar` and `wine64-lazy.json`. They hold 64-bit Wine's install (GEX_TEST_WINE64_DIST, wine64-dist.sh's WINE64_DIST) at /wine64 and a page prefix made from GEX_TEST_WINE64_PREFIX (wine/page-prefix.sh) at /pfx. Files over 64 KiB are lazy, served from `wine64/` in the work directory (fixtures/wine/pack.py). A link in the install that points out of it (a dist made of links into another) is packed as what it points at.

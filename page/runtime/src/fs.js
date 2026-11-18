@@ -55,7 +55,7 @@ async function tarBytes(src) {
 
 /** A lazy list, as `[[path, size, url, mode, mtime], ...]`: the page's own
  *  (`[[path, size, url, mode], ...]`), or the URL of one as JSON, which may
- *  also be an ejected build's lazy.json (site/eject-site.mjs: `{ base, files:
+ *  also be a site's lazy.json (`{ base, files:
  *  [[path, size, rel, mtime, mode], ...] }`, mtime in seconds, mode and
  *  mtime optional; `rel` may be a rest bundle's `BUNDLE#OFFSET`), or such
  *  an object itself (its `base` then resolved against the page). A file's
@@ -111,7 +111,7 @@ async function keyList(lazy) {
   }
   return list;
 }
-/** A lazy source's key, at most (lazy-cache.mjs URL_MAX). */
+/** A lazy source's key, at most (lazy-cache.mjs KEY_MAX). */
 const KEY_MAX = 1000;
 
 /** A same-origin URL as the path the kernel keeps for a lazy file. */
@@ -225,7 +225,7 @@ export class Filesystem extends EventTarget {
       /** A program's image as an untarred bundle has it (kfs.js
        *  `layImage`): a preset's (a test page's runProgram), not the API's. */
       addImage: (layer) => this.#add(Promise.resolve({ image: true, ...layer })),
-      /** `{ module, data }` (setLazySource), or null; boot's owner of the lazy files imports it. */
+      /** `{ module, data }` (setLazySource), or null; its Worker (lazy-source-worker.js) imports it. */
       lazySource: () => this.#lazySource,
       /** The page's end of the line to the source, once the owner has started. */
       setLazyPort: (port) => { this.#lazyPort = port; },
@@ -266,7 +266,7 @@ export class Filesystem extends EventTarget {
 
   /**
    * The page's own source of the lazy files' bytes, in place of the
-   * runtime's (a ranged fetch of each file's URL, kept in Cache Storage):
+   * runtime's (a ranged fetch of each file's URL, in each Worker that reads it):
    * `module` (a URL) is imported into the Worker that answers every
    * program's read of a lazy file, and exports `read(key, offset, length)`,
    * which resolves to `length` bytes of the file `key` names from `offset`,

@@ -118,13 +118,6 @@ function unitModuleWorker(zstd) {
   };
 }
 
-/** `fetchUnit`, but a unit the fill brings (`late`: key to its Module's
- *  promise) from there: one download of it, not two. */
-function lateFirst(late, fetchUnit) {
-  if (!late?.size) return fetchUnit;
-  return (url) => late.get(url.split('/').at(-2)) ?? fetchUnit(url);
-}
-
 async function fetchBytes(url, onProgress) {
   // Revalidated, never taken from cache on faith: the shim and seed have fixed
   // URLs with no content hash, so a browser would keep serving a broken build
@@ -215,7 +208,7 @@ export function primeRuntime(r) {
   if (r?.fetchOther) fetchOther = r.fetchOther;
   if (r?.shimBytes && !shimBytes) shimBytes = r.shimBytes;
   if (r?.seedBytes && !seedBytes) seedBytes = r.seedBytes;
-  // An ejected site's page fetches the kernel through its pack too (app.js).
+  // A page may fetch the kernel itself too.
   if (r?.kernelBytes && !kernelBytes) kernelBytes = r.kernelBytes;
 }
 
@@ -580,12 +573,12 @@ export function glStarter(compositor, glChannel, { dom, backend = 'wgpu', source
 /**
  * The process host every guest process runs under (host.mjs): its Worker
  * pool, the runtime's modules, and the switches each Worker takes (`extra`).
- * `o` is what of `runProgram`'s options it needs, and the channels made for
+ * `o` is what of the system's options it needs, and the channels made for
  * the page's devices; `on` its callbacks (ProcessHost's `onOutput`,
  * `onExit`, `readStdin`, `onMessage`).
  */
 export async function makeProcessHost({
-  kernel, closure = null, lateUnits = null, heartbeat = defaultHeartbeat(), fill = null, lazyCache = null, pageFs = null,
+  kernel, closure = null, heartbeat = defaultHeartbeat(), lazyCache = null, pageFs = null,
   restBundle = false, identities = null, providerSources = null, stateful = null, recompileObjects = defaultRecompile(),
   closureBuildNumbered = false, link = defaultLink(), uid, preModules = null, glChannel = null, wlChannel = null,
   netChannel = null, network = null, winsize,
@@ -597,7 +590,7 @@ export async function makeProcessHost({
   // A compressed unit (`?cgenzst=1`) is fetched, decoded and compiled in a
   // Worker of its own, off this thread.
   unitModule: globalThis.GEX_CGEN && globalThis.GEX_CGEN_ZST && globalThis.GEX_CGEN_ZSTD
-    ? lateFirst(lateUnits, unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD))) : null,
+    ? unitModuleWorker(absUrl(globalThis.GEX_CGEN_ZSTD)) : null,
   shim: shimBytes,
   // The closure's image module in place of the seed: it holds the program's
   // own text, already lifted.
@@ -625,7 +618,6 @@ export async function makeProcessHost({
     // In `extra` so every Worker gets it, not only pid 1: the interesting
     // process is the X server and the client it forks, not the demo's shell.
     heartbeat: heartbeat || undefined,
-    fill: fill || undefined,
     lazyCache: lazyCache || undefined,
     pageFs: pageFs || undefined,
     restBundle: restBundle || undefined,

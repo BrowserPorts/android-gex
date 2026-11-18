@@ -378,6 +378,12 @@ async function startBrowser() {
     iso();
     const type = TYPES[f.slice(f.lastIndexOf('.'))];
     if (type) res.setHeader('Content-Type', type);
+    // `?plain`: a host that is no help, Range ignored and no Content-Length
+    // (the whole file, chunked).
+    if (new URLSearchParams(query).has('plain')) {
+      for (let at = 0; at < all.length; at += 1 << 16) res.write(all.subarray(at, at + (1 << 16)));
+      return res.end();
+    }
     res.setHeader('Accept-Ranges', 'bytes');
     const m = /bytes=(\d+)-(\d*)/.exec(req.headers.range ?? '');
     if (m) {

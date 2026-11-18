@@ -121,10 +121,6 @@ function programArgs(what, argv, opts = {}) {
   return [argv, opts];
 }
 
-/** The Cache Storage that keeps the lazy files a system read (boot's owner
- *  of them, page/src/lazy-cache-worker.js), by URL and version. */
-const LAZY_CACHE = 'gex-runtime-lazy-v1';
-
 export class System extends EventTarget {
   #opts;
   #state = { phase: 'new', error: null, progress: null, console: '' };
@@ -478,20 +474,16 @@ export class System extends EventTarget {
     const { compositor } = dev;
     const netChannel = await rt.openNet(this.#net);
     this.#mark('network');
-    // A lazy file in a rest bundle (`BUNDLE#OFFSET`: an ejected site's
-    // lazy.json, site/eject-site.mjs) is read through zstd frames. (A
-    // page's own lazy source names its files by keys of its own.)
+    // A lazy file in a rest bundle (`BUNDLE#OFFSET`) is read through zstd
+    // frames, by each Worker that reads one. (A page's own lazy source names
+    // its files by keys of its own.)
     const lazySource = this.#parts.get('filesystem')?.[INTERNAL]?.lazySource() ?? null;
     this.#restBundle = !lazySource && opts.layers.some((l) => l.lazy?.some(([, , url]) => String(url).includes('#')));
     const stops = [];
-    // One Worker owns the lazy files (page/src/lazy-cache-worker.js), as an
-    // ejected page's does: every Worker's read asks it, and it keeps what it
-    // fetched in Cache Storage for the next visit and decodes a rest
-    // bundle's frames with the one decoder. Without it each Worker loaded a
-    // decoder of its own, an engine memory reservation in each, and a
-    // desktop's Workers ran the page out of them. Where it cannot run (no
-    // shared memory, no Cache Storage), each Worker reads for itself.
-    const lazyCache = await this.#lazyOwner(rt, kernel, opts.layers, stops);
+    // A lazy source's Worker owns the lazy files when the page set one
+    // (fs.js setLazySource): every Worker's read asks it. Without one, each
+    // Worker reads a lazy file for itself, by ranged requests.
+    const lazyCache = lazySource ? await this.#lazySourceOwner(kernel, this.#parts.get('filesystem')[INTERNAL], stops) : null;
     this.#mark('lazy owner');
     const host = await rt.makeProcessHost({
       // Every Worker gets the page-fs channel's control buffer: a mount made
@@ -1197,39 +1189,6 @@ export class System extends EventTarget {
         removeEventListener('pagehide', leave);
       }
     });
-  }
-
-  /** The lazy files' owner for boot's `layers` (see boot): its control
-   *  buffer for every Worker (`{ ctl }`), or null where there is none. One
-   *  the page made already (an ejected page's, which also downloads the rest
-   *  bundle ahead into its cache) is the owner: a second one beside it read
-   *  from a cache of its own and fetched again what the first had stored. */
-  async #lazyOwner(rt, kernel, layers, stops) {
-    const fsi = this.#parts.get('filesystem')?.[INTERNAL];
-    if (fsi?.lazySource()) return this.#lazySourceOwner(kernel, fsi, stops);
-    if (this.#preset.host.lazyCache) return this.#preset.host.lazyCache;
-    const lazy = layers.flatMap((l) => l.lazy ?? []);
-    if (!MP_CODE || !lazy.length || typeof Worker !== 'function' || typeof caches !== 'object' || typeof SharedArrayBuffer !== 'function'
-      || !(kernel.memory?.buffer instanceof SharedArrayBuffer)) return null;
-    const { makeControl, lazyVersion } = await import('../../../hosts/browser/js/lazy-cache.mjs');
-    const ctl = makeControl();
-    const w = new Worker(new URL('../../src/lazy-cache-worker.js', import.meta.url), { type: 'module', name: 'lazy-cache' });
-    const ready = await new Promise((r) => {
-      w.onmessage = ({ data: m }) => { if (m.kind === 'ready') r(m); };
-      w.onerror = (e) => r({ ok: false, why: e.message ?? String(e) });
-      setTimeout(() => r({ ok: false, why: 'no answer in 5 s' }), 5000);
-      w.postMessage({
-        ctl, memory: kernel.memory, cache: LAZY_CACHE, zstd: this.#restBundle || null,
-        versions: Object.fromEntries(lazy.map(([, size, url, , mtime]) => [url, lazyVersion(size, mtime)])),
-      });
-    });
-    if (!ready.ok) {
-      w.terminate();
-      if (this.#restBundle) this.#say(`gex: lazy files read by each process: ${ready.why}\n`);
-      return null;
-    }
-    stops.push(() => w.terminate());
-    return { ctl };
   }
 
   /** The owner of the lazy files for the page's own source (fs.js
