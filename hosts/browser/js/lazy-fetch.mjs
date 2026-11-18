@@ -6,7 +6,7 @@
 import { noteFetch } from './fetch-note.mjs';
 import { logNamed } from './log.mjs';
 import { lateZstd } from './zstd-late.mjs';
-import { CHUNK, OWNER_FAILED, cachedRead, lazyCacheOn, FailedFrames, retrySync } from './lazy-cache.mjs';
+import { CHUNK, OWNER_FAILED, cachedRead, lazyCacheOn, lazyOwnerOnly, FailedFrames, retrySync } from './lazy-cache.mjs';
 
 // The background fill (app.js `fill`): lazy files the page downloads, packed
 // one after another in one stream, while the guest runs. `buf` (a
@@ -379,6 +379,14 @@ export function lazyFetch(memory) {
       if (n >= 0) return n;
     }
     const done = noteFetch(href, len);
+    // The page's own source (fs.js setLazySource): the key is its, and the
+    // owner is the only one who can read it.
+    if (lazyOwnerOnly()) {
+      const c = cachedRead(href, from, dst, len);
+      done(c === len ? len : 0);
+      if (c !== len) sayOnce(href, `[lazy] ${href.replace(/^\/=/, '')} @${from}+${len}: the page's lazy source failed`);
+      return c === len ? len : -1;
+    }
     if (href.includes('#')) {
       // The owner's decoder, when the page has one; this Worker's own if not.
       const c = cachedRead(absolute(href), from, dst, len);

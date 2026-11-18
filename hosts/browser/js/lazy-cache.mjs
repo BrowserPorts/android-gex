@@ -16,7 +16,8 @@
 //
 // The slots: `ctl`, an Int32Array on a SharedArrayBuffer of SLOTS * SLOT
 // bytes after a header of HEAD bytes. ctl[0] counts requests (the owner
-// waits on it). A slot, i32 at SLOT/4 * i + HEAD/4:
+// waits on it); ctl[1] counts slots freed (a reader with nowhere else to go
+// waits on it for a free slot). A slot, i32 at SLOT/4 * i + HEAD/4:
 //   [0] state: FREE, ASKED (the reader waits), TAKEN (the owner reads the
 //       cache or fetches; the reader keeps waiting), WRITING (the owner
 //       copies), DONE, GIVEN_UP (no owner took the ask in time and the
@@ -52,6 +53,9 @@ export function makeControl() {
 
 let ctl = null;
 let raw = null;
+/** Whether the owner is the only way to a lazy file's bytes: a page's own
+ *  source (fs.js setLazySource), whose keys are not URLs. */
+let only = false;
 /** Whether this Worker has an owner to ask (`setLazyCache`). */
 export function lazyCacheOn() {
   return ctl !== null;
@@ -62,6 +66,12 @@ export function setLazyCache(c) {
   if (!c?.ctl) return;
   ctl = new Int32Array(c.ctl);
   raw = new Uint8Array(c.ctl);
+  only = !!c.only;
+}
+
+/** Whether a read must go to the owner and nowhere else (`only`). */
+export function lazyOwnerOnly() {
+  return only;
 }
 
 // How long a reader waits for the owner to take its ask before it asks the
@@ -85,8 +95,14 @@ export function cachedRead(href, from, dst, len) {
   const url = new TextEncoder().encode(href);
   if (url.length > URL_MAX) return -1;
   let s = -1;
-  for (let i = 0; i < SLOTS; i++) {
-    if (Atomics.compareExchange(ctl, (HEAD + i * SLOT) / 4, FREE, ASKED + 100) === FREE) { s = i; break; }
+  for (;;) {
+    const freed = Atomics.load(ctl, 1);
+    for (let i = 0; i < SLOTS; i++) {
+      if (Atomics.compareExchange(ctl, (HEAD + i * SLOT) / 4, FREE, ASKED + 100) === FREE) { s = i; break; }
+    }
+    // With no other way to the bytes, a full set of slots is waited out.
+    if (s >= 0 || !only) break;
+    Atomics.wait(ctl, 1, freed, 1000);
   }
   if (s < 0) return -1;
   const base = (HEAD + s * SLOT) / 4;
@@ -110,7 +126,7 @@ export function cachedRead(href, from, dst, len) {
       said = true;
       console.warn(`[gex] a read of ${href} @${from} has waited 10 s for the page's lazy files (${st === ASKED ? 'not taken yet' : 'taken'})`);
     }
-    if (st === ASKED && Date.now() - t0 > WAIT_MS) {
+    if (st === ASKED && !only && Date.now() - t0 > WAIT_MS) {
       if (Atomics.compareExchange(ctl, base, ASKED, GIVEN_UP) === ASKED) return -1;
       continue;
     }
@@ -118,6 +134,8 @@ export function cachedRead(href, from, dst, len) {
   }
   const n = ctl[base + 1];
   Atomics.store(ctl, base, FREE);
+  Atomics.add(ctl, 1, 1);
+  Atomics.notify(ctl, 1);
   return n < 0 ? OWNER_FAILED : n;
 }
 

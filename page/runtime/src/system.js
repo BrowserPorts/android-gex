@@ -444,8 +444,10 @@ export class System extends EventTarget {
     const netChannel = await rt.openNet(this.#net);
     this.#mark('network');
     // A lazy file in a rest bundle (`BUNDLE#OFFSET`: an ejected site's
-    // lazy.json, site/eject-site.mjs) is read through zstd frames.
-    this.#restBundle = opts.layers.some((l) => l.lazy?.some(([, , url]) => String(url).includes('#')));
+    // lazy.json, site/eject-site.mjs) is read through zstd frames. (A
+    // page's own lazy source names its files by keys of its own.)
+    const lazySource = this.#parts.get('filesystem')?.[INTERNAL]?.lazySource() ?? null;
+    this.#restBundle = !lazySource && opts.layers.some((l) => l.lazy?.some(([, , url]) => String(url).includes('#')));
     const stops = [];
     // One Worker owns the lazy files (page/src/lazy-cache-worker.js), as an
     // ejected page's does: every Worker's read asks it, and it keeps what it
@@ -551,6 +553,7 @@ export class System extends EventTarget {
     const gl = single.gl && { d3d: !!single.gl.d3d };
     // A rest bundle's lazy files (`BUNDLE#OFFSET`) are read through zstd
     // frames: the system Worker loads the decoder before its kernel starts.
+    if (this.#parts.get('filesystem')?.[INTERNAL]?.lazySource()) throw new Error('setLazySource: the single-thread build has no owner of the lazy files to run a page\'s source in; use the default build');
     this.#restBundle = opts.layers.some((l) => l.lazy?.some(([, , url]) => String(url).includes('#')));
     const k = await Kernel.startSingle({ globals: rt.pageGlobals(), arch, host: { ...this.#preset.host, restBundle: this.#restBundle }, wl, gl }, (m) => {
       if (m.ev === 'output') this.#say(m.text);
@@ -1126,6 +1129,8 @@ export class System extends EventTarget {
    *  bundle ahead into its cache) is the owner: a second one beside it read
    *  from a cache of its own and fetched again what the first had stored. */
   async #lazyOwner(rt, kernel, layers, stops) {
+    const fsi = this.#parts.get('filesystem')?.[INTERNAL];
+    if (fsi?.lazySource()) return this.#lazySourceOwner(kernel, fsi, stops);
     if (this.#preset.host.lazyCache) return this.#preset.host.lazyCache;
     const lazy = layers.flatMap((l) => l.lazy ?? []);
     if (!MP_CODE || !lazy.length || typeof Worker !== 'function' || typeof caches !== 'object' || typeof SharedArrayBuffer !== 'function'
@@ -1149,6 +1154,32 @@ export class System extends EventTarget {
     }
     stops.push(() => w.terminate());
     return { ctl };
+  }
+
+  /** The owner of the lazy files for the page's own source (fs.js
+   *  `setLazySource`, lazy-source-worker.js): its control buffer for every
+   *  Worker, which reads through it alone (`only`). */
+  async #lazySourceOwner(kernel, fsi, stops) {
+    if (!MP_CODE || typeof SharedArrayBuffer !== 'function' || !(kernel.memory?.buffer instanceof SharedArrayBuffer)) {
+      throw new Error('setLazySource: the lazy source needs shared memory (a cross-origin isolated page, the default build)');
+    }
+    const { makeControl } = await import('../../../hosts/browser/js/lazy-cache.mjs');
+    const ctl = makeControl();
+    const { module, data } = fsi.lazySource();
+    const line = new MessageChannel();
+    const w = new Worker(new URL('./lazy-source-worker.js', import.meta.url), { type: 'module', name: 'lazy-source' });
+    const ready = await new Promise((r) => {
+      w.onmessage = ({ data: m }) => { if (m.kind === 'ready') r(m); };
+      w.onerror = (e) => r({ ok: false, why: e.message ?? String(e) });
+      w.postMessage({ ctl, memory: kernel.memory, module, data, port: line.port2 }, [line.port2]);
+    });
+    if (!ready.ok) {
+      w.terminate();
+      throw new Error(`setLazySource: ${module}: ${ready.why}`);
+    }
+    fsi.setLazyPort(line.port1);
+    stops.push(() => { w.terminate(); line.port1.close(); });
+    return { ctl, only: true };
   }
 
   /** Spawn with pipes, write `input` (if any), wait, collect:

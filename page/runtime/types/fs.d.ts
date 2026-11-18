@@ -58,6 +58,24 @@ export type LazyList =
   | string
   | URL;
 
+/** What a lazy source's `init(ctx)` is given (Filesystem.setLazySource). */
+export interface LazySourceContext {
+  /** setLazySource's `data`. */
+  data: unknown;
+  /** The source's end of the line whose other end is the filesystem's `lazyPort`. */
+  port: MessagePort;
+  /** Bytes of `key` from `offset`, handed over before a program reads them: a read inside
+   *  them is answered from them, and they are let go once read. */
+  put(key: string, offset: number, bytes: Uint8Array): void;
+}
+
+/** A lazy source module (Filesystem.setLazySource). */
+export interface LazySourceModule {
+  init?(ctx: LazySourceContext): void | Promise<void>;
+  /** `length` bytes of the file `key` names from `offset`; a rejection is EIO to the program. */
+  read(key: string, offset: number, length: number): Promise<Uint8Array | ArrayBuffer>;
+}
+
 /** Abstract: a page makes a MemoryFilesystem, an OPFSFilesystem, or a
  *  subclass of its own that implements the store's methods (`new
  *  Filesystem(sys)` throws). */
@@ -76,6 +94,13 @@ export declare abstract class Filesystem extends EventTarget {
   /** An error with `code: 'ENOSPC'` when the store is full. */
   truncate(length: number): Promise<void>;
   flush(): Promise<void>;
+  /** The page's own source of the lazy files' bytes: `module` is imported into the Worker that
+   *  answers the programs' reads, and exports `read(key, offset, length)` (and `init(ctx)`,
+   *  optional; see LazySourceContext). A lazy list's third field is then a key of the page's.
+   *  Once, before boot and before any addTar; the default build only. */
+  setLazySource(module: string | URL, options?: { data?: unknown }): void;
+  /** The page's end of the line to its lazy source, once the system runs; else null. */
+  get lazyPort(): MessagePort | null;
   addTar(src: Source | null, options?: { at?: string; lazy?: LazyList }): Promise<unknown>;
   addFiles(files: Record<string, Source>, options?: { mode?: number }): Promise<unknown>;
   mount(path: string, provider: MountProvider): Mount;

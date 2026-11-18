@@ -96,6 +96,23 @@ async function lazyList(lazy) {
   return list.map(([p, size, url, mode, mtime]) => [p, size, new URL(url, base).href, mode, mtime]);
 }
 
+/** A lazy list for a lazy source: `[[path, size, key, mode, mtime], ...]`,
+ *  or the URL of one as JSON; each key a string the source knows. */
+async function keyList(lazy) {
+  const list = typeof lazy === 'string' || lazy instanceof URL
+    ? JSON.parse(new TextDecoder().decode(await bytesOf(new URL(lazy, globalThis.location?.href).href, 'lazy list')))
+    : lazy;
+  if (!Array.isArray(list)) throw new TypeError('lazy: a list of [path, size, key] or its URL');
+  const enc = new TextEncoder();
+  for (const [p, size, key] of list) {
+    if (typeof key !== 'string' || !key || enc.encode(key).length > KEY_MAX) throw new TypeError(`lazy ${p}: a lazy source's key is a string of 1 to ${KEY_MAX} bytes`);
+    if (!Number.isSafeInteger(size) || size < 0) throw new TypeError(`lazy ${p}: size ${size}`);
+  }
+  return list;
+}
+/** A lazy source's key, at most (lazy-cache.mjs URL_MAX). */
+const KEY_MAX = 1000;
+
 /** A same-origin URL as the path the kernel keeps for a lazy file. */
 function lazyPath(href) {
   const u = new URL(href, globalThis.location?.href);
@@ -161,6 +178,9 @@ export class Filesystem extends EventTarget {
   #sources = [];
   #mounts = new Map(); // path -> { mount, id }
   #exclude;
+  /** The page's own source of the lazy files' bytes (`setLazySource`), or null. */
+  #lazySource = null;
+  #lazyPort = null;
 
   /** Abstract: a page makes a `MemoryFilesystem`, an `OPFSFilesystem`, or
    *  a subclass of its own that implements the store's methods. `cache`:
@@ -202,6 +222,10 @@ export class Filesystem extends EventTarget {
       /** A program's image as an untarred bundle has it (kfs.js
        *  `layImage`): a preset's (page/src/run-program.js), not the API's. */
       addImage: (layer) => this.#add(Promise.resolve({ image: true, ...layer })),
+      /** `{ module, data }` (setLazySource), or null; boot's owner of the lazy files imports it. */
+      lazySource: () => this.#lazySource,
+      /** The page's end of the line to the source, once the owner has started. */
+      setLazyPort: (port) => { this.#lazyPort = port; },
     };
   }
 
@@ -238,16 +262,56 @@ export class Filesystem extends EventTarget {
   }
 
   /**
+   * The page's own source of the lazy files' bytes, in place of the
+   * runtime's (a ranged fetch of each file's URL, kept in Cache Storage):
+   * `module` (a URL) is imported into the Worker that answers every
+   * program's read of a lazy file, and exports `read(key, offset, length)`,
+   * which resolves to `length` bytes of the file `key` names from `offset`,
+   * or rejects (the program's read fails with EIO). A lazy list's third
+   * field is then the file's key, any string of the page's (at most 1000
+   * bytes), not a URL. The module may export `init(ctx)`, awaited before
+   * the first read: `ctx.data` is `data` (anything structured clone takes),
+   * `ctx.port` the source's end of a MessagePort whose other end is
+   * `fs.lazyPort` once the system runs, and `ctx.put(key, offset, bytes)`
+   * hands over bytes before any program reads them (a download the source
+   * makes ahead): a later read inside them is answered from them, and they
+   * are let go once read. Once, before boot and before any `addTar`; the
+   * default build only (the single-thread build's boot rejects it).
+   */
+  setLazySource(module, { data } = {}) {
+    if (this.#sys.phase !== 'new') throw new Error(`setLazySource: before boot (the system is ${this.#sys.phase})`);
+    if (this.#lazySource) throw new Error('setLazySource: this filesystem has its lazy source already');
+    if (this.#sources.length) throw new Error('setLazySource: before the first addTar or addFiles');
+    let href;
+    try { href = new URL(module, globalThis.location?.href).href; } catch { throw new TypeError(`setLazySource: ${module} is not a module's URL`); }
+    this.#lazySource = { module: href, data };
+  }
+
+  /** The page's end of the line to its lazy source (`setLazySource`), a
+   *  MessagePort, once the system runs; else null. */
+  get lazyPort() { return this.#lazyPort; }
+
+  /**
    * A tar (bytes, a Blob, a stream, or a URL; zstd or not) laid over the
    * root at `at` (default '/'). Before boot it is one more layer; after, it
    * is written into the running tree. `lazy`: files fetched as they are
    * first read, `[[path, size, url, mode], ...]` (mode optional, 0644 without
    * one) or the URL of such a list, laid with the tar (`src` may then be
    * null). A list at a URL may be `{ base, files }`, each url relative to
-   * `base`, itself relative to the list.
+   * `base`, itself relative to the list. With a lazy source
+   * (`setLazySource`), each url is the file's key for the source instead,
+   * and the list is the array or the URL of one.
    */
   addTar(src, { at = '/', lazy } = {}) {
+    const keyed = !!this.#lazySource;
     const p = (async () => {
+      if (keyed && lazy) {
+        const lz = await keyList(lazy);
+        // The kernel keeps a lazy file's source as a path ('/' and the rest
+        // of it, leading slashes gone): a key goes as `=KEY`, which it keeps
+        // as `/=KEY` whatever the key starts with (lazy-source-worker.js).
+        return { tar: src == null ? null : await tarBytes(src), at: norm(at), lazy: lz.map(([p, size, key, mode, mtime]) => [under(at, p), size, `=${key}`, mode, mtime]) };
+      }
       const lz = lazy ? await lazyList(lazy) : [];
       return {
         tar: src == null ? null : await tarBytes(src),
@@ -281,8 +345,8 @@ export class Filesystem extends EventTarget {
     }
     return layer.then((l) => {
       // Its Workers started without the rest bundle's decoder (boot's
-      // layers had no such file).
-      if (l.lazy?.some(([, , url]) => url.includes('#')) && !this.#sys.restBundle()) {
+      // layers had no such file). (A lazy source's keys are its own.)
+      if (!this.#lazySource && l.lazy?.some(([, , url]) => url.includes('#')) && !this.#sys.restBundle()) {
         throw new Error('addTar: a rest bundle\'s lazy files (BUNDLE#OFFSET) after boot, in a system that booted with none: add the bundle\'s list before boot');
       }
       return l.image ? this.#files('addTar').layImage(l) : this.#files('addTar').lay(l);

@@ -338,6 +338,8 @@ files are written into the running tree.
 | Member | Does |
 | --- | --- |
 | `addTar(src, { at, lazy })` | A tar (zstd or not) as bytes, a `Blob`, a `Response`, a stream or a URL, laid at `at` (default `/`). `lazy`: files fetched when first read, `[[path, size, url, mode, mtime], ...]` (mode optional, 0644 without; mtime in seconds, optional) or the URL of such a list as JSON. A list (or the list at a URL) may be an ejected site's `lazy.json` instead: `{ base, files: [[path, size, url, mtime, mode], ...] }`, each url relative to `base`, which resolves against the list's URL (an ejected site's `/project/build/web/` names the list's own directory, wherever the site is served) or, for the object, the page, and a url `BUNDLE#OFFSET` a file in the site's rest bundle (zstd frames, indexed by `BUNDLE.json`), which must be added before boot. Their URLs must be on the page's own origin and answer range requests. What a system reads of them is kept in the page's Cache Storage (`gex-runtime-lazy-v1`), by URL and version (size and mtime), for the next visit, where the page has shared memory and Cache Storage. |
+| `setLazySource(module, { data })` | The page's own source of the lazy files' bytes, in place of the runtime's ranged fetch of each file's URL and its Cache Storage (Lazy sources below). Once, before boot and before any `addTar`; the default build only (the single-thread build's boot rejects it). |
+| `lazyPort` | With a lazy source, the page's end of a `MessagePort` to it, once the system runs; else null. |
 | `addFiles({ path: data }, { mode })` | Single files: bytes, a `Blob`, a URL, or a string (the file's text); `mode` default 0644. |
 | `readFile(path, { encoding })` | Bytes, or text with an `encoding`. |
 | `writeFile(path, data, { mode, append, exclusive })` | Writes the file, made if missing. |
@@ -347,6 +349,36 @@ files are written into the running tree.
 | `watch(path, fn)` | `fn({ type, path })` for each change to a directory's entries or to a file, by a program or the page: `create`, `change` (a write finished), `attrib`, `delete`, `move-out` and `move-in` (one rename's halves share a `cookie`), and `gone` when `path` itself went. Returns a function that stops it. |
 
 Errors carry `code` (`'ENOENT'`, ...) and `errno`.
+
+### Lazy sources
+
+A page decides how its lazy files' bytes arrive: from which server, in which
+pieces and order, cached where, decoded how. `fs.setLazySource(module, { data })`
+names a module that the runtime imports into the Worker that answers every
+program's read of a lazy file. A lazy list's third field is then the file's key,
+a string of the page's (at most 1000 bytes), not a URL. A program's read waits,
+in its own thread only, for the module's answer.
+
+| Export | Does |
+| --- | --- |
+| `read(key, offset, length)` | Resolves to `length` bytes (a `Uint8Array` or `ArrayBuffer`) of the file `key` names, from `offset`. A rejection is `EIO` to the program. Reads come in pieces of up to 1 MiB, several at once. |
+| `init(ctx)` | Optional, awaited before the first read. `ctx.data` is `setLazySource`'s `data` (anything structured clone takes); `ctx.port` is the module's end of a `MessagePort` whose other end is `fs.lazyPort`; `ctx.put(key, offset, bytes)` hands over bytes before any program asks for them (a download the source makes ahead): a later read inside them is answered from them, and they are let go once read. |
+
+```js
+// source.js, imported into the runtime's Worker
+let base;
+export function init(ctx) { base = ctx.data.base; }
+export async function read(key, offset, length) {
+  const r = await fetch(new URL(key, base), { headers: { Range: `bytes=${offset}-${offset + length - 1}` } });
+  if (r.status !== 206) throw new Error(`${key}: ${r.status}`);
+  return new Uint8Array(await r.arrayBuffer());
+}
+```
+
+```js
+fs.setLazySource(new URL('./source.js', import.meta.url), { data: { base: location.href } });
+fs.addTar('/trees/base.tar.zst', { lazy: [['/usr/share/big.dat', 52428800, 'files/big.dat']] });
+```
 
 ### Mounts
 
