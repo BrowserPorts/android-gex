@@ -285,6 +285,27 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     await one('bigdata', src, ['-O1'], { want: /bigdata: ends 1 module 1 1/ });
   }
   await one('hostdatacc', join(W, 'hostdata.c'), ['-O2']);
+  if (want('shmview')) {
+    // two views of one section in one process are one range, the ended
+    // threads' TLS gone from Wine's views; a based view is the expected copy
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'shmview.c'), 'shmview.exe', ['-O2']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      t.check(`${pre}shmview: build`, false, String(e.message));
+    }
+    const tls = 'shmview: 0 of 8 ended threads\' TLS still committed\n';
+    for (const m of ['same', 'whole', 'shifted']) {
+      if (exe) await w.nt({ ...o, name: `${pre}shmview-${m}`, exe, extra: [`${exe}.wasm`], args: [m, '5'],
+        want: new RegExp(`${tls}shmview: views one range\nshmview: ${m} [1-9]\\d* records, 0 bad\n0 failures`) });
+    }
+    if (exe) await w.nt({ ...o, name: `${pre}shmview-rdonly`, exe, extra: [`${exe}.wasm`], args: ['rdonly', '1'],
+      want: new RegExp(`${tls}shmview: rdonly views one range, written through the second read through the first\n` +
+        'shmview: rdonly first view reports PAGE_READWRITE \\(one range, one protection: an expected gap\\)\n0 failures') });
+    if (exe) await w.nt({ ...o, name: `${pre}shmview-big`, exe, extra: [`${exe}.wasm`], args: ['big', '1'],
+      want: new RegExp(`${tls}shmview: big views one range\n0 failures`) });
+    if (exe) await w.nt({ ...o, name: `${pre}shmview-based`, exe, extra: [`${exe}.wasm`], args: ['based', '1'],
+      want: new RegExp(`${tls}shmview: based views two ranges \\(a separate copy, as expected\\)\n0 failures`) });
+  }
   if (want('owndll')) {
     // a program linked against its own DLL's import library (the DLL
     // without a .def: its default-visibility symbols are its exports):
