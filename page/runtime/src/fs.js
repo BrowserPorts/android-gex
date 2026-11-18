@@ -431,6 +431,20 @@ export class Filesystem extends EventTarget {
     return this.#files('writeFile').writeFile(norm(path), bytes, { mode, append, exclusive });
   }
 
+  /**
+   * The files whose bytes the programs have read so far (an open or a stat
+   * alone is not a read), in the order of their first reads: a page that
+   * splits its tree by use (what a start reads ships first, the rest lazy)
+   * records it here. The default build only.
+   */
+  async usedFiles() {
+    this.#files('usedFiles');
+    const spec = this.#sys.kernelSpec();
+    if (!spec?.module || !spec?.memory) throw new Error('usedFiles: the default build only (a shared kernel)');
+    const { openedFiles } = await import('../../src/fs-opened.js');
+    return openedFiles(spec);
+  }
+
   /** `{type, mode, size, ino, mtime (ms), nlink}`; `follow: false` is lstat. */
   stat(path, { follow = true } = {}) {
     return this.#files('stat').stat(norm(path), follow);

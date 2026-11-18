@@ -3,3 +3,4 @@
 export { System } from './system.js';
 export { Process, Pty, DataEvent } from './process.js';
 export { SIGNALS } from './internal.js';
+export { hostTimeZone } from './timezone.js';

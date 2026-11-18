@@ -16,6 +16,10 @@ export declare const SIGNALS: Readonly<{
   SIGCHLD: 17; SIGCONT: 18; SIGSTOP: 19; SIGTSTP: 20; SIGTTIN: 21; SIGTTOU: 22; SIGWINCH: 28;
 }>;
 
+/** The browser's time zone for a program's `env`: `TZ` (its rules as a POSIX string) and
+ *  `WINEGEX_TZNAME` (the zone's name, for Wine), or `{}` when the browser names none. */
+export declare function hostTimeZone(): { TZ?: string; WINEGEX_TZNAME?: string };
+
 export interface SystemOptions {
   /** The directory that holds `gex/` (default: beside the modules). */
   baseUrl?: string;

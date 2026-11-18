@@ -109,6 +109,9 @@ export declare abstract class Filesystem extends EventTarget {
   readFile(path: string): Promise<Uint8Array>;
   readFile(path: string, options: { encoding: string }): Promise<string>;
   writeFile(path: string, data: string | Uint8Array, options?: { mode?: number; append?: boolean; exclusive?: boolean }): Promise<void>;
+  /** The files whose bytes the programs have read so far, in the order of their first reads
+   *  (the default build only). */
+  usedFiles(): Promise<string[]>;
   stat(path: string, options?: { follow?: boolean }): Promise<Stat>;
   readdir(path: string): Promise<{ name: string; type: FileType }[]>;
   mkdir(path: string, options?: { recursive?: boolean; mode?: number }): Promise<void>;

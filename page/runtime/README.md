@@ -65,6 +65,10 @@ filesystem's `writeback` (5 s), at a program's `fsync` or `sync`, and when
 the tab is hidden or left: a desktop need not call `sys.sync()`, though it
 may before it unloads. `/tmp`, `/run` and mounts are never kept.
 
+**The time.** A tree without zoneinfo runs on UTC. `hostTimeZone()` (from
+`@gexemu/runtime`) gives the browser's zone as environment, `{ TZ, WINEGEX_TZNAME }`, for
+the `env` of the programs a page starts: `{ ...env, ...hostTimeZone() }`.
+
 **Terminals.** A terminal is a `spawn` with a `pty`; its `data` events go to the
 desktop's terminal widget and its keys come back with `pty.write`. Resize
 with `pty.resize(cols, rows)`. Nothing is inherited, so give every program its
@@ -343,6 +347,7 @@ files are written into the running tree.
 | `addFiles({ path: data }, { mode })` | Single files: bytes, a `Blob`, a URL, or a string (the file's text); `mode` default 0644. |
 | `readFile(path, { encoding })` | Bytes, or text with an `encoding`. |
 | `writeFile(path, data, { mode, append, exclusive })` | Writes the file, made if missing. |
+| `usedFiles()` | The paths whose bytes the programs have read so far (an open or a stat alone is not a read), in the order of their first reads: what a page that splits its tree by use ships first. The default build only. |
 | `stat(path, { follow })` | `{ type, mode, size, ino, mtime, nlink }`; `follow: false` does not follow a last symlink. |
 | `readdir(path)` | `[{ name, type }]`. |
 | `mkdir(path, { recursive, mode })`, `rm(path, { recursive, force })`, `rename(from, to)`, `symlink(target, path)`, `readlink(path)`, `chmod(path, mode)` | As their commands. |

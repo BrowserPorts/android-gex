@@ -135,6 +135,9 @@ export class System extends EventTarget {
   #afterBoot = [];
   /** The kernel from the page (kernel.js), and what works through it. */
   #kernel = null;
+  /** The shared kernel's module and memory (runtime.js loadKernel), in the
+   *  default build: what a helper Worker of the page's instantiates. */
+  #kernelSpec = null;
   #files = null;
   #programs = null;
   /** The running system: { host, kernel, term, rt, compositor, wlChannel,
@@ -248,6 +251,7 @@ export class System extends EventTarget {
       /** The kernel's exports (kernel.js), the guest's files (kfs.js), and
        *  the programs, watches and X hold (programs.js), once the system runs. */
       kernel: () => this.#kernel,
+      kernelSpec: () => this.#kernelSpec,
       files: () => this.#files,
       programs: () => this.#programs,
       /** The guest's sockets from now on (page/src/net.js `Sockets`): a
@@ -428,6 +432,7 @@ export class System extends EventTarget {
     this.#mark('tso');
     const kernel = await (kernelEarly ?? rt.loadKernel());
     if (!kernel) throw new Error('the kernel would not load');
+    this.#kernelSpec = kernel;
     this.#mark('kernel loaded');
 
     // What the runtime says (the X server, Mesa), on the console.
