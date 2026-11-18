@@ -20822,6 +20822,43 @@ pub extern "C" fn gex_guest_mapped_mib() -> u32 {
     (crate::sigs::proc_home().mm().lock().vm_counters().1 >> 20) as u32
 }
 
+/// The spans of this process's memory anything was handed (the guest's
+/// accessible mappings and gex's own regions, merged, in order), for a pass
+/// over them that counts what is resident (the exit line's, worker.mjs's
+/// `touchedMib`): a memory64 is 8 GiB, nearly none of it ever mapped. Taken
+/// by `gex_resident_spans` (how many; 0: the map cannot say, walk all) and
+/// read back by `gex_resident_span`.
+static RESIDENT_SPANS: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+#[no_mangle]
+pub extern "C" fn gex_resident_spans() -> u32 {
+    let Some(mut v) = memmap::runtime_regions() else { return 0 };
+    for m in crate::sigs::proc_home().mm().lock().vmas() {
+        if m.prot != 0 {
+            v.push((m.start, m.end));
+        }
+    }
+    v.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(v.len());
+    for (a, b) in v {
+        match out.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    let n = out.len() as u32;
+    *RESIDENT_SPANS.lock().unwrap_or_else(|e| e.into_inner()) = out;
+    n
+}
+
+/// Span `i`'s start (`end` 0) or end (`end` 1) of the last
+/// `gex_resident_spans`; 0 past them.
+#[no_mangle]
+pub extern "C" fn gex_resident_span(i: u32, end: u32) -> u64 {
+    let s = RESIDENT_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    s.get(i as usize).map_or(0, |&(a, b)| if end != 0 { b } else { a })
+}
+
 /// What this process's address space went on, in MiB: 0 guest mappings, 1 the
 /// runtime's own heap, 2 Worker stacks.
 ///
