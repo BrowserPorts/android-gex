@@ -2793,6 +2793,9 @@ fn start_guest_thread(cx: Arc<SpawnContext>, child: ThreadState) -> Result<()> {
 struct SparseCopy {
     pagemap: Option<std::fs::File>,
     buf: Vec<u8>,
+    /// Where there is no `pagemap` (macOS): which host pages were ever
+    /// touched, by `mincore` ([`gex_mem::host_pages_touched`]).
+    touched: Vec<u8>,
 }
 
 impl SparseCopy {
@@ -2804,7 +2807,7 @@ impl SparseCopy {
         let pagemap = (std::env::var_os("GEX_FORK_FULL_COPY").is_none())
             .then(|| std::fs::File::open("/proc/self/pagemap").ok())
             .flatten();
-        SparseCopy { pagemap, buf: vec![0; Self::BATCH * 8] }
+        SparseCopy { pagemap, buf: vec![0; Self::BATCH * 8], touched: Vec::new() }
     }
 
     /// Bytes written to `dst` (the non-zero pages of `src[a..b]`).
@@ -2830,10 +2833,19 @@ impl SparseCopy {
                 let off = ((base + p) / page * 8) as u64;
                 f.read_exact_at(&mut self.buf[..n * 8], off).ok().map(|()| &self.buf[..n * 8])
             });
+            // Without a pagemap: the host's `mincore` (macOS), where a
+            // read of a page never touched would make the host give it.
+            let host_page = if entries.is_none() && std::env::var_os("GEX_FORK_FULL_COPY").is_none() {
+                gex_mem::host_pages_touched(base + p, n * page, &mut self.touched)
+            } else {
+                None
+            };
+            let first_host_page = host_page.map(|hp| (base + p) / hp);
             for k in 0..n {
-                let present = match entries {
-                    Some(e) => u64::from_le_bytes(e[k * 8..k * 8 + 8].try_into().unwrap()) >> 62 != 0,
-                    None => true,
+                let present = match (entries, host_page, first_host_page) {
+                    (Some(e), _, _) => u64::from_le_bytes(e[k * 8..k * 8 + 8].try_into().unwrap()) >> 62 != 0,
+                    (None, Some(hp), Some(first)) => self.touched.get((base + p + k * page) / hp - first).is_none_or(|&t| t != 0),
+                    _ => true,
                 };
                 if !present {
                     continue;
@@ -2984,17 +2996,20 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // to that boundary leaves the child with an all-zero directory, so
         // every page resolves to the miss stub and the first branch after the
         // fork translates the same block forever.
+        // Sparsely too: the child's memory is fresh zero, and the M64
+        // directory is 66 MiB, mostly untouched, which a whole copy made
+        // the host give both processes (on macOS, a read alone does).
+        let mut sparse = SparseCopy::new();
         let low = gex_abi::DISPATCH_DIR_END as usize;
-        dst[..low].copy_from_slice(&src[..low]);
+        copied += sparse.copy(src, dst, 0, low);
         // An M64 memory's directory and patched bits are its dense tables
         // above 4 GiB instead.
         if gex_abi::mem64() {
             // (not the protection table after them: the child's kernel
             // writes its own, `Kernel::flush_perms`)
             let (a, b) = (gex_abi::DISPATCH_DIR64 as usize, gex_abi::PERM_TABLE64 as usize);
-            dst[a..b].copy_from_slice(&src[a..b]);
+            copied += sparse.copy(src, dst, a, b);
         }
-        let mut sparse = SparseCopy::new();
         for (start, end) in &regions {
             let (a, b) = (*start as usize, (*end as usize).min(src.len()));
             if a < b {

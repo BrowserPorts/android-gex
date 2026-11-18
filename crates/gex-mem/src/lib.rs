@@ -126,6 +126,52 @@ impl GuestMemory {
 
 pub mod alloc_tag;
 
+/// Which host pages of `[addr, addr + len)` the host has ever given this
+/// process (in memory, or swapped or compressed out of it), one byte each
+/// in `out` (non-zero for touched), by the host's `mincore`; and the host's
+/// page size. `None` where the host cannot say: the caller then takes every
+/// page as touched. For a range of the process's own memory: on macOS,
+/// reading a page the host never gave makes the host give it, so a fork's
+/// copy that reads every page to find the non-zero ones costs all of them.
+pub fn host_pages_touched(addr: usize, len: usize, out: &mut Vec<u8>) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn mincore(addr: *const std::ffi::c_void, len: usize, vec: *mut u8) -> i32;
+            fn sysconf(name: i32) -> i64;
+        }
+        const SC_PAGESIZE: i32 = 29;
+        // In memory, paged out (swapped or compressed), or written.
+        const TOUCHED: u8 = 0x1 | 0x4 | 0x20;
+        // SAFETY: a read of a constant of the system's.
+        let page = unsafe { sysconf(SC_PAGESIZE) };
+        if page <= 0 {
+            return None;
+        }
+        let page = page as usize;
+        let lo = addr & !(page - 1);
+        let hi = (addr + len).div_ceil(page) * page;
+        let n = (hi - lo) / page;
+        out.clear();
+        out.resize(n, 0);
+        // SAFETY: `mincore` reads the host's page tables for the range, which
+        // is the caller's own mapped memory, and writes one byte a page into
+        // `out`, which has room for each.
+        if unsafe { mincore(lo as *const std::ffi::c_void, hi - lo, out.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        for b in out.iter_mut() {
+            *b &= TOUCHED;
+        }
+        Some(page)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (addr, len, out);
+        None
+    }
+}
+
 /// Give the host back what its allocator keeps of memory the program has
 /// freed (glibc's `malloc_trim`; nothing on a host with another
 /// allocator). Here with the other thing the host cannot say safely: glibc
