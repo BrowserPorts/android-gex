@@ -1166,10 +1166,13 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
             let line = "needs 64-bit memory; it will get it the next time it starts";
             // Moving is no crash: a notice, unless it crashed (a signal
             // that dumps core, not one of gex's for want of room, or a
-            // crash it gave itself)
+            // crash it gave itself). An end gex made (asked again) says so
+            // in the notice.
             if core && !rec.runtime {
                 ended();
                 procs.add_crash_line(pid, line);
+            } else if rec.ended {
+                procs.end_line_or_notice(pid, &format!("ended by gex: it asked again for {:#x} bytes, which its 32-bit memory has no room for; {line}", rec.last));
             } else {
                 procs.end_line_or_notice(pid, line);
             }
@@ -17472,7 +17475,7 @@ mod tests {
     /// A program that fell short of its 32-bit memory and ends for it is
     /// recorded for a 64-bit one at its next start, and that end is no
     /// crash: a notice (a nonzero exit, and an end gex made for want of
-    /// room). A signal that dumps core, or a crash the program said, stays
+    /// room, which the notice says). A signal that dumps core, or a crash the program said, stays
     /// a crash, with the move as one more line of its reason.
     #[test]
     fn a_program_moving_to_a_64_bit_memory_gives_a_notice_not_a_crash() {
@@ -17509,7 +17512,8 @@ mod tests {
         assert_eq!(got, vec![notice(pid, "exits")]);
         // ended by gex (SIGKILL) for asking again
         let (pid, got) = end("asks", None, true, 9);
-        assert_eq!(got, vec![notice(pid, "asks")]);
+        let reason = format!("ended by gex: it asked again for {:#x} bytes, which its 32-bit memory has no room for; {LINE}", 3u64 << 30);
+        assert_eq!(got, vec![Crash { reason, ..notice(pid, "asks") }]);
         // SIGSEGV: a crash
         let (pid, got) = end("faults", None, false, 11);
         assert_eq!(got, vec![Crash { pid, name: "faults".into(), reason: format!("SIGSEGV; {LINE}"), code: 139, signal: 11, notice: false }]);
