@@ -4357,6 +4357,8 @@ export class Gex {
     this.#programStore(true);
     const thread = {
       tid,
+      // GEX_LOG=waits: when it was made (an epoch ms every Worker reads alike), for its start's latency
+      cloneAt: this.#ws ? performance.timeOrigin + performance.now() : undefined,
       ctx: e.gex_thread_ctx(),
       pc: e.gex_thread_pc(),
       memory: this.#memory,
@@ -4465,6 +4467,7 @@ export class Gex {
       }
     }
     this.#threadTid = thread.tid;
+    this.#cloneAt = thread.cloneAt;
     const _t = (s) => { if (globalThis.GEX_ATTACH_TRACE) console.error(`[thr ${thread.tid}] ${s}`); };
     _t('attached, adopting');
     const entry = this.#shim.exports.gex_adopt_thread(thread.tid);
@@ -4498,6 +4501,7 @@ export class Gex {
   async snapThread(shimWasm, guestWasm, thread) {
     this.#threaded();
     this.#threadTid = thread.tid;
+    this.#cloneAt = thread.cloneAt;
     this.#promise = false;
     // The first of a process's Workers: the memory's shim slots are the
     // snapshot's Workers', none of which runs now (as a fork child's).
@@ -11173,6 +11177,8 @@ export class Gex {
    *  server requests made in this Worker (`#doorCall`) and its waits for
    *  lazy files' bytes (`fetchWaited`). False when off, null before. */
   #ws = null;
+  /** GEX_LOG=waits: when this Worker's thread was made (`#takeThread`), epoch ms. */
+  #cloneAt = undefined;
 
   /** The wait split for the thread starting here: the shim's parks of this
    *  Worker so far (`gex_wait_split_ms`), which its waits are counted from. */
@@ -11182,6 +11188,9 @@ export class Gex {
     e.gex_wait_split_on?.();
     const ws = { t0: now, said: now, ms: new Float64Array(K), n: new Uint32Array(K), door: 0, doorN: 0, fetch0: fetchWaited() };
     // Each lazy file's fetch, said as it ends: the files a thread waited for.
+    // Its start: made at the clone, its first instruction now (the run loop's start).
+    const at = performance.timeOrigin + now;
+    if (this.#cloneAt) console.warn(`[waits] ${e.gex_my_pid?.() ?? 0}:${this.#threadTid} started: made at ${(this.#cloneAt / 1000).toFixed(3)}, first instruction at ${(at / 1000).toFixed(3)} (${(at - this.#cloneAt).toFixed(1)} ms later)`);
     setFetchSay((what, bytes, ms) => console.warn(`[waits] ${e.gex_my_pid?.() ?? 0}:${this.#threadTid || e.gex_my_pid?.() || 0} fetched ${what}: ${bytes} bytes in ${ms.toFixed(1)} ms`));
     return ws;
   }

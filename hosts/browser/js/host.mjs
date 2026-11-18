@@ -2112,8 +2112,8 @@ export class ProcessHost {
           }
           spare.ref.key = key;
           if (logNamed('spare')) console.warn(`[spare] ${key}: on ${spare.key}, ${held ? 'still starting' : 'ready'}`);
-          const { tid, ctx, pc, procOpts } = m.thread;
-          spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts } });
+          const { tid, ctx, pc, procOpts, cloneAt } = m.thread;
+          spare.w.postMessage({ kind: 'spareGo', thread: { tid, ctx, pc, procOpts, cloneAt } });
         } else {
           this.#threadWorker(pid, key, { kind: 'thread', ...m.thread, park: !this.#foreign(proc) && !!this.#extra?.shared && !(SP_CODE && single.on) });
         }
