@@ -2117,6 +2117,8 @@ let glServing = false;
 // shared device (gpu-device.js textureCanvas), which the scene samples.
 let glTarget = null;
 let glFrames = null;
+// True when `document` is this worker's own shim (see startGl).
+let glOwnDocument = false;
 
 /** What the guest last said its frames belong to, or null. */
 function glAttachment() {
@@ -2144,6 +2146,7 @@ function glSurfaceList() {
   if (glSurfaceFrame === glTick) return glSurfaces;
   glSurfaceFrame = glTick;
   glSurfaces = glDevice.surfaces();
+  glSurfaceCanvasesPrune(glSurfaces);
   return glSurfaces;
 }
 
@@ -2159,11 +2162,45 @@ function glFrameFor(win) {
       ? win.token === s.token && win.surface === s.id
       : win.info?.xid === s.id;
     if (!hit) continue;
-    // The WebGPU backend has one canvas and one frame; it is this window's if
-    // the match above says so.
-    return glFrame();
+    return glSurfaceFrame_(s.frame) ?? glFrame();
   }
   return null;
+}
+
+/* A texture canvas per GL surface, by the device's frame key for it.
+ *
+ * One shared canvas was every GL window's picture: a client drawing two
+ * windows with one context (Godot's project manager and its dialogs, or any
+ * WGL program with a second window) presented both into it each tick, so each
+ * window showed the other's frame pasted over or scaled into its own. Each
+ * surface now presents into its own canvas (`surfaceCanvas`, as the DOM
+ * compositor does), found by Emscripten under `#gex-gl-<frame>` through this
+ * worker's document shim. A surface the list no longer has gives its canvas
+ * and texture back in `glSurfaceList`. */
+const glSurfaceCanvases = new Map();
+
+function glSurfaceFrame_(frame) {
+  if (!frame || !glOwnDocument) return null;
+  let c = glSurfaceCanvases.get(frame);
+  if (!c) {
+    c = textureCanvas();
+    glSurfaceCanvases.set(frame, c);
+    glDevice.surfaceCanvas(frame, true);
+  }
+  const tex = c.texture();
+  if (!tex || tex.width < 2 || tex.height < 2) return null;
+  return { tex, w: tex.width, h: tex.height, serial: c.serial() };
+}
+
+function glSurfaceCanvasesPrune(list) {
+  if (!glSurfaceCanvases.size) return;
+  const live = new Set(list.map((s) => s.frame));
+  for (const [frame, c] of glSurfaceCanvases) {
+    if (live.has(frame)) continue;
+    glDevice?.surfaceCanvas(frame, false);
+    c.texture()?.destroy();
+    glSurfaceCanvases.delete(frame);
+  }
 }
 
 /** The frame itself, or null if there is none yet: `tex` is the texture
@@ -2199,7 +2236,18 @@ async function startGl(m, canvas) {
   // Emscripten looks a canvas up by selector, and a worker has no document.
   // Nothing else is in it (a dev server's client, seeing a document, lists
   // its styles).
-  if (!globalThis.document) globalThis.document = { querySelector: () => glTarget, querySelectorAll: () => [] };
+  // Per-surface canvases (`glSurfaceCanvases`) are only reachable through
+  // this shim; in a realm with a real document every surface shares glTarget.
+  if (!globalThis.document) {
+    glOwnDocument = true;
+    globalThis.document = {
+      querySelector: (sel) => {
+        const m = /^#gex-gl-(\d+)$/.exec(sel);
+        return m ? glSurfaceCanvases.get(+m[1])?.canvas ?? null : glTarget;
+      },
+      querySelectorAll: () => [],
+    };
+  }
   const { MesaGlDevice } = await import('./mesa-gl.js');
   glDevice = await MesaGlDevice.create(glTarget, {
     url: m.url,

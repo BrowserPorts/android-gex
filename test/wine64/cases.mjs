@@ -44,8 +44,9 @@ export const kuser = (compact) => [
 /** USER on the null driver: window procs entered from NtUser* calls,
  *  messages between threads (user_win), a window proc's exceptions
  *  (wndproc_seh, wndproc_uncaught), two levels of calls into Wine with
- *  traps out of the inner one (nestsp). */
-export const NULLDRV = ['user_win', 'wndproc_seh', 'nestsp', 'wndproc_uncaught'].map((n) => ({ name: n, want: allOk, exe: `${n}.exe`, nullDriver: true }));
+ *  traps out of the inner one (nestsp), a caption kept in the work area
+ *  (capkeep). */
+export const NULLDRV = ['user_win', 'wndproc_seh', 'nestsp', 'wndproc_uncaught', 'capkeep'].map((n) => ({ name: n, want: allOk, exe: `${n}.exe`, nullDriver: true }));
 
 /** Run `cases` with `o` on top, each named `pre` + its name. */
 export async function each(w, cases, o = {}, pre = '') {
