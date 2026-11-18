@@ -77,7 +77,7 @@ async function forkBulkIn(child) {
 // Static, not a run-time specifier: a bundler cannot resolve `import(msg.url)`,
 // so the built Worker chunk 404'd on a bare `./gex.mjs` and rejected where
 // nobody listened. This file and `gex.mjs` are siblings everywhere.
-import { setFill, fillFile, lazyReady, kernelThread, lazyFetch, processMemories } from './lazy-fetch.mjs';
+import { setFill, fillFile, lazyReady, kernelThread, lazyFetch, lazyStats, processMemories } from './lazy-fetch.mjs';
 import { blockIo } from './blocks.mjs';
 import { lateZstd } from './zstd-late.mjs';
 import { forkTransfer } from './fork-transfer.mjs';
@@ -1526,7 +1526,9 @@ async function handle(msg) {
         const n = e.gex_sys_times(p, 2048) >>> 0;
         const t = new TextDecoder().decode(new Uint8Array(gex.memory.buffer, p, n).slice());
         e.gex_free?.(p, 2048);
-        return t || undefined;
+        // and this Worker's lazy file reads, by how they were served
+        const l = Object.entries(lazyStats).map(([k, [n, ms, b]]) => `${k} ${n} reads ${ms.toFixed(1)} ms ${(b / 1048576).toFixed(1)} MiB`).join(', ');
+        return t ? t + (l ? `; this Worker's lazy reads: ${l}` : '') : undefined;
       })() : undefined,
       exitPc: msg.exitTrace ? Number(ex.gex_current_pc?.() ?? 0n) : undefined,
       // Whatever the runner asked to be read out of the guest before its

@@ -532,6 +532,8 @@ extern "C" {
     /// written (`FileHandle::share_from`): the size, a negated errno, or
     /// `remote::NOT_SHARED`.
     fn k_fs_share(dst: i32, src: i32) -> i64;
+    /// `?systime=1`'s split of `fadvise64` in the kernel (its `k_advise_stat`).
+    fn k_advise_stat(on: u32, i: u32) -> u64;
     /// `fsync`/`fdatasync` of an open file, and `sync(2)`: the root's
     /// contents in the page's store made durable (0 or a negated errno).
     fn k_fs_sync(handle: i32, data_only: u32) -> i32;
@@ -1217,13 +1219,20 @@ extern "C" fn rf_truncate(handle: i32, len: u64) -> i32 {
 }
 extern "C" fn rf_advise(handle: i32, offset: u64, len: u64, advice: u32) -> i32 {
     gex_kernel::phase::mark(7);
+    let timed = SYS_TIME.load(std::sync::atomic::Ordering::Relaxed);
+    let t0 = if timed { now_ns() } else { 0 };
     let r = unsafe { k_fs_advise(handle, offset, len, advice) };
+    if timed {
+        ADVISE_CALL_NS.fetch_add(now_ns().saturating_sub(t0), std::sync::atomic::Ordering::Relaxed);
+    }
     gex_kernel::phase::mark(8);
     r
 }
 extern "C" fn rf_share(dst: i32, src: i32) -> i64 {
     unsafe { k_fs_share(dst, src) }
 }
+/// `?systime=1`: this process's time in the kernel's `posix_fadvise` (`rf_advise`).
+static ADVISE_CALL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 extern "C" fn rf_sync(handle: i32, data_only: u32) -> i32 {
     unsafe { k_fs_sync(handle, data_only) }
 }
@@ -8463,6 +8472,10 @@ static SYS_TIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 #[no_mangle]
 pub extern "C" fn gex_set_sys_time(on: i32) {
     SYS_TIME.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+    if on != 0 {
+        // SAFETY: a kernel import taking scalars.
+        unsafe { k_advise_stat(1, 0) };
+    }
 }
 
 /// Calls of each syscall number, beside `SYS_NS`, while `SYS_TIME` is on.
@@ -8490,6 +8503,13 @@ pub extern "C" fn gex_sys_times(out: u32, max: u32) -> u32 {
     );
     for (ns, n, nr) in v.into_iter().take(16) {
         text.push_str(&format!(" {}={}/{n}", gex_kernel::syscalls::syscall_name(nr as u64), ms(ns)));
+    }
+    // fadvise64 in the kernel, every process's so far: waiting for its file
+    // to be laid, against the lazy file's own fetches.
+    // SAFETY: a kernel import taking scalars.
+    let adv = |i| unsafe { k_advise_stat(2, i) };
+    if adv(2) > 0 {
+        text.push_str(&format!("; fadvise in the kernel {} ms; every process so far: {} fadvise calls, {} waits for files not laid yet, {} ms (10 ms slices)", ms(ADVISE_CALL_NS.load(Relaxed)), adv(2), adv(1), ms(adv(0))));
     }
     let n = text.len().min(max as usize);
     shim_slice_mut(out, n as u32).copy_from_slice(&text.as_bytes()[..n]);
