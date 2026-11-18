@@ -14,9 +14,9 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 /// The tags, by number.
-pub const NAMES: [&str; N] = ["other", "kernel", "translate", "thread", "load", "install", "replay", "fork", "run", "fill"];
+pub const NAMES: [&str; N] = ["other", "kernel", "translate", "thread", "load", "install", "replay", "fork", "run", "fill", "store", "image", "tables", "blocks"];
 
-const N: usize = 10;
+const N: usize = 14;
 
 pub const OTHER: u8 = 0;
 pub const KERNEL: u8 = 1;
@@ -31,6 +31,12 @@ pub const FORK: u8 = 7;
 pub const RUN: u8 = 8;
 /// A dispatch's empty slot or stale table being answered.
 pub const FILL: u8 = 9;
+/// A new thread's parts, apart: its store, its instance of the image
+/// module, its dispatch tables, and its dense dispatch's `blocks` table.
+pub const STORE: u8 = 10;
+pub const IMAGE: u8 = 11;
+pub const TABLES: u8 = 12;
+pub const BLOCKS: u8 = 13;
 
 static LIVE: [AtomicI64; N] = [const { AtomicI64::new(0) }; N];
 

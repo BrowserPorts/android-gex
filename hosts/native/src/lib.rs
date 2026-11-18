@@ -3658,6 +3658,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
     let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::THREAD);
     // Without the kernel lock at the end, which a process ending may hold.
     let slots = Arc::clone(&cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).next_ctx_slot);
+    let store_tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::STORE);
     let mut store = Store::new(
         &cx.engine,
         HostState {
@@ -3699,10 +3700,14 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
     )?;
     profile::new_thread();
     profile::link(&mut linker, &mut store, &cx.prof_proc)?;
+    drop(store_tag);
+    let image_tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::IMAGE);
     let instance = linker
         .instantiate(&mut store, &cx.image_module)
         .context("instantiating the image module for a new thread")?;
     profile::attach(&mut store, &instance)?;
+    drop(image_tag);
+    let tables_tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::TABLES);
     let tables = dispatch_tables(&mut store, &instance)?;
     let table = tables[0];
     if let Some(shared) = &cx.jit_shared {
@@ -3720,7 +3725,10 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             blocks: None,
         });
     }
+    drop(tables_tag);
+    let blocks_tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::BLOCKS);
     store_blocks(&mut store, &instance)?;
+    drop(blocks_tag);
 
     // This thread's table starts with only what the image module installed,
     // so everything translated since has to be replayed into it before the
