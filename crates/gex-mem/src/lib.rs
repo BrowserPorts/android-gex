@@ -133,6 +133,19 @@ pub mod alloc_tag;
 /// process's threads each free tens of megabytes when it ends
 /// (`gex_native`'s `trim_heap`).
 pub fn trim_heap() {
+    // macOS's allocator keeps what is freed too, and gives it back when
+    // asked (`malloc_zone_pressure_relief`, every zone, as much as it can).
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: the system allocator's own call, which takes each zone's
+        // lock, made from any thread at any time.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         extern "C" {
@@ -157,6 +170,25 @@ pub fn trim_heap() {
 /// unless set; 0 for never) the arenas' free pages are given back when
 /// they come to 64 MiB or more. Nothing on a host with another allocator.
 pub fn tune_heap() {
+    // macOS: no threshold to fix, but the same periodic giving back, when
+    // a megabyte or more is free in the zones.
+    #[cfg(target_os = "macos")]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let secs = std::env::var("GEX_HEAP_TRIM").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(10);
+            if secs == 0 {
+                return;
+            }
+            let _ = std::thread::Builder::new().name("gex-heap-trim".into()).spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                let z = zone_stats();
+                if z.size_allocated.saturating_sub(z.size_in_use) >= 64 << 20 {
+                    trim_heap();
+                }
+            });
+        });
+    }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -181,6 +213,29 @@ pub fn tune_heap() {
             });
         });
     }
+}
+
+/// macOS's `malloc_statistics_t`, over every zone.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Default)]
+struct ZoneStats {
+    blocks_in_use: u32,
+    size_in_use: usize,
+    max_size_in_use: usize,
+    size_allocated: usize,
+}
+
+#[cfg(target_os = "macos")]
+fn zone_stats() -> ZoneStats {
+    extern "C" {
+        fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut ZoneStats);
+    }
+    let mut z = ZoneStats::default();
+    // SAFETY: the system allocator's own call, a null zone being all of
+    // them; it writes the one structure given.
+    unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut z) };
+    z
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -213,6 +268,33 @@ fn mallinfo() -> Mallinfo2 {
 /// holds from memory the allocator keeps after it was freed. Nothing on a
 /// host with another allocator, or unless asked.
 pub fn heap_stats_every() {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(secs) = std::env::var("GEX_HEAP_STATS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else {
+            return;
+        };
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let start = std::time::Instant::now();
+            let _ = std::thread::Builder::new().name("gex-heap-stats".into()).spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                let z = zone_stats();
+                eprintln!(
+                    "gex: heap at {}s: {} MiB from the system in the zones, {} MiB in use, {} MiB in use at most, {} blocks",
+                    start.elapsed().as_secs(),
+                    z.size_allocated >> 20,
+                    z.size_in_use >> 20,
+                    z.max_size_in_use >> 20,
+                    z.blocks_in_use
+                );
+                let live = alloc_tag::live();
+                if live.iter().any(|&b| b != 0) {
+                    let parts: Vec<String> = alloc_tag::NAMES.iter().zip(live).map(|(n, b)| format!("{n} {}", b >> 20)).collect();
+                    eprintln!("gex: heap by tag at {}s (MiB): {}", start.elapsed().as_secs(), parts.join(", "));
+                }
+            });
+        });
+    }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         let Some(secs) = std::env::var("GEX_HEAP_STATS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else {
