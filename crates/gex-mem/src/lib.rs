@@ -54,6 +54,71 @@ impl GuestMemory {
         unsafe { std::slice::from_raw_parts_mut(cells.as_ptr() as *mut u8, cells.len()) }
     }
 
+    /// How many bytes of `[start, end)` the host has in memory now (its
+    /// `mincore`): what a guest's resident size is made of, since a page
+    /// the guest never touched is one the host never gave it. Counted by
+    /// the host's pages, each clipped to the range. `None` where the host
+    /// cannot say.
+    pub fn resident(&self, start: u64, end: u64) -> Option<u64> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::ffi::c_void;
+            extern "C" {
+                fn mincore(addr: *mut c_void, len: usize, vec: *mut u8) -> i32;
+                fn sysconf(name: i32) -> i64;
+            }
+            #[cfg(target_os = "linux")]
+            const SC_PAGESIZE: i32 = 30;
+            #[cfg(target_os = "macos")]
+            const SC_PAGESIZE: i32 = 29;
+            // SAFETY: a read of a constant of the system's.
+            let page = unsafe { sysconf(SC_PAGESIZE) };
+            if page <= 0 || !(page as u64).is_power_of_two() {
+                return None;
+            }
+            let page = page as u64;
+            let cells = self.inner.data();
+            let base = cells.as_ptr() as u64;
+            let len = cells.len() as u64;
+            let (start, end) = (start.min(len), end.min(len));
+            if start >= end {
+                return Some(0);
+            }
+            // At most this many host pages a call, for a bounded vector.
+            const CHUNK: u64 = 1 << 16;
+            let (lo, hi) = ((base + start) & !(page - 1), base + end);
+            let mut vec = vec![0u8; CHUNK.min((hi - lo).div_ceil(page)) as usize];
+            let mut n = 0;
+            let mut at = lo;
+            while at < hi {
+                let to = hi.min(at + CHUNK * page);
+                let pages = (to - at).div_ceil(page) as usize;
+                // SAFETY: `[at, to)` is within the memory's own mapping (its
+                // start rounded down to a host page, which holds the
+                // mapping's page-aligned base), `mincore` only reads the
+                // host's page tables, and `vec` has a byte for each page.
+                let r = unsafe { mincore(at as *mut c_void, (to - at) as usize, vec.as_mut_ptr()) };
+                if r != 0 {
+                    return None;
+                }
+                for (i, v) in vec[..pages].iter().enumerate() {
+                    if v & 1 != 0 {
+                        let a = (at + i as u64 * page).max(base + start);
+                        let b = (at + (i as u64 + 1) * page).min(hi);
+                        n += b - a;
+                    }
+                }
+                at = to;
+            }
+            Some(n)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (start, end);
+            None
+        }
+    }
+
     pub fn shared(&self) -> &SharedMemory {
         &self.inner
     }

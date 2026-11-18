@@ -511,6 +511,21 @@ impl Perms {
     }
 }
 
+/// The host's answer to how many bytes of `[start, end)` of a process's
+/// memory it holds now (`None`: it cannot say), which Linux's resident
+/// size counts: the pages touched, not the pages mapped. Without it every
+/// accessible page counts, and a program that reserves much and uses
+/// little (perfetto's `traced_probes`, which a watchdog of its own ends
+/// past 32 MB) reads as large.
+#[derive(Clone)]
+pub struct Resident(pub std::sync::Arc<dyn Fn(u64, u64) -> Option<u64> + Send + Sync>);
+
+impl std::fmt::Debug for Resident {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Resident")
+    }
+}
+
 /// The process's address space.
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
@@ -522,6 +537,10 @@ pub struct MemoryMap {
     /// pages are missing ([`crate::uffd`]): a missing page is in the
     /// protection table as mapped with no access.
     uffd: crate::uffd::UffdState,
+    /// The host's answer to how much of a range it holds in memory
+    /// ([`Resident`]); `None` where it has not said, and every accessible
+    /// page is counted as resident.
+    resident: Option<Resident>,
     /// Where the program's stack began at `execve` (`mm->start_stack`),
     /// which `/proc/<pid>/stat` gives; 0 until a host says.
     start_stack: u64,
@@ -812,6 +831,7 @@ impl MemoryMap {
             vmas: Vec::new(),
             perms: gex_abi::access_checks().then(Perms::default),
             uffd: crate::uffd::UffdState::default(),
+            resident: None,
             start_stack: 0,
             view: ViewCell(std::sync::Arc::new(MapView::new(&[]))),
             generation: 0,
@@ -859,6 +879,8 @@ impl MemoryMap {
         if let Some(p) = &mut fresh.perms {
             p.at = None;
         }
+        // The same memory: the host's answer for it holds.
+        fresh.resident = self.resident.take();
         *self = fresh;
         self.publish();
     }
@@ -2425,13 +2447,22 @@ impl MemoryMap {
             let n = v.end - v.start;
             size += n;
             if v.prot != 0 {
-                rss += n;
+                // What the host holds of it: a page never touched is not
+                // resident on Linux, and here the host has never given it.
+                let held = self.resident.as_ref().and_then(|r| (r.0)(v.start, v.end)).unwrap_or(n);
+                rss += held;
                 if v.origin.is_none() {
-                    anon += n;
+                    anon += held;
                 }
             }
         }
         (size, rss, anon)
+    }
+
+    /// The host's way to say how much of a range of this process's memory
+    /// it holds, for the resident sizes `/proc` gives.
+    pub fn set_resident(&mut self, r: Resident) {
+        self.resident = Some(r);
     }
 
     /// What the map holds, for a debug line on a memory's growth: its

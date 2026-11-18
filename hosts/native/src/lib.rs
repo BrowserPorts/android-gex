@@ -2879,6 +2879,8 @@ impl gex_kernel::proc::PeerMem for PeerMemory {
 fn publish_vm(k: &Kernel, memory: &gex_mem::GuestMemory) {
     let vm = gex_kernel::proc::PeerVm { mm: k.mem.shared(), mem: Arc::new(PeerMemory(memory.clone())) };
     k.procs.set_vm(k.pid, Some(Arc::new(vm)));
+    let held = memory.clone();
+    k.mem.lock().set_resident(gex_kernel::mem::Resident(Arc::new(move |a, b| held.resident(a, b))));
 }
 
 fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest, inside: bool) -> Result<()> {
