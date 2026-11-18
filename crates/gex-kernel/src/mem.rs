@@ -1858,7 +1858,13 @@ impl MemoryMap {
         // stays below MMAP_TOP, where the dispatch directory reaches. A file
         // mapping stays low whatever its protection: ld.so reserves a whole
         // library read-only and then maps its text executable inside it.
-        if prot & prot::EXEC == 0 && origin.is_none() {
+        // An AArch64 process in an M64 memory, whose dispatch directory
+        // covers all of it, has everything placed high as Linux places it
+        // (`mmap_base` near the top): the low addresses stay free for what
+        // asks for them by hint, as ART's boot image at 0x70000000 does,
+        // which libraries and files filling down from MMAP_TOP had taken.
+        let all_high = !gex_abi::X86 && gex_abi::mem64();
+        if all_high || (prot & prot::EXEC == 0 && origin.is_none()) {
             if let Some(start) = self.find_high(len) {
                 if let Some(back) = self.back {
                     back(start, start + len).ok_or(Errno::ENOMEM)?;
