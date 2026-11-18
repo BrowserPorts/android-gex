@@ -33,7 +33,7 @@ export default async function (t) {
   // Each window's place on the canvas, from the compositor's own list.
   const place = async (title) => {
     const d = await out.describe();
-    const l = d?.list?.find((s) => s.endsWith(title));
+    const l = d?.list?.find((s) => s.endsWith(`"${title}"`));
     const m = l && /(\d+)x(\d+)@(-?\d+),(-?\d+)/.exec(l);
     return m ? { w: +m[1], h: +m[2], x: +m[3], y: +m[4] } : null;
   };
@@ -41,10 +41,15 @@ export default async function (t) {
   await until(async () => (a = await place('twowin A')) && (b = await place('twowin B')), 'both windows listed', 30000)
     .catch(async (e) => { throw new Error(`${e.message}; ${JSON.stringify((await out.describe())?.list)}`); });
   const colour = (px, [r, g, bl]) => Math.abs(px[0] - r) < 40 && Math.abs(px[1] - g) < 40 && Math.abs(px[2] - bl) < 40;
-  const look = async (win, name, want) => {
-    // Its middle, and a point near its top-left corner, which the other
-    // window's frame covered when both shared one canvas.
-    const pts = [[win.x + (win.w >> 1), win.y + (win.h >> 1)], [win.x + 6, win.y + 6]];
+  // The points of WIN that no window in OVER covers (the window manager may
+  // stack B on part of A): its middle and its four corners' insets, among
+  // them the top-left, which the other window's frame covered when both
+  // shared one canvas.
+  const inside = (w, x, y) => x >= w.x && x < w.x + w.w && y >= w.y && y < w.y + w.h;
+  const look = async (win, name, want, over = []) => {
+    const pts = [[win.x + (win.w >> 1), win.y + (win.h >> 1)], [win.x + 6, win.y + 6], [win.x + win.w - 7, win.y + 6],
+      [win.x + 6, win.y + win.h - 7], [win.x + win.w - 7, win.y + win.h - 7]].filter(([x, y]) => !over.some((o) => inside(o, x, y)));
+    check(`${name} has points no other window covers`, pts.length >= 2, `window ${JSON.stringify(win)}, over it ${JSON.stringify(over)}`);
     let px = [];
     const ok = await until(async () => {
       px = await Promise.all(pts.map(([x, y]) => t.pixel(x, y)));
@@ -52,7 +57,7 @@ export default async function (t) {
     }, `${name} its own colour`, 20000).then(() => true, () => false);
     check(`${name} shows its own frame`, ok, `at ${JSON.stringify(pts)}: ${JSON.stringify(px)}; window ${JSON.stringify(win)}`);
   };
-  await look(a, 'twowin A (magenta)', [255, 0, 255]);
+  await look(a, 'twowin A (magenta)', [255, 0, 255], [b]);
   await look(b, 'twowin B (cyan)', [0, 255, 255]);
   p.kill?.();
   await sys.shutdown();
