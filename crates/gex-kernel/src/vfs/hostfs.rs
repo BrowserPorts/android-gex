@@ -173,6 +173,49 @@ pub(crate) fn convert(md: &std::fs::Metadata) -> Metadata {
     }
 }
 
+/// Where this process is not the host's root, the guest's owner of a host
+/// file is kept in this host attribute of it, "uid gid" in decimal: a tree
+/// unpacked by a user with its owners written there (an Android image on
+/// a Mac) says them, and `chown` and a file's making keep them. A file
+/// without one says none, as before.
+pub(crate) const OWNER_ATTR: &str = "user.gex.owner";
+
+/// The owner kept in [`OWNER_ATTR`], where the host is not root.
+fn kept_owner(on: host_xattr::On<'_>) -> Option<(u32, u32)> {
+    if host_is_root() {
+        return None;
+    }
+    let mut b = [0u8; 32];
+    let n = host_xattr::raw(on, super::XattrOp::Get { name: OWNER_ATTR, buf: &mut b }).ok()?;
+    let mut it = std::str::from_utf8(&b[..n]).ok()?.split_whitespace();
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+}
+
+/// Keep `(uid, gid)` as the owner of a host file ([`OWNER_ATTR`]).
+fn keep_owner(on: host_xattr::On<'_>, owner: (u32, u32)) -> Result<(), Errno> {
+    let v = format!("{} {}", owner.0, owner.1);
+    host_xattr::raw(on, super::XattrOp::Set { name: OWNER_ATTR, value: v.as_bytes(), flags: 0 }).map(|_| ())
+}
+
+/// `md` with the owner kept for it, where the host said none.
+fn owned(mut md: Metadata, on: host_xattr::On<'_>) -> Metadata {
+    if md.owner.is_none() {
+        md.owner = kept_owner(on);
+    }
+    md
+}
+
+/// A `chown` where owners are kept in [`OWNER_ATTR`]: what is not changed
+/// stays as kept, or as the host file's own ids where none is.
+fn chown_kept(on: host_xattr::On<'_>, now: &std::fs::Metadata, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+    let (u0, g0) = kept_owner(match &on {
+        host_xattr::On::Path(p) => host_xattr::On::Path(p),
+        host_xattr::On::Fd(f) => host_xattr::On::Fd(f),
+    })
+    .unwrap_or((now.uid(), now.gid()));
+    keep_owner(on, (uid.unwrap_or(u0), gid.unwrap_or(g0)))
+}
+
 /// Whether this process is the host's root: by the owner of its own
 /// directory in the host's /proc (a Linux host; any other is taken not
 /// to be).
@@ -186,12 +229,19 @@ fn host_is_root() -> bool {
 /// the host's root, and owners are said, it is given over here. Its group
 /// is left as the host made it in a directory that hands its group down.
 fn made(host: &Path) -> Result<(), Errno> {
-    if !host_is_root() {
-        return Ok(());
-    }
     let Some((uid, gid)) = super::Maker::current() else {
         return Ok(());
     };
+    if !host_is_root() {
+        // Kept for the guest instead, where the host keeps attributes on
+        // such a file (a Linux host keeps none on a symbolic link).
+        let gid = match host.parent().and_then(|p| std::fs::metadata(p).ok()) {
+            Some(m) if m.mode() & 0o2000 != 0 => kept_owner(host_xattr::On::Path(host.parent().unwrap())).map_or(gid, |(_, g)| g),
+            _ => gid,
+        };
+        let _ = keep_owner(host_xattr::On::Path(host), (uid, gid));
+        return Ok(());
+    }
     let handed = host.parent().and_then(|p| std::fs::metadata(p).ok()).is_some_and(|m| m.mode() & 0o2000 != 0);
     std::os::unix::fs::lchown(host, Some(uid), (!handed).then_some(gid)).map_err(|e| Errno::from_io(&e))
 }
@@ -282,7 +332,18 @@ impl FileHandle for HostHandle {
     /// (`host_is_root`); nowhere else is there an owner to change.
     fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Option<Result<(), Errno>> {
         if !host_is_root() {
-            return None;
+            let f = self.file.lock().unwrap_or_else(|e| e.into_inner());
+            let now = f.metadata().ok()?;
+            // Kept, where the file keeps an owner (or none was said).
+            if kept_owner(host_xattr::On::Fd(&f)).is_none() {
+                return None;
+            }
+            let r = chown_kept(host_xattr::On::Fd(&f), &now, uid, gid);
+            drop(f);
+            if r.is_ok() {
+                self.note(crate::inotify::mask::ATTRIB);
+            }
+            return Some(r);
         }
         let r = std::os::unix::fs::fchown(&*self.file.lock().unwrap_or_else(|e| e.into_inner()), uid, gid).map_err(|e| Errno::from_io(&e));
         if r.is_ok() {
@@ -344,7 +405,7 @@ impl FileHandle for HostHandle {
     fn metadata(&self) -> Result<Metadata, Errno> {
         let f = self.file.lock().unwrap();
         f.metadata()
-            .map(|m| convert(&m))
+            .map(|m| owned(convert(&m), host_xattr::On::Fd(&f)))
             .map_err(|e| Errno::from_io(&e))
     }
 }
@@ -527,9 +588,10 @@ impl FileSystem for HostFs {
                 // as on Linux, though it is listed only later
                 let f = File::open(&host).map_err(|e| Errno::from_io(&e))?;
                 let held = self.canon.get_or_init(|| self.root.canonicalize().ok()).clone().map(|root| (f, path.to_string(), root));
+                let md = owned(convert(md), host_xattr::On::Path(&host));
                 return Ok(Arc::new(HostDir {
                     host,
-                    md: convert(md),
+                    md,
                     held,
                     gate: Arc::clone(&self.gate),
                 }));
@@ -608,9 +670,10 @@ impl FileSystem for HostFs {
 
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
         let host = self.host_path(path)?;
-        std::fs::metadata(&host)
-            .map(|m| convert(&m))
-            .map_err(|e| Errno::from_io(&e))
+        let md = std::fs::metadata(&host).map_err(|e| Errno::from_io(&e))?;
+        // The owner kept on what a link leads to.
+        let at = std::fs::canonicalize(&host).unwrap_or(host);
+        Ok(owned(convert(&md), host_xattr::On::Path(&at)))
     }
 
     /// The host's answer: a guest that believes it owns everything (stat
@@ -628,7 +691,7 @@ impl FileSystem for HostFs {
 
     fn metadata_nofollow(&self, path: &str) -> Result<Metadata, Errno> {
         let host = self.host_path(path)?;
-        std::fs::symlink_metadata(&host).map(|md| convert(&md)).map_err(|e| Errno::from_io(&e))
+        std::fs::symlink_metadata(&host).map(|md| owned(convert(&md), host_xattr::On::Path(&host))).map_err(|e| Errno::from_io(&e))
     }
 
     fn read_link(&self, path: &str) -> Result<String, Errno> {
@@ -761,7 +824,16 @@ impl FileSystem for HostFs {
     fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
         let host = self.host_path(path)?;
         if !host_is_root() {
-            return std::fs::symlink_metadata(&host).map(|_| ()).map_err(|e| Errno::from_io(&e));
+            let now = std::fs::symlink_metadata(&host).map_err(|e| Errno::from_io(&e))?;
+            // A tree whose owners are kept: the change is kept too.
+            if kept_owner(host_xattr::On::Path(&host)).is_some() {
+                if self.read_only {
+                    return Err(Errno::EROFS);
+                }
+                chown_kept(host_xattr::On::Path(&host), &now, uid, gid)?;
+                hnote(self.watch_fs(), &host, host_ino(&host), crate::inotify::mask::ATTRIB, 0);
+            }
+            return Ok(());
         }
         if self.read_only {
             return Err(Errno::EROFS);
@@ -953,11 +1025,19 @@ pub mod host_xattr {
             return Ok(HOST_LABEL);
         }
         xattr_name(name)?;
-        // The label's own keeping is not the guest's to touch.
-        if name == HOST_LABEL {
+        // The label's and the owner's own keeping are not the guest's
+        // to touch.
+        if name == HOST_LABEL || name == super::OWNER_ATTR {
             return Err(Errno::EOPNOTSUPP);
         }
         Ok(name)
+    }
+
+    /// The host's call as it is, no name mapped: for what the kernel keeps
+    /// in the host's attributes of its own ([`super::OWNER_ATTR`]).
+    pub(super) fn raw(on: On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
+        let calls = CALLS.get().ok_or(Errno::EOPNOTSUPP)?;
+        calls(&on, op)
     }
 
     pub fn call(on: On<'_>, op: XattrOp<'_>) -> Result<usize, Errno> {
@@ -1006,7 +1086,7 @@ pub mod host_xattr {
                     mine.extend_from_slice(LABEL.as_bytes());
                     mine.push(0);
                 }
-                for name in all.split(|&c| c == 0).filter(|n| n.starts_with(b"user.") && *n != HOST_LABEL.as_bytes()) {
+                for name in all.split(|&c| c == 0).filter(|n| n.starts_with(b"user.") && *n != HOST_LABEL.as_bytes() && *n != super::OWNER_ATTR.as_bytes()) {
                     mine.extend_from_slice(name);
                     mine.push(0);
                 }
