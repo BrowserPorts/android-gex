@@ -172,7 +172,8 @@ impl Metadata {
             ino: 1,
             mtime: 0,
             nlink: 1,
-            rdev: 0, dev: 0,
+            rdev: 0,
+            dev: 0,
             times: Default::default(),
             owner: None,
         }
@@ -185,7 +186,8 @@ impl Metadata {
             ino: 1,
             mtime: 0,
             nlink: 2,
-            rdev: 0, dev: 0,
+            rdev: 0,
+            dev: 0,
             times: Default::default(),
             owner: None,
         }
@@ -1081,7 +1083,8 @@ pub trait FileSystem: Send + Sync {
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
-                rdev: 0, dev: 0,
+                rdev: 0,
+                dev: 0,
                 times: Default::default(),
                 owner: None,
             });

@@ -483,23 +483,11 @@ impl FileHandle for HostDir {
     }
 }
 
-/// `open`'s flags on the host, for what [`std::fs::OpenOptions`] does not
-/// express.
+/// macOS's `O_SYMLINK`, which [`std::fs::OpenOptions`] does not express
+/// (the other open flags are [`host_o`]'s).
 #[cfg(target_os = "macos")]
 mod hostflag {
-    pub const O_NONBLOCK: i32 = 0x4;
     pub const O_SYMLINK: i32 = 0x20_0000;
-    pub const O_CREAT: i32 = 0x200;
-    pub const O_TRUNC: i32 = 0x400;
-    pub const O_EXCL: i32 = 0x800;
-}
-
-#[cfg(not(target_os = "macos"))]
-mod hostflag {
-    pub const O_CREAT: i32 = 0o100;
-    pub const O_EXCL: i32 = 0o200;
-    pub const O_TRUNC: i32 = 0o1000;
-    pub const O_NONBLOCK: i32 = 0o4000;
 }
 
 impl FileSystem for HostFs {
@@ -618,14 +606,14 @@ impl FileSystem for HostFs {
             } else {
                 // std refuses to create without write access; Linux creates
                 // with O_RDONLY (gnulib's open tests, `touch`-like opens)
-                custom |= hostflag::O_CREAT;
+                custom |= host_o::CREAT;
             }
         }
         if flags & oflags::O_EXCL != 0 {
             if want_write {
                 opts.create_new(true);
             } else if flags & oflags::O_CREAT != 0 {
-                custom |= hostflag::O_EXCL;
+                custom |= host_o::EXCL;
             }
         }
         if flags & oflags::O_TRUNC != 0 {
@@ -633,7 +621,7 @@ impl FileSystem for HostFs {
             if want_write && flags & oflags::O_APPEND == 0 {
                 opts.truncate(true);
             } else {
-                custom |= hostflag::O_TRUNC;
+                custom |= host_o::TRUNC;
             }
         }
         if flags & oflags::O_APPEND != 0 {
@@ -642,7 +630,7 @@ impl FileSystem for HostFs {
         // O_NONBLOCK reaches the host: opening a host FIFO without a writer
         // must not block (grep -D skip opens one so, to fstat and skip it).
         if flags & oflags::O_NONBLOCK != 0 {
-            custom |= hostflag::O_NONBLOCK;
+            custom |= host_o::NONBLOCK;
         }
         opts.custom_flags(custom);
         let file = opts.open(&host).map_err(|e| Errno::from_io(&e))?;
@@ -940,6 +928,22 @@ impl FileSystem for HostFs {
 
 use std::os::unix::fs::OpenOptionsExt;
 
+/// The host's open flags `OpenOptions` leaves to `custom_flags`: Linux's
+/// (asm-generic/fcntl.h) and XNU's (sys/fcntl.h).
+#[cfg(not(target_os = "macos"))]
+mod host_o {
+    pub const CREAT: i32 = 0o100;
+    pub const EXCL: i32 = 0o200;
+    pub const TRUNC: i32 = 0o1000;
+    pub const NONBLOCK: i32 = 0o4000;
+}
+#[cfg(target_os = "macos")]
+mod host_o {
+    pub const CREAT: i32 = 0x200;
+    pub const EXCL: i32 = 0x800;
+    pub const TRUNC: i32 = 0x400;
+    pub const NONBLOCK: i32 = 0x4;
+}
 
 /// Extended attributes on the host's files, `user.` only either way: a
 /// guest neither sets nor sees the host's other namespaces. The calls
@@ -1212,9 +1216,9 @@ mod tests {
 }
 
 /// `access(2)` against the host's permission bits, for this process's
-/// effective ids and groups ([`host_identity`], or `/proc/self/status`; no
-/// unsafe here, so not the host call itself). Root may read and write anything and execute
-/// what has an execute bit. ACLs and read-only mounts are not seen.
+/// effective ids and groups (the host's word, [`crate::hostos`]; no unsafe
+/// here, so not the host call itself). Root may read and write anything and
+/// execute what has an execute bit. ACLs and read-only mounts are not seen.
 #[cfg(unix)]
 fn host_access(host: &std::path::Path, mode: u32) -> Result<(), Errno> {
     let md = std::fs::metadata(host).map_err(|e| Errno::from_io(&e))?;
@@ -1260,27 +1264,11 @@ struct HostIds {
 #[cfg(unix)]
 fn host_ids() -> &'static HostIds {
     static IDS: std::sync::OnceLock<HostIds> = std::sync::OnceLock::new();
-    IDS.get_or_init(|| {
-        if let Some((uid, gid, groups)) = host_identity::get() {
-            return HostIds { uid, gid, groups };
-        }
-        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        // "Uid:\treal\teffective\tsaved\tfs"; the effective one decides.
-        let field = |name: &str| -> Vec<u32> {
-            status
-                .lines()
-                .find_map(|l| l.strip_prefix(name))
-                .map(|r| r.split_whitespace().filter_map(|v| v.parse().ok()).collect())
-                .unwrap_or_default()
-        };
-        let uid = field("Uid:");
-        let gid = field("Gid:");
-        HostIds {
-            // Unknown ids (no /proc) count as nobody's, the cautious answer.
-            uid: uid.get(1).copied().unwrap_or(u32::MAX - 1),
-            gid: gid.get(1).copied().unwrap_or(u32::MAX - 1),
-            groups: field("Groups:"),
-        }
+    IDS.get_or_init(|| match (crate::hostos::calls().ids)() {
+        // the effective ids decide
+        Some(ids) => HostIds { uid: ids.euid, gid: ids.egid, groups: ids.groups },
+        // Unknown ids count as nobody's, the cautious answer.
+        None => HostIds { uid: u32::MAX - 1, gid: u32::MAX - 1, groups: Vec::new() },
     })
 }
 

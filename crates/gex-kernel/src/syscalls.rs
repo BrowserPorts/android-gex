@@ -14476,6 +14476,7 @@ impl Kernel {
 
     fn stat_from(md: &crate::vfs::Metadata) -> Stat {
         Stat {
+            dev: md.dev,
             ino: md.ino,
             mode: md.file_type.mode_bits() | md.mode,
             nlink: md.nlink.max(1),

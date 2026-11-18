@@ -43,7 +43,10 @@
 #    linked into target/web-debug/<flavour>/ for symbolizing. vite then
 #    builds the flavour's dist from that tree.
 #
-# $CACHE is GEX_WEB_BUILD, by default target/web-build.
+# $CACHE is GEX_WEB_BUILD, by default target/web-build. The packages
+# toolchain/debian-package.sh unpacks stay in the caller's store
+# (GEX_PACKAGE_CACHE, or the caller's CACHE): that store is case-sensitive,
+# and the build folder need not be.
 #
 # To serve both at once:
 #
@@ -53,6 +56,7 @@
 set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+export GEX_PACKAGE_CACHE="${GEX_PACKAGE_CACHE:-${CACHE:-$HOME/.cache/gex}}"
 CACHE="${GEX_WEB_BUILD:-$ROOT/target/web-build}"
 DEBUGDIR="$ROOT/target/web-debug"
 MP=1 SP=0 ASSETS=1 GL=1 X=1 DEBUG=0 DISTS=1
@@ -129,11 +133,9 @@ xwl_key() { # xwl_key <mt|st>
     } | sha256sum | cut -c1-32
 }
 xwl_host_tools() {
-    # The distro's, when it has them all; otherwise built once into the cache.
-    if pkg-config --exists wayland-scanner wayland-protocols xwaylandproto 2>/dev/null &&
-       [ -f /usr/share/aclocal/xorg-macros.m4 ] && [ -f /usr/include/X11/xshmfence.h ]; then
-        return 0
-    fi
+    # Built once into the cache at host-tools.sh's tags, on every host: the
+    # X protocol headers are then the same everywhere, not the distribution's
+    # (and a host that is not Linux has none).
     "$HERE/../ports/xwayland/host-tools.sh" "$CACHE/xwl-host"
     GEX_XWL_HOST_TOOLS="$CACHE/xwl-host"; export GEX_XWL_HOST_TOOLS
 }

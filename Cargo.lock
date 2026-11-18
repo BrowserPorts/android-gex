@@ -772,6 +772,7 @@ dependencies = [
  "gex-f80",
  "gex-key",
  "gex-ld",
+ "gex-store",
 ]
 
 [[package]]
@@ -862,6 +863,17 @@ dependencies = [
  "gex-abi",
  "wasm-encoder 0.219.2",
  "wasmparser 0.219.2",
+]
+
+[[package]]
+name = "gex-store"
+version = "0.0.1"
+
+[[package]]
+name = "gex-store-wasm"
+version = "0.0.1"
+dependencies = [
+ "gex-store",
 ]
 
 [[package]]

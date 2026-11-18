@@ -905,7 +905,8 @@ impl FileHandle for PipeEnd {
             ino: crate::vfs::anon_ino(Arc::as_ptr(&self.pipe) as *const u8),
             mtime: 0,
             nlink: 1,
-            rdev: 0, dev: 0,
+            rdev: 0,
+            dev: 0,
             times: Default::default(),
             owner: None,
         })

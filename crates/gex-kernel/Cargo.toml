@@ -14,6 +14,8 @@ gex-f80.workspace = true
 gex-ld.workspace = true
 # SHA-256, for a BPF program's tag.
 gex-key.workspace = true
+# The block store's format and allocator, shared with the page's offline editor.
+gex-store.workspace = true
 
 [features]
 # Serve an x86-64 guest: its syscall numbers, struct layouts and signal frame.
