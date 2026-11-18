@@ -18,7 +18,7 @@ const ROOT = join(import.meta.dirname, '..', '..');
 export const FIXTURES = join(import.meta.dirname, '..', 'fixtures');
 
 export async function checks(t, file, { env = {}, timeout = 300000, args = [], node = [], need = [], summary = false } = {}) {
-  for (const f of need) if (!existsSync(join(ROOT, f))) t.skip(`no ${f} (make page)`);
+  for (const f of need) if (!existsSync(join(ROOT, f))) t.skip(`no ${f} (make assets, make mesa)`);
   const tmp = join(t.workDir, 'tmp');
   mkdirSync(tmp, { recursive: true });
   // Not this process's IPC channel to the runner (fork's NODE_CHANNEL_FD).

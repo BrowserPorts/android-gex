@@ -2,7 +2,7 @@
  * Do files dropped on the page land in the guest's filesystem, tree and bytes
  * and modes, and does an aborted drop take back what it wrote?
  *
- * handle.drop (page/src/app.js) reads a drop's tree in the page (drop.js
+ * The runtime's drop (@gexemu/runtime/drop) reads a drop's tree in the page (drop.js
  * `walk`) and has drop-worker.js write it through its own kernel instance.
  * This runs both against the kernel module in Node: `walk` over a folder as
  * a FileSystemDirectoryHandle and as a webkitGetAsEntry entry gives, and the
