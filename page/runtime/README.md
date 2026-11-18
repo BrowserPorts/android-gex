@@ -788,6 +788,39 @@ image is in. `env`, `resize(width, height)` (device pixels), `describe()`.
 `process.windows()` is for HostWindows; the other two keep their windows to
 themselves.
 
+### HostDrop (`@gexemu/runtime/drop`)
+
+`new HostDrop(sys, { windows })`: files and folders dropped on the page,
+copied into the guest's filesystem with their tree (in a Worker on the shared
+kernel: the page never waits on the copy), then dragged onto the window under
+the drop's point, whose program may take them (Wine's file manager, a
+desktop). `windows` is the system's `CompositorWindows`; without it a drop is
+only copied. The page wires its own events; nothing here listens to the DOM:
+
+```js
+const drop = new HostDrop(sys, { windows });
+canvas.addEventListener('dragover', (e) => e.preventDefault());
+canvas.addEventListener('drop', (e) => {
+  e.preventDefault();
+  // At once, before anything awaits: the browser empties dataTransfer after the event.
+  drop.drop(e.dataTransfer, { x: e.clientX, y: e.clientY, fallback: '/root/Desktop' });
+});
+```
+
+`drop(data, { x, y, dir, fallback, signal, onProgress })`: `data` the event's
+`dataTransfer`, its `items`, a `FileList` or an array of `File`s; `dir` the
+guest directory to copy into (made if missing; default a new
+`/tmp/drops/N`); `fallback` where the copy moves when no window takes it (a
+name already there gets " (2)", " (3)", ...); `signal` stops the copy and
+takes back what it wrote; `onProgress({ done, total, files, filesDone, name })`.
+It resolves `{ path, files, bytes, ms, window, accepted, paths }`: the
+directory made, its files and bytes, the window at the point (`{ title,
+client, surface, x, y }`) or null, whether its program took the drop, and
+where the top-level files and folders are now. Files are 0644 (0755 for one
+that starts as a program does), folders 0755. `windowAt(x, y)` names the
+window a drop at that point would go to (a browser names a drag's files only
+at its drop). The default build only.
+
 ## Building
 
 In gex's tree, `page/runtime/build.sh DIR` builds the package into `DIR`: its modules, their

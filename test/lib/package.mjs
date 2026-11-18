@@ -8,6 +8,7 @@ export const PACKAGE_ENTRIES = {
   'windows/compositor.js': 'windows-compositor.mjs',
   'net/wisp.mjs': 'net-wisp.mjs',
   'audio.js': 'audio.mjs',
+  'drop.js': 'drop.mjs',
   'gl.js': 'gl.mjs',
   'input.js': 'input.mjs',
 };

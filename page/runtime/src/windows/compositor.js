@@ -97,6 +97,8 @@ export class CompositorWindows extends EventTarget {
       x,
       of: () => [],
       shutdown: () => this.#c?.stop(),
+      /** The compositor's window at a page point, with its block (drop.js). */
+      windowAt: (x, y) => this.#c?.windowAt?.(x, y) ?? null,
     };
   }
 
