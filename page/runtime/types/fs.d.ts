@@ -103,7 +103,7 @@ export declare abstract class Filesystem extends EventTarget {
   get lazyPort(): MessagePort | null;
   /** `early`: laid as it downloads, the programs started once its index (its first entry,
    *  `/.gex-index`) is in; at the root, without `lazy`, one per filesystem, before boot. */
-  addTar(src: Source | null, options?: { at?: string; lazy?: LazyList; early?: boolean }): Promise<unknown>;
+  addTar(src: Source | null, options?: { at?: string; lazy?: LazyList; early?: boolean; xattrs?: Record<string, Record<string, Uint8Array | string>> }): Promise<unknown>;
   addFiles(files: Record<string, Source>, options?: { mode?: number }): Promise<unknown>;
   mount(path: string, provider: MountProvider): Mount;
   unmount(path: string): Promise<void>;

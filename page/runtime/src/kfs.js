@@ -284,10 +284,11 @@ export class Files {
   /** A layer (fs.js) into the root, over whatever is there: a tar (its
    *  bytes, unpacked in the kernel as they come, pagetar.rs) laid at `at`,
    *  single files with their modes, lazy files (`[path, size, url, mode,
-   *  mtime]`, mtime in seconds; either may be undefined).
+   *  mtime]`, mtime in seconds; either may be undefined), then extended
+   *  attributes (`{ path: { name: value } }`).
    *  Seeding, not a program's writes: the store keeps none of it. The
    *  count of files laid. */
-  async lay({ tar, at = '/', files = {}, modes = {}, lazy = [] }) {
+  async lay({ tar, at = '/', files = {}, modes = {}, lazy = [], xattrs }) {
     const k = this.#k;
     let n = 0;
     if (tar) {
@@ -316,8 +317,15 @@ export class Files {
       if (mtime !== undefined) list.push({ f: 'k_fs_set_mtime', a: [{ in: p }, BigInt(Math.trunc(mtime))] });
       n++;
     }
+    for (const [p, attrs] of Object.entries(xattrs ?? {})) {
+      for (const [name, value] of Object.entries(attrs)) {
+        const v = value instanceof Uint8Array ? value : enc.encode(String(value));
+        list.push({ f: 'k_fs_xattr', a: [-1, { in: p }, XATTR_SET, { in: name }, { in: v }, 0] });
+      }
+    }
     await batched(k, list, (r, c) => {
       if ((c.f === 'k_fs_add' || c.f === 'k_fs_add_lazy') && r < 0) throw errno(r, c.a[0].in);
+      if (c.f === 'k_fs_xattr' && r < 0) throw errno(r, `${c.a[1].in}: ${c.a[3].in}`);
     });
     return n;
   }

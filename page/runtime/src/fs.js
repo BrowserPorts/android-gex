@@ -305,6 +305,10 @@ export class Filesystem extends EventTarget {
    * (`setLazySource`), each url is the file's key for the source instead,
    * and the list is the array or the URL of one.
    *
+   * `xattrs`: extended attributes set on the layer's files once they are
+   * laid, `{ '/path': { 'user.NAME': value } }` (paths under `at`, a value
+   * bytes or a string), over the tar's own (pax `SCHILY.xattr.user.*`).
+   *
    * `early: true`: laid as it downloads (`src` a stream, a Response, a Blob
    * or a URL), and boot does not wait for its end when its first entry is
    * its index (`/.gex-index`, the kernel's seed records: every directory,
@@ -314,28 +318,30 @@ export class Filesystem extends EventTarget {
    * index it is laid part by part, boot waiting for its end. At the root,
    * without `lazy`; one per filesystem, before boot.
    */
-  addTar(src, { at = '/', lazy, early = false } = {}) {
+  addTar(src, { at = '/', lazy, early = false, xattrs } = {}) {
     if (early) {
-      if (norm(at) !== '/' || lazy) throw new TypeError('addTar early: at the root, without lazy (add the lazy list in an addTar of its own)');
+      if (norm(at) !== '/' || lazy || xattrs) throw new TypeError('addTar early: at the root, without lazy or xattrs (add those in an addTar of its own)');
       if (this.#sys.phase !== 'new') throw new Error(`addTar early: before boot (the system is ${this.#sys.phase})`);
       if (this.#early) throw new Error('addTar early: one per filesystem');
       this.#early = true;
       return this.#add(import('./early-tar.js').then(({ earlyLayer }) => earlyLayer(src)));
     }
     const keyed = !!this.#lazySource;
+    const attrs = xattrs && Object.fromEntries(Object.entries(xattrs).map(([p, a]) => [under(at, p), a]));
     const p = (async () => {
       if (keyed && lazy) {
         const lz = await keyList(lazy);
         // The kernel keeps a lazy file's source as a path ('/' and the rest
         // of it, leading slashes gone): a key goes as `=KEY`, which it keeps
         // as `/=KEY` whatever the key starts with (lazy-source-worker.js).
-        return { tar: src == null ? null : await tarBytes(src), at: norm(at), lazy: lz.map(([p, size, key, mode, mtime]) => [under(at, p), size, `=${key}`, mode, mtime]) };
+        return { tar: src == null ? null : await tarBytes(src), at: norm(at), lazy: lz.map(([p, size, key, mode, mtime]) => [under(at, p), size, `=${key}`, mode, mtime]), xattrs: attrs };
       }
       const lz = lazy ? await lazyList(lazy) : [];
       return {
         tar: src == null ? null : await tarBytes(src),
         at: norm(at),
         lazy: lz.map(([p, size, url, mode, mtime]) => [under(at, p), size, lazyPath(url), mode, mtime]),
+        xattrs: attrs,
       };
     })();
     return this.#add(p);
