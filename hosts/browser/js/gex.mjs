@@ -6718,7 +6718,12 @@ export class Gex {
     let fn = t.get(slot);
     if (!fn || fn === empty) {
       this.#cgenCatchUp();
-      // its callee's module, if this Worker deferred it (`#lateDefer`)
+      // its callee's module, if this Worker deferred it (`#lateDefer`): the
+      // list read again first, as a deferred module's install does not read
+      // it (the slot's provider may have been installed since, a DLL the
+      // loader mapped after the one calling: Setup.tmp's secur32, after
+      // the module that imports it)
+      this.#wasmdllLate(st);
       const prov = st.lateProv?.get(Number(slot));
       if (prov !== undefined) this.#lateWantModule(prov);
       this.#wasmdllLate(st);
