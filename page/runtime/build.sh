@@ -63,12 +63,12 @@ for infix in "" .x86; do
             echo "page/runtime/build.sh: $PUB/gex_browser$infix.shared.wasm has no providers in $PUB/cgen/providers (page/build-assets.sh)" >&2; exit 1; }
     fi
 done
-# An x86 guest's memory64 shim and seed (runtime.js: a process with
+# An x86 guest's memory64 shim, seed and kernel (runtime.js: a process with
 # GEX_MEM64 or user.gex.mem64, as 64-bit Wine's programs over 4 GiB run),
-# beside its wasm32 one; the kernel serves both, in either build.
+# beside its wasm32 ones.
 if [ -f "$G/gex_browser.x86.shared.wasm" ]; then
-    for f in gex_browser.x86.m64.shared.wasm seed.x86.m64.shared.wasm; do
-        [ -f "$PUB/$f" ] || { echo "page/runtime/build.sh: no $PUB/$f: an x86 process with GEX_MEM64 would not start (GEX_ARCH=x86 GEX_MEM64=1 hosts/browser/build.sh)" >&2; exit 1; }
+    for f in gex_browser.x86.m64.shared.wasm seed.x86.m64.shared.wasm gex_kernel.x86.m64.wasm; do
+        [ -f "$PUB/$f" ] || { echo "page/runtime/build.sh: no $PUB/$f: an x86 process with GEX_MEM64 would not start (GEX_ARCH=x86 GEX_MEM64=1 hosts/kernel/build.sh and hosts/browser/build.sh)" >&2; exit 1; }
         cp "$PUB/$f" "$G/$f"
         strip_wasm "$G/$f"
     done
