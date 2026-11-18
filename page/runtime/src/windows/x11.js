@@ -1,5 +1,5 @@
 // X11 for every windows part: display :0 held by the page (programs.js) until
-// the first X client connects, then the runtime's X server (page/src/hostx.js,
+// the first X client connects, then the runtime's X server (page/runtime/src/host/hostx.js,
 // runtime.js `startXServer`) started on those sockets, where the client
 // waits.
 

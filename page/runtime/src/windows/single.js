@@ -1,5 +1,5 @@
 // `SingleCanvas`: the guest's windows drawn straight into one element of the
-// page, laid out there with no frames (page/src/bare-desktop.js): for a page
+// page, laid out there with no frames (page/runtime/src/host/bare-desktop.js): for a page
 // that is one program -- a game, a Win32 program whose windows draw their own
 // frames -- rather than a desktop.
 
@@ -27,7 +27,7 @@ export class SingleCanvas extends EventTarget {
     // `onDesktop(desktop, bare)` when the desktop is made.
     const x = {};
     i.devices(async (dev) => {
-      const { bareDesktop } = await import('../../../src/bare-desktop.js');
+      const { bareDesktop } = await import('../host/bare-desktop.js');
       const onDesktop = (d) => {
         this.#d = bareDesktop(d, container);
         x.onDesktop?.(d, this.#d);

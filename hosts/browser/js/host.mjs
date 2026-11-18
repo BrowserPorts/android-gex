@@ -1443,7 +1443,7 @@ export class ProcessHost {
   /**
    * A kernel stack slice for something that is not a guest Worker but calls
    * into the global kernel from a realm of its own (a page's drop Worker,
-   * `page/src/drop.js`). Undefined until the first Worker has said
+   * `page/runtime/src/host/drop.js`). Undefined until the first Worker has said
    * where the stacks are. Give it back with `releaseKernelStack(key)`.
    */
   takeKernelStack(key) {

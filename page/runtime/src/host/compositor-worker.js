@@ -50,7 +50,7 @@ import {
   EV_RELATIVE,
   waitPublish,
   releaseToken,
-} from '../../hosts/browser/js/wl-bridge.mjs';
+} from '../../../../hosts/browser/js/wl-bridge.mjs';
 
 // -- decoration metrics -----------------------------------------------------
 //
@@ -2318,7 +2318,7 @@ if (globalThis.GEX_COMPOSITOR_IN_REALM) globalThis.__gexGlInRealm = glInRealm;
 async function serveGlRing() {
   if (glServing) return;
   glServing = true;
-  const { serveGl } = await import('../../hosts/browser/js/gl-bridge.mjs');
+  const { serveGl } = await import('../../../../hosts/browser/js/gl-bridge.mjs');
   serveGl(glDevice, glChannel);
 }
 

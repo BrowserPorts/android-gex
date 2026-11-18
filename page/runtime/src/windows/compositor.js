@@ -1,19 +1,19 @@
 // `CompositorWindows`: the guest's whole desktop drawn into one canvas by
-// gex's scene compositor (page/src/compositor.js, on WebGPU in a Worker of its
+// gex's scene compositor (page/runtime/src/host/compositor.js, on WebGPU in a Worker of its
 // own): window frames, title bars, stacking, the cursor and its own hit
 // testing. For a page that wants a desktop without being a window manager.
 
 import { INTERNAL, internals } from '../internal.js';
 import { xOnDemand } from './x11.js';
 
-/** The page's compositor (page/src/compositor.js) for one whose scene is in
+/** The page's compositor (page/runtime/src/host/compositor.js) for one whose scene is in
  *  the single-thread build's system Worker `k`: what it would post to its
  *  Worker goes as `{ comp }`, what comes back arrives as `comp-out` events
  *  (`listeners`), and its counters, which it cannot share, as copies. */
 async function relayed(canvas, scale, k, listeners, background) {
   // gex-eject's `"compositor": false` builds drop it (runtime.js `openWayland`).
   if (!(typeof __GEX_COMPOSITOR__ === 'undefined' || __GEX_COMPOSITOR__)) throw new Error('this build has no compositor: give `wl` an element (bare-desktop.js)');
-  const { Compositor } = await import('../../../src/compositor.js');
+  const { Compositor } = await import('../host/compositor.js');
   const mine = new Set();
   let stats = null;
   listeners.add((m) => {

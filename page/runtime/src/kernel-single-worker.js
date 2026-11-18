@@ -48,7 +48,7 @@
 import { enableSingle, sched } from '../../../hosts/browser/js/single.mjs';
 import { runCallsAsync, readsFiles } from './kernel-calls.js';
 import { lazyReady } from '../../../hosts/browser/js/lazy-fetch.mjs';
-import { Sockets, pageRelay } from '../../src/net.js';
+import { Sockets, pageRelay } from './host/net.js';
 import { setPageFsAsk } from '../../../hosts/browser/js/page-fs.mjs';
 import { blocksOpen, blocksVerify } from '../../../hosts/browser/js/blocks.mjs';
 
@@ -92,7 +92,7 @@ let restBundle = false;
 let audioTimer = 0;
 
 /** The audio rings at `at` (hosts/kernel/src/audio.rs), kept in the page's
- *  worklet's copy (page/src/audio.js) over `port`: each slot's new frames
+ *  worklet's copy (page/runtime/src/host/audio.js) over `port`: each slot's new frames
  *  every 5 ms, from where a new generation starts; and what the worklet read
  *  and its clock, as it sends them, written back here for the device. */
 function mirrorAudio(at, port) {
@@ -165,13 +165,13 @@ async function load(globals, arch) {
   loadedArch = arch;
   // The page's switches, as the default build's Workers get them.
   Object.assign(globalThis, globals);
-  await import('../../src/page-env.js');
+  await import('./host/page-env.js');
   const q = new URLSearchParams(globalThis.GEX_PAGE_SEARCH ?? '');
-  const { setGlobals } = await import('../../src/page-globals.js');
+  const { setGlobals } = await import('./host/page-globals.js');
   setGlobals((name) => q.get(name), { arch });
   // A fiber runs worker.mjs's code: it registers itself (single.mjs
   // `registerWorkerMain`) as it loads.
-  const [, rt] = await Promise.all([import('../../../hosts/browser/js/worker.mjs'), import('../../src/runtime.js')]);
+  const [, rt] = await Promise.all([import('../../../hosts/browser/js/worker.mjs'), import('./host/runtime.js')]);
   // The shim and seed (the processes' host's) are fetched while the
   // kernel is: one wait for the network, not two in turn.
   const runtime = rt.loadRuntime();
@@ -179,7 +179,7 @@ async function load(globals, arch) {
   [globalThis.__gexTso, kernel] = await Promise.all([rt.detectTso(), rt.loadKernel()]);
   if (!kernel) throw new Error('the kernel would not load');
   await runtime;
-  const { helperKernel } = await import('../../src/kernel-helper.js');
+  const { helperKernel } = await import('./host/kernel-helper.js');
   ({ k, mem } = await helperKernel(kernel, 0, 32, { suspending: true }));
   return rt;
 }
@@ -228,9 +228,9 @@ const ops = {
         },
         send: () => {},
       };
-      if (gl && COMPOSITOR) glr = (await import('../../src/gl-in-realm.js')).openGlInRealm(post);
+      if (gl && COMPOSITOR) glr = (await import('./host/gl-in-realm.js')).openGlInRealm(post);
     } else if (wl && COMPOSITOR) {
-      const { openCompositor } = await import('../../src/compositor-in-realm.js');
+      const { openCompositor } = await import('./host/compositor-in-realm.js');
       comp = await openCompositor(wl.width, wl.height, wl.scale, (m, transfer) => post({ ev: 'comp-out', m }, transfer));
       compTimer = setInterval(() => post({ ev: 'comp-stats', stats: comp.stats() }), 500);
       // The guests' GL (MesaGl): no ring, each process's submit runs the
@@ -319,7 +319,7 @@ const ops = {
   // here, beside the scene it draws into (runtime.js `startXServer`).
   async startX({ listen, rootful }) {
     if (!comp) throw new Error('no windows to put an X server in');
-    const rt = await import('../../src/runtime.js');
+    const rt = await import('./host/runtime.js');
     const term = { writeln: (t) => post({ ev: 'output', fd: 2, text: `${t}\n` }), write: (t) => post({ ev: 'output', fd: 2, text: String(t) }) };
     await rt.startXServer({ kernel, wlChannel: comp.channel, compositor: () => comp.compositor, term, listen, rootful });
     return { value: null };

@@ -6,8 +6,8 @@
 // file not yet in waits for it, a lookup or `stat` never does. An archive
 // without an index is laid part by part as it arrives, the guest started
 // once it is all in (kfs.js `#layStream`).
-import { TarStream } from '../../src/tar.js';
-import { isZstd, zstdDecoder } from '../../src/zfetch.js';
+import { TarStream } from './host/tar.js';
+import { isZstd, zstdDecoder } from './host/zfetch.js';
 
 /** The index's path: the archive's first entry. */
 export const INDEX_PATH = '/.gex-index';

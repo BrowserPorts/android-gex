@@ -16,7 +16,7 @@ export async function openCompositor(width, height, scale, post) {
     (typeof __GEX_COMPOSITOR__ === 'undefined' || __GEX_COMPOSITOR__)
       ? import('./compositor-worker.js')
       : Promise.reject(new Error('this build has no compositor')),
-    import('../../hosts/browser/js/wl-bridge.mjs'),
+    import('../../../../hosts/browser/js/wl-bridge.mjs'),
   ]);
   const channel = makeWlChannel();
   setOutputSize(channel, width, height, Math.max(1, Math.round(scale ?? 1)));

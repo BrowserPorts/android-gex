@@ -36,10 +36,10 @@ export class MesaGl extends EventTarget {
           d3d,
           attach: (compositor, listeners, k) => {
             this.#start = async () => {
-              const { assetUrl, assetFiles } = await import('../../src/page-env.js');
+              const { assetUrl, assetFiles } = await import('./host/page-env.js');
               const opts = { api: 'core', url: assetUrl('/gex/st/gex-wgpu-replay.js'), files: assetFiles('/gex/st/') };
               // Beside a DOM desktop the device is the Worker's, relayed.
-              if (dom) return compositor.hostGl(null, { device: (await import('../../src/gl-relay.js')).relayedGl(k, listeners, opts) });
+              if (dom) return compositor.hostGl(null, { device: (await import('./host/gl-relay.js')).relayedGl(k, listeners, opts) });
               return compositor.hostGl(null, source ? { ...opts, source } : opts);
             };
             if (!eager) listeners.add((m) => { if (m.ev === 'gl-wanted') this.start().catch(() => {}); });

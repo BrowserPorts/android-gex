@@ -5,9 +5,9 @@
 // it may ask while the page's terminal does. fs-opened.js asks
 // one at a time, so two of these never share it.
 
-import { helperStackTop, kernelThread, lazyFetch, processMemories, wasmMemory } from '../../hosts/browser/js/lazy-fetch.mjs';
-import { blockIo } from '../../hosts/browser/js/blocks.mjs';
-import { pageFs } from '../../hosts/browser/js/page-fs.mjs';
+import { helperStackTop, kernelThread, lazyFetch, processMemories, wasmMemory } from '../../../../hosts/browser/js/lazy-fetch.mjs';
+import { blockIo } from '../../../../hosts/browser/js/blocks.mjs';
+import { pageFs } from '../../../../hosts/browser/js/page-fs.mjs';
 
 const SCRATCH = 0x1000;
 

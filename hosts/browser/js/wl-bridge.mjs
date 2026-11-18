@@ -148,7 +148,7 @@ export const EV_CONFIGURE = 7;
 export const EV_CLOSE = 8;
 export const EV_DISMISS_POPUP = 9;
 export const EV_MOVED = 10;
-/** The page's drag of host files (page/src/drag.js): enters a surface at
+/** The page's drag of host files (page/runtime/src/host/drag.js): enters a surface at
  *  (x, y) with the page's serial for it (its data is `setDragData`'s),
  *  moves (x, y, time), is dropped (serial), leaves. */
 export const EV_DRAG_ENTER = 11;
@@ -1250,7 +1250,7 @@ export function mergeDamage(a, b) {
 // -- the single-thread build's page: a mirror of the arena ------------------
 //
 // The arena and the guests' memories are in the system Worker, which the
-// page's DOM desktop (page/src/dom-compositor.js) cannot read. The Worker
+// page's DOM desktop (page/runtime/src/host/dom-compositor.js) cannot read. The Worker
 // sends the page what changed (`mirrorTake`): each block's header, a changed
 // block's records, and the damaged rows of each surface's pixels, copied out
 // of its process's memory into a buffer per surface, which the records then

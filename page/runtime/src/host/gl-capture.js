@@ -88,7 +88,7 @@ export class GlCapture {
  * The capture a device should use, or null.
  *
  * Reads `?glcapture=1` in a page and `GEX_GLCAPTURE` under Node, matching how
- * every other switch in `page/src` is spelled. The result is published on
+ * every other switch in `page/runtime/src/host` is spelled. The result is published on
  * `globalThis.__gexGlCapture` so a CDP driver can collect it without the page
  * having to offer a download.
  */

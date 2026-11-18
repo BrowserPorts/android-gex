@@ -13,7 +13,7 @@
 // server puts it into the window between two turns of its loop
 // (ports/xwayland/gexgl.c, hostx.js `xgl`).
 
-import { wakeProcess } from '../../hosts/browser/js/wl-bridge.mjs';
+import { wakeProcess } from '../../../../hosts/browser/js/wl-bridge.mjs';
 
 /** Words of the control buffer. */
 export const XGL = {

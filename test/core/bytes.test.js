@@ -4,7 +4,7 @@
 // host's compiled shim.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { heldBytes } from '../../page/src/runtime.js';
+import { heldBytes } from '../../page/runtime/src/host/runtime.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 

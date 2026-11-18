@@ -3,16 +3,16 @@
 // under, and the channels of the page's devices (windows, GL, network, the X
 // server).
 
-import { ProcessHost } from '../../hosts/browser/js/host.mjs';
-import { xcHash, xcRead } from '../../hosts/browser/js/xcache.mjs';
+import { ProcessHost } from '../../../../hosts/browser/js/host.mjs';
+import { xcHash, xcRead } from '../../../../hosts/browser/js/xcache.mjs';
 
 /** A saved translation cache's bytes by name (the runtime API's `xcache`). */
 export { xcRead };
-import { single, singleSupported, FiberWorker } from '../../hosts/browser/js/single.mjs';
-import { SP_CODE, MP_CODE } from '../../hosts/browser/js/mode.mjs';
-import { spareMemories } from '../../hosts/browser/js/lazy-fetch.mjs';
-import { logNamed } from '../../hosts/browser/js/log.mjs';
-import { startOptions } from '../../hosts/browser/js/options.mjs';
+import { single, singleSupported, FiberWorker } from '../../../../hosts/browser/js/single.mjs';
+import { SP_CODE, MP_CODE } from '../../../../hosts/browser/js/mode.mjs';
+import { spareMemories } from '../../../../hosts/browser/js/lazy-fetch.mjs';
+import { logNamed } from '../../../../hosts/browser/js/log.mjs';
+import { startOptions } from '../../../../hosts/browser/js/options.mjs';
 import { assetFiles, assetUrl, pageParams, pageSearch } from './page-env.js';
 import { workerGraph, workerUrlOf } from './worker-graph.js';
 import { startAudio } from './audio.js';
@@ -281,7 +281,7 @@ export async function detectTso() {
  * arrive there as `GEX_*` environment variables.
  */
 /** `?audiolatency=S`: the AudioContext's latency hint in seconds, else
- *  'interactive' (page/src/audio.js). */
+ *  'interactive' (page/runtime/src/host/audio.js). */
 function audioLatency() {
   const v = flag('audiolatency');
   return v !== null && v !== '' && Number.isFinite(+v) ? +v : 'interactive';
@@ -333,7 +333,7 @@ export async function startHostGl(compositor, glChannel, opts, term) {
     term?.writeln?.(`gex: the guest's OpenGL did not start (${opts.backend || 'wgpu'}): ${why}`);
     term?.writeln?.('gex: GL windows will be blank; everything else still runs');
     globalThis.__gexGlError = why;
-    if (glChannel?.control) (await import('../../hosts/browser/js/gl-bridge.mjs')).failGlChannel(glChannel);
+    if (glChannel?.control) (await import('../../../../hosts/browser/js/gl-bridge.mjs')).failGlChannel(glChannel);
     return null;
   }
 }
@@ -391,7 +391,7 @@ async function guestWorkerFactory() {
     const named = (w, name) => ((w.gexName = name), w);
     const make = () => {
       const name = `gex-w${++serial}`;
-      return named(new Worker(new URL('../../hosts/browser/js/worker.mjs', import.meta.url), {
+      return named(new Worker(new URL('../../../../hosts/browser/js/worker.mjs', import.meta.url), {
         type: 'module',
         name,
       }), name);
@@ -410,7 +410,7 @@ async function guestWorkerFactory() {
     };
   }
   const { Worker: NodeWorker } = await import('node:worker_threads');
-  const where = ['..', '..', 'hosts', 'browser', 'js', 'worker.mjs'].join('/');
+  const where = ['..', '..', '..', '..', 'hosts', 'browser', 'js', 'worker.mjs'].join('/');
   return () => new NodeWorker(new URL(where, import.meta.url));
 }
 
@@ -459,7 +459,7 @@ export function audioFrom(m) {
 }
 
 /**
- * The X server in the page (`hostX`, page/src/hostx.js): a Worker holding
+ * The X server in the page (`hostX`, page/runtime/src/host/hostx.js): a Worker holding
  * Xwayland and the compositor beside it, or a fiber of this realm in the
  * single-thread build. Resolves once it listens: on display :0's names, or
  * on `listen`, sockets of the global kernel bound already (a caller that
@@ -781,7 +781,7 @@ export async function openNet(network) {
   // shared memory: an isolated page's, or the Node test host's (which has
   // no crossOriginIsolated)
   if (!network || typeof SharedArrayBuffer !== 'function' || globalThis.crossOriginIsolated === false) return null;
-  const { makeNetChannel, serveNet } = await import('../../hosts/browser/js/net-bridge.mjs');
+  const { makeNetChannel, serveNet } = await import('../../../../hosts/browser/js/net-bridge.mjs');
   const channel = makeNetChannel();
   if (channel) serveNet(network, channel);
   return channel;
@@ -793,7 +793,7 @@ export async function openGlChannel(d3d = false) {
   if (!globalThis.crossOriginIsolated) {
     throw new Error('the guest GL needs a cross-origin isolated page (SharedArrayBuffer bridge).');
   }
-  const { makeGlChannel } = await import('../../hosts/browser/js/gl-bridge.mjs');
+  const { makeGlChannel } = await import('../../../../hosts/browser/js/gl-bridge.mjs');
   const channel = makeGlChannel();
   channel.d3d = !!d3d;
   return channel;
@@ -835,7 +835,7 @@ export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop =
   if (!globalThis.crossOriginIsolated) {
     throw new Error('the Wayland compositor needs a cross-origin isolated page (SharedArrayBuffer bridge).');
   }
-  const { makeWlChannel, setOutputSize } = await import('../../hosts/browser/js/wl-bridge.mjs');
+  const { makeWlChannel, setOutputSize } = await import('../../../../hosts/browser/js/wl-bridge.mjs');
   const wlChannel = makeWlChannel();
   const element = typeof wl.getContext !== 'function' && wl.nodeType === 1 ? wl : null;
   if (element) {
@@ -872,7 +872,7 @@ export { loadKernel as globalKernel };
  * the Worker's updates (`mirrorTake`).
  */
 export async function openWaylandMirror({ wl, post, onDesktop = null, say = () => {} }) {
-  const { mirrorChannel, mirrorApply } = await import('../../hosts/browser/js/wl-bridge.mjs');
+  const { mirrorChannel, mirrorApply } = await import('../../../../hosts/browser/js/wl-bridge.mjs');
   const wlChannel = mirrorChannel(post);
   const { DomDesktop } = await import('./dom-compositor.js');
   const compositor = DomDesktop.create(wl, wlChannel, { width: wl.clientWidth, height: wl.clientHeight });

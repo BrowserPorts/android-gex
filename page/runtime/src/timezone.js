@@ -2,7 +2,7 @@
 // zoneinfo files unless its tree ships them, and its libc is then on UTC: a
 // POSIX TZ string with this year's rules (posix-tz.js) needs none, and Wine
 // takes its clock and the Windows zone it matches from the libc's localtime.
-import { posixTz } from '../../src/posix-tz.js';
+import { posixTz } from './host/posix-tz.js';
 
 /**
  * `{ TZ, WINEGEX_TZNAME }` for the browser's zone (`TZ` its rules as a POSIX

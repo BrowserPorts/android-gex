@@ -15,7 +15,7 @@
 //                               fetched as it is read: here read from the
 //                               host file, each fetch GEX_LAZY_DELAY_MS late
 //                               (default 0), a slow link's (lazy-fetch.mjs)
-//     --tar <host.tar>          a root filesystem tar (page/src/tar.js, as the
+//     --tar <host.tar>          a root filesystem tar (page/runtime/src/host/tar.js, as the
 //                               page unpacks one): files, modes, empty
 //                               directories, hard and symbolic links
 //     --busybox <host>          a wasm32 busybox as /bin/busybox, hard-linked
@@ -260,7 +260,7 @@ const rest = [];
       if (eq <= 0) { console.error('--extract wants <guest>=<host>'); process.exit(2); }
       extract.push([spec.slice(0, eq), spec.slice(eq + 1)]);
     } else if (av[i] === '--tar') {
-      const { untar } = await import('../../../page/src/tar.js');
+      const { untar } = await import('../../../page/runtime/src/host/tar.js');
       inputs.push(av[i + 1] ?? '');
       const buf = readFileSync(av[++i] ?? '');
       const tree = untar(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
@@ -807,7 +807,7 @@ const host = new ProcessHost({
 });
 
 // `/dev/dsp`'s rings in the global kernel (hosts/kernel/src/audio.rs,
-// layout 2), as the page plays them (page/src/audio.js). GEX_AUDIO_TAP=1
+// layout 2), as the page plays them (page/runtime/src/host/audio.js). GEX_AUDIO_TAP=1
 // reports, at exit, what the newest quarter second of the slot written last
 // sounds like: its rate, generation, RMS and frequency (left channel, by
 // the spacing of its zero crossings), and how many slots were ever used.

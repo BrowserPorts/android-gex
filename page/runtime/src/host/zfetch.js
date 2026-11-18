@@ -5,7 +5,7 @@ let decoder = null;
 async function zstd() {
   if (!decoder) {
     decoder = (async () => {
-      const { ZSTDDecoder } = await import('../vendor/zstddec/zstddec-stream.mjs');
+      const { ZSTDDecoder } = await import('../../../vendor/zstddec/zstddec-stream.mjs');
       const d = new ZSTDDecoder();
       await d.init();
       return d;

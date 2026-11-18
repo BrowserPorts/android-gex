@@ -407,7 +407,7 @@ why, rather than doing nothing.
 
 | Feature | What it is | Off |
 | --- | --- | --- |
-| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing | each window is its own canvas in the page, laid out by `page/src/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The compositor's code is not in the bundle |
+| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing | each window is its own canvas in the page, laid out by `page/runtime/src/host/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The compositor's code is not in the bundle |
 | `gl` | the guest's OpenGL: Mesa on WebGPU | the page ships no Mesa |
 | `multiprocess` | more than one guest process | not yet: a Wine program is several processes |
 | `translation` | run-time translation (tier-1, the function JIT) behind the units | not yet: the translator is not a separate build |

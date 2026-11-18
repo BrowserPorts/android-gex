@@ -125,7 +125,7 @@ const entryOf = (name, body) =>
         },
       };
 
-const { walk } = await import(gexUrl('page/src/drop.js'));
+const { walk } = await import(gexUrl('page/runtime/src/host/drop.js'));
 const byHandle = await walk(Object.entries(tree).map(([n, b]) => ({ handle: Promise.resolve(handleOf(n, b)), entry: null, file: null })));
 const byEntry = await walk(Object.entries(tree).map(([n, b]) => ({ handle: null, entry: entryOf(n, b), file: null })));
 const paths = (l) => l.map((e) => `${e.path}${e.file ? '' : '/'}`).join(' ');
@@ -136,7 +136,7 @@ check(paths(byEntry) === paths(byHandle), `walk by entry: ${paths(byEntry)}`);
 const out = [];
 let wake = null;
 globalThis.self = { postMessage: (m) => { out.push(m); wake?.(); } };
-await import(gexUrl('page/src/drop-worker.js'));
+await import(gexUrl('page/runtime/src/host/drop-worker.js'));
 const send = (m) => self.onmessage({ data: m });
 const answer = async (id) => {
   for (;;) {

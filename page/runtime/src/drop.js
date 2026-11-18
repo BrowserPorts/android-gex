@@ -1,12 +1,12 @@
 // `HostDrop`: files and folders dropped on the page, copied into the guest's
-// filesystem with their tree (page/src/drop.js, in a Worker of its own on the
+// filesystem with their tree (page/runtime/src/host/drop.js, in a Worker of its own on the
 // shared kernel, so the page never waits on the copy), then dragged onto the
-// window under the point, whose program may take them (page/src/drag.js, a
+// window under the point, whose program may take them (page/runtime/src/host/drag.js, a
 // drag of their text/uri-list through the guest's Wayland compositor). The
 // page wires its own drop events to it; nothing listens to the DOM here.
 
 import { INTERNAL, internals } from './internal.js';
-import { Dropper, checkDrop, dropItems, walk } from '../../src/drop.js';
+import { Dropper, checkDrop, dropItems, walk } from './host/drop.js';
 
 export class HostDrop {
   #sys = null;
@@ -80,7 +80,7 @@ export class HostDrop {
       let accepted = false;
       if (hit && s.wlChannel) {
         if (!this.#drag) {
-          const { PageDrag } = await import('../../src/drag.js');
+          const { PageDrag } = await import('./host/drag.js');
           this.#drag = new PageDrag(s.wlChannel, await import('../../../hosts/browser/js/wl-bridge.mjs'));
         }
         accepted = await this.#drag.drop(hit, paths);

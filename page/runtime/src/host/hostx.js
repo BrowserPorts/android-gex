@@ -26,14 +26,14 @@
 // server calls every turn of its loop: after `callMain` there is no JavaScript
 // turn left to do it in.
 
-import { WlProxy, outputSize, REC, EV, SLOTS } from '../../hosts/browser/js/wl-bridge.mjs';
+import { WlProxy, outputSize, REC, EV, SLOTS } from '../../../../hosts/browser/js/wl-bridge.mjs';
 import { isZstd, unzstd } from './zfetch.js';
 import { xglBuffers, xglServer } from './xgl.js';
-import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../hosts/browser/js/lazy-fetch.mjs';
-import { blockIo } from '../../hosts/browser/js/blocks.mjs';
-import { pageFs } from '../../hosts/browser/js/page-fs.mjs';
-import { single, sched } from '../../hosts/browser/js/single.mjs';
-import { SP_CODE } from '../../hosts/browser/js/mode.mjs';
+import { helperStackTop, kernelThread, lazyFetch, processMemories } from '../../../../hosts/browser/js/lazy-fetch.mjs';
+import { blockIo } from '../../../../hosts/browser/js/blocks.mjs';
+import { pageFs } from '../../../../hosts/browser/js/page-fs.mjs';
+import { single, sched } from '../../../../hosts/browser/js/single.mjs';
+import { SP_CODE } from '../../../../hosts/browser/js/mode.mjs';
 
 /** Events taken from the page in one turn. */
 const MAX_INPUT = 64;

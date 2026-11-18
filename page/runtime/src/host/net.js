@@ -8,9 +8,9 @@
 // buffer per stream, and calls that never wait -- they must not, because the page's event loop
 // is what delivers the bytes the parked guest is waiting on.
 
-import { logOn } from '../../hosts/browser/js/log.mjs';
-import { PageHostStream } from '../../hosts/browser/js/page-host.mjs';
-import { NET_DGRAM, frame, frameOf, Unframer } from '../../hosts/browser/js/dgram-frames.mjs';
+import { logOn } from '../../../../hosts/browser/js/log.mjs';
+import { PageHostStream } from '../../../../hosts/browser/js/page-host.mjs';
+import { NET_DGRAM, frame, frameOf, Unframer } from '../../../../hosts/browser/js/dgram-frames.mjs';
 
 const CONNECTING = 0;
 const OPEN = 1;

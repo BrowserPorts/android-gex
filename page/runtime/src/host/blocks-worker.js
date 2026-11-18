@@ -6,7 +6,7 @@
 // on the slots, never yields.
 //
 // In: `{ memory, ctl, name, verify }`. Out: `{ kind: 'ready', ok, why }`.
-import { blocksVerify, handleOp, openHandle, sharedReads, storeDir, STORE_FILE, SLOT0, SLOTW, SLOTS, ASKED, DONE } from '../../hosts/browser/js/blocks.mjs';
+import { blocksVerify, handleOp, openHandle, sharedReads, storeDir, STORE_FILE, SLOT0, SLOTW, SLOTS, ASKED, DONE } from '../../../../hosts/browser/js/blocks.mjs';
 
 onmessage = async ({ data: { memory, ctl, name, verify } }) => {
   blocksVerify(verify);

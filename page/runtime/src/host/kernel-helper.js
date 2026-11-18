@@ -3,9 +3,9 @@
 // paths and bytes in a scratch "process" memory of its own; a Worker and not
 // the page because the kernel's locks may wait, and the page's thread cannot.
 
-import { kernelThread, lazyFetch, processMemories, wasmMemory, wasmMemoryGone } from '../../hosts/browser/js/lazy-fetch.mjs';
-import { blockIo } from '../../hosts/browser/js/blocks.mjs';
-import { pageFs, pageFsSuspending, setPageFs } from '../../hosts/browser/js/page-fs.mjs';
+import { kernelThread, lazyFetch, processMemories, wasmMemory, wasmMemoryGone } from '../../../../hosts/browser/js/lazy-fetch.mjs';
+import { blockIo } from '../../../../hosts/browser/js/blocks.mjs';
+import { pageFs, pageFsSuspending, setPageFs } from '../../../../hosts/browser/js/page-fs.mjs';
 
 /**
  * Instantiate the kernel `spec` ({module, memory}: runtime.js's

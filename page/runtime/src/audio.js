@@ -1,6 +1,6 @@
 // `WebAudio`: what the guest's programs play on `/dev/dsp` (and ALSA, Pulse
 // or Wine over it), out of the page's speakers through an AudioWorklet, the
-// page runtime's player (page/src/audio.js). One per system, made any time;
+// page runtime's player (page/runtime/src/host/audio.js). One per system, made any time;
 // browsers start audio only after a user gesture, so a page makes it in
 // one's handler, or the first pointer or key event after resumes it. Until
 // there is one, what programs write is played to nobody, at the wall clock's
@@ -26,11 +26,11 @@ export class WebAudio extends EventTarget {
       i.afterBoot(async (s) => {
         try {
           // The single-thread build's rings are its Worker's: the worklet
-          // plays a copy (page/src/audio.js `mirror`).
+          // plays a copy (page/runtime/src/host/audio.js `mirror`).
           const ring = s.audio ? await s.audio.ring() : null;
           const at = ring ? ring.at : (await i.kernel().r('k_audio_ring')) >>> 0;
           if (this.#closed) return resolve(this);
-          const { playAudio } = await import('../../src/audio.js');
+          const { playAudio } = await import('./host/audio.js');
           this.#player = ring
             ? (at ? playAudio({ mirror: { ...ring, connect: s.audio.connect }, latency, context: ctx }) : null)
             : playAudio({ memory: s.kernel.memory, at, latency, context: ctx });

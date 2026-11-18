@@ -1,6 +1,6 @@
 // The guest's sockets as every Worker reaches them (served by
 // hosts/browser/js/net-bridge.mjs), standing for the system's socket table
-// (page/src/net.js `Sockets`), made when the page first sets a network: until
+// (page/runtime/src/host/net.js `Sockets`), made when the page first sets a network: until
 // then every connection out is unreachable.
 
 const CLOSED = 2;
@@ -10,7 +10,7 @@ export class NetSwitch {
   #rings = null;
   onActivity = () => {};
 
-  /** The socket table (page/src/net.js `Sockets`). */
+  /** The socket table (page/runtime/src/host/net.js `Sockets`). */
   set(backend) {
     this.#b = backend;
     if ('rings' in backend) backend.rings = this.#rings;

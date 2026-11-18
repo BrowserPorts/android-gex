@@ -330,7 +330,7 @@ export class Files {
     return n;
   }
 
-  /** A program's image as a page's untarred bundle has it (page/src/tar.js
+  /** A program's image as a page's untarred bundle has it (page/runtime/src/host/tar.js
    *  `untar`; a preset's, a test page's runProgram), in the order a program's
    *  own loading of it took: empty directories, files with their modes,
    *  directories' modes, lazy files (`[path, size, url, head]`; a bundled

@@ -958,7 +958,7 @@ async function handle(msg) {
   // must run before `load` -- which mounts /dev/gex-gl only when the flag is on.
   if (msg.glChannel?.inRealm) {
     // The single-thread build: the compositor's Mesa is in this realm
-    // (page/src/compositor-worker.js `glInRealm`), and a submit is a promise
+    // (page/runtime/src/host/compositor-worker.js `glInRealm`), and a submit is a promise
     // the Suspending `gl_submit` waits on. A batch is run straight out of
     // this process's memory: no copy, and no batch in flight unwaited.
     // An unwaited batch is waited for all the same; its answer is what the
@@ -1162,7 +1162,7 @@ async function handle(msg) {
     gex.useNetwork(new NetProxy(msg.netChannel, msg.child?.pid ?? msg.pid ?? 1), { shared: true });
   } else if (msg.pageHosts && !msg.network) {
     // Only the page-served hosts, where the page cannot serve its sockets.
-    const { Sockets } = await import('../../../page/src/net.js');
+    const { Sockets } = await import('../../../page/runtime/src/host/net.js');
     const net = new Sockets(null, { pageHosts: msg.pageHosts, onEvent: (e) => port.post({ kind: 'net', event: e }) });
     gex.useNetwork(net);
   }

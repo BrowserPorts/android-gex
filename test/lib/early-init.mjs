@@ -9,7 +9,7 @@
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { bytesOf } from '../../page/runtime/src/internal.js';
-import { unzstd } from '../../page/src/zfetch.js';
+import { unzstd } from '../../page/runtime/src/host/zfetch.js';
 import { tarOf } from './tar.mjs';
 
 const enc = new TextEncoder();

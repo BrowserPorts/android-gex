@@ -1,6 +1,6 @@
 // The runtime's globals, set from the page's switches (System's `debug`).
 // Internal, not the runtime's API.
-import { pageOptions } from '../../hosts/browser/js/options.mjs';
+import { pageOptions } from '../../../../hosts/browser/js/options.mjs';
 
 /**
  * The runtime's globals from its switches (`get(name)`): what gex.mjs,

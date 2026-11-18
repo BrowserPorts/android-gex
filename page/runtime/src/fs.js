@@ -37,7 +37,7 @@ const isZstd = (b) => b.length > 4 && b[0] === 0x28 && b[1] === 0xb5 && b[2] ===
 async function tarBytes(src) {
   let bytes = await bytesOf(src, 'tar');
   if (isZstd(bytes)) {
-    const { unzstd } = await import('../../src/zfetch.js');
+    const { unzstd } = await import('./host/zfetch.js');
     bytes = await unzstd(bytes);
   }
   // A tar's first header says "ustar" (POSIX and GNU), or the tar is empty
@@ -466,7 +466,7 @@ export class Filesystem extends EventTarget {
     this.#files('usedFiles');
     const spec = this.#sys.kernelSpec();
     if (!spec?.module || !spec?.memory) throw new Error('usedFiles: the default build only (a shared kernel)');
-    const { openedFiles } = await import('../../src/fs-opened.js');
+    const { openedFiles } = await import('./host/fs-opened.js');
     return openedFiles(spec);
   }
 

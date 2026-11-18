@@ -3,7 +3,7 @@
 // sound, GL -- is a class of its own that takes the system as
 // its first argument (page/runtime/README.md).
 //
-// Built from the page runtime's pieces (page/src/runtime.js: the kernel, the
+// Built from the page runtime's pieces (page/runtime/src/host/runtime.js: the kernel, the
 // processes' host, the devices), with no program of its own for pid 1
 // unless `boot` is given one. Each program
 // `spawn` asks for starts in a Worker of its own from an exec record
@@ -14,7 +14,7 @@
 import { INTERNAL, bytesOf, envList, signalNumber } from './internal.js';
 import { Process } from './process.js';
 import { NetSwitch } from './netswitch.js';
-import { Sockets, dialFor } from '../../src/net.js';
+import { Sockets, dialFor } from './host/net.js';
 import { GuestConnection, UnixListener } from './connection.js';
 import { PageFsHost } from './mount.js';
 import { Kernel, errno } from './kernel.js';
@@ -99,7 +99,7 @@ function filesArch(files = {}) {
 /** The guest architecture of the layers laid at the root (fs.js), the last
  *  first, each one's read only as far as it takes. */
 async function layersArch(layers) {
-  const { tarEntries } = await import('../../src/tar.js');
+  const { tarEntries } = await import('./host/tar.js');
   for (const l of [...layers].reverse()) {
     if (l.at && l.at !== '/') continue;
     const m = l.tar ? tarArch(tarEntries, l.tar) : filesArch(l.files);
@@ -156,7 +156,7 @@ export class System extends EventTarget {
   #arch = null;
   #net = new NetSwitch();
   #network = null;
-  /** The guest's sockets (page/src/net.js), made with the first network. */
+  /** The guest's sockets (page/runtime/src/host/net.js), made with the first network. */
   #sockets = null;
   /** The single-thread build's system Worker (kernel.js `startSingle`). */
   #earlyWorker = null;
@@ -255,7 +255,7 @@ export class System extends EventTarget {
       beforeBoot: (fn) => this.#beforeBoot.push(fn),
       /** `fn(dev)` makes the part's device once the kernel is loaded and
        *  before any process (awaited): `dev` holds the runtime (`rt`,
-       *  page/src/runtime.js), `kernel`, `term`, `say`, and what earlier
+       *  page/runtime/src/host/runtime.js), `kernel`, `term`, `say`, and what earlier
        *  parts made (`wlChannel`, `compositor`, `dom`, `glChannel`). Stage
        *  0 the windows, 1 what uses them (GL), whichever part was made first. */
       devices: (fn, stage = 0) => this.#devices.push({ fn, stage }),
@@ -274,7 +274,7 @@ export class System extends EventTarget {
       kernelSpec: () => this.#kernelSpec,
       files: () => this.#files,
       programs: () => this.#programs,
-      /** The guest's sockets from now on (page/src/net.js `Sockets`): a
+      /** The guest's sockets from now on (page/runtime/src/host/net.js `Sockets`): a
        *  preset's, with its page-served hosts. `sys.network` sets theirs. */
       sockets: (sockets) => {
         sockets.network ??= this.#network;
@@ -387,7 +387,7 @@ export class System extends EventTarget {
     // the files below are got ready.
     if (SP_CODE && SINGLE && typeof Worker === 'function') this.#earlyWorker = Kernel.singleWorker();
     // The page runtime takes its switches and asset base from these
-    // (page/src/page-env.js, page-globals.js); never the page's URL.
+    // (page/runtime/src/host/page-env.js, page-globals.js); never the page's URL.
     const { arch: wantArch, ...switches } = this.#opts.debug;
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(switches)) if (v !== undefined && v !== false && k !== 'console') q.set(k, v === true ? '1' : String(v));
@@ -411,7 +411,7 @@ export class System extends EventTarget {
     globalThis.GEX_PAGE_SEARCH = `?${q}`;
     globalThis.GEX_ASSET_BASE = new URL(this.#opts.baseUrl, globalThis.location?.href).href;
     if (this.#opts.files) globalThis.GEX_ASSET_FILES = this.#opts.files;
-    await import('../../src/page-env.js');
+    await import('./host/page-env.js');
     this.#mark('page-env');
 
     // An architecture the page names (`arch`): the kernel, shim and seed load
@@ -419,9 +419,9 @@ export class System extends EventTarget {
     const given = this.#opts.arch ?? wantArch;
     let kernelEarly = null;
     if (given) {
-      const { setGlobals } = await import('../../src/page-globals.js');
+      const { setGlobals } = await import('./host/page-globals.js');
       setGlobals((name) => q.get(name), { arch: given });
-      const rt = await import('../../src/runtime.js');
+      const rt = await import('./host/runtime.js');
       if (SP_CODE && SINGLE) this.#earlyWorker?.postMessage({ prepare: { globals: rt.pageGlobals(), arch: given } });
       // Not under Node, whose runtime is primed from files first (below).
       else if (!(globalThis.process?.versions?.node && !globalThis.document)) {
@@ -443,9 +443,9 @@ export class System extends EventTarget {
     // second architecture of a wasm32 tree, so apt can install them later.
     // A program of the other one does not run.
     const arch = given ?? (await layersArch(opts.layers)) ?? 'aarch64';
-    const { setGlobals } = await import('../../src/page-globals.js');
+    const { setGlobals } = await import('./host/page-globals.js');
     setGlobals((name) => q.get(name), { arch });
-    const rt = await import('../../src/runtime.js');
+    const rt = await import('./host/runtime.js');
     if (SP_CODE && SINGLE) return this.#bootSingle(rt, arch, opts);
     // Under Node (the runtime's tests) there is no fetch of a file URL.
     if (globalThis.process?.versions?.node && !globalThis.document) {
@@ -613,7 +613,7 @@ export class System extends EventTarget {
       // The game controller table is the Worker's: a copy here, written back
       // (input.js `Gamepads`).
       joy: { table: () => k.ask('joyTable'), write: (at, words) => k.post({ joy: { at, words } }) },
-      // So are the audio rings: the worklet keeps a copy (page/src/audio.js).
+      // So are the audio rings: the worklet keeps a copy (page/runtime/src/host/audio.js).
       audio: { ring: () => k.ask('audioRing'), connect: (port) => k.post({ audio: { port } }, [port]) },
       spawnExec: ({ uid = 0, gid = uid, ...r }) => host.spawnExec({ ...r, opts: { ...rt.execOptions({ uid, gid }), ...this.#preset.exec } }),
       onStop: (fn) => stops.push(fn),
@@ -1138,7 +1138,7 @@ export class System extends EventTarget {
       await k.ask('blocksOpen', { name: st.name, verify: check });
     } else {
       persistent();
-      const w = new Worker(new URL('../../src/blocks-worker.js', import.meta.url), { type: 'module', name: 'gex-blocks' });
+      const w = new Worker(new URL('./host/blocks-worker.js', import.meta.url), { type: 'module', name: 'gex-blocks' });
       const ready = await new Promise((r) => {
         w.onmessage = ({ data: m }) => { if (m.kind === 'ready') r(m); };
         w.onerror = (e) => r({ ok: false, why: e.message ?? String(e) });

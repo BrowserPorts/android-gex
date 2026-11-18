@@ -1,6 +1,6 @@
 // `HostWindows`: the guest's windows handed to the page one by one, each a
 // bare canvas the page frames and places itself (a desktop's window manager,
-// AliceWM in Anura). The guest's compositor is gex's (page/src/dom-compositor.js
+// AliceWM in Anura). The guest's compositor is gex's (page/runtime/src/host/dom-compositor.js
 // `DomDesktop`): the same protocol in every guest process, the windows drawn
 // into their own canvases, input taken from each.
 

@@ -1,6 +1,6 @@
 // A GL X client on a rootful X screen (CompositorWindows x11: 'rootful'),
 // where no window of the scene is an X window: its frames must go into its
-// window's own pixels on the screen (page/src/xgl.js, ports/xwayland/gexgl.c).
+// window's own pixels on the screen (page/runtime/src/host/xgl.js, ports/xwayland/gexgl.c).
 // /probes/gles-window-xcb-under clears its window magenta at (40, 30) with a
 // green window over part of it: magenta in the window, green where the other
 // covers it, neither outside. Then the same at 1100x617, for what the frames'

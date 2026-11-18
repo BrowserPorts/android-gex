@@ -1,5 +1,5 @@
 // The runtime's kernel-call Worker: an instance of the global kernel of its
-// own (page/src/kernel-helper.js) whose exports the page calls by name.
+// own (page/runtime/src/host/kernel-helper.js) whose exports the page calls by name.
 //
 // It exists only because the page's thread cannot call the kernel itself:
 // the kernel's locks may wait (memory.atomic.wait), and an atomic wait traps
@@ -29,7 +29,7 @@
 // Answered `{ call, value: [[{ r, out: [bytes...] }]] }`, a list per batch
 // with one per call made, or `{ call, error }`.
 
-import { helperKernel } from '../../src/kernel-helper.js';
+import { helperKernel } from './host/kernel-helper.js';
 import { runCalls, readsFiles } from './kernel-calls.js';
 import { lazyReady } from '../../../hosts/browser/js/lazy-fetch.mjs';
 import { setLazyCache } from '../../../hosts/browser/js/lazy-cache.mjs';

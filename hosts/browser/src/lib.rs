@@ -272,7 +272,7 @@ const NET_DGRAM: i32 = 0x1_0000;
 
 /// One of the page's UDP flows, as the kernel's [`net::Transport`]: a
 /// stream of datagrams, each framed as its length (two bytes, big-endian)
-/// and its bytes, both ways (page/src/net.js's `Sockets`). Nothing is kept
+/// and its bytes, both ways (page/runtime/src/host/net.js's `Sockets`). Nothing is kept
 /// here: a datagram is read only once all of it has arrived, so the holders
 /// of a moved socket (each its own process) read whole ones off the one
 /// stream.
@@ -1594,7 +1594,7 @@ fn audio_capture(pos: Option<u32>, buf: &mut [u8], format: u32, rate: u32, chann
 }
 
 /// Where the audio ring is in the global kernel's memory (0 with none), for
-/// the page's player (page/src/audio.js).
+/// the page's player (page/runtime/src/host/audio.js).
 #[no_mangle]
 pub extern "C" fn gex_audio_ring_addr() -> u32 {
     if unsafe { k_present() } == 0 {
