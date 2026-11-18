@@ -78,7 +78,7 @@ function watchLibraries() {
   libChannel.onmessage = (ev) => seeLibrary(ev.data?.status);
 }
 /** A Worker's note (fetch-note.mjs): seen here, and said on the channel for
- *  the page (app.js `watchFetches`), which this side's own channel is not
+ *  the page, which this side's own channel is not
  *  handed back. */
 function relayNote(note, pid) {
   seeLibrary(note?.status);

@@ -1,6 +1,5 @@
-// The runtime's globals, set from the page's switches: app.js `start()`
-// calls it with the build's switches and its options'. Not part of the app
-// library's API (page/src/README.md).
+// The runtime's globals, set from the page's switches (System's `debug`).
+// Internal, not the runtime's API.
 import { pageOptions } from '../../hosts/browser/js/options.mjs';
 
 /**

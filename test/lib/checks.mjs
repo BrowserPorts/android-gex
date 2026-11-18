@@ -8,7 +8,7 @@
 // `summary`: a script that prints no check lines, only a summary last, which
 // names its one check (its exit status).
 //
-//   await checks(t, join(FIXTURES, 'page/lazy-rest.mjs'));
+//   await checks(t, join(FIXTURES, 'page/drop.mjs'));
 
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';

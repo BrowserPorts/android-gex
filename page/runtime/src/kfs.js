@@ -396,7 +396,7 @@ export class Files {
       onPart?.(t);
     }
     // Hard links whose target is a file of the image, as the page's own
-    // untarred tree keeps them (app.js).
+    // untarred tree keeps them.
     for (const [p, target] of Object.entries(hard)) if (!sizes.has(target)) delete hard[p];
     return n + await this.#layRest([], {
       dirs, modes, lazy, hard, symlinks, mtimes: lazyMtimes ? { ...lazyMtimes, ...mtimes } : undefined, xattrs,
@@ -406,8 +406,8 @@ export class Files {
     });
   }
 
-  /** A streamed image whose archive starts with its index (app.js
-   *  `streamBundle`, kde/bundles.py): every directory, link, mode and time
+  /** A streamed image whose archive starts with its index (`addTar`'s
+   *  `early`): every directory, link, mode and time
    *  of the archive, and each file as pending (its size; hosts/kernel
    *  `k_fs_seed`), laid at once with the lazy files, and the guest may start:
    *  a use of a file's bytes waits until they come, a lookup or `stat` never

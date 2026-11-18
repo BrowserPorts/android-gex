@@ -1377,7 +1377,7 @@ pub fn build(dir: &Path) -> Result<Wine32Report> {
     };
     // Split units: the page fetches their cold clusters (gex.mjs `gex.cold`).
     let mut params = params;
-    // Translation off: nothing is translated at run time (app.js `aot`).
+    // Translation off: nothing is translated at run time (`aot`).
     params.retain(|(k, _)| k != "aot");
     if aot {
         params.push(("aot".to_string(), s("1")));

@@ -1,8 +1,7 @@
 // The files whose bytes a run used in the global kernel's filesystem (TmpFs's
-// `read_set`, hosts/kernel `k_fs_opened`; an open or a stat alone is not a use): what gex-eject's 32-bit Wine recorder
-// (site/record-wine32.mjs) keeps as the run's read set, so that the site
-// can ship those in its bundle and serve the rest as lazy files
-// (crates/gex-eject/README.md, "The bundle split").
+// `read_set`, hosts/kernel `k_fs_opened`; an open or a stat alone is not a use): what a recording keeps as the run's
+// read set, so that a site can ship those in its bundle and serve the rest
+// as lazy files.
 //
 // A Worker asks, not the page: the kernel's locks may wait
 // (memory.atomic.wait), which the main thread may not.

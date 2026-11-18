@@ -410,7 +410,7 @@ export class DomDesktop {
     return d;
   }
 
-  /** The output's size from now on (app.js `resize()`): what a client asks
+  /** The output's size from now on: what a client asks
    *  for the screen's size sees this. Windows already up keep their places.
    *  `scale`, when given: device pixels per surface unit (wl_output.scale),
    *  which clients that connect after it are told. */

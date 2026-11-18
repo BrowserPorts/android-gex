@@ -2,8 +2,6 @@ target/
 /out/
 *.gexm
 page/node_modules/
-page/dist/
-page/dist-sp/
 page/public/gex/
 page/public/rootfs/
 /page/public/fs/

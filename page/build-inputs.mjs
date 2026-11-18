@@ -1,6 +1,6 @@
 // Which source a build was made from, and whether that is still the source.
 //
-// page/dist and page/public/gex are not rebuilt when the source changes, and an
+// page/public/gex is not rebuilt when the source changes, and an
 // old build does not fail: it runs the old code, and a test reports what the
 // old code does. So each build writes a stamp, `.inputs`, beside what it
 // built: one line per artefact, `NAME KEY`, where KEY hashes the content of the
@@ -14,7 +14,7 @@
 //                                    (re)write NAME's line in DIR/.inputs: KEY,
 //                                    taken before the build, or the key now
 //
-// NAME is an artefact (gex_kernel, gex_browser, page), with the arch after a
+// NAME is an artefact (gex_kernel, gex_browser), with the arch after a
 // dot for another arch's build (gex_kernel.x86), which has the same inputs.
 //
 // The harness (gexdev/web/test/harness.mjs) and the test runner (test/run.mjs) call
@@ -27,13 +27,11 @@ import { join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
 
-// What each artefact is built from. The page's JavaScript (`page`) is bundled
-// by vite; the kernel and the shim are wasm.
+// What each artefact is built from: the kernel and the shim, both wasm.
 const RUST = ['crates', 'Cargo.toml', 'Cargo.lock'];
 const INPUTS = {
   gex_kernel: ['hosts/kernel', ...RUST],
   gex_browser: ['hosts/browser', ':(exclude)hosts/browser/js', ...RUST],
-  page: ['page/src', 'page/runtime/src', 'page/index.html', 'page/vite.config.js', 'page/package-lock.json', 'hosts/browser/js'],
 };
 // Not build inputs anywhere: documentation and tests.
 const SKIP = [':(exclude,glob)**/*.md', ':(exclude,glob)**/tests/**', ':(exclude,glob)**/test/**'];

@@ -1,5 +1,5 @@
 // Files dropped on the page, copied into the running system's filesystem
-// (app.js's handle.drop, drop.js). One Worker for every drop of a page, on a
+// (@gexemu/runtime/drop, drop.js). One Worker for every drop of a page, on a
 // kernel instance and a kernel stack of its own (kernel-helper.js); drops
 // are copied one at a time, in the order they came.
 //

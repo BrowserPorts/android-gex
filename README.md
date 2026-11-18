@@ -73,9 +73,8 @@ for debugging and for building what a page loads ahead of time.
 - **Ahead-of-time builds.** `gexc run --record` records what a run loaded
   and executed. `gexc eject` turns a recording into a project that builds
   everything ahead of time, and runs only what that build made.
-  `site/eject-site.mjs` makes the web build of an
-  ejected project into a static site. The site is a JavaScript library that
-  your own page imports.
+  Its web build is data (a tree, units, a launch file) that your own page
+  runs on the `@gexemu/runtime` package.
 
 ## Layout
 
@@ -103,9 +102,8 @@ for debugging and for building what a page loads ahead of time.
 | `hosts/hostwl` | the compositor for an X server that runs in the page |
 | `hosts/native` | the native host, on wasmtime |
 | `guest/` | libraries installed into the guest: GL and EGL, GLX setup, `libsteam_api` |
-| `page/` | the page: its source, runtime assets and build (`make page`) |
+| `page/` | the `@gexemu/runtime` package (`page/runtime`), its internal modules and the files it loads (`make assets`, `make mesa`, `make xwayland`) |
 | `ports/` | the Mesa, Xwayland and Tint builds the page ships |
-| `site/` | eject and demo sites built from the page, and recording a Windows program for eject |
 | `toolchain/` | gexcc, the wasm32 C/C++ compiler, its sysroots, busybox, and `pins`, the version of every fetched toolchain |
 | `wine/` | Wine for gex: dist, prefix, runner |
 | `scripts/` | generators for the GL transport and compatibility tables, source fetching, the script lint, profile and unit helpers |
@@ -139,16 +137,16 @@ $ gexc ir <elf> --at 0x400abc       # the GIR for one block
 $ gexc run --strace <elf>           # syscall trace
 ```
 
-### Build the page
+### Build the runtime package
 
 ```console
-$ make page                         # the multi-process build, page/dist
-$ make serve                        # http://localhost:8088/
+$ make assets mesa xwayland         # the files the runtime loads, page/public
+$ make runtime PKG=DIR              # the @gexemu/runtime package
 ```
 
-`page/README.md` describes the two builds (`make page-sp` is the
-single-thread one), the runtime package (`make runtime`) and ejected
-programs' sites.
+`page/README.md` describes the two builds (multi-process and
+single-thread) and the runtime package. gex has no page of its own: a
+page imports the package (`page/runtime/README.md`).
 
 ### Run a Windows program
 

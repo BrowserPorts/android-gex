@@ -53,7 +53,7 @@ export default async function (t) {
   const fs = new OPFSFilesystem(sys, { name: STORE });
   const tar = 'project/build/web/rootfs.tar';
   fs.addTar(at(packed(tar) ? `${tar}.zst` : tar));
-  // The bundle's larger files, kept out of its tar (eject-site.mjs --pieces):
+  // The bundle's larger files, kept out of its tar (the site's pieces):
   // the tar holds each empty, its bytes are a piece's.
   if (params.pieces) {
     const list = await (await fetch(at(params.pieces))).json();

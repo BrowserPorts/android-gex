@@ -9,7 +9,7 @@
 //
 //   GEX_LOG=1 (or all)   everything, as before
 //   GEX_LOG=debug        the narration (Worker hand-offs, fork costs, the shim's lines)
-//   GEX_LOG=record       the `[gex-record]` lines (site/record-wine32.mjs)
+//   GEX_LOG=record       the `[gex-record]` lines (a recording of a session)
 //   GEX_LOG=unit         a line per function-tier unit placed in a process
 //   GEX_LOG=unitstall    timed lines for unit installs: each first call, catch-up,
 //                        publish, sync fetch, and the page's compiles ahead

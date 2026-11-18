@@ -11,7 +11,7 @@ function str(bytes, off, len) {
   const stop = off + len;
   while (end < stop && bytes[end] !== 0) end++;
   // A copy, not a view: TextDecoder refuses a view of a SharedArrayBuffer,
-  // which is what a bundle shared with a Worker is (page/src/nt-page.js).
+  // which is what a bundle shared with a Worker is.
   return new TextDecoder().decode(bytes.slice(off, end));
 }
 
@@ -90,7 +90,7 @@ function tree() {
     // Keeps this to the few hundred binaries.
     modes: Object.create(null),
     // Each file's modification time (seconds), for a page that hands them on
-    // (nt-page's `mtimes=1`).
+    // (`mtimes`).
     mtimes: Object.create(null),
     // Extended attributes (`user.*`), path to { name: bytes }: what the pax
     // headers carry, for `gex_set_xattr`.
@@ -198,8 +198,8 @@ export class TarStream {
   }
 
   /** Directories and links passed over unread (their headers' names not
-   *  decoded): an archive with an index names them all already (app.js
-   *  `streamBundle`), and its tens of thousands of links were half of this
+   *  decoded): an archive with an index names them all already (`addTar`'s
+   *  `early`), and its tens of thousands of links were half of this
    *  parser's time, at the archive's end, on the page's main thread. */
   skipLinks = false;
 

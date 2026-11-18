@@ -1,8 +1,7 @@
 // Where the runtime's switches and files are, for a page that is not gex's
-// own. gex's test pages (nt.html, index.html) take their switches from the
-// URL, and their files from the site root (/gex/...). An ejected program's
-// library (app.js `start()`) lives in the user's page, whose URL is the
-// user's: the library sets `GEX_PAGE_SEARCH` from its own options (never the
+// own. A test page takes its switches from the URL, and its files from the
+// site root (/gex/...). The runtime lives in the user's page, whose URL is
+// the user's: it sets `GEX_PAGE_SEARCH` from its own options (never the
 // URL) and `GEX_ASSET_BASE` to where its files are, and everything below
 // reads them through these.
 

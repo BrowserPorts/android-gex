@@ -1,4 +1,4 @@
-// A drop of host files on a guest window (app.js `drop`), as the guest's
+// A drop of host files on a guest window (@gexemu/runtime/drop), as the guest's
 // Wayland compositor sees it (hosts/browser/src/wl.rs): once the files are
 // copied, a drag of their text/uri-list enters the window under the point,
 // moves there, and is dropped if the window's program accepts it. Each guest

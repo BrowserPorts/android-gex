@@ -1,5 +1,5 @@
 // Files and folders dropped on the page, copied into the guest: the page side
-// of app.js's handle.drop (the copying is drop-worker.js's).
+// of @gexemu/runtime/drop (the copying is drop-worker.js's).
 //
 // What a drop carries is read in two steps. `dropItems` runs in the drop
 // event's handler, before anything awaits: a DataTransfer's items can only
@@ -86,7 +86,7 @@ export async function walk(items, signal) {
 export const goodDir = (p) =>
   typeof p === 'string' && p.startsWith('/') && /[^/]/.test(p) && !p.split('/').includes('..') && !p.includes('\0');
 
-/** The options handle.drop takes (app.js), and what each must be. */
+/** The options a drop takes, and what each must be. */
 export const DROP_OPTIONS = ['x', 'y', 'dir', 'fallback', 'signal', 'onProgress'];
 
 /**

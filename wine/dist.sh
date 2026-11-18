@@ -434,7 +434,7 @@ dist_make() {
 	mkdir -p lib/wine/x86_64-unix share
 	cp -p "$C/b64-$K-$S"/out/wine* lib/wine/x86_64-unix/
 	# (gex-rest-only: a site keeps the side modules out of its boot bundle, in
-	# the rest bundle, fetched on the first dlopen: site/site-bundle.mjs)
+	# the rest bundle, fetched on the first dlopen)
 	rm -f lib/wine/x86_64-unix/gex-rest-only
 	[ -z "$GS" ] || { cp -p "$C/b64-$K-$S"/out/winegstreamer.so lib/wine/x86_64-unix/ &&
 		echo winegstreamer.so >> lib/wine/x86_64-unix/gex-rest-only; }

@@ -20,7 +20,7 @@ export default async function (t) {
   check('a second throws', (() => { try { new MesaGl(sys); return false; } catch { return true; } })());
   await timeout(sys.boot(), 60000, 'boot');
   // A translated program's /dev/gex-gl (hosts/browser): said, not checked.
-  // The i386 test tree has none, under runProgram alone too.
+  // The i386 test tree has none.
   const dev = await sys.run(['ls', '/dev/gex-gl'], { env: { PATH: '/bin' } });
   say(`  ls /dev/gex-gl: ${dev.code ? dev.stderr.trim() : dev.stdout.trim()}`);
   check('Mesa is not fetched at boot', !performance.getEntriesByType('resource').some((e) => /gex-wgpu-replay/.test(e.name)));

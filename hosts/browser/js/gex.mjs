@@ -5456,8 +5456,8 @@ export class Gex {
       pbytes = pcopy();
       pkey = `wasm:${moduleContentKey(pbytes)}`;
     }
-    // What gex-eject's 32-bit Wine recorder (site/record-wine32.mjs) collects: the
-    // native wasm32 modules a session ran.
+    // What a recording of a session collects (GEX_LOG=record): the native
+    // wasm32 modules it ran.
     if (wasmdll) {
       const file = this.#cgenStr(e.gex_cgen_pmod_file, prov);
       if (logOn('record')) console.warn(`[gex-record] module ${file} ${pkey.slice(5)}`);
@@ -6011,7 +6011,7 @@ export class Gex {
   #covUsed = 0;
 
   /** Say the slots instrumented units were entered at since the last time:
-   *  `[gex-cov] <key> <slot or a-b>,...` (site/record-wine32.mjs), and
+   *  `[gex-cov] <key> <slot or a-b>,...` (a recording's), and
    *  the profile, `[gex-prof] <key> <slot>:<first>:<calls>,...`: each slot
    *  entered since, its first entry (ms of the epoch; empty once said) and
    *  its entries since the last line (gexc units profile adds them up). */
