@@ -455,7 +455,14 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
 
     // Data exports: the skeleton's export address table pointed at the
     // module's data. In a 32-bit memory a 32-bit RVA wraps to any address;
-    // in a 64-bit one it reaches only the 4 GiB above the image.
+    // in a 64-bit one it reaches only the 4 GiB above the image. A second
+    // view of a DLL whose loaded mapping is live (an image mapped as a
+    // resource, LOAD_LIBRARY_AS_IMAGE_RESOURCE: winedevice's setupapi maps
+    // system32's DLLs so, at one address after another, top down) goes
+    // where the loaded one's pin cannot, and its RVAs may not reach the
+    // data, which is the loaded one's: Wine runs nothing of such a view and
+    // gives no export of it, so that goes to the debug trace only.
+    let extra_view = !released && wp.mapped.get(&dll).is_some_and(|&o| o != base);
     let edir = pe.dirs.first().map(|d| d.0).unwrap_or(0);
     if edir != 0 && !data_list.is_empty() {
         let mut gm = crate::guest();
@@ -468,7 +475,8 @@ fn publish(path: &str, base: u64, pe: &gex_ld::pe::PeImage) -> Result<i32, Strin
             let at = wp.data + *off as u64;
             let target = at.wrapping_sub(base);
             if gex_abi::mem64() && target > u32::MAX as u64 {
-                crate::warn_line(&format!("gex-pe: {path}: data export {link} at {at:#x} is out of its 32-bit RVA's reach from the image at {base:#x}\n"));
+                let line = format!("gex-pe: {path}: data export {link} at {at:#x} is out of its 32-bit RVA's reach from the image at {base:#x}\n");
+                if extra_view { crate::trace_line(&line) } else { crate::warn_line(&line) }
             }
             let _ = gm.write_u32(base + functions + 4 * *i as u64, target as u32);
         }
@@ -1350,12 +1358,18 @@ pub extern "C" fn gex_image_mapped(base: u64, fd: i32) -> i32 {
 }
 
 /// `gex.image_floats(fd)` (64-bit Wine's ntdll, in a 64-bit memory, for an
-/// image the server gives an address below 4 GiB): 1 when the image is a
-/// DLL of Wine's core PE module, whose one data block the DLLs it holds
-/// share. That block is in the window at the top of the space, within the
-/// 32-bit RVA reach of the images placed top down below it but of none
-/// lower, so ntdll places such an image top down too, not at its address
-/// (a pin of the prefix's dll-bases). 0 for any other image.
+/// image the server gives an address below 4 GiB): 1 when the image's
+/// module has its data in the window at the top of the space already, which
+/// is within the 32-bit RVA reach of the images placed top down below it but
+/// of none lower, so ntdll places such an image top down too, not at its
+/// address (a pin of the prefix's dll-bases). That is a DLL of Wine's core
+/// PE module, whose one data block the DLLs it holds share; and a DLL with
+/// a module of its own installed before its image mapped, for another
+/// module that imports its data (user32's of gdi32's): its data went in
+/// the window then, with no image to place it near, and a pinned image's
+/// data exports (gdi32's pfnRealizePalette) were out of their RVAs' reach.
+/// 0 for any other image: one whose module is installed as it maps has its
+/// data placed near it (`pe_data_near`).
 #[no_mangle]
 pub extern "C" fn gex_image_floats(fd: i32) -> i32 {
     if !gex_abi::mem64() {
@@ -1366,7 +1380,12 @@ pub extern "C" fn gex_image_floats(fd: i32) -> i32 {
     let Some(sec) = pe.sections.iter().find(|s| s.name == ".wasmref") else { return 0 };
     let raw = pe.data.get(sec.raw_offset as usize..).unwrap_or_default();
     let module = raw.strip_prefix(&b"GEXWREF1"[..]).and_then(|r| r.split(|&c| c == 0).next());
-    (pe.is64 && module == Some(CORE_MODULE.as_bytes())) as i32
+    let Some(module) = module.filter(|_| pe.is64) else { return 0 };
+    if module == CORE_MODULE.as_bytes() {
+        return 1;
+    }
+    let (lo, hi) = crate::wine64_pe_data();
+    lock(&WINE_PE).mods.iter().any(|w| w.ptr64 && w.name.as_bytes() == module && (lo..hi).contains(&w.data)) as i32
 }
 
 /// In a 64-bit memory, a PE32+ module's data where its skeleton's data
