@@ -986,6 +986,13 @@ export class ProcessHost {
     if (this.#restored) return { refused: SNAP_RESTORED, stopMs: 0 };
     const st = this.#stacks;
     if (!this.#kernel?.memory || !st?.snapWord) throw new Error('snapshot: no global kernel with a snapshot word');
+    // Spares hold no thread: let go rather than stopped (one waits for its
+    // thread in JS, not at the snapshot word). Their processes start new
+    // ones as their next threads come, restored ones too (`atThread`).
+    const spares = this.#spares.splice(0);
+    for (const sp of spares) this.#letSpareGo(sp);
+    const t00 = performance.now();
+    while (spares.some((sp) => this.#workers.has(sp.ref.key)) && performance.now() - t00 < timeout) await new Promise((r) => setTimeout(r, 10));
     if (this.#pending.size) return { refused: `still starting: ${[...this.#pending.keys()].join(' ')}`, stopMs: 0 };
     const want = [...this.#workers.keys()].map(String);
     const parked = new Map();
