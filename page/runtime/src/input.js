@@ -85,7 +85,7 @@ export class Clipboard extends EventTarget {
         i.say('gex: Clipboard: this system has no windows to share a clipboard with\n');
         return;
       }
-      this.#api = await import('@gex/wl-bridge.mjs');
+      this.#api = await import('../../../hosts/browser/js/wl-bridge.mjs');
       this.#channel = s.wlChannel;
       this.#seen = this.#api.clipboardSerial(this.#channel);
       this.#timer = setInterval(() => this.#poll(), CLIP_POLL_MS);

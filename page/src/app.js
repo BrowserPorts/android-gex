@@ -1046,7 +1046,7 @@ async function begin(opts, base, at, state, meter, lets) {
   let drag = null;
   const pageDrag = async () => {
     if (drag || !sys?.wlChannel) return drag;
-    drag = new PageDrag(sys.wlChannel, await import('@gex/wl-bridge.mjs'));
+    drag = new PageDrag(sys.wlChannel, await import('../../hosts/browser/js/wl-bridge.mjs'));
     return drag;
   };
   return {

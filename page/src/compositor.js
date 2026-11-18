@@ -8,7 +8,7 @@
 // can do: DOM events, and the canvas's size.
 
 import { assetFiles, assetUrl, pageParams } from './page-env.js';
-import { startWakeRelay } from '@gex/wl-bridge.mjs';
+import { startWakeRelay } from '../../hosts/browser/js/wl-bridge.mjs';
 import { EVDEV, BTN, modsOf } from './input-map.js';
 import { mesaSources } from './mesa-source.js';
 

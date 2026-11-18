@@ -13,7 +13,7 @@ import { requestGexDevice } from './gpu-device.js';
 import { MAGIC, PROTOCOL_VERSION, HEADER_BYTES, error } from './gl-proto.js';
 import { captureIfRequested } from './gl-capture.js';
 import { assetFiles, assetUrl, pageParams } from './page-env.js';
-import { logOn } from '@gex/log.mjs';
+import { logOn } from '../../hosts/browser/js/log.mjs';
 import { ValidationLog } from './gl-validation.js';
 import { fitReply } from './gl-reply.js';
 

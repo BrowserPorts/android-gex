@@ -73,10 +73,10 @@ import {
   ROLE_SUBSURFACE,
   ROLE_CURSOR,
   takesPointer,
-} from '@gex/wl-bridge.mjs';
+} from '../../hosts/browser/js/wl-bridge.mjs';
 import { pageParams } from './page-env.js';
 import { EVDEV, BTN, BIT, modsOf } from './input-map.js';
-import { logNamed } from '@gex/log.mjs';
+import { logNamed } from '../../hosts/browser/js/log.mjs';
 
 /** `GEX_LOG=win` (only when named): a line when a toplevel appears, first
  *  shows pixels (its first buffer painted, or its GL frame shown) and is
@@ -485,7 +485,7 @@ export class DomDesktop {
       throw new Error(device.error || 'the GL device would not start');
     }
     this.#gl = device;
-    const { serveGl } = await import('@gex/gl-bridge.mjs');
+    const { serveGl } = await import('../../hosts/browser/js/gl-bridge.mjs');
     this.#glServe = serveGl(device, channel);
     this.#glServed = true;
     this.ongl?.(device.describe());

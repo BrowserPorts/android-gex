@@ -340,7 +340,7 @@ export async function startHostGl(compositor, glChannel, opts, term) {
     term?.writeln?.(`gex: the guest's OpenGL did not start (${opts.backend || 'wgpu'}): ${why}`);
     term?.writeln?.('gex: GL windows will be blank; everything else still runs');
     globalThis.__gexGlError = why;
-    if (glChannel?.control) (await import('@gex/gl-bridge.mjs')).failGlChannel(glChannel);
+    if (glChannel?.control) (await import('../../hosts/browser/js/gl-bridge.mjs')).failGlChannel(glChannel);
     return null;
   }
 }
@@ -801,7 +801,7 @@ export async function openGlChannel(d3d = false) {
   if (!globalThis.crossOriginIsolated) {
     throw new Error('the guest GL needs a cross-origin isolated page (SharedArrayBuffer bridge).');
   }
-  const { makeGlChannel } = await import('@gex/gl-bridge.mjs');
+  const { makeGlChannel } = await import('../../hosts/browser/js/gl-bridge.mjs');
   const channel = makeGlChannel();
   channel.d3d = !!d3d;
   return channel;
@@ -843,7 +843,7 @@ export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop =
   if (!globalThis.crossOriginIsolated) {
     throw new Error('the Wayland compositor needs a cross-origin isolated page (SharedArrayBuffer bridge).');
   }
-  const { makeWlChannel, setOutputSize } = await import('@gex/wl-bridge.mjs');
+  const { makeWlChannel, setOutputSize } = await import('../../hosts/browser/js/wl-bridge.mjs');
   const wlChannel = makeWlChannel();
   const element = typeof wl.getContext !== 'function' && wl.nodeType === 1 ? wl : null;
   if (element) {
@@ -880,7 +880,7 @@ export { loadKernel as globalKernel };
  * the Worker's updates (`mirrorTake`).
  */
 export async function openWaylandMirror({ wl, post, onDesktop = null, say = () => {} }) {
-  const { mirrorChannel, mirrorApply } = await import('@gex/wl-bridge.mjs');
+  const { mirrorChannel, mirrorApply } = await import('../../hosts/browser/js/wl-bridge.mjs');
   const wlChannel = mirrorChannel(post);
   const { DomDesktop } = await import('./dom-compositor.js');
   const compositor = DomDesktop.create(wl, wlChannel, { width: wl.clientWidth, height: wl.clientHeight });
