@@ -52,6 +52,11 @@
 //   relocations applies within the engines' function size limit (pelink
 //   splits it);
 // - hostdatacc: hostdata.c's statics, gex's memory outside every image;
+// - shmview-same, -whole, -shifted: two views of one section in one
+//   process (Firefox's Shmem with e10s off) are one range, records handed
+//   through them under section churn read back as written, and ended
+//   threads' TLS chunks no longer show as Wine's memory; shmview-based: a
+//   view at an address asked for, a separate copy (expected);
 // - owndll: a program linked against its own DLL's import library, the
 //   DLL's exports its default-visibility symbols: calls, a struct by value,
 //   the DLL's int and struct written and read on both sides;
