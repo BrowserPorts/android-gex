@@ -12,5 +12,6 @@ export declare class CompositorWindows extends EventTarget {
   get env(): WindowEnv;
   /** The output's new size, in device pixels. */
   resize(width: number, height: number): void;
-  describe(): Promise<unknown>;
+  /** `pixels: false`: without the hash of what is shown. */
+  describe(options?: { pixels?: boolean }): Promise<unknown>;
 }

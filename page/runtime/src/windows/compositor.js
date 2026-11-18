@@ -112,8 +112,9 @@ export class CompositorWindows extends EventTarget {
     this.#c?.resize(width, height);
   }
 
-  /** The scene: its windows, titles and a hash of what is shown. */
-  describe() {
-    return this.#c?.describe() ?? Promise.resolve(null);
+  /** The scene: its windows, titles and a hash of what is shown;
+   *  `pixels: false` leaves out the hash (cheap enough to ask often). */
+  describe({ pixels = true } = {}) {
+    return this.#c?.describe({ pixels }) ?? Promise.resolve(null);
   }
 }

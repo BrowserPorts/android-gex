@@ -783,7 +783,9 @@ as a KDE or Xfce session does). `background` is the desktop behind the
 windows: a colour (`'#rrggbb'`) or `{ color, image, anchor }`, `image` a URL
 or a `Blob` covering the canvas, `anchor` the edge that always shows
 (`'top'`, `'center'`, the default, or `'bottom'`); the colour shows until the
-image is in. `env`, `resize(width, height)` (device pixels), `describe()`.
+image is in. `env`, `resize(width, height)` (device pixels), `describe({ pixels })`
+(the scene: `list`, a line per window with its title, `frames`, and, unless
+`pixels: false`, a hash of what is shown).
 
 `process.windows()` is for HostWindows; the other two keep their windows to
 themselves.
