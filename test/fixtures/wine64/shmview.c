@@ -17,7 +17,8 @@
  * argv[1]: "same" (B maps what A maps), "whole" (A maps the first page
  * only, B the whole section), "shifted" (both from the second page),
  * "based" (B at an address asked for: a separate copy, as expected, with
- * no handoff); argv[2]: seconds (default 10).
+ * no handoff), "rdonly" (A read-only, B read-write, written through B and
+ * read through A, no handoff); argv[2]: seconds (default 10).
  * Prints "shmview: MODE N records, M bad" then "N failures". */
 #include <windows.h>
 #include <stdio.h>
@@ -159,6 +160,19 @@ int main(int argc, char **argv)
         unsigned char *b = MapViewOfFile(dup, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, SECTION);
         va = a ? a + 4096 : NULL;
         vb = b ? b + 4096 : NULL;
+    }
+    else if (!strcmp(mode, "rdonly"))
+    {
+        unsigned char *a = MapViewOfFile(s, FILE_MAP_READ, 0, 0, SECTION);
+        unsigned char *b = MapViewOfFile(dup, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, SECTION);
+        int same = 1;
+        if (!a || !b) { printf("shmview FAIL MapViewOfFile %lu\n1 failures\n", GetLastError()); return 1; }
+        for (int i = 0; i < SECTION; i++) b[i] = (unsigned char)(i * 13 + 5);
+        for (int i = 0; i < SECTION; i++) if (a[i] != (unsigned char)(i * 13 + 5)) { same = 0; break; }
+        printf("shmview: rdonly views %s, written through the second %s\n", a == b ? "one range" : "two ranges",
+               same ? "read through the first" : "NOT read through the first");
+        printf("%d failures\n", same ? 0 : 1);
+        return same ? 0 : 1;
     }
     else
     {
