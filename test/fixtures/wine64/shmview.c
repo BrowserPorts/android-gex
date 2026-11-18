@@ -18,7 +18,12 @@
  * only, B the whole section), "shifted" (both from the second page),
  * "based" (B at an address asked for: a separate copy, as expected, with
  * no handoff), "rdonly" (A read-only, B read-write, written through B and
- * read through A, no handoff); argv[2]: seconds (default 10).
+ * read through A, no handoff; on gex the read-only view reports the
+ * read-write protection: one range has one protection, an expected gap),
+ * "big" (a 256 MiB section, a page viewed at its start and one at 200 MiB:
+ * one range, the second where the first's would reach, no handoff; argv[2]
+ * seconds to stay mapped, so the process's memory can be read meanwhile);
+ * argv[2]: seconds (default 10).
  * Prints "shmview: MODE N records, M bad" then "N failures". */
 #include <windows.h>
 #include <stdio.h>
@@ -169,10 +174,27 @@ int main(int argc, char **argv)
         if (!a || !b) { printf("shmview FAIL MapViewOfFile %lu\n1 failures\n", GetLastError()); return 1; }
         for (int i = 0; i < SECTION; i++) b[i] = (unsigned char)(i * 13 + 5);
         for (int i = 0; i < SECTION; i++) if (a[i] != (unsigned char)(i * 13 + 5)) { same = 0; break; }
+        MEMORY_BASIC_INFORMATION mbi;
         printf("shmview: rdonly views %s, written through the second %s\n", a == b ? "one range" : "two ranges",
                same ? "read through the first" : "NOT read through the first");
+        if (VirtualQuery(a, &mbi, sizeof(mbi)))
+            printf("shmview: rdonly first view reports %s\n", mbi.Protect == PAGE_READONLY ? "PAGE_READONLY" :
+                   mbi.Protect == PAGE_READWRITE ? "PAGE_READWRITE (one range, one protection: an expected gap)" : "another protection");
         printf("%d failures\n", same ? 0 : 1);
         return same ? 0 : 1;
+    }
+    else if (!strcmp(mode, "big"))
+    {
+        HANDLE big = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 256 << 20, NULL);
+        unsigned char *a = big ? MapViewOfFile(big, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 4096) : NULL;
+        unsigned char *b = big ? MapViewOfFile(big, FILE_MAP_READ | FILE_MAP_WRITE, 0, 200 << 20, 4096) : NULL;
+        if (!a || !b) { printf("shmview FAIL big MapViewOfFile %lu\n1 failures\n", GetLastError()); return 1; }
+        a[0] = 0x11; b[0] = 0x22;
+        printf("shmview: big views %s\n", b == a + (200 << 20) ? "one range" : "two ranges");
+        fflush(stdout);
+        Sleep(secs * 1000);
+        printf("%d failures\n", b == a + (200 << 20) && a[0] == 0x11 && b[0] == 0x22 ? 0 : 1);
+        return 0;
     }
     else
     {

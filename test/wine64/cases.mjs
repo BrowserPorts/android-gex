@@ -299,7 +299,10 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
         want: new RegExp(`${tls}shmview: views one range\nshmview: ${m} [1-9]\\d* records, 0 bad\n0 failures`) });
     }
     if (exe) await w.nt({ ...o, name: `${pre}shmview-rdonly`, exe, extra: [`${exe}.wasm`], args: ['rdonly', '1'],
-      want: new RegExp(`${tls}shmview: rdonly views one range, written through the second read through the first\n0 failures`) });
+      want: new RegExp(`${tls}shmview: rdonly views one range, written through the second read through the first\n` +
+        'shmview: rdonly first view reports PAGE_READWRITE \\(one range, one protection: an expected gap\\)\n0 failures') });
+    if (exe) await w.nt({ ...o, name: `${pre}shmview-big`, exe, extra: [`${exe}.wasm`], args: ['big', '1'],
+      want: new RegExp(`${tls}shmview: big views one range\n0 failures`) });
     if (exe) await w.nt({ ...o, name: `${pre}shmview-based`, exe, extra: [`${exe}.wasm`], args: ['based', '1'],
       want: new RegExp(`${tls}shmview: based views two ranges \\(a separate copy, as expected\\)\n0 failures`) });
   }

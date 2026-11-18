@@ -58,7 +58,9 @@
 //   threads' TLS chunks no longer show as Wine's memory; shmview-based: a
 //   view at an address asked for, a separate copy (expected); shmview-rdonly:
 //   a read-only first view and a read-write second, one range, written
-//   through the second;
+//   through the second (it reports read-write: one range, one protection,
+//   an expected gap); shmview-big: a page viewed at the start of a 256 MiB
+//   section and one at 200 MiB, one range;
 // - owndll: a program linked against its own DLL's import library, the
 //   DLL's exports its default-visibility symbols: calls, a struct by value,
 //   the DLL's int and struct written and read on both sides;
