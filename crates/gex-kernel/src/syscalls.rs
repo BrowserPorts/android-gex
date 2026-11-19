@@ -10656,12 +10656,44 @@ fn write_back(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result<(),
     r
 }
 
+/// `GEX_CHECK_MAPS=1`: a shared mapping of a file opened read-only can
+/// hold nothing but the file, so a page of it whose hash moved since it
+/// was read is memory something else wrote: said, with the first byte
+/// that is not the file's, when the mapping is written back (its
+/// `munmap`, `msync`, a futex wake).
+fn check_read_only_map(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("GEX_CHECK_MAPS").is_some()) {
+        return;
+    }
+    const P: u64 = crate::mem::PAGE_SIZE;
+    let (from, to) = (map.start.max(lo), (map.start + map.len).min(hi));
+    let mut at = from & !(P - 1);
+    while at < to {
+        let page = (at - map.start) / P;
+        let n = (P as usize).min((map.start + map.len - at) as usize);
+        let Ok(bytes) = m.read(at, n) else { return };
+        let h = page_hash(bytes);
+        if map.pages.get(page as usize).map(|s| s.load(std::sync::atomic::Ordering::Relaxed)) != Some(h) {
+            let mut file = vec![0u8; n];
+            let got = (map.file.pread_mapped(map.offset + page * P, &mut file).unwrap_or(0) as usize).min(n);
+            let first = bytes.iter().zip(&file[..got]).position(|(a, b)| a != b);
+            eprintln!(
+                "gex: BUG: a read-only shared mapping of {} at {:#x} (file offset {:#x}) does not hold the file: page {page} at {at:#x}, first difference at {first:x?} ({got} bytes of the file read)",
+                map.file.path, map.start, map.offset
+            );
+        }
+        at += P;
+    }
+}
+
 fn write_back_own(m: &GuestMem<'_>, map: &SharedMap, lo: u64, hi: u64) -> Result<(), Errno> {
     // A mapping of a descriptor opened read-only has nothing to
     // write back (Linux refuses it PROT_WRITE): its stores are
     // the process's own, as Wine's relocations of an image view
     // are. Writing them was EBADF, and failed the next mmap.
     if !map.file.writable {
+        check_read_only_map(m, map, lo, hi);
         return Ok(());
     }
     let from = map.start.max(lo);
