@@ -1594,6 +1594,10 @@ pub struct MemFd {
     /// read off the end, and an ignored seal hands back the guarantee without
     /// the safety.
     seals: Mutex<u32>,
+    /// What each shared mapping that may become writable holds
+    /// (`map_hold`): while any does, `F_SEAL_WRITE` is `EBUSY`
+    /// (`mapping_deny_writable`).
+    writers: Arc<()>,
 }
 
 /// `F_ADD_SEALS` bits.
@@ -1614,6 +1618,7 @@ impl MemFd {
             data: Mutex::new(Vec::new()),
             backing: std::sync::OnceLock::new(),
             seals: Mutex::new(0),
+            writers: Arc::new(()),
         }
     }
 
@@ -1664,6 +1669,9 @@ impl MemFd {
         let mut held = self.seals.lock().unwrap();
         if *held & seal::SEAL != 0 {
             return Err(Errno::EPERM);
+        }
+        if add & seal::WRITE != 0 && *held & seal::WRITE == 0 && Arc::strong_count(&self.writers) > 1 {
+            return Err(Errno::EBUSY);
         }
         *held |= add;
         Ok(0)
@@ -1718,6 +1726,45 @@ impl FileHandle for MemFd {
 
     fn as_memfd(self: Arc<Self>) -> Option<Arc<MemFd>> {
         Some(self)
+    }
+
+    /// A writable shared mapping of a memfd sealed against writing is
+    /// `EPERM` (`shmem_mmap` and `memfd_check_seals_mmap`).
+    fn may_map(&self, _offset: u64, _len: u64, prot: u32, shared: bool) -> Result<(), Errno> {
+        if shared && prot & crate::mem::prot::WRITE != 0 && self.seals() & (seal::WRITE | seal::FUTURE_WRITE) != 0 {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
+    }
+
+    /// A read-only shared mapping of a memfd sealed against writing may
+    /// never be made writable (`memfd_check_seals_mmap` clears
+    /// `VM_MAYWRITE`).
+    fn read_only_mapping_stays(&self) -> bool {
+        self.seals() & (seal::WRITE | seal::FUTURE_WRITE) != 0
+    }
+
+    /// A shared mapping that may become writable counts for
+    /// `F_SEAL_WRITE`, read-only or not (`is_shared_maywrite`): every one
+    /// but those made once the memfd was sealed.
+    fn map_hold(&self, _prot: u32, shared: bool) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, Errno> {
+        Ok((shared && !self.read_only_mapping_stays()).then(|| Arc::clone(&self.writers) as Arc<dyn std::any::Any + Send + Sync>))
+    }
+
+    /// A mapping's pages written back are not a `write()`: a seal added
+    /// since it was made does not stop them (`F_SEAL_FUTURE_WRITE` leaves
+    /// existing writable mappings writable), nor does the size seal, as
+    /// a mapping does not grow the file.
+    fn write_mapped(&self, offset: u64, buf: &[u8]) -> SysResult {
+        let mut data = self.data.lock().unwrap();
+        if let Some(b) = self.backing.get() {
+            drop(data);
+            return b.write_mapped(offset, buf);
+        }
+        let start = (offset as usize).min(data.len());
+        let n = buf.len().min(data.len() - start);
+        data[start..start + n].copy_from_slice(&buf[..n]);
+        Ok(n as u64)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
