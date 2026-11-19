@@ -173,22 +173,35 @@ export class CompositorWindows extends EventTarget {
       query?.addEventListener('change', onScale);
     };
     const onScale = () => {
-      scaleNow();
+      again();
       watchScale();
     };
-    const ro = new ResizeObserver(([e]) => {
-      // Zoomed out below 1: the output stays at the CSS size (scale 1), and
-      // the browser shrinks it.
-      const box = (Number(globalThis.devicePixelRatio) || 1) >= 1 ? e.devicePixelContentBoxSize?.[0] : null;
-      const css = e.contentBoxSize?.[0];
-      const nw = box ? box.inlineSize : Math.round((css?.inlineSize ?? 0) * dprNow());
-      const nh = box ? box.blockSize : Math.round((css?.blockSize ?? 0) * dprNow());
+    const sized = (box, css) => {
+      // The device-pixel box is the CSS box times the scale, snapped to
+      // whole pixels; one that is not (an emulated scale reports the CSS
+      // box there) is not taken.
+      const s = dprNow();
+      const take = (d, c) => (d && Math.abs(d - c * s) < 2 ? d : Math.round(c * s));
+      const nw = take(box?.inlineSize, css?.inlineSize ?? 0);
+      const nh = take(box?.blockSize, css?.blockSize ?? 0);
       scaleNow();
       if (!nw || !nh || (nw === w && nh === h)) return;
       w = nw;
       h = nh;
       this.#c?.resize(w, h);
+    };
+    const ro = new ResizeObserver(([e]) => {
+      // Zoomed out below 1: the output stays at the CSS size (scale 1), and
+      // the browser shrinks it.
+      sized((Number(globalThis.devicePixelRatio) || 1) >= 1 ? e.devicePixelContentBoxSize?.[0] : null, e.contentBoxSize?.[0]);
     });
+    // A scale that changes the device-pixel box without the observer seeing
+    // it (an emulated one): the CSS box again, at the scale there is now.
+    const again = () => {
+      const r = canvas.getBoundingClientRect();
+      sized(null, { inlineSize: canvas.clientWidth || r.width, blockSize: canvas.clientHeight || r.height });
+    };
+    globalThis.addEventListener?.('resize', again);
     try {
       ro.observe(canvas, { box: 'device-pixel-content-box' });
     } catch {
@@ -198,6 +211,7 @@ export class CompositorWindows extends EventTarget {
     this.#unfollow = () => {
       ro.disconnect();
       query?.removeEventListener('change', onScale);
+      globalThis.removeEventListener?.('resize', again);
     };
   }
 

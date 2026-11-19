@@ -1,7 +1,7 @@
 // CompositorWindows sizes its canvas in device pixels: the backing store is the
 // canvas's content box at the real devicePixelRatio (1.5 is 1.5, not 2), and
 // follows a layout change and a change of scale (a zoom, another monitor) with
-// the frames drawn at it. `scale: 1` turns it off: the page's own size.
+// the frames drawn at it. `scale: 1` turns it off (hidpi-fixed.test.js).
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
@@ -13,7 +13,9 @@ export const meta = {
 
 export default async function (t) {
   const { check, timeout, until } = t;
-  const dsf = (deviceScaleFactor) => t.cdp({ method: 'Emulation.setDeviceMetricsOverride', width: 1000, height: 700, deviceScaleFactor, mobile: false });
+  // Each with its own viewport width: an emulated scale alone changes no box an observer sees.
+  let vw = 1000;
+  const dsf = (deviceScaleFactor) => t.cdp({ method: 'Emulation.setDeviceMetricsOverride', width: vw++, height: 700, deviceScaleFactor, mobile: false });
   await dsf(1.5);
   await until(async () => devicePixelRatio === 1.5, 'devicePixelRatio 1.5', 5000);
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
@@ -38,19 +40,5 @@ export default async function (t) {
   await seen('625x250 1.25');
   check('and back down, unrounded', true);
   await sys.shutdown();
-  // scale: 1, the page's own size: the canvas is left as it is.
-  const sys2 = new System({ baseUrl: t.baseUrl, debug: t.debug() });
-  new MemoryFilesystem(sys2).addTar(t.work('bb.tar.zst'));
-  const c = document.createElement('canvas');
-  c.width = 320; c.height = 200;
-  c.style.cssText = 'position:absolute;left:600px;top:0;width:160px;height:100px';
-  document.body.append(c);
-  const out2 = new CompositorWindows(sys2, { canvas: c, scale: 1 });
-  await timeout(sys2.boot(), 60000, 'boot');
-  let d2 = null;
-  await until(async () => (d2 = await out2.describe({ pixels: false }))?.output === '320x200', 'scale 1: 320x200', 10000)
-    .catch((e) => { throw new Error(`${e.message}: ${d2?.output}`); });
-  check('scale: 1 keeps the page\'s size', d2.scale === 1, String(d2.scale));
-  await sys2.shutdown();
   await dsf(1);
 }
