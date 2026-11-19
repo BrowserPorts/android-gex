@@ -1,9 +1,9 @@
 // A process that crashes in the runtime is reported (System's `crash`
 // event) even when another process kills it at the same moment: rt-probe
 // killrace's child crashes the kernel on purpose (prctl PR_GEX_DEBUG_TRAP,
-// armed by `debugpanic=prctl`), and its sibling sends it SIGKILL as soon as
-// it says it is about to, so the kill lands while the crashed child's
-// Worker is ending. Before, the kill's end claimed the process first and
+// armed by `debugpanic=prctl`), and its other thread sends the process
+// SIGKILL the moment the crash begins, so the kill ends the process in that
+// thread's Worker while the crashed one's is still on its way to its end. Before, the kill's end claimed the process first and
 // the crash was never said. Then rt-killwait: SIGKILL ends a process whose
 // every thread is waiting.
 import { System } from '../../page/runtime/src/index.js';

@@ -58,6 +58,15 @@
 #include <sys/xattr.h>
 #include <unistd.h>
 #include <sys/prctl.h>
+#include <pthread.h>
+
+static int killrace_up, killrace_go;
+static void *killrace_killer(void *_) {
+  __atomic_store_n(&killrace_up, 1, __ATOMIC_SEQ_CST);
+  while (!__atomic_load_n(&killrace_go, __ATOMIC_SEQ_CST)) { }
+  kill(getpid(), SIGKILL);
+  return 0;
+}
 
 int main(int argc, char **argv) {
   const char *what = argc > 1 ? argv[1] : "";
@@ -106,36 +115,27 @@ int main(int argc, char **argv) {
   } else if (!strcmp(what, "trap")) {
     __builtin_trap();
   } else if (!strcmp(what, "killrace") && argc == 3) {
-    /* N rounds: a child that crashes the runtime (prctl PR_GEX_DEBUG_TRAP,
-     * armed by the page's debugpanic=prctl) and a sibling that kills it with
-     * SIGKILL as soon as it says it is about to: the kill lands while the
-     * crashed child's Worker is ending. Each child's pid, for the test to
-     * match against the crash reports. */
+    /* N rounds of a child that crashes the runtime (prctl
+     * PR_GEX_DEBUG_TRAP, armed by the page's debugpanic=prctl) while its
+     * other thread, in a Worker of its own, sends the process SIGKILL the
+     * moment it sees the crash begin: the kill ends the process there
+     * while the crashed thread's Worker is still on its way to its end.
+     * Each child's pid, for the test to match against the crash reports. */
     int n = atoi(argv[2]);
     for (int r = 0; r < n; r++) {
-      int p[2];
-      if (pipe(p)) return 2;
+      killrace_go = 0;
       pid_t a = fork();
       if (a == 0) {
-        close(p[0]);
-        (void)!write(p[1], "x", 1);
+        pthread_t t;
+        pthread_create(&t, 0, killrace_killer, 0);
+        while (!__atomic_load_n(&killrace_up, __ATOMIC_SEQ_CST)) { }
+        __atomic_store_n(&killrace_go, 1, __ATOMIC_SEQ_CST);
         prctl(0x474500f0, 0, 0, 0, 0);
         _exit(42); /* not armed */
       }
-      pid_t b = fork();
-      if (b == 0) {
-        char c;
-        close(p[1]);
-        (void)!read(p[0], &c, 1);
-        while (kill(a, SIGKILL) == 0) usleep(200);
-        _exit(0);
-      }
-      close(p[0]);
-      close(p[1]);
       int st;
       waitpid(a, &st, 0);
       int sa = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
-      waitpid(b, &st, 0);
       printf("round %d pid %d %d\n", r, (int)a, sa);
     }
   } else if (!strcmp(what, "sigpipe")) {
