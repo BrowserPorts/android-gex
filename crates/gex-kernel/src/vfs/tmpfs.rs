@@ -1267,8 +1267,8 @@ impl TmpFs {
             return p.write(offset, bytes).map(|_| ());
         }
         let mut data = f.data.lock().unwrap();
-        let start = offset as usize;
-        let end = start + bytes.len();
+        let end = mem_end(offset, bytes.len())?;
+        let start = end - bytes.len();
         if end > data.len() {
             let was = data.capacity();
             reserve(&mut data, end)?;
@@ -1878,9 +1878,7 @@ impl FileHandle for TmpHandle {
             let mut cow = file.cow.lock().unwrap();
             if let Some(c) = cow.as_mut() {
                 // a shared file's write is its own: the chunks it touches copied first
-                if usize::try_from(offset + buf.len() as u64).is_err() {
-                    return Err(Errno::EFBIG);
-                }
+                mem_end(offset, buf.len())?;
                 c.write(offset, buf);
                 if c.worth_owning() {
                     let v = c.to_vec();
@@ -1897,7 +1895,8 @@ impl FileHandle for TmpHandle {
                 return Ok(buf.len() as u64);
             }
         }
-        let start = offset as usize;
+        let end = mem_end(offset, buf.len())?;
+        let start = end - buf.len();
         if start + buf.len() > data.len() {
             let was = data.capacity();
             reserve(&mut data, start + buf.len())?;
@@ -2071,8 +2070,9 @@ impl FileHandle for TmpHandle {
                 }
             } else {
                 let was = data.capacity();
-                reserve(&mut data, len as usize)?;
-                data.resize(len as usize, 0);
+                let len = mem_end(len, 0)?;
+                reserve(&mut data, len)?;
+                data.resize(len, 0);
                 note_capacity(was, data.capacity());
             }
             file.changed();
@@ -2523,6 +2523,17 @@ impl FileSystem for TmpFs {
 /// lives in the kernel's memory, and a `resize` the allocator cannot meet is an
 /// abort there, with the file's lock (and every process's kernel) held for good.
 /// The usual doubling first, then exactly `len` when doubling is what failed.
+/// Where a write of `len` bytes at `offset` ends, as an in-memory file's
+/// length: EFBIG when that does not fit the kernel's `usize` (it is wasm32,
+/// where `offset as usize` would wrap onto the start of the file).
+fn mem_end(offset: u64, len: usize) -> Result<usize, Errno> {
+    offset
+        .checked_add(len as u64)
+        .and_then(|e| usize::try_from(e).ok())
+        .filter(|&e| e <= isize::MAX as usize)
+        .ok_or(Errno::EFBIG)
+}
+
 fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
     let more = len.saturating_sub(data.len());
     if more == 0 || data.capacity() >= len {

@@ -1362,7 +1362,12 @@ async function handle(msg) {
     // their dispatch); on keeps tables small across a many-fork run like apt.
     if (msg.claimPages !== undefined) ex.gex_set_claim_pages?.(msg.claimPages);
     if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
-    if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
+    if (msg.coherentLoads === 2 && ex.gex_set_tso2) ex.gex_set_tso2(1);
+    else if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
+    // A memory that is not shared (the single-thread build): the shim never
+    // grows it by nothing to take another Worker's length (lib.rs
+    // `grow_refresh`), which would detach its buffer.
+    if (!(typeof SharedArrayBuffer === 'function' && gex.memory?.buffer instanceof SharedArrayBuffer)) ex.gex_set_memory_unshared?.(1);
     // TEST (GEX_DEBUG_PANIC, a test-only switch): the shim panics on purpose.
     if (msg.debugPanic) {
       try {
@@ -1600,6 +1605,9 @@ async function handle(msg) {
       // What this process's memory grew to -- the question is whether a forked
       // child pays the same again.
       memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)),
+      // Of that, what was grown ahead of what was asked for (lib.rs
+      // `grow_memory_to`'s headroom): address space, not use.
+      headroomMib: gex.shim.exports.gex_headroom_mib?.(),
       // And what of it holds anything: its pages not all zero, MiB, which is
       // what the browser keeps resident for it (a memory's size is not: a
       // memory64 is 8 GiB from its first instruction). Only where the exit
@@ -1682,14 +1690,17 @@ async function handle(msg) {
     // The global kernel has no console of its own, so a panic there unwinds to
     // a bare `unreachable`. Its message is in its own memory, readable here
     // because this Worker made the instance.
+    // What the crash notice says of it (`gex_crash_line`): the panic's own
+    // words, its last line ("capacity overflow"), not its source path.
+    let kernelWhy = '';
     try {
       const k = gex.kernel;
       if (k?.k_panic_len?.()) {
         const n = k.k_panic_len() >>> 0;
         const at = k.k_panic_ptr() >>> 0;
-        where += ` -- the global kernel panicked: ${utf8(
-          new Uint8Array(msg.kernel.memory.buffer, at, n),
-        )}`;
+        const text = utf8(new Uint8Array(msg.kernel.memory.buffer, at, n));
+        where += ` -- the global kernel panicked: ${text}`;
+        kernelWhy = `the gex kernel failed: ${text.trim().split('\n').at(-1).slice(0, 200)}`;
       }
     } catch {
       // Nothing to add.
@@ -1707,6 +1718,17 @@ async function handle(msg) {
       // process runs on in its other Workers.
       if (!inert) {
         if (!outgrew) gex?.shim?.exports?.gex_dump_state?.();
+        const ex = gex?.shim?.exports;
+        if (kernelWhy && ex?.gex_crash_line && ex.gex_alloc) {
+          try {
+            const bytes = new TextEncoder().encode(kernelWhy);
+            const p = ex.gex_alloc(bytes.length) >>> 0;
+            new Uint8Array(gex.memory.buffer, p, bytes.length).set(bytes);
+            ex.gex_crash_line(p, bytes.length);
+          } catch {
+            // The notice keeps its plain words.
+          }
+        }
         const abandon = gex?.shim?.exports?.gex_abandon;
         // In the single-thread build the kernel's calls may suspend, which
         // needs a stack of its own (`WebAssembly.promising`).

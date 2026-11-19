@@ -326,6 +326,13 @@ pub enum BlockOp {
         /// lost -- the native host holds the lock across both instead and
         /// ignores this. See [`futex::FutexTable::park`].
         parked: Option<crate::futex::Parked>,
+        /// The host's shared wake generation of `uaddr`
+        /// ([`crate::futex::shared_gen`]), sampled BEFORE the word was
+        /// checked, as `parked` is: a wake from another Worker either
+        /// changed the word the check then saw, or bumps a generation past
+        /// this one. Sampled after the check, a wake between the two was
+        /// already in the sample and the park lasted for ever.
+        shared_gen: u32,
     },
     Sleep(std::time::Duration),
     /// `FUTEX_LOCK_PI(2)`: take the priority-inheritance lock at `uaddr` for
@@ -8391,11 +8398,15 @@ pub fn futex_block(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Bl
     // will see. The native host holds the queue lock across its
     // check-and-sleep instead and ignores this.
     let parked = cx.table.park(a[0]);
+    // The host's cross-Worker generation, likewise before the word (an
+    // acquire load: the word's load below cannot move above it).
+    let shared_gen = futex::shared_gen(a[0]);
     // The word must still hold what the caller expects, or the
     // wake that changed it has already been and gone and the wait
     // would be permanent. A mismatch declines the wait (EAGAIN via
-    // `sys_futex`).
-    if m.read_u32(a[0]).ok()? != a[2] as u32 {
+    // `sys_futex`). One atomic load, as Linux's: on a weakly ordered host
+    // a plain one may read a value older than the generation above.
+    if m.load_u32(a[0]).ok()? != a[2] as u32 {
         return None;
     }
     let deadline = if a[3] == 0 {
@@ -8431,6 +8442,7 @@ pub fn futex_block(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Bl
         val: a[2] as u32,
         deadline,
         parked: Some(parked),
+        shared_gen,
     })
 }
 
@@ -9033,27 +9045,39 @@ fn io_readv(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64, 
         if len == 0 {
             continue;
         }
-        let mut tmp = vec![0u8; len as usize];
-        let n = match file.read_here(&mut tmp) {
-            Ok(n) => n,
-            // The vector filled and the next one found the socket empty,
-            // which is `EAGAIN`. Reporting that would discard the count
-            // for bytes this call has *already taken out of the socket*
-            // and written into the caller's memory -- they are consumed,
-            // and nothing can give them back. The caller sees "nothing
-            // arrived" and waits for data it is already holding.
-            //
-            // That is the X protocol deadlocking: the server reads a
-            // request header into the first vector, loses it here, and
-            // waits forever for a request the client believes it sent.
-            Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
-        };
-        m.write(base, &tmp[..n as usize])?;
-        if !file.handle.is_stream() {
-            shared_after_read(shared, m, &file, file.offset() - n, base, n);
+        // The guest's length (Linux's cap, and no further than its memory)
+        // in pieces of at most 16 MiB: a vector of gigabytes is never one
+        // buffer the kernel's own memory cannot hold, and a regular file
+        // still fills it whole, as Linux's read does.
+        let want = rw_len(m, base, len) as u64;
+        let mut got = 0u64;
+        while got < want {
+            let mut tmp = vec![0u8; (want - got).min(1 << 24) as usize];
+            let n = match file.read_here(&mut tmp) {
+                Ok(n) => n,
+                // The vector filled and the next one found the socket empty,
+                // which is `EAGAIN`. Reporting that would discard the count
+                // for bytes this call has *already taken out of the socket*
+                // and written into the caller's memory -- they are consumed,
+                // and nothing can give them back. The caller sees "nothing
+                // arrived" and waits for data it is already holding.
+                //
+                // That is the X protocol deadlocking: the server reads a
+                // request header into the first vector, loses it here, and
+                // waits forever for a request the client believes it sent.
+                Err(e) => return if total + got > 0 { Ok(total + got) } else { Err(e) },
+            };
+            m.write(base + got, &tmp[..n as usize])?;
+            if !file.handle.is_stream() {
+                shared_after_read(shared, m, &file, file.offset() - n, base + got, n);
+            }
+            got += n;
+            if n < tmp.len() as u64 {
+                break;
+            }
         }
-        total += n;
-        if n < len {
+        total += got;
+        if got < len {
             break;
         }
     }

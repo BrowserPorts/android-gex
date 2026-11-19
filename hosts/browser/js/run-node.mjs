@@ -678,7 +678,7 @@ const host = new ProcessHost({
     // so shared reads stay coherent under true parallelism (V8 can't hoist a
     // plain wasm load across a guest fence). Tests whether the GTK startup race
     // is plain-load coherence at guest fences. Default off.
-    coherentLoads: !!(process.env.GEX_COHERENT_LOADS || (process.env.GEX_TSO && process.env.GEX_TSO !== "0")),
+    coherentLoads: process.env.GEX_TSO === "2" ? 2 : !!(process.env.GEX_COHERENT_LOADS || (process.env.GEX_TSO && process.env.GEX_TSO !== "0")),
     // GEX_SP_GUARD: at each safepoint, catch a worker thread whose SP has strayed
     // into the MAIN thread's stack (it would smash a canary the main thread only
     // detects later -- the complex-Qt/designer stack smash). Loud when it fires.
@@ -763,7 +763,7 @@ const host = new ProcessHost({
     }
     if (pid !== 1) {
       if (process.env.GEX_DEBUG_EXIT) {
-        const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB`;
+        const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB${m.headroomMib ? ` (headroom ${m.headroomMib} MiB)` : ''}`;
         process.stderr.write(`[gex] process ${pid} exited ${m.status}${mem}${arenaSaid(m)}\n`);
       }
       return;
@@ -776,7 +776,7 @@ const host = new ProcessHost({
     }
     // What this process's memory grew to; a run costs this times its process count.
     if (process.env.GEX_DEBUG_EXIT && m.memoryMib !== undefined) {
-      process.stderr.write(`[gex] memory ${m.memoryMib} MiB${arenaSaid(m)}\n`);
+      process.stderr.write(`[gex] memory ${m.memoryMib} MiB${m.headroomMib ? ` (headroom ${m.headroomMib} MiB)` : ''}${arenaSaid(m)}\n`);
     }
     if (process.env.GEX_HOT) {
       // An empty answer is a question about the run, not a crash.

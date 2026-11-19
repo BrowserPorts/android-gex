@@ -2775,13 +2775,34 @@ fn grow_memory_to(end: u64) -> bool {
     // Worker grew the SharedArrayBuffer (the "OOB after syscall 222/mmap"
     // signature). Off by default; on, the memory reaches the floor once.
     let target = if pregrow() { end.max(768 * 1024 * 1024) } else { end };
-    if target <= have {
+    ASKED_TOP.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
+    // Headroom: the memory is grown ahead of what is asked for, by
+    // `headroom(have)`, and grown again once a request comes within that
+    // of its end. So a small request lands in pages an earlier grow made,
+    // which every Worker has had a whole grow's interval to take the
+    // length of. That covers a thread that takes no call into the kernel
+    // (`grow_settle` waits for the others). Shared memory pages are given
+    // only when touched, so this costs address space, not resident memory.
+    // The exit line says it (`gex_headroom_mib`).
+    let room = headroom(have);
+    if target.saturating_add(room) <= have {
         return true;
     }
-    // A megabyte at a time past what was asked for: `memory.grow` may copy, so
-    // a guest mapping a page at a time should not pay per page.
-    let want = (target - have).div_ceil(PAGE).max(16);
-    let prev = warch::memory_grow(0, want as usize);
+    // At least a megabyte past what was asked for: `memory.grow` may copy,
+    // so a guest mapping a page at a time should not pay per page.
+    let need = if target > have { (target - have).div_ceil(PAGE).max(16) } else { 0 };
+    let mut want = (target + 2 * room).saturating_sub(have).div_ceil(PAGE).max(need);
+    let mut prev = warch::memory_grow(0, want as usize);
+    if prev == usize::MAX {
+        if need == 0 {
+            // Only headroom was wanted, and the memory is at its maximum.
+            return true;
+        }
+        // Near the maximum: the headroom gives way, and what was asked for
+        // is grown alone, as before there was any.
+        want = need;
+        prev = warch::memory_grow(0, want as usize);
+    }
     if prev == usize::MAX {
         grow_failed(have, have + want * PAGE);
         return false;
@@ -2792,9 +2813,38 @@ fn grow_memory_to(end: u64) -> bool {
         foreign(have.max(OWN_TOP.load(std::sync::atomic::Ordering::Relaxed)), prev);
     }
     OWN_TOP.fetch_max(prev + want * PAGE, std::sync::atomic::Ordering::AcqRel);
-    GROW_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let g = GROW_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    // This Worker's own grow gives it the new length; one between its last
+    // look and this grow did not (`grow_refresh` then still grows by nothing).
+    let _ = GROW_SEEN.with(|c| if c.get() == g - 1 { c.set(g) });
     GREW.with(|c| c.set(true));
     true
+}
+
+/// The headroom a memory of `have` bytes is grown ahead by: an eighth of
+/// it, at least 64 MiB and at most 512 MiB.
+/// None without shared memory: one Worker, so no length to go stale.
+fn headroom(have: u64) -> u64 {
+    if cfg!(feature = "shared-memory") && !UNSHARED.load(std::sync::atomic::Ordering::Relaxed) {
+        (have / 8).clamp(64 << 20, 512 << 20) & !0xffff
+    } else {
+        0
+    }
+}
+
+/// The highest end anyone has asked the memory to cover ([`grow_memory_to`]).
+static ASKED_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// MiB of the memory grown ahead of what was asked for (the headroom of
+/// [`grow_memory_to`]): part of its size, not of its use.
+#[no_mangle]
+pub extern "C" fn gex_headroom_mib() -> u32 {
+    let have = warch::memory_size(0) as u64 * 65536;
+    let asked = ASKED_TOP.load(std::sync::atomic::Ordering::Relaxed);
+    if asked == 0 {
+        return 0;
+    }
+    (have.saturating_sub(asked) >> 20) as u32
 }
 
 /// A grow the engine refused, said (the first few): a failed `memory.grow`
@@ -4573,6 +4623,9 @@ fn install_panic_hook() {
         // the process's stderr beside the guest's own complaint: a Worker's
         // console reaches no log a game run keeps.
         gex_kernel::mem::set_say(|s| unsafe { write_stderr(s) });
+        // A futex wait's cross-Worker generation, sampled by the kernel
+        // before it checks the word (BlockOp::FutexWait's `shared_gen`).
+        gex_kernel::futex::set_shared_gen(|a| if unsafe { k_present() } != 0 { unsafe { k_futex_gen(a) } } else { 0 });
         // A 64-bit guest that outgrew the lowered memory gets the 64-bit
         // one at its next start, where the page runs both.
         gex_kernel::syscalls::set_outgrow_host(gex_kernel::syscalls::OutgrowHost {
@@ -8682,10 +8735,11 @@ fn growth_note() {
     let spent: Vec<u64> = ARENA_SPENT.iter().map(|b| b.load(Ordering::Relaxed) >> 20).collect();
     let map = with_exec_lock(|h| h.kernel.mem.lock().growth_summary());
     warn_line(&format!(
-        "[gex] growth pid {} {}: memory {} MiB; shim heap reach {} MiB, live {} MiB (by size {:?}), arena taken maps/heap/stacks/largest {:?} MiB in {} refills; {map}\n",
+        "[gex] growth pid {} {}: memory {} MiB (headroom {} MiB); shim heap reach {} MiB, live {} MiB (by size {:?}), arena taken maps/heap/stacks/largest {:?} MiB in {} refills; {map}\n",
         my_pid(),
         crate::sigs::proc_home().exe(),
         have >> 20,
+        gex_headroom_mib(),
         HEAP_REACH.load(Ordering::Relaxed) >> 20,
         live >> 20,
         classes,
@@ -9347,19 +9401,18 @@ fn syscall_entry(ctx: i32, pc: i64) {
                         deadline,
                         parked,
                         val,
+                        shared_gen,
                     } => Waiting::Futex {
                         val: *val,
-                        // The shared generation of this address, sampled now --
-                        // BEFORE parking but AFTER the kernel checked the word,
-                        // which is fine: a wake landing between the check and here
-                        // bumps the counter, so the first re-check sees the change.
-                        // (A wake between the word-check and the *kernel's*
-                        // snapshot is caught by `parked`, taken before the check.)
-                        wake_gen: if unsafe { k_present() } != 0 {
-                            unsafe { k_futex_gen(*uaddr) }
-                        } else {
-                            0
-                        },
+                        // The shared generation of this address, which the
+                        // kernel sampled BEFORE it checked the word (the
+                        // hook set in `install_panic_hook`): a wake from
+                        // another Worker either changed the word the check
+                        // saw, or moves the generation past this. Sampled
+                        // here, after the check, a wake between the two was
+                        // in the sample already and the thread slept for
+                        // good.
+                        wake_gen: *shared_gen,
                         // The place the kernel snapshotted BEFORE it checked the
                         // word -- using it (not a fresh `park` here, after the
                         // check) is what stops a wake between the check and the
@@ -11444,6 +11497,14 @@ pub(crate) fn leave_guest() {
 /// fixtures/native/stale-bound on x86-64.
 static GROW_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Set when this process's memory is not shared (worker.mjs,
+/// `gex_set_memory_unshared`): there is no other Worker's length to go stale.
+static UNSHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[no_mangle]
+pub extern "C" fn gex_set_memory_unshared(on: i32) {
+    UNSHARED.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 thread_local! {
     /// The [`GROW_GEN`] this Worker last took the memory's length at.
     static GROW_SEEN: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
@@ -11457,6 +11518,13 @@ thread_local! {
 /// Worker's bound on the memory, for all of its instances. `t`, this Worker's
 /// thread, if it has one, says so for [`grow_settle`].
 fn grow_refresh(t: Option<&ThreadCell>) {
+    // A memory that is not shared (the single-thread build's, the shared
+    // build's shim with its memory's flag cleared) has one length for
+    // everyone, and a grow by nothing would detach its buffer under every
+    // JavaScript view of it.
+    if UNSHARED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let g = GROW_GEN.load(std::sync::atomic::Ordering::SeqCst);
     if GROW_SEEN.with(|c| c.replace(g)) != g {
         warch::memory_grow(0, 0);
@@ -11469,9 +11537,17 @@ fn grow_refresh(t: Option<&ThreadCell>) {
 /// The longest a grower waits for a thread to take the new length. A
 /// translated guest gets there at its next back-edge. Native wasm code
 /// has no safepoints, so it gets there at its next call into the kernel;
-/// meanwhile its engine's own interrupt, which comes within microseconds,
-/// gives it the length.
-const GROW_SETTLE_MAX_NS: u64 = 1_000_000;
+/// meanwhile its engine's own interrupt, which comes within microseconds
+/// of a thread that runs, gives it the length. 20 ms, not 1: under load a
+/// sibling may not run for that long (1 ms and 5 ms both failed under the
+/// gate's load). The headroom (`grow_memory_to`) keeps such grows rare.
+///
+/// The gap that is left: a native wasm loop that makes no call, given a
+/// pointer into pages a grow made just now (a mapping bigger than the
+/// headroom), on a thread the machine does not run for this long. It
+/// depends on the engine's interrupt alone. Translated code (safepoints)
+/// and code that calls into the kernel get the length for certain.
+const GROW_SETTLE_MAX_NS: u64 = 20_000_000;
 
 /// After a call that grew the memory, before it returns what lies in the new
 /// pages: every other thread running guest code takes the new length first.
@@ -11480,6 +11556,9 @@ const GROW_SETTLE_MAX_NS: u64 = 1_000_000;
 /// code). A thread out of guest code takes the length at its return.
 fn grow_settle() {
     use std::sync::atomic::Ordering::SeqCst;
+    if UNSHARED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let g = GROW_GEN.load(SeqCst);
     let me = cur();
     let cells: Vec<(Arc<ThreadCell>, u64)> = with_exec_lock(|h| {
@@ -14214,9 +14293,9 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
                     && unsafe { k_futex_gen(parked.addr()) } != *wake_gen)
                 || (unsafe { k_present() } == 0
                     && guest()
-                        .read_u32(parked.addr())
-                        .map(|w| w != *val)
-                        .unwrap_or(false))
+                        .word_mut(parked.addr())
+                        .and_then(|w| gex_atomic::load_u32(w, 0))
+                        .is_some_and(|w| w != *val))
         }
         Waiting::Sleep(d) => now >= *d,
         Waiting::Read(handle) => handle.poll_readable(),
@@ -15044,13 +15123,12 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         // As the kernel's park: re-checked on the scheduler's way round,
         // woken by the descriptors' queues (`waitq::queues_of`).
         gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| turn_now() + d.as_nanos() as u64)),
-        // A futex wait, as the kernel's park: the shared generation of the
-        // address sampled now, after the word was checked (a wake since
-        // bumps it, so the first look sees it), and the place the call took
-        // before it checked the word (a wake between the two is seen there).
-        gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val } => Waiting::Futex {
+        // A futex wait, as the kernel's park: the shared generation and the
+        // queue place the call took before it checked the word (a wake
+        // between the check and the park is seen in one or the other).
+        gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val, shared_gen } => Waiting::Futex {
             val: *val,
-            wake_gen: if unsafe { k_present() } != 0 { unsafe { k_futex_gen(*uaddr) } } else { 0 },
+            wake_gen: *shared_gen,
             parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
             deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
         },
@@ -19174,7 +19252,28 @@ fn kuser_unfolded(arg: i64, resumable: bool) {
 /// [`gex_guest_trap`] with `SIGSEGV`.
 #[no_mangle]
 pub extern "C" fn gex_guest_oob(ctx_addr: u32) -> u32 {
+    stale_bound_note();
     gex_guest_trap(ctx_addr, 11)
+}
+
+/// An access out of bounds in a Worker that has not taken the memory's
+/// length since another Worker grew it ([`GROW_GEN`]): very likely the
+/// engine's stale bound on memory that is there, not the guest's fault.
+/// The engine gives no address, so it is said as likely (the first few),
+/// and the fault goes on as the guest's.
+fn stale_bound_note() {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let g = GROW_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    let seen = GROW_SEEN.with(|c| c.get());
+    if g == seen || SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4 {
+        return;
+    }
+    warn_line(&format!(
+        "[gex] pid {}: an access out of bounds in a Worker {} grows behind the memory's length; likely the engine's stale bound on a shared memory, not the program's fault (memory {} MiB)\n",
+        my_pid(),
+        g.wrapping_sub(seen),
+        warch::memory_size(0) as u64 * 65536 >> 20,
+    ));
 }
 
 /// A trap in guest code the run loop caught (gex.mjs `guestTrapSignal`), as
@@ -21236,6 +21335,17 @@ pub extern "C" fn gex_dump_state() {
     })();
 }
 
+/// One more line for the crash of this Worker's process, which the Worker
+/// is about to abandon ([`gex_abandon`]): what failed, when the host knows
+/// (the global kernel's panic). `len` bytes of UTF-8 at `at`.
+#[no_mangle]
+pub extern "C" fn gex_crash_line(at: u32, len: u32) {
+    let Some(home) = sigs::home() else { return };
+    // SAFETY: the host wrote `len` bytes at `at`, in this module's memory.
+    let b = unsafe { core::slice::from_raw_parts(at as usize as *const u8, len as usize) };
+    home.procs().add_crash_line(home.pid(), &String::from_utf8_lossy(b));
+}
+
 /// Publish an exit for a process whose Worker is stopping without one.
 ///
 /// A process that stops existing must become collectable, however it stopped.
@@ -21918,6 +22028,17 @@ pub extern "C" fn gex_set_copy_loop(on: i32) {
 #[no_mangle]
 pub extern "C" fn gex_set_coherent_loads(on: i32) {
     gex_xlate::set_coherent_loads(on != 0);
+    if on != 0 {
+        crate::cgen::set_tso();
+    }
+}
+
+/// Debug (`?tso=2`): the coherent flavour plus misaligned accesses made
+/// whole and vector stores, copies and fills fenced (gex_emit::tier1
+/// `TSO2`). Default off.
+#[no_mangle]
+pub extern "C" fn gex_set_tso2(on: i32) {
+    gex_xlate::set_tso2(on != 0);
     if on != 0 {
         crate::cgen::set_tso();
     }

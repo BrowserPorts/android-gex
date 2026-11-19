@@ -18,7 +18,8 @@ export default async function (t) {
   await timeout(sys.boot(), 60000, 'boot');
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };
   for (let i = 1; i <= 5; i++) {
-    const r = await timeout(sys.run(['rt-stalebound', '30'], { env }), 120000, `run ${i}`);
+    // spinning with a call: see native/stale-bound
+    const r = await timeout(sys.run(['rt-stalebound', '30', 'yield'], { env }), 120000, `run ${i}`);
     eq(`run ${i}`, `${r.code} ${r.stdout.trim()}`, '0 stale-bound ok 30', r.stderr.trim().split('\n').slice(-4).join(' / '));
   }
 }

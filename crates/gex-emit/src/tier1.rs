@@ -419,6 +419,29 @@ pub fn set_coherent_loads(on: bool) {
     COHERENT_LOADS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Debug (`?tso=2`, default OFF, nothing emitted when off): what the
+/// coherent flavour leaves plain, ordered and made whole as x86 makes it.
+/// A misaligned scalar load or store is one atomic access of the aligned
+/// word holding it (a compare-exchange; across two words, under the split
+/// lock), so another thread never sees half of it -- x86 makes a misaligned
+/// access inside a cache line atomic, an arm64 host only an aligned one. A
+/// vector store, `memory.copy` and `memory.fill` are followed by a fence and
+/// a vector load preceded by one, so a store of the guest's that publishes
+/// through them is ordered as on x86. For finding a weakly ordered host's
+/// bug, not shipping: every guest access pays for it.
+static TSO2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_tso2(on: bool) {
+    TSO2.store(on, std::sync::atomic::Ordering::Relaxed);
+    if on {
+        set_coherent_loads(true);
+    }
+}
+
+fn tso2() -> bool {
+    TSO2.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn coherent_loads() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENV.get_or_init(|| std::env::var_os("GEX_COHERENT_LOADS").is_some())
@@ -1965,6 +1988,9 @@ impl<'a> Emitter<'a> {
                     };
                     self.f.simd_mem_lane(sub, align, static_off, 0);
                 }
+                if tso2() {
+                    self.f.atomic_fence();
+                }
             }
             Stmt::MemCopy { dst, src, len } if copy_loop() => {
                 self.emit_memcopy_loop(*dst, *src, *len);
@@ -1986,6 +2012,9 @@ impl<'a> Emitter<'a> {
                 self.f.u32(code::MEMORY_COPY);
                 self.f.byte(0); // destination memory
                 self.f.byte(0); // source memory
+                if tso2() {
+                    self.f.atomic_fence();
+                }
             }
             Stmt::MemFill { dst, val, len } => {
                 let d = if gex_abi::mem64() { self.scratch_addr.0 } else { self.scratch_i32 };
@@ -2000,6 +2029,9 @@ impl<'a> Emitter<'a> {
                 self.f.byte(crate::wasm::op::MISC_PREFIX);
                 self.f.u32(code::MEMORY_FILL);
                 self.f.byte(0); // memory
+                if tso2() {
+                    self.f.atomic_fence();
+                }
             }
             Stmt::MemCmp { dst, a, b, len } => self.emit_memcmp(*dst, *a, *b, *len),
             Stmt::Fence => self.f.atomic_fence(),
@@ -2830,9 +2862,20 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(mask);
         self.f.byte(0x71); // i32.and
         self.f.if_result(val_type(ty));
-        // unaligned: plain load (handles signed natively)
-        self.f.local_get(a);
-        self.f.load(load_op(ty, sz, signed), alogp, static_off);
+        if tso2() {
+            // unaligned, whole: an atomic `or 0` of the word(s) holding it
+            let z = self.alloc(ty);
+            if ty == Ty::I64 { self.f.i64_const(0) } else { self.f.i32_const(0) }
+            self.f.local_set(z);
+            self.emit_misaligned_atomic(a, ty, sz, static_off, Misaligned::Rmw { op: RmwOp::Or, val: z });
+            if signed {
+                self.sign_extend_after_atomic(ty, sz);
+            }
+        } else {
+            // unaligned: plain load (handles signed natively)
+            self.f.local_get(a);
+            self.f.load(load_op(ty, sz, signed), alogp, static_off);
+        }
         self.f.else_();
         // aligned: atomic (unsigned) load, then sign-extend if needed
         self.f.local_get(a);
@@ -2864,10 +2907,16 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(mask);
         self.f.byte(0x71); // i32.and
         self.f.if_void();
-        // unaligned: plain store
-        self.f.local_get(a);
-        self.f.local_get(v);
-        self.f.store(store_op(ty, sz), alogp, static_off);
+        if tso2() {
+            // unaligned, whole: an atomic exchange of the word(s) holding it
+            self.emit_misaligned_atomic(a, ty, sz, static_off, Misaligned::Rmw { op: RmwOp::Xchg, val: v });
+            self.f.drop_();
+        } else {
+            // unaligned: plain store
+            self.f.local_get(a);
+            self.f.local_get(v);
+            self.f.store(store_op(ty, sz), alogp, static_off);
+        }
         self.f.else_();
         // aligned: atomic store
         self.f.local_get(a);
@@ -3134,7 +3183,12 @@ impl<'a> Emitter<'a> {
                 addr,
                 offset,
                 bytes,
-            } => self.emit_vload(*addr, *offset, *bytes),
+            } => {
+                if tso2() {
+                    self.f.atomic_fence();
+                }
+                self.emit_vload(*addr, *offset, *bytes)
+            }
             Expr::VConst(b) => self.f.v128_const(b),
             Expr::VSplat { a, lane_bytes } => {
                 self.push(*a);

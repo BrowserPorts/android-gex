@@ -250,6 +250,8 @@ export function runtimeUrls() {
  * when the host is arm64 ([`detectTso`]): a page whose program needs x86
  * ordering sets that, since on x86 an atomic store
  * is an `xchg` and the flavour costs every program that does not need it.
+ * `tso=2`, a debug flavour: misaligned accesses whole and vector stores,
+ * copies and fills fenced as well (gex_emit::tier1 `TSO2`), far slower.
  */
 function tso() {
   const v = flag('tso') ?? flag('coherentloads');
@@ -761,7 +763,8 @@ export async function makeProcessHost({
     // `?coherentloads=1`: guest loads and stores as atomic wasm accesses
     // where aligned, so V8 cannot move them across the guest's fences. In
     // `extra` for every Worker.
-    coherentLoads: tso() ? 1 : undefined,
+    // `tso=2`: the debug flavour, misaligned and vector accesses too (tier1.rs `TSO2`)
+    coherentLoads: tso() ? (flag('tso') === '2' ? 2 : 1) : undefined,
     // `?wltrace=1` turns on gex-wayland protocol tracing (buffers, commits,
     // "produced no frame") to debug why a client's window is not shown.
     wlTrace: flag('wltrace') ? 1 : undefined,
