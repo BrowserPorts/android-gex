@@ -4894,6 +4894,31 @@ fn access_fault(caller: &mut Caller<'_, HostState>, addr: u64, pc: u64, size: u3
     let what = if write { "a store" } else { "a load" };
     match state.with_kernel(|k| k.access_fault(&mut gm, pc, addr, size, write)) {
         gex_kernel::syscalls::AccessFault::Retry => {
+            // The translated check said no and the map says yes: the table
+            // was behind, and the instruction runs again. The same pc again
+            // and again, with nothing else between, is a check and a map
+            // that disagree for good (a livelock with no system call in
+            // it): said once, with what each side sees.
+            thread_local! {
+                static RETRIES: std::cell::Cell<(u64, u64, bool)> = const { std::cell::Cell::new((0, 0, false)) };
+            }
+            RETRIES.with(|r| {
+                let (at, n, said) = r.get();
+                let n = if at == pc { n + 1 } else { 1 };
+                let mut said = said && at == pc;
+                if n >= 100_000 && !said {
+                    said = true;
+                    let page = addr >> gex_abi::PERM_PAGE_SHIFT;
+                    let byte = |a: u64| gm.read(gex_abi::perm_table() + (a >> gex_abi::PERM_PAGE_SHIFT), 1).ok().map(|b| b[0]);
+                    let last = addr.wrapping_add(size as u64 - 1);
+                    eprintln!(
+                        "gex: BUG: {what} of {size} at {addr:#x} (pc {pc:#x}) retried {n} times: the check refuses it and the map allows it (table byte {:x?} for page {page:#x}, {:x?} for its last byte's)",
+                        byte(addr),
+                        byte(last)
+                    );
+                }
+                r.set((pc, n, said));
+            });
             let _ = gm.write_u64(state.thread.ctx_addr + ctx::PC as u64, pc);
             state.resume_cause = Some("an access the map allows".into());
             state.resume_at = Some(pc);
@@ -5431,6 +5456,31 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
         imports::DISPATCH_MISS,
         |mut caller: Caller<'_, HostState>, _ctx: i32, pc: i64| -> wasmtime::Result<i32> { crate::host((|| -> anyhow::Result<i32> {
             let pc = pc as u64;
+            // The same address missing again and again with nothing else
+            // missing between: a dispatch that never finds what it was
+            // given (the livelock check in `remiss` sees only the misses
+            // that translate again). Said once, with what dispatch sees.
+            thread_local! {
+                static MISSES: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+            }
+            let n = MISSES.with(|r| {
+                let (at, n) = r.get();
+                let n = if at == pc { n + 1 } else { 1 };
+                r.set((pc, n));
+                n
+            });
+            // (not the signal-return trampoline, which every handler's
+            // return reaches, and which no translation ever serves)
+            if n == 100_000 && pc != gex_kernel::signal::SIGRETURN_TRAMPOLINE {
+                let (translated, replays) = caller.data().jit.as_ref().map_or((false, 0), |j| {
+                    let sh = j.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    (sh.translated.contains(&gex_abi::addr_key(pc, false)), sh.registry.len())
+                });
+                let c = caller.data().thread.ctx_addr;
+                let m = caller.data().memory.clone();
+                let (at, lt) = m.map_or((0, 0), |m| (read_u64(m.bytes(), (c + ctx::PC as u64) as usize), read_u64(m.bytes(), (c + ctx::LAST_TARGET as u64) as usize)));
+                eprintln!("gex: BUG: dispatch missed {pc:#x} {n} times running (translated: {translated}; {replays} units; ctx pc {at:#x}, last target {lt:#x})");
+            }
             // Returning from a signal handler with no `sa_restorer` lands
             // here: the trampoline address deliberately has no translation.
             if pc == gex_kernel::signal::SIGRETURN_TRAMPOLINE {
@@ -5959,6 +6009,34 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 let start = pc as u64;
                 // In the mode the block ran in: the thread's.
                 let key = gex_abi::addr_key(start, thread_alt(&caller));
+                // The same block failing its check again and again: a page
+                // check that nothing this does can satisfy. Said once.
+                thread_local! {
+                    static STALES: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+                }
+                let n = STALES.with(|r| {
+                    let (at, n) = r.get();
+                    let n = if at == start { n + 1 } else { 1 };
+                    r.set((start, n));
+                    n
+                });
+                if n == 100_000 {
+                    let alt = thread_alt(&caller);
+                    let page = gex_abi::page_key(start, alt);
+                    let (provider, translated, shared_base, retired) = caller.data().jit.as_ref().map_or((None, false, None, 0), |j| {
+                        let sh = j.shared.lock().unwrap_or_else(|e| e.into_inner());
+                        (sh.provider.get(&key).copied(), sh.translated.contains(&key), sh.page_table.lookup(page), sh.retired_pages.get(&page).copied().unwrap_or(0))
+                    });
+                    let dir = caller.data().memory.clone().and_then(|m| {
+                        let alt_dir = if alt { other_dir(&caller) } else { 0 };
+                        gex_abi::dir_entry_addr(page, alt_dir).and_then(|a| GuestMem::new(m.bytes()).read_u32(a).ok())
+                    });
+                    eprintln!(
+                        "gex: BUG: block {start:#x} failed its page check {n} times running: it says module {:#x} (dense base {:#x}); provider {provider:x?}, translated {translated}; page {page:#x} has base {shared_base:?}, directory entry {dir:?}, retired {retired} times",
+                        addr as u64 & 0xffff_ffff,
+                        addr as u64 >> 32
+                    );
+                }
                 let again = match caller.data().jit.as_ref().map(|j| Arc::clone(&j.shared)) {
                     Some(shared) => {
                         let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
