@@ -13,10 +13,10 @@ import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300 };
 
 const ENV = { PATH: '/bin:/usr/bin', HOME: '/root' };
-const BIG = 3 << 20; // lazy.bin (images.mjs)
+const BIG = 3 << 20; // lazy-written-ARCH.bin (images.mjs)
 
 /** How many times the page and its Workers asked the test server for the lazy file. */
-const asked = async () => Number(await (await fetch('/__t/asked?lazy.bin')).text());
+const asked = async (name) => Number(await (await fetch(`/__t/asked?${name}`)).text());
 
 export default async function (t) {
   const { eq, timeout } = t;
@@ -26,7 +26,9 @@ export default async function (t) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
   const fs = new OPFSFilesystem(sys, { name: STORE, cache: 16 });
   fs.addTar(t.work('bb.tar.zst'));
-  fs.addTar(null, { lazy: { base: t.work('lazy.bin'), files: [['/root/save/big.bin', BIG, 'lazy.bin', 1_700_000_000, 0o644]] } });
+  // Its own, for this arch: the requests for it are counted.
+  const LAZY = `lazy-written-${t.arch}.bin`;
+  fs.addTar(null, { lazy: { base: t.work(LAZY), files: [['/root/save/big.bin', BIG, LAZY, 1_700_000_000, 0o644]] } });
   await timeout(sys.boot(), 60000, 'boot');
   const sh = async (cmd) => {
     const r = await timeout(sys.run(['sh', '-c', cmd], { env: ENV }), 120000, cmd.slice(0, 40));
@@ -36,7 +38,7 @@ export default async function (t) {
   if (t.phase === 1) {
     eq('the first visit writes a save', (await sh('echo one > /root/save/a.txt')).code, 0);
     await timeout(sys.sync(), 60000, 'sync');
-    eq('the sync fetched none of the lazy file', await asked(), 0);
+    eq('the sync fetched none of the lazy file', await asked(LAZY), 0);
     return t.reload();
   }
   if (t.phase === 2) {
