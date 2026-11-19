@@ -2804,7 +2804,10 @@ fn grow_memory_to(end: u64) -> bool {
         foreign(have.max(OWN_TOP.load(std::sync::atomic::Ordering::Relaxed)), prev);
     }
     OWN_TOP.fetch_max(prev + want * PAGE, std::sync::atomic::Ordering::AcqRel);
-    GROW_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let g = GROW_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    // This Worker's own grow gives it the new length; one between its last
+    // look and this grow did not (`grow_refresh` then still grows by nothing).
+    let _ = GROW_SEEN.with(|c| if c.get() == g - 1 { c.set(g) });
     GREW.with(|c| c.set(true));
     true
 }
@@ -2813,7 +2816,7 @@ fn grow_memory_to(end: u64) -> bool {
 /// it, at least 64 MiB and at most 512 MiB.
 /// None without shared memory: one Worker, so no length to go stale.
 fn headroom(have: u64) -> u64 {
-    if cfg!(feature = "shared-memory") {
+    if cfg!(feature = "shared-memory") && !UNSHARED.load(std::sync::atomic::Ordering::Relaxed) {
         (have / 8).clamp(64 << 20, 512 << 20) & !0xffff
     } else {
         0
@@ -11472,6 +11475,14 @@ pub(crate) fn leave_guest() {
 /// fixtures/native/stale-bound on x86-64.
 static GROW_GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Set when this process's memory is not shared (worker.mjs,
+/// `gex_set_memory_unshared`): there is no other Worker's length to go stale.
+static UNSHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[no_mangle]
+pub extern "C" fn gex_set_memory_unshared(on: i32) {
+    UNSHARED.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 thread_local! {
     /// The [`GROW_GEN`] this Worker last took the memory's length at.
     static GROW_SEEN: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
@@ -11485,6 +11496,13 @@ thread_local! {
 /// Worker's bound on the memory, for all of its instances. `t`, this Worker's
 /// thread, if it has one, says so for [`grow_settle`].
 fn grow_refresh(t: Option<&ThreadCell>) {
+    // A memory that is not shared (the single-thread build's, the shared
+    // build's shim with its memory's flag cleared) has one length for
+    // everyone, and a grow by nothing would detach its buffer under every
+    // JavaScript view of it.
+    if UNSHARED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let g = GROW_GEN.load(std::sync::atomic::Ordering::SeqCst);
     if GROW_SEEN.with(|c| c.replace(g)) != g {
         warch::memory_grow(0, 0);
@@ -11497,9 +11515,17 @@ fn grow_refresh(t: Option<&ThreadCell>) {
 /// The longest a grower waits for a thread to take the new length. A
 /// translated guest gets there at its next back-edge. Native wasm code
 /// has no safepoints, so it gets there at its next call into the kernel;
-/// meanwhile its engine's own interrupt, which comes within microseconds,
-/// gives it the length.
-const GROW_SETTLE_MAX_NS: u64 = 1_000_000;
+/// meanwhile its engine's own interrupt, which comes within microseconds
+/// of a thread that runs, gives it the length. 20 ms, not 1: under load a
+/// sibling may not run for that long (1 ms and 5 ms both failed under the
+/// gate's load). The headroom (`grow_memory_to`) keeps such grows rare.
+///
+/// The gap that is left: a native wasm loop that makes no call, given a
+/// pointer into pages a grow made just now (a mapping bigger than the
+/// headroom), on a thread the machine does not run for this long. It
+/// depends on the engine's interrupt alone. Translated code (safepoints)
+/// and code that calls into the kernel get the length for certain.
+const GROW_SETTLE_MAX_NS: u64 = 20_000_000;
 
 /// After a call that grew the memory, before it returns what lies in the new
 /// pages: every other thread running guest code takes the new length first.
@@ -11508,6 +11534,9 @@ const GROW_SETTLE_MAX_NS: u64 = 1_000_000;
 /// code). A thread out of guest code takes the length at its return.
 fn grow_settle() {
     use std::sync::atomic::Ordering::SeqCst;
+    if UNSHARED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let g = GROW_GEN.load(SeqCst);
     let me = cur();
     let cells: Vec<(Arc<ThreadCell>, u64)> = with_exec_lock(|h| {

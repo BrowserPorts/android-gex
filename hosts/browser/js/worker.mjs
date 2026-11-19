@@ -1363,6 +1363,10 @@ async function handle(msg) {
     if (msg.claimPages !== undefined) ex.gex_set_claim_pages?.(msg.claimPages);
     if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
     if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
+    // A memory that is not shared (the single-thread build): the shim never
+    // grows it by nothing to take another Worker's length (lib.rs
+    // `grow_refresh`), which would detach its buffer.
+    if (!(typeof SharedArrayBuffer === 'function' && gex.memory?.buffer instanceof SharedArrayBuffer)) ex.gex_set_memory_unshared?.(1);
     // TEST (GEX_DEBUG_PANIC, a test-only switch): the shim panics on purpose.
     if (msg.debugPanic) {
       try {
