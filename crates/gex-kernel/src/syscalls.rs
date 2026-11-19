@@ -5742,8 +5742,20 @@ impl MapIo<'_> {
                                 addr = up(addr);
                             }
                         } else if let Ok(at) = mm.mmap(0, len_aligned + p - crate::mem::PAGE_SIZE, prot_bits, flags, &name) {
-                            let _ = mm.unmap(at, len_aligned + p - crate::mem::PAGE_SIZE);
-                            addr = up(at);
+                            // Only the slack is given back: the mapping's
+                            // own pages stay reserved until the fixed
+                            // mapping below replaces them, so another
+                            // thread's mapping cannot land there meanwhile
+                            // (and be mapped over: the package manager's
+                            // parallel parsers lost an APEX's zip so).
+                            let (s, end) = (up(at), at + len_aligned + p - crate::mem::PAGE_SIZE);
+                            if s > at {
+                                let _ = mm.unmap(at, s - at);
+                            }
+                            if s + len_aligned < end {
+                                let _ = mm.unmap(s + len_aligned, end - (s + len_aligned));
+                            }
+                            addr = s;
                             flags |= crate::mem::flags::FIXED;
                         }
                     }
