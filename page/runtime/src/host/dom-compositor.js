@@ -169,6 +169,8 @@ class DomWindow {
     this.states = 0;
     /** Buffer pixels per surface unit (`wl_surface.set_buffer_scale`). */
     this.bufferScale = 1;
+    /** Its viewport's destination, its size in surface units, or null. */
+    this.view = null;
     this.#desktop = desktop;
   }
 
@@ -191,12 +193,23 @@ class DomWindow {
   }
 
   /** Ask the client to be this size. It answers by drawing at it. */
+  /** Its size in surface units (CSS pixels): its viewport's destination, or
+   *  its buffer over its scale. A fractional-scale client's buffer is in
+   *  device pixels and its destination in units. */
+  unitsWide() {
+    return this.view ? this.view.w : Math.round(this.width / (this.bufferScale || 1));
+  }
+
+  unitsHigh() {
+    return this.view ? this.view.h : Math.round(this.height / (this.bufferScale || 1));
+  }
+
   resize(w, h) {
     this.#desktop.configure(this, Math.max(1, Math.round(w)), Math.max(1, Math.round(h)));
   }
 
   /** Tell the client its states (`DomDesktop.STATE_*`), with its size. */
-  setStates(states, w = this.width, h = this.height) {
+  setStates(states, w = this.unitsWide(), h = this.unitsHigh()) {
     this.states = states & ~1;
     this.#desktop.configure(this, Math.max(1, Math.round(w)), Math.max(1, Math.round(h)));
   }
@@ -750,7 +763,9 @@ export class DomDesktop {
       win.appId = s.appId;
       win.onappid?.(s.appId);
     }
-    if (s.width !== win.width || s.height !== win.height) {
+    const view = s.view ?? null;
+    if (s.width !== win.width || s.height !== win.height || view?.w !== win.view?.w || view?.h !== win.view?.h) {
+      win.view = view;
       win.width = s.width;
       win.height = s.height;
       win.canvas.width = Math.max(1, s.width);
@@ -914,11 +929,11 @@ export class DomDesktop {
     if (this.#focusPrev.length > 16) this.#focusPrev.shift();
     if (old) {
       sendEvent(this.#channel, old.block, EV_KEYBOARD_FOCUS, 0, 0, 0, 0, old.client, 0);
-      this.configure(old, old.width, old.height);
+      this.configure(old, old.unitsWide(), old.unitsHigh());
     }
     sendEvent(this.#channel, win.block, EV_KEYBOARD_FOCUS, 0, 0, 0, 0,
               win.client, win.surface);
-    this.configure(win, win.width, win.height);
+    this.configure(win, win.unitsWide(), win.unitsHigh());
   }
 
   // -- input --------------------------------------------------------------
@@ -1015,8 +1030,8 @@ export class DomDesktop {
       const x = Math.round(e.offsetX), y = Math.round(e.offsetY);
       if (win.placed && c.hasPointerCapture?.(e.pointerId)) return { x, y, t: Math.round(e.timeStamp) };
       return {
-        x: Math.max(0, Math.min(win.width - 1, x)),
-        y: Math.max(0, Math.min(win.height - 1, y)),
+        x: Math.max(0, Math.min(win.unitsWide() - 1, x)),
+        y: Math.max(0, Math.min(win.unitsHigh() - 1, y)),
         t: Math.round(e.timeStamp),
       };
     };

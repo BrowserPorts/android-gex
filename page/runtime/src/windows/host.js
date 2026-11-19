@@ -104,20 +104,27 @@ export class GuestWindow extends EventTarget {
    *  parent's canvas, a placed window on the output. 0 for a toplevel the
    *  page places. */
   get x() {
-    return this.kind === 'toplevel' && !this.placed ? 0 : this.#w.relX | 0;
+    return this.kind === 'toplevel' && !this.placed ? 0 : this.#css(this.#w.relX);
   }
 
   get y() {
-    return this.kind === 'toplevel' && !this.placed ? 0 : this.#w.relY | 0;
+    return this.kind === 'toplevel' && !this.placed ? 0 : this.#css(this.#w.relY);
+  }
+
+  /** A client's position in CSS pixels: a placed surface's is in the output's
+   *  (device) pixels, a popup's or subsurface's in surface units, which are
+   *  CSS pixels. */
+  #css(v) {
+    return this.placed ? Math.round((v | 0) / this.#host[INTERNAL].scale()) : v | 0;
   }
 
   /** Its size in CSS pixels. */
   get width() {
-    return Math.round(this.#w.width / (this.#w.bufferScale || 1));
+    return this.#w.unitsWide();
   }
 
   get height() {
-    return Math.round(this.#w.height / (this.#w.bufferScale || 1));
+    return this.#w.unitsHigh();
   }
 
   /** What the page last said of it (`setStates`). */
@@ -172,7 +179,8 @@ export class HostWindows extends EventTarget {
    * The guest's windows, each handed to the page (`window` event) to frame
    * and place. `width`, `height`: the output's size in CSS pixels, what a
    * program asking for the screen's size sees (default the viewport);
-   * `scale`: device pixels per CSS pixel (default devicePixelRatio, rounded).
+   * `scale`: device pixels per CSS pixel (default devicePixelRatio, not
+   * rounded: 1.5 is 1.5).
    * X11 programs' windows come as any other, through the runtime's X server,
    * started for the first of them.
    */
@@ -197,7 +205,7 @@ export class HostWindows extends EventTarget {
       // here (runtime.js `openWaylandMirror`).
       if (dev.single) {
         const { w, h, scale } = this.#size;
-        mirrored(dev, m, { width: w * scale, height: h * scale, scale }, (d) => this.#start(d));
+        mirrored(dev, m, { width: Math.round(w * scale), height: Math.round(h * scale), scale }, (d) => this.#start(d));
         return;
       }
       Object.assign(dev, await dev.rt.openWayland({ wl: m, onDesktop: (d) => this.#start(d), say: (t) => dev.say(`${t}\n`) }));
@@ -207,6 +215,8 @@ export class HostWindows extends EventTarget {
       x,
       byKey: (k) => self.#wins.get(k) ?? null,
       of: (pid) => [...self.#wins.values()].filter((w) => w.pid === pid),
+      /** Device pixels per CSS pixel. */
+      scale: () => self.#size.scale,
       shutdown: () => {
         self.#d?.stop();
         self.#mount?.remove();
@@ -215,7 +225,9 @@ export class HostWindows extends EventTarget {
   }
 
   #fit(width, height, scale) {
-    const s = Math.max(1, Math.round(scale ?? globalThis.devicePixelRatio ?? 1));
+    // The real scale, not rounded: clients that take wp_fractional_scale_v1
+    // draw at device size, the rest at the scale rounded up.
+    const s = Math.max(1, Number(scale ?? globalThis.devicePixelRatio ?? 1) || 1);
     return {
       w: Math.max(1, Math.round(width ?? globalThis.innerWidth ?? 1280)),
       h: Math.max(1, Math.round(height ?? globalThis.innerHeight ?? 720)),
@@ -233,7 +245,7 @@ export class HostWindows extends EventTarget {
    *  changes: what programs see as their screen from now on. */
   setOutputSize(width, height, scale) {
     this.#size = this.#fit(width, height, scale ?? this.#size.scale);
-    this.#d?.resizeOutput(this.#size.w * this.#size.scale, this.#size.h * this.#size.scale, this.#size.scale);
+    this.#d?.resizeOutput(Math.round(this.#size.w * this.#size.scale), Math.round(this.#size.h * this.#size.scale), this.#size.scale);
   }
 
   /** Every window there is, oldest first. */
@@ -256,7 +268,7 @@ export class HostWindows extends EventTarget {
   #start(d) {
     this.#d = d;
     const { w, h, scale } = this.#size;
-    d.resizeOutput(w * scale, h * scale, scale);
+    d.resizeOutput(Math.round(w * scale), Math.round(h * scale), scale);
     // The client's cursor, on every window's canvas (a `cursor` event says
     // it too, for a page that draws its own).
     d.oncursor = (css) => {
