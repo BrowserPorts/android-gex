@@ -22013,6 +22013,17 @@ pub extern "C" fn gex_set_coherent_loads(on: i32) {
     }
 }
 
+/// Debug (`?tso=2`): the coherent flavour plus misaligned accesses made
+/// whole and vector stores, copies and fills fenced (gex_emit::tier1
+/// `TSO2`). Default off.
+#[no_mangle]
+pub extern "C" fn gex_set_tso2(on: i32) {
+    gex_xlate::set_tso2(on != 0);
+    if on != 0 {
+        crate::cgen::set_tso();
+    }
+}
+
 /// Diagnostic: at each safepoint, check the running thread's SP against the
 /// stacks it must NOT be in. A worker running with a stray SP that points into
 /// the MAIN thread's stack writes into it and smashes a canary a quiet main

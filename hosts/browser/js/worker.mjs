@@ -1362,7 +1362,8 @@ async function handle(msg) {
     // their dispatch); on keeps tables small across a many-fork run like apt.
     if (msg.claimPages !== undefined) ex.gex_set_claim_pages?.(msg.claimPages);
     if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
-    if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
+    if (msg.coherentLoads === 2 && ex.gex_set_tso2) ex.gex_set_tso2(1);
+    else if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
     // A memory that is not shared (the single-thread build): the shim never
     // grows it by nothing to take another Worker's length (lib.rs
     // `grow_refresh`), which would detach its buffer.
