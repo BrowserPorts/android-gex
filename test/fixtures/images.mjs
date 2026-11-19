@@ -246,10 +246,14 @@ export const images = {
     // The same for core/runprogram, which reads it, apart from core/dir-times's
     // lazy.bin while the two may run at once.
     writeFileSync(join(work, 'lazy-program.bin'), Buffer.alloc(3 << 20, 7));
+    // core/fs-persist-written's lazy file, one for each arch: it counts the
+    // requests for it, which another test's or arch's reads would add to.
+    for (const a of ['aarch64', 'x86']) writeFileSync(join(work, `lazy-written-${a}.bin`), Buffer.alloc(3 << 20, 7));
     // A rest bundle for page/rest-ahead (one copy for each setting, so the
-    // page's cache of one is not the other's): six 64 KiB zstd frames, one
+    // page's cache of one is not the other's, and for each arch, which may run
+    // at once and whose requests the test counts): six 64 KiB zstd frames, one
     // lazy file in its first.
-    for (const name of ['ra-off', 'ra-on']) restBundle(join(work, name), name);
+    for (const name of ['ra-off', 'ra-on']) for (const a of ['aarch64', 'x86']) restBundle(join(work, `${name}-${a}`), `${name}-${a}`);
     const have = existsSync(join(work, 'bb.tar.zst')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8');
     // Without busybox here, what a run before made (a copy where there is no
     // gexcc); else only if made from the same inputs.

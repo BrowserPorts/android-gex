@@ -18,7 +18,7 @@ export default async function (t) {
   // phase 1 without it, phase 2 (a fresh page) with it
   {
     const ahead = t.phase >= 2;
-    const dir = ahead ? 'ra-on' : 'ra-off', bin = `${dir}/rest.bin`;
+    const dir = `${ahead ? 'ra-on' : 'ra-off'}-${arch ?? 'aarch64'}`, bin = `${dir}/rest.bin`;
     const from = (await t.asked()).length;
     const app = await timeout(start({
       container: document.getElementById('app'),
