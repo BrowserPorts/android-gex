@@ -705,6 +705,10 @@ extern "C" {
     fn k_pty_for_sid(sid: i32) -> i32;
     fn k_last_kill() -> u64;
     fn k_last_kill_seq() -> u32;
+    /// The last kill that reached this pid or its group (`k_last_kill`'s
+    /// packing; 0 none), and its number.
+    fn k_last_kill_to(pid: i32, pgid: i32) -> u64;
+    fn k_last_kill_to_seq(pid: i32, pgid: i32) -> u32;
     fn k_pty_available(id: i32, master: i32) -> i32;
     fn k_pty_ptn(id: i32) -> i32;
     fn k_pty_get_lock(id: i32) -> i32;
@@ -9334,11 +9338,12 @@ fn syscall_entry(ctx: i32, pc: i64) {
                     use std::sync::atomic::{AtomicU32, Ordering};
                     static SAID: AtomicU32 = AtomicU32::new(0);
                     if SAID.fetch_add(1, Ordering::Relaxed) < 32 {
-                        let last = if unsafe { k_present() } != 0 {
-                            let v = unsafe { k_last_kill() };
+                        // (the last kill that reached this process: `killed`'s)
+                        let last = if unsafe { k_present() } != 0 && unsafe { k_last_kill_to(h.kernel.pid, 0) } != 0 {
+                            let v = unsafe { k_last_kill_to(h.kernel.pid, 0) };
                             format!(
                                 " (signal #{}: {} from pid {} to {})",
-                                unsafe { k_last_kill_seq() },
+                                unsafe { k_last_kill_to_seq(h.kernel.pid, 0) },
                                 v & 0xff,
                                 (v >> 40) as i32,
                                 ((v >> 8) & 0xffff_ffff) as i32
@@ -15288,17 +15293,27 @@ fn killed(signal: i32, at: u64) -> i32 {
     // Who sent it, if the global kernel knows: "killed by signal 1"
     // is true of a hangup, a terminal's line discipline and any
     // guest's `kill`, and they are not the same bug.
+    // The last kill that reached this process (to it, its group, or
+    // everyone), not anybody's last: a process ended by one kill was named
+    // the next one, sent to another pid (wineserver ending a program, then
+    // its conhost).
     let mut sent = None;
+    let me = home.pid();
+    let pgid = home.procs().pgid(me, me).unwrap_or(0);
     let from = if unsafe { k_present() } != 0 {
-        let v = unsafe { k_last_kill() };
-        let caller = (v >> 40) as i32;
-        let target = ((v >> 8) & 0xffff_ffff) as i32;
-        let signo = (v & 0xff) as u32;
-        sent = Some((caller, target, signo));
-        format!(
-            " (signal #{}: {signo} from pid {caller} to {target})",
-            unsafe { k_last_kill_seq() }
-        )
+        let v = unsafe { k_last_kill_to(me, pgid) };
+        if v == 0 {
+            String::new()
+        } else {
+            let caller = (v >> 40) as i32;
+            let target = ((v >> 8) & 0xffff_ffff) as i32;
+            let signo = (v & 0xff) as u32;
+            sent = Some((caller, target, signo));
+            format!(
+                " (signal #{}: {signo} from pid {caller} to {target})",
+                unsafe { k_last_kill_to_seq(me, pgid) }
+            )
+        }
     } else {
         String::new()
     };
@@ -15308,7 +15323,7 @@ fn killed(signal: i32, at: u64) -> i32 {
     let pid = home.pid();
     if matches!(sent, Some((caller, target, signo))
         if signo == signal as u32 && matches!(signo, 2 | 9 | 15)
-            && caller != pid && (target == pid || target == -pid || target == 0))
+            && caller != pid && (target == pid || target == -pid || target == -pgid || target == -1 || target == 0))
     {
         trace_line(&format!("[gex] pid {pid} ended by signal {signal}{from}\n"));
     } else if signal == 13 {

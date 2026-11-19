@@ -2120,6 +2120,13 @@ pub extern "C" fn k_kill(caller: i32, target: i32, signo: u32) -> i32 {
 /// are spread out -- the shared terminal's line discipline, a pty hangup, and
 /// any guest's own `kill`. The shim reads this for its death report.
 static LAST_KILL: Mutex<(i32, i32, u32)> = Mutex::new((0, 0, 0));
+
+/// The last kills, with their numbers ([`KILL_SEQ`]), for a report about
+/// one process ([`k_last_kill_to`]): [`LAST_KILL`] is anybody's, and a
+/// process that died of a kill named the one sent to another pid after it
+/// (wineserver ending a crashed program and then its conhost).
+const KILLS_KEPT: usize = 64;
+static KILLS: Mutex<std::collections::VecDeque<(i32, i32, u32, u32)>> = Mutex::new(std::collections::VecDeque::new());
 /// How many signals have been sent, so notes from different Workers can be put
 /// in order -- which is the whole question when one process's signal makes
 /// another one misbehave.
@@ -2128,7 +2135,12 @@ static KILL_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::ne
 fn note_kill(caller: i32, target: i32, signo: u32) {
     if signo != 0 {
         *LAST_KILL.lock().unwrap_or_else(|e| e.into_inner()) = (caller, target, signo);
-        KILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let seq = KILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Release) + 1;
+        let mut k = KILLS.lock().unwrap_or_else(|e| e.into_inner());
+        if k.len() >= KILLS_KEPT {
+            k.pop_front();
+        }
+        k.push_back((caller, target, signo, seq));
     }
 }
 
@@ -2136,6 +2148,26 @@ fn note_kill(caller: i32, target: i32, signo: u32) {
 #[no_mangle]
 pub extern "C" fn k_last_kill_seq() -> u32 {
     KILL_SEQ.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The last kill that reached `pid` (of [`KILLS_KEPT`]): sent to it, to its
+/// process group `pgid`, or to everyone (`kill(-1)`); as [`k_last_kill`]
+/// packs one, 0 for none. Its number from [`k_last_kill_to_seq`].
+#[no_mangle]
+pub extern "C" fn k_last_kill_to(pid: i32, pgid: i32) -> u64 {
+    last_kill_to(pid, pgid).map_or(0, |(caller, target, signo, _)| {
+        ((caller as i64 as u64) << 40) | (((target as i64 as u64) & 0xffff_ffff) << 8) | (signo as u64 & 0xff)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn k_last_kill_to_seq(pid: i32, pgid: i32) -> u32 {
+    last_kill_to(pid, pgid).map_or(0, |k| k.3)
+}
+
+fn last_kill_to(pid: i32, pgid: i32) -> Option<(i32, i32, u32, u32)> {
+    let k = KILLS.lock().unwrap_or_else(|e| e.into_inner());
+    k.iter().rev().find(|&&(_, t, _, _)| t == pid || t == -1 || (pgid > 0 && t == -pgid)).copied()
 }
 
 /// Caller in the high bits, target in the middle, signal in the low byte. A
