@@ -11485,6 +11485,13 @@ pub extern "C" fn gex_set_memory_unshared(on: i32) {
     UNSHARED.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether this process's memory has one length for everyone: a shim built
+/// without `shared-memory` (the single-thread build's), whatever it was
+/// told, or one told so ([`UNSHARED`]).
+fn memory_unshared() -> bool {
+    !cfg!(feature = "shared-memory") || UNSHARED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 thread_local! {
     /// The [`GROW_GEN`] this Worker last took the memory's length at.
     static GROW_SEEN: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
@@ -11502,7 +11509,7 @@ fn grow_refresh(t: Option<&ThreadCell>) {
     // build's shim with its memory's flag cleared) has one length for
     // everyone, and a grow by nothing would detach its buffer under every
     // JavaScript view of it.
-    if UNSHARED.load(std::sync::atomic::Ordering::Relaxed) {
+    if memory_unshared() {
         return;
     }
     let g = GROW_GEN.load(std::sync::atomic::Ordering::SeqCst);
@@ -11536,7 +11543,7 @@ const GROW_SETTLE_MAX_NS: u64 = 20_000_000;
 /// code). A thread out of guest code takes the length at its return.
 fn grow_settle() {
     use std::sync::atomic::Ordering::SeqCst;
-    if UNSHARED.load(std::sync::atomic::Ordering::Relaxed) {
+    if memory_unshared() {
         return;
     }
     let g = GROW_GEN.load(SeqCst);
