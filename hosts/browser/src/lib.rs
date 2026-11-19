@@ -4614,6 +4614,9 @@ fn install_panic_hook() {
         // the process's stderr beside the guest's own complaint: a Worker's
         // console reaches no log a game run keeps.
         gex_kernel::mem::set_say(|s| unsafe { write_stderr(s) });
+        // A futex wait's cross-Worker generation, sampled by the kernel
+        // before it checks the word (BlockOp::FutexWait's `shared_gen`).
+        gex_kernel::futex::set_shared_gen(|a| if unsafe { k_present() } != 0 { unsafe { k_futex_gen(a) } } else { 0 });
         // A 64-bit guest that outgrew the lowered memory gets the 64-bit
         // one at its next start, where the page runs both.
         gex_kernel::syscalls::set_outgrow_host(gex_kernel::syscalls::OutgrowHost {
@@ -9378,19 +9381,18 @@ fn syscall_entry(ctx: i32, pc: i64) {
                         deadline,
                         parked,
                         val,
+                        shared_gen,
                     } => Waiting::Futex {
                         val: *val,
-                        // The shared generation of this address, sampled now --
-                        // BEFORE parking but AFTER the kernel checked the word,
-                        // which is fine: a wake landing between the check and here
-                        // bumps the counter, so the first re-check sees the change.
-                        // (A wake between the word-check and the *kernel's*
-                        // snapshot is caught by `parked`, taken before the check.)
-                        wake_gen: if unsafe { k_present() } != 0 {
-                            unsafe { k_futex_gen(*uaddr) }
-                        } else {
-                            0
-                        },
+                        // The shared generation of this address, which the
+                        // kernel sampled BEFORE it checked the word (the
+                        // hook set in `install_panic_hook`): a wake from
+                        // another Worker either changed the word the check
+                        // saw, or moves the generation past this. Sampled
+                        // here, after the check, a wake between the two was
+                        // in the sample already and the thread slept for
+                        // good.
+                        wake_gen: *shared_gen,
                         // The place the kernel snapshotted BEFORE it checked the
                         // word -- using it (not a fresh `park` here, after the
                         // check) is what stops a wake between the check and the
@@ -14271,9 +14273,9 @@ fn wait_ready(waiting: &Waiting, blocked_on: &Option<gex_kernel::BlockOp>, now: 
                     && unsafe { k_futex_gen(parked.addr()) } != *wake_gen)
                 || (unsafe { k_present() } == 0
                     && guest()
-                        .read_u32(parked.addr())
-                        .map(|w| w != *val)
-                        .unwrap_or(false))
+                        .word_mut(parked.addr())
+                        .and_then(|w| gex_atomic::load_u32(w, 0))
+                        .is_some_and(|w| w != *val))
         }
         Waiting::Sleep(d) => now >= *d,
         Waiting::Read(handle) => handle.poll_readable(),
@@ -15101,13 +15103,12 @@ fn park_free(op: gex_kernel::BlockOp, restore_sigmask: Option<u64>, pc: u64) -> 
         // As the kernel's park: re-checked on the scheduler's way round,
         // woken by the descriptors' queues (`waitq::queues_of`).
         gex_kernel::BlockOp::Poll { deadline, .. } => Waiting::Net(deadline.map(|d| turn_now() + d.as_nanos() as u64)),
-        // A futex wait, as the kernel's park: the shared generation of the
-        // address sampled now, after the word was checked (a wake since
-        // bumps it, so the first look sees it), and the place the call took
-        // before it checked the word (a wake between the two is seen there).
-        gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val } => Waiting::Futex {
+        // A futex wait, as the kernel's park: the shared generation and the
+        // queue place the call took before it checked the word (a wake
+        // between the check and the park is seen in one or the other).
+        gex_kernel::BlockOp::FutexWait { table, uaddr, deadline, parked, val, shared_gen } => Waiting::Futex {
             val: *val,
-            wake_gen: if unsafe { k_present() } != 0 { unsafe { k_futex_gen(*uaddr) } } else { 0 },
+            wake_gen: *shared_gen,
             parked: parked.clone().unwrap_or_else(|| table.park(*uaddr)),
             deadline: deadline.map(|d| turn_now() + d.as_nanos() as u64),
         },

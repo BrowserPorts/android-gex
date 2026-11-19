@@ -326,6 +326,13 @@ pub enum BlockOp {
         /// lost -- the native host holds the lock across both instead and
         /// ignores this. See [`futex::FutexTable::park`].
         parked: Option<crate::futex::Parked>,
+        /// The host's shared wake generation of `uaddr`
+        /// ([`crate::futex::shared_gen`]), sampled BEFORE the word was
+        /// checked, as `parked` is: a wake from another Worker either
+        /// changed the word the check then saw, or bumps a generation past
+        /// this one. Sampled after the check, a wake between the two was
+        /// already in the sample and the park lasted for ever.
+        shared_gen: u32,
     },
     Sleep(std::time::Duration),
     /// `FUTEX_LOCK_PI(2)`: take the priority-inheritance lock at `uaddr` for
@@ -8391,11 +8398,15 @@ pub fn futex_block(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Bl
     // will see. The native host holds the queue lock across its
     // check-and-sleep instead and ignores this.
     let parked = cx.table.park(a[0]);
+    // The host's cross-Worker generation, likewise before the word (an
+    // acquire load: the word's load below cannot move above it).
+    let shared_gen = futex::shared_gen(a[0]);
     // The word must still hold what the caller expects, or the
     // wake that changed it has already been and gone and the wait
     // would be permanent. A mismatch declines the wait (EAGAIN via
-    // `sys_futex`).
-    if m.read_u32(a[0]).ok()? != a[2] as u32 {
+    // `sys_futex`). One atomic load, as Linux's: on a weakly ordered host
+    // a plain one may read a value older than the generation above.
+    if m.load_u32(a[0]).ok()? != a[2] as u32 {
         return None;
     }
     let deadline = if a[3] == 0 {
@@ -8431,6 +8442,7 @@ pub fn futex_block(cx: &FutexCx<'_>, m: &GuestMem<'_>, a: [u64; 6]) -> Option<Bl
         val: a[2] as u32,
         deadline,
         parked: Some(parked),
+        shared_gen,
     })
 }
 

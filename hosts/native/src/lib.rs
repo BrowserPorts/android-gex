@@ -2004,6 +2004,7 @@ fn perform_block(
             val,
             deadline,
             parked,
+            ..
         } => {
             // The re-read has to happen under the queue's own lock, which is
             // what closes the race between checking the word and sleeping.
