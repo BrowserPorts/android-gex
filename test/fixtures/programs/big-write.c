@@ -16,6 +16,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
 
 static int bad;
 
@@ -57,6 +59,31 @@ static void far(const char *dir, const char *what, int64_t off) {
     unlink(p);
 }
 
+/* the same on a memfd, and its length set far out */
+static void memfd(const char *what, int64_t off) {
+    char buf[1286], got[1286] = {0};
+    int f = memfd_create("big-write", 0);
+    memset(buf, 'y', sizeof buf);
+    errno = 0;
+    ssize_t n = pwrite(f, buf, sizeof buf, off);
+    const char *r;
+    if (n < 0) {
+        r = errno == EFBIG || errno == ENOSPC || errno == EINVAL ? "refused" : "wrong error";
+    } else {
+        struct stat st;
+        pread(f, got, sizeof got, off);
+        fstat(f, &st);
+        r = n == (ssize_t)sizeof buf && !memcmp(got, buf, sizeof buf) && st.st_size == off + (off_t)sizeof buf ? "there" : "elsewhere";
+    }
+    bad |= *r == 'w' || *r == 'e';
+    errno = 0;
+    int t = ftruncate(f, off);
+    int tok = t == 0 || errno == EFBIG || errno == ENOSPC || errno == EINVAL;
+    bad |= !tok;
+    printf("memfd %s: write %s, ftruncate %s\n", what, r, t == 0 ? "done" : tok ? "refused" : "wrong error");
+    close(f);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "/tmp";
     int pf[2], nul = open("/dev/null", O_WRONLY);
@@ -87,6 +114,26 @@ int main(int argc, char **argv) {
     far(dir, "64 TiB", (int64_t)1 << 46);
     far(dir, "2^48 + 2^45", ((int64_t)1 << 48) + ((int64_t)1 << 45));
     far(dir, "2^62", (int64_t)1 << 62);
+    memfd("2 GiB", (int64_t)1 << 31);
+    memfd("4 GiB", ((int64_t)1 << 32) + 100);
+    memfd("2^62", (int64_t)1 << 62);
+    /* readv with one vector far longer than its buffer */
+    {
+        static char small[16];
+        char p2[256];
+        snprintf(p2, sizeof p2, "%s/big-write.rv", dir);
+        int g = open(p2, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        write(g, "readv", 5);
+        lseek(g, 0, SEEK_SET);
+        struct iovec v = {small, (size_t)-1 / 2};
+        errno = 0;
+        ssize_t n = readv(g, &v, 1);
+        int ok = n == 5 || (n < 0 && errno == EFAULT) || (n < 0 && errno == EINVAL);
+        bad |= !ok;
+        printf("readv a huge vector: %s\n", n >= 0 ? "a count" : strerror(errno));
+        close(g);
+        unlink(p2);
+    }
     puts(bad ? "big-write FAILED" : "big-write ok");
     return bad;
 }

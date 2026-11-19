@@ -9033,27 +9033,39 @@ fn io_readv(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, iov: u64, count: u64, 
         if len == 0 {
             continue;
         }
-        let mut tmp = vec![0u8; len as usize];
-        let n = match file.read_here(&mut tmp) {
-            Ok(n) => n,
-            // The vector filled and the next one found the socket empty,
-            // which is `EAGAIN`. Reporting that would discard the count
-            // for bytes this call has *already taken out of the socket*
-            // and written into the caller's memory -- they are consumed,
-            // and nothing can give them back. The caller sees "nothing
-            // arrived" and waits for data it is already holding.
-            //
-            // That is the X protocol deadlocking: the server reads a
-            // request header into the first vector, loses it here, and
-            // waits forever for a request the client believes it sent.
-            Err(e) => return if total > 0 { Ok(total) } else { Err(e) },
-        };
-        m.write(base, &tmp[..n as usize])?;
-        if !file.handle.is_stream() {
-            shared_after_read(shared, m, &file, file.offset() - n, base, n);
+        // The guest's length (Linux's cap, and no further than its memory)
+        // in pieces of at most 16 MiB: a vector of gigabytes is never one
+        // buffer the kernel's own memory cannot hold, and a regular file
+        // still fills it whole, as Linux's read does.
+        let want = rw_len(m, base, len) as u64;
+        let mut got = 0u64;
+        while got < want {
+            let mut tmp = vec![0u8; (want - got).min(1 << 24) as usize];
+            let n = match file.read_here(&mut tmp) {
+                Ok(n) => n,
+                // The vector filled and the next one found the socket empty,
+                // which is `EAGAIN`. Reporting that would discard the count
+                // for bytes this call has *already taken out of the socket*
+                // and written into the caller's memory -- they are consumed,
+                // and nothing can give them back. The caller sees "nothing
+                // arrived" and waits for data it is already holding.
+                //
+                // That is the X protocol deadlocking: the server reads a
+                // request header into the first vector, loses it here, and
+                // waits forever for a request the client believes it sent.
+                Err(e) => return if total + got > 0 { Ok(total + got) } else { Err(e) },
+            };
+            m.write(base + got, &tmp[..n as usize])?;
+            if !file.handle.is_stream() {
+                shared_after_read(shared, m, &file, file.offset() - n, base + got, n);
+            }
+            got += n;
+            if n < tmp.len() as u64 {
+                break;
+            }
         }
-        total += n;
-        if n < len {
+        total += got;
+        if got < len {
             break;
         }
     }
