@@ -364,7 +364,7 @@ pieces and order, cached where, decoded how. `fs.setLazySource(module, { data })
 names a module that the runtime imports into the Worker that answers every
 program's read of a lazy file. A lazy list's third field is then the file's key,
 a string of the page's (at most 1000 bytes), not a URL. A program's read waits,
-in its own thread only, for the module's answer.
+in its own thread only, for the module's answer. The default build only.
 
 | Export | Does |
 | --- | --- |
