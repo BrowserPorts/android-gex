@@ -147,6 +147,13 @@ pub extern "C" fn k_futex_wake(addr: u64) {
     wait::notify(q);
 }
 
+/// TEST (`debugpanic=prctl`): let `prctl(PR_GEX_DEBUG_TRAP)` panic here, in
+/// the global kernel, where a process's prctl is answered.
+#[no_mangle]
+pub extern "C" fn k_arm_debug_trap() {
+    gex_kernel::proc::arm_debug_trap();
+}
+
 /// The generation of the futex at `addr`, sampled when a Worker parks on it and
 /// compared on every re-check.
 #[no_mangle]

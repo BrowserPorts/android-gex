@@ -763,6 +763,8 @@ export async function makeProcessHost({
     // `?coherentloads=1`: guest loads and stores as atomic wasm accesses
     // where aligned, so V8 cannot move them across the guest's fences. In
     // `extra` for every Worker.
+    // TEST `debugpanic=prctl`: a process's prctl(PR_GEX_DEBUG_TRAP) panics in the kernel
+    debugPanic: flag('debugpanic') === 'prctl' ? 4 : undefined,
     // `tso=2`: the debug flavour, misaligned and vector accesses too (tier1.rs `TSO2`)
     coherentLoads: tso() ? (flag('tso') === '2' ? 2 : 1) : undefined,
     // `?wltrace=1` turns on gex-wayland protocol tracing (buffers, commits,

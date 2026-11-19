@@ -388,6 +388,11 @@ struct Proc {
     crash_more: Vec<u8>,
     /// The notices it has given ([`ProcTable::notice`]), each given once.
     noticed: Vec<String>,
+    /// Its end as a wait status, once it has ended ([`ProcTable::exit`]):
+    /// a crash said after that is reported then ([`ProcTable::set_crash`]).
+    ended: Option<i32>,
+    /// Its crash has been reported: once a process.
+    crash_told: bool,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -423,6 +428,23 @@ pub const PR_GEX_SHORT: u64 = 0x4745_0003;
 /// address, `arg3` its length): a need no memory gex has can meet, which
 /// the program goes on without. [`ProcTable::notice`].
 pub const PR_GEX_NOTICE: u64 = 0x4745_0004;
+
+/// TEST (`prctl` option gex adds, a test's stand-in for a panic in the
+/// runtime): the kernel panics in the calling process's syscall, once a
+/// host has armed it ([`arm_debug_trap`], the page's `debugpanic=prctl`).
+/// Unarmed, EINVAL as any unknown option.
+pub const PR_GEX_DEBUG_TRAP: u64 = 0x4745_00f0;
+
+static DEBUG_TRAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Let [`PR_GEX_DEBUG_TRAP`] panic (a test's switch).
+pub fn arm_debug_trap() {
+    DEBUG_TRAP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn debug_trap_armed() -> bool {
+    DEBUG_TRAP.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// A note's first byte when it gives way to one the process gave itself
 /// ([`ProcTable::set_crash_unless_said`]).
@@ -568,7 +590,11 @@ impl Table {
     /// Process `pid`'s crash, if ending with `status` is one: heard by the
     /// host's hook and kept for the reader. Whether it was.
     fn record_crash(&mut self, pid: i32, status: i32) -> bool {
-        let Some(c) = self.procs.iter_mut().find(|p| p.pid == pid).and_then(|p| Crash::of(pid, &p.info, std::mem::take(&mut p.crash), std::mem::take(&mut p.crash_more), status)) else {
+        let Some(c) = self.procs.iter_mut().find(|p| p.pid == pid && !p.crash_told).and_then(|p| {
+            let c = Crash::of(pid, &p.info, std::mem::take(&mut p.crash), std::mem::take(&mut p.crash_more), status)?;
+            p.crash_told = true;
+            Some(c)
+        }) else {
             return false;
         };
         if let Some(f) = CRASH_HOOK.get() {
@@ -710,6 +736,8 @@ impl ProcTable {
                     usage: Usage::default(),
                     crash: Vec::new(),
                     crash_more: Vec::new(),
+                    ended: None,
+                    crash_told: false,
                     noticed: Vec::new(),
                 }],
                 gone_cpu_ns: 0,
@@ -758,6 +786,8 @@ impl ProcTable {
             usage: Usage::default(),
             crash: Vec::new(),
             crash_more: Vec::new(),
+            ended: None,
+            crash_told: false,
             noticed: Vec::new(),
         });
         pid
@@ -888,12 +918,40 @@ impl ProcTable {
             }
             return;
         }
-        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
-            match note.split_first() {
-                Some((&UNLESS_SAID, rest)) if p.crash.is_empty() => p.crash = rest.to_vec(),
-                Some((&UNLESS_SAID, _)) => {}
-                Some((&ADD_LINE, rest)) => p.crash_more = rest.to_vec(),
-                _ => p.crash = note.to_vec(),
+        let mut t = self.lock();
+        let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else {
+            // Ended and collected already: a host's account of a trap (its
+            // Worker's abandon, `UNLESS_SAID`) still makes its crash, which
+            // nothing else reported (a kill's end is none).
+            if let Some((&UNLESS_SAID, rest)) = note.split_first() {
+                let mut parts = rest.split(|&b| b == 0).map(|b| String::from_utf8_lossy(b).into_owned());
+                let (name, reason) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+                let c = Crash { pid, name, reason: if reason.is_empty() { "crashed".into() } else { reason }, code: 137, signal: 9, notice: false };
+                if let Some(f) = CRASH_HOOK.get() {
+                    f(&c);
+                }
+                if t.crashes.len() >= CRASHES_KEPT {
+                    t.crashes.pop_front();
+                }
+                t.crashes.push_back(c);
+                drop(t);
+                self.crash_notify();
+            }
+            return;
+        };
+        match note.split_first() {
+            Some((&UNLESS_SAID, rest)) if p.crash.is_empty() => p.crash = rest.to_vec(),
+            Some((&UNLESS_SAID, _)) => {}
+            Some((&ADD_LINE, rest)) => p.crash_more = rest.to_vec(),
+            _ => p.crash = note.to_vec(),
+        }
+        // Said after its end was published (a host's account of a Worker
+        // that trapped while another task's kill ended the process first):
+        // reported now, as its end would have.
+        if let Some(word) = p.ended.filter(|_| !p.crash.is_empty()) {
+            if t.record_crash(pid, word) {
+                drop(t);
+                self.crash_notify();
             }
         }
     }
@@ -1106,6 +1164,7 @@ impl ProcTable {
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
                     p.vm = None;
+                    p.ended.get_or_insert(word);
                     (Arc::clone(&p.child.status), Arc::clone(&p.child.done), ppid, p.queue.id(), orphans)
                 }
                 None => return,

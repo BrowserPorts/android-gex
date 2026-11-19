@@ -470,6 +470,8 @@ extern "C" {
     /// exact, where re-reading the guest word only guesses.
     fn k_futex_wake(addr: u64);
     fn k_futex_gen(addr: u64) -> u32;
+    /// TEST: arm the global kernel's `PR_GEX_DEBUG_TRAP` (`gex_debug_panic(4)`).
+    fn k_arm_debug_trap();
     fn k_lock_call(req: gex_kernel::PAddr, req_len: u32, out: gex_kernel::PAddr, out_len: u32, caller: i32) -> i64;
     fn k_lock_queue() -> u32;
     fn k_lock_seq() -> u64;
@@ -4698,12 +4700,19 @@ pub extern "C" fn gex_panic_reporting() -> u32 {
 
 /// TEST (run-node GEX_DEBUG_PANIC, a test-only switch): panic on purpose,
 /// to check that the report reaches the console. 1 a plain panic, 2 one that
-/// panics again inside the hook, 3 one with a 4 KiB message. Only a caller
-/// that asks runs it.
+/// panics again inside the hook, 3 one with a 4 KiB message; 4 none now,
+/// but a process's `prctl(PR_GEX_DEBUG_TRAP)` panics in the kernel
+/// (`debugpanic=prctl`). Only a caller that asks runs it.
 #[no_mangle]
 pub extern "C" fn gex_debug_panic(kind: u32) {
     install_panic_hook();
     match kind {
+        4 => {
+            gex_kernel::proc::arm_debug_trap();
+            if unsafe { k_present() } != 0 {
+                unsafe { k_arm_debug_trap() };
+            }
+        }
         2 => {
             DEBUG_PANIC_IN_HOOK.with(|d| d.set(true));
             panic!("gex debug panic: outer");
@@ -21333,6 +21342,18 @@ pub extern "C" fn gex_crash_line(at: u32, len: u32) {
     home.procs().add_crash_line(home.pid(), &String::from_utf8_lossy(b));
 }
 
+/// This Worker's process crashed in the runtime (a trap in the shim or the
+/// global kernel, not a guest exit): its crash, said before anything else
+/// of its end, so that it is reported however the process ends -- by
+/// [`gex_abandon`], or by a sibling task's kill or exit that claimed or
+/// published the end at the same moment (the table reports a crash said
+/// after the end then: `ProcTable::set_crash`).
+#[no_mangle]
+pub extern "C" fn gex_trap_crash() {
+    let Some(home) = sigs::home() else { return };
+    home.procs().set_crash_unless_said(home.pid(), b"\0gex could not run it on");
+}
+
 /// Publish an exit for a process whose Worker is stopping without one.
 ///
 /// A process that stops existing must become collectable, however it stopped.
@@ -21355,10 +21376,10 @@ pub extern "C" fn gex_abandon(code: i32) {
     // No kernel lock: the end is claimed as `exit_process` claims it, and a
     // process already ending (or with a status) is left to that.
     let Some(home) = sigs::home() else { return };
+    let pid = home.pid();
     if home.exit().status().is_some() || !home.exit().claim() {
         return;
     }
-    let pid = home.pid();
     trace_line(&format!("[proc] abandon {pid}: the Worker stopped without an exit\n"));
     // The descriptors, on the same terms as `exit_process`: a status alone
     // ends a `wait4` and nothing else. A parent reading a dead child's pipe

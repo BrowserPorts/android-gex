@@ -1717,6 +1717,9 @@ async function handle(msg) {
       if (!inert) {
         if (!outgrew) gex?.shim?.exports?.gex_dump_state?.();
         const ex = gex?.shim?.exports;
+        // A crash in the runtime is said first, so that a kill of the
+        // process at the same moment does not end it as a plain SIGKILL.
+        if (e?.gexRuntimeTrap) ex?.gex_trap_crash?.();
         if (kernelWhy && ex?.gex_crash_line && ex.gex_alloc) {
           try {
             const bytes = new TextEncoder().encode(kernelWhy);

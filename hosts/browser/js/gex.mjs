@@ -8917,14 +8917,14 @@ export class Gex {
               `, ${this.#installs} modules installed`
             );
           });
-          throw new Error(
+          throw Object.assign(new Error(
             `the gex runtime trapped inside the shim (${this.#thrownName(err)}${at}${lr}${nr}` +
               `${code}${heap}${where}` +
               `${this.#shim.exports.gex_panic_reporting?.() ? '; it panicked again inside the panic report, whose message is lost (the first is above)' : ''}` +
               `). That is a crash in the runtime, not a guest exit; ` +
               'anything printed above is all the guest managed to do first.'
               + (globalThis.GEX_TRAP_STACK ? `\n${err.stack ?? ''}` : ''),
-          );
+          ), { gexRuntimeTrap: true });
         }
         // A trap abandons the engine's frames without running the epilogues
         // that restore the shim's shadow-stack global, leaking a few dozen
