@@ -15,8 +15,11 @@ export default async function (t) {
   eq('before boot, none', await sys.signal('sh', 'SIGUSR1'), 0);
   await timeout(sys.boot(), 60000, 'boot');
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };
-  // Started by another shell, so the page holds no Process for it.
-  const p = sys.spawn(['sh', '-c', `sh -c 'trap "echo got usr1" USR1; echo ready; while :; do sleep 1; done' & wait`], { env });
+  // Started by another shell, so the page holds no Process for it. Its loop
+  // forks nothing once it is ready (a builtin read on a FIFO nobody writes, a
+  // second at a time): busybox runs `sleep` as a fork of sh that never execs,
+  // and a third process named sh while it sleeps made the count racy.
+  const p = sys.spawn(['sh', '-c', `sh -c 'mkfifo /tmp/sn; exec 3<>/tmp/sn; trap "echo got usr1" USR1; echo ready; while :; do read -t 1 _ <&3; done' & wait`], { env });
   const said = lines(p);
   await until(() => said.includes('ready'), 'the trapping shell is up', 30000);
   // (both shells are named sh: the outer one, waiting, ends on it; the
