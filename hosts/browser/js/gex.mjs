@@ -7867,7 +7867,10 @@ export class Gex {
     Atomics.store(i32, (a + 4) >> 2, 1);
     Atomics.notify(i32, a >> 2);
     this.#doorKick();
-    while (Atomics.load(i32, (a + 4) >> 2) !== 2) Atomics.wait(i32, (a + 4) >> 2, 1, 5);
+    for (let n = 0; Atomics.load(i32, (a + 4) >> 2) !== 2; n++) {
+      Atomics.wait(i32, (a + 4) >> 2, 1, 5);
+      if (n % 200 === 199) this.#stillRunning(() => `in a door call, its syscall ${nr} proxied to the wineserver's pump and not answered (proxy state ${Atomics.load(i32, (a + 4) >> 2)}, door lock ${Atomics.load(i32, a >> 2)} held by tid ${i32[(a + 116) >> 2]})`);
+    }
     const r = i32[(a + 36) >> 2];
     Atomics.store(i32, (a + 4) >> 2, 0);
     if (tp) { st.tProxy += performance.now() - tp; (st.byNr[nr] = (st.byNr[nr] ?? 0) + 1); }
@@ -7875,6 +7878,21 @@ export class Gex {
   }
 
   #doorScratch = 0;
+
+  /** A thread of a process that ended seconds ago still running here,
+   *  in a wait of the host's (a door's): said once per thread, with where,
+   *  since nothing else will (a rare event, so said by default). */
+  #stillSaid = false;
+  #stillRunning(where) {
+    if (this.#stillSaid) return;
+    const e = this.#shim?.exports;
+    const age = e?.gex_end_age_ms?.() ?? -1;
+    if (age < 5000) return;
+    this.#stillSaid = true;
+    const pid = e.gex_my_pid?.() ?? "?", tid = this.#threadTid ?? pid, code = e.gex_end_code?.() ?? 0;
+    const how = code < 0 ? (code === -9 ? 'SIGKILL' : `signal ${-code}`) : `exit ${code}`;
+    console.error(`[gex] pid ${pid}: ${tid === pid ? 'main thread' : `thread ${tid}`} still running ${Math.round(age / 1000)} s after ${how}: ${where()}`);
+  }
 
   /** `gex.wake_write` inside a door: a client's wait pipe written from this
    *  Worker (the pipes are the global kernel's), not proxied to the pump. */
@@ -8080,6 +8098,7 @@ export class Gex {
       if (this.#snapRec && this.#kernel?.k_snap_pending?.()) return false;
       if (v === 1 && Atomics.compareExchange(i32, L, 1, 2) !== 1) continue;
       Atomics.wait(i32, L, 2, 1);
+      if (waitedMs % 1000 === 999) this.#stillRunning(() => `waiting for the wineserver's door lock, held by tid ${i32[(a + 116) >> 2]} of pid ${i32[(a + 120) >> 2]} (proxy state ${i32[(a + 4) >> 2]})`);
       // A lock held this long is a stuck door (a Worker ended inside one,
       // or a deadlock): say who holds it, every 5 s of waiting.
       if (++waitedMs % 5000 === 0) {

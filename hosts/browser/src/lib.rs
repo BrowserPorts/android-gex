@@ -12317,6 +12317,8 @@ fn exit_process(code: i32) -> i32 {
     // No kernel lock: what the end touches locks itself.
     if let Some(home) = sigs::home() {
         if home.exit().claim() {
+            END_AT.store(turn_now().max(1), std::sync::atomic::Ordering::Relaxed);
+            END_CODE.store(code, std::sync::atomic::Ordering::Relaxed);
             end_process_once(home, code);
         }
     } else {
@@ -12329,6 +12331,30 @@ fn exit_process(code: i32) -> i32 {
     set_resume_none();
     set_resume_ctx_none();
     2
+}
+
+/// When this process's end was claimed (`turn_now`, 0 not yet) and with what
+/// (`exit_process`'s code: a negated signal for a signal death), for a
+/// thread still running long after it (`gex_end_age_ms`). In the memory: every
+/// Worker of the process sees it.
+static END_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static END_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// How long ago this process's end was claimed, in ms (-1: it has not
+/// ended). A thread still running seconds after (a Worker inside a host
+/// call, a door's wait) says so (gex.mjs `#stillRunning`).
+#[no_mangle]
+pub extern "C" fn gex_end_age_ms() -> i32 {
+    match END_AT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => -1,
+        t => (turn_now().saturating_sub(t) / 1_000_000).min(i32::MAX as u64) as i32,
+    }
+}
+
+/// The end's code (`exit_process`'s: a negated signal for a signal death).
+#[no_mangle]
+pub extern "C" fn gex_end_code() -> i32 {
+    END_CODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// This process's memory is a forked copy of its parent's (`gex_adopt_child`):
