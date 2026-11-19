@@ -93,6 +93,12 @@ int main(void) {
     }
     strcpy(top, "/tmp/statdev-XXXXXX");
     if (!mkdtemp(top)) die("mkdtemp", errno, 0);
+    // By the path mountinfo will give: /tmp may be a link (a Mac's is,
+    // to private/tmp), and a mount is listed where the link leads.
+    char *real = realpath(top, NULL);
+    if (!real || strlen(real) >= sizeof top) die("realpath", errno, 0);
+    strcpy(top, real);
+    free(real);
     dev_t under = dev_of(top);
     if (mount("tmpfs", top, "tmpfs", 0, "mode=0755")) die("a tmpfs", errno, 0);
     dev_t one = dev_of(top);
