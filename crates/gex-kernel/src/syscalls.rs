@@ -5696,10 +5696,56 @@ impl MapIo<'_> {
                     // address it named (Wine maps every view into its own
                     // reserved range), so that one is a mapping of its own,
                     // read from the file the others are written back to.
-                    if flags & crate::mem::flags::FIXED == 0 || addr == at {
+                    // Nor for one asking for another protection (a writable
+                    // view of pages mapped read-only, as ART's JIT keeps
+                    // its cache): it is a mapping of its own on Linux, and
+                    // handing back the read-only pages made its first
+                    // store fault. The host makes it one memory with the
+                    // other where it can (`alias_pages`, below).
+                    let same_prot = mm.vma_at(at).is_some_and(|v| v.prot == prot_bits && at + len_aligned <= v.end);
+                    if same_prot && (flags & crate::mem::flags::FIXED == 0 || addr == at) {
                         mm.log.shared_maps.alias(i, at, len_aligned);
                         mm.log.shared_maps.hold(i, hold);
                         return Ok(at);
+                    }
+                }
+            }
+            // A shared mapping of pages of a file this process maps shared
+            // elsewhere already goes where the host can make the two one
+            // memory (`alias_pages`, below): as far into a host page as the
+            // other is at the same place in the file. A hint is moved there
+            // (it is a hint: ART's search below 4 GiB takes any address
+            // below it); with none, a host page more is found and trimmed.
+            let mut flags = flags;
+            if flags & crate::mem::flags::SHARED != 0 && flags & (crate::mem::flags::FIXED | crate::mem::flags::FIXED_NOREPLACE) == 0 {
+                let mut mm = self.mem.lock();
+                let p = mm.alias_page();
+                let other = mm
+                    .log
+                    .shared_maps
+                    .iter()
+                    .find(|s| s.file.same_file(&file) && s.offset < offset + len_aligned && offset < s.offset + s.len)
+                    .map(|s| s.start.wrapping_sub(s.offset));
+                // (The first such mapping of a file is placed so too, as
+                // if another were at a host page boundary: then every view
+                // of the file lines up with every other, whole host pages
+                // and all.)
+                if let Some(p) = p {
+                    let base = other.unwrap_or(0);
+                    if p > crate::mem::PAGE_SIZE {
+                        let want = base.wrapping_add(offset) % p;
+                        let up = |a: u64| a + (want + p - a % p) % p;
+                        if addr != 0 {
+                            // (moved only for an alias to be made: a hint
+                            // free to take is otherwise taken as asked)
+                            if other.is_some() {
+                                addr = up(addr);
+                            }
+                        } else if let Ok(at) = mm.mmap(0, len_aligned + p - crate::mem::PAGE_SIZE, prot_bits, flags, &name) {
+                            let _ = mm.unmap(at, len_aligned + p - crate::mem::PAGE_SIZE);
+                            addr = up(at);
+                            flags |= crate::mem::flags::FIXED;
+                        }
                     }
                 }
             }
@@ -5772,6 +5818,27 @@ impl MapIo<'_> {
                     self.mem.lock().set_never_write(start, start + len_aligned);
                 }
                 let path_of_map = file.path.clone();
+                // Where this process maps the same pages of the file
+                // already (at another address, or only part of them, so
+                // not handed back above): one memory with that mapping, as
+                // far as the host can make it, rather than a copy kept in
+                // step only at system calls. ART's JIT cache is one file
+                // mapped writable at one address and read-only at another,
+                // and reads what it has just written through the other.
+                {
+                    let mut mm = self.mem.lock();
+                    let others: Vec<(u64, u64, u64)> = mm
+                        .log
+                        .shared_maps
+                        .iter()
+                        .filter(|s| s.file.same_file(&file) && s.offset < offset + len_aligned && offset < s.offset + s.len)
+                        .map(|s| (s.start, s.offset, s.len))
+                        .collect();
+                    for (at, from, n) in others {
+                        let (lo, hi) = (offset.max(from), (offset + len_aligned).min(from + n));
+                        mm.alias_pages(start + (lo - offset), at + (lo - from), hi - lo);
+                    }
+                }
                 let changes = if before != 0 && file.handle.changes() == before { before } else { 0 };
                 let kept = if changes != 0 { self.mem.lock().log.shared_maps.recall(&file, offset, len_aligned, changes) } else { None };
                 let pages = match kept {
@@ -20805,8 +20872,13 @@ mod tests {
         let a = sys_locked(&mut m, &mut k, at, nr::MMAP, &[0x07010000, 0x2000, rw, mf::SHARED | mf::FIXED, fd, 0]);
         assert_eq!(a, 0x07010000);
         m.write(0x07011004, b"new").unwrap();
-        let b = sys_locked(&mut m, &mut k, at, nr::MMAP, &[0, 0x1000, prot::READ as u64, mf::SHARED, fd, 0x1000]);
+        let b = sys_locked(&mut m, &mut k, at, nr::MMAP, &[0, 0x1000, rw, mf::SHARED, fd, 0x1000]);
         assert_eq!(b, 0x07011000, "a second shared mapping is the first's pages");
+        // Asking for another protection, a mapping of its own (as on
+        // Linux), which still reads what the first wrote.
+        let r = sys_locked(&mut m, &mut k, at, nr::MMAP, &[0x07030000, 0x1000, prot::READ as u64, mf::SHARED, fd, 0x1000]);
+        assert_ne!(r, 0x07011000, "a read-only view of writable pages is not handed those pages");
+        assert_eq!(m.read(r + 4, 3).unwrap(), b"new");
         let c = sys_locked(&mut m, &mut k, at, nr::MMAP, &[0x07020000, 0x2000, rw, mf::PRIVATE | mf::FIXED, fd, 0]);
         assert_eq!(c, 0x07020000);
         assert_eq!(m.read(0x07021004, 3).unwrap(), b"new", "the private copy has the shared mapping's writes");

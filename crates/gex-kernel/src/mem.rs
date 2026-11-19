@@ -526,6 +526,39 @@ impl std::fmt::Debug for Resident {
     }
 }
 
+/// The host's way to make two ranges of a process's memory one memory, as
+/// a page cache makes two shared mappings of one file on Linux: `alias(dst,
+/// src, len)` maps `src`'s pages at `dst` too, `unalias(start, len)` gives a
+/// range pages of its own again, keeping what it holds. Both in units of
+/// `page`, the host's page size, which may be larger than the guest's.
+#[derive(Clone)]
+pub struct HostAlias {
+    pub page: u64,
+    pub alias: std::sync::Arc<dyn Fn(u64, u64, u64) -> bool + Send + Sync>,
+    pub unalias: std::sync::Arc<dyn Fn(u64, u64) -> bool + Send + Sync>,
+}
+
+/// What of a process's memory is one with something else ([`HostAlias`]):
+/// both sides of each alias made, in host pages. A fork's copy has none
+/// (its memory is a copy), and no hook until its host gives it one.
+#[derive(Default)]
+struct Aliases {
+    host: Option<HostAlias>,
+    ranges: Vec<(u64, u64)>,
+}
+
+impl Clone for Aliases {
+    fn clone(&self) -> Aliases {
+        Aliases::default()
+    }
+}
+
+impl std::fmt::Debug for Aliases {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Aliases({})", self.ranges.len())
+    }
+}
+
 /// The process's address space.
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
@@ -541,6 +574,10 @@ pub struct MemoryMap {
     /// ([`Resident`]); `None` where it has not said, and every accessible
     /// page is counted as resident.
     resident: Option<Resident>,
+    /// Ranges the host has made one with others ([`Self::alias_pages`]),
+    /// given pages of their own again before they are unmapped or mapped
+    /// over ([`Self::break_aliases`]).
+    aliases: Aliases,
     /// Where the program's stack began at `execve` (`mm->start_stack`),
     /// which `/proc/<pid>/stat` gives; 0 until a host says.
     start_stack: u64,
@@ -832,6 +869,7 @@ impl MemoryMap {
             perms: gex_abi::access_checks().then(Perms::default),
             uffd: crate::uffd::UffdState::default(),
             resident: None,
+            aliases: Aliases::default(),
             start_stack: 0,
             view: ViewCell(std::sync::Arc::new(MapView::new(&[]))),
             generation: 0,
@@ -1773,6 +1811,9 @@ impl MemoryMap {
 
     /// As [`Self::mmap`], recording the file and offset the bytes came from.
     pub fn mmap_from(&mut self, addr: u64, len: u64, prot: u32, flags: u64, name: &str, origin: Option<(String, u64)>) -> SysResult {
+        if flags & flags::FIXED != 0 && addr.is_multiple_of(PAGE_SIZE) {
+            self.break_aliases(addr, addr.saturating_add(page_align_up(len)));
+        }
         let mut r = self.mmap_from_unpublished(addr, len, prot, flags, name, origin.clone());
         // A file's mapping is kept low because it is usually an object's,
         // and an object's text is mapped inside it. One with no room below
@@ -1945,6 +1986,8 @@ impl MemoryMap {
     /// bytes. musl's `realloc` calls this for mmap-backed buffers, so `ENOSYS`
     /// would make it copy on every growth.
     pub fn mremap(&mut self, addr: u64, old_len: u64, new_len: u64, may_move: bool) -> Result<(u64, bool), Errno> {
+        // (moved, the bytes are copied: a copy of its own)
+        self.break_aliases(addr, addr.saturating_add(page_align_up(old_len.max(new_len))));
         let r = self.mremap_unpublished(addr, old_len, new_len, may_move);
         self.publish();
         r
@@ -1957,6 +2000,8 @@ impl MemoryMap {
     /// (`MREMAP_DONTUNMAP`) leaves it mapped and empty. The caller moves
     /// the bytes, before this.
     pub fn mremap_to(&mut self, addr: u64, old_len: u64, new_len: u64, new_addr: u64, keep_old: bool) -> Result<u64, Errno> {
+        self.break_aliases(addr, addr.saturating_add(page_align_up(old_len)));
+        self.break_aliases(new_addr, new_addr.saturating_add(page_align_up(new_len)));
         let r = self.mremap_to_unpublished(addr, old_len, new_len, new_addr, keep_old);
         self.publish();
         r
@@ -2151,6 +2196,9 @@ impl MemoryMap {
 
     /// Remove `[addr, addr+len)` from the map, splitting mappings as needed.
     pub fn unmap(&mut self, addr: u64, len: u64) -> Result<(), Errno> {
+        if addr.is_multiple_of(PAGE_SIZE) {
+            self.break_aliases(addr, addr.saturating_add(page_align_up(len)));
+        }
         let r = self.unmap_unpublished(addr, len);
         self.publish();
         r
@@ -2490,6 +2538,84 @@ impl MemoryMap {
     /// it holds, for the resident sizes `/proc` gives.
     pub fn set_resident(&mut self, r: Resident) {
         self.resident = Some(r);
+    }
+
+    /// The host's way to make ranges of this process's memory one
+    /// ([`HostAlias`]), where it has one.
+    pub fn set_host_alias(&mut self, h: HostAlias) {
+        self.aliases.host = Some(h);
+    }
+
+    /// The host's page size, where it can make ranges one ([`HostAlias`]).
+    pub fn alias_page(&self) -> Option<u64> {
+        self.aliases.host.as_ref().map(|h| h.page)
+    }
+
+    /// Make as much of `[dst, dst + len)` as the host can the same memory as
+    /// the same place in `[src, src + len)`: the host pages wholly inside
+    /// it, when the two are the same distance into a host page. Returns the
+    /// bytes made one, from `dst`'s first whole host page (0: none, and both
+    /// stay as they were). For two shared mappings of one file in a
+    /// process, which the kernel otherwise keeps as copies brought back
+    /// into step at system calls.
+    pub fn alias_pages(&mut self, dst: u64, src: u64, len: u64) -> u64 {
+        let made = self.alias_pages_inner(dst, src, len);
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TRACE.get_or_init(|| std::env::var_os("GEX_TRACE_ALIAS").is_some()) {
+            eprintln!("gex: alias {dst:#x} as {src:#x}, {len:#x} bytes: {made:#x} made one (host page {:?})", self.alias_page());
+        }
+        made
+    }
+
+    fn alias_pages_inner(&mut self, dst: u64, src: u64, len: u64) -> u64 {
+        let Some(h) = self.aliases.host.clone() else { return 0 };
+        let p = h.page;
+        if !dst.abs_diff(src).is_multiple_of(p) {
+            return 0;
+        }
+        let lo = dst.next_multiple_of(p);
+        let hi = (dst + len) / p * p;
+        if hi <= lo {
+            return 0;
+        }
+        let from = src + (lo - dst);
+        if !(h.alias)(lo, from, hi - lo) {
+            return 0;
+        }
+        self.aliases.ranges.push((lo, hi));
+        self.aliases.ranges.push((from, from + (hi - lo)));
+        hi - lo
+    }
+
+    /// Give every host page of `[start, end)` that is one with another
+    /// range pages of its own again, keeping their bytes: before the range
+    /// is unmapped, mapped over or moved, so that what is done to it (the
+    /// zeroing of a new mapping, above all) is not done to the other.
+    fn break_aliases(&mut self, start: u64, end: u64) {
+        if self.aliases.ranges.is_empty() || end <= start {
+            return;
+        }
+        let Some(h) = self.aliases.host.clone() else { return };
+        let p = h.page;
+        let (lo, hi) = (start / p * p, end.next_multiple_of(p));
+        let mut keep = Vec::with_capacity(self.aliases.ranges.len());
+        for &(a, b) in &self.aliases.ranges {
+            let (x, y) = (a.max(lo), b.min(hi));
+            if x >= y {
+                keep.push((a, b));
+                continue;
+            }
+            if !(h.unalias)(x, y - x) {
+                eprintln!("gex: memory at {x:#x}..{y:#x} is still one with another range");
+            }
+            if a < x {
+                keep.push((a, x));
+            }
+            if y < b {
+                keep.push((y, b));
+            }
+        }
+        self.aliases.ranges = keep;
     }
 
     /// What the map holds, for a debug line on a memory's growth: its
@@ -3395,6 +3521,51 @@ mod tests {
             .unwrap();
         assert_eq!(got, a);
         assert!(m.check_access(a, 0x1000, prot::WRITE));
+    }
+
+    /// A host with 16 KiB pages that records what it is asked.
+    fn alias_host(log: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> HostAlias {
+        let (a, u) = (log.clone(), log.clone());
+        HostAlias {
+            page: 0x4000,
+            alias: std::sync::Arc::new(move |d, s, n| {
+                a.lock().unwrap().push(format!("alias {d:#x} {s:#x} {n:#x}"));
+                true
+            }),
+            unalias: std::sync::Arc::new(move |s, n| {
+                u.lock().unwrap().push(format!("unalias {s:#x} {n:#x}"));
+                true
+            }),
+        }
+    }
+
+    #[test]
+    fn aliases_are_whole_host_pages_and_broken_before_the_range_is_reused() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut m = MemoryMap::new(0x40_1000);
+        m.set_host_alias(alias_host(&log));
+        // A different distance into a host page: nothing.
+        assert_eq!(m.alias_pages(0x1000_1000, 0x2000_0000, 0x10000), 0);
+        // The same: the host pages wholly inside.
+        assert_eq!(m.alias_pages(0x1000_1000, 0x2000_1000, 0x10000), 0xc000);
+        assert_eq!(*log.lock().unwrap(), ["alias 0x10004000 0x20004000 0xc000"]);
+        log.lock().unwrap().clear();
+        // Unmapping a guest page of one side gives its host page back.
+        m.insert(0x1000_0000, 0x1001_4000, prot::READ, "a");
+        m.unmap(0x1000_5000, 0x1000).unwrap();
+        assert_eq!(*log.lock().unwrap(), ["unalias 0x10004000 0x4000"]);
+        log.lock().unwrap().clear();
+        // Mapping over another part of it, the same.
+        m.mmap(0x1000_8000, 0x4000, prot::READ, flags::ANONYMOUS | flags::FIXED, "b").unwrap();
+        assert_eq!(*log.lock().unwrap(), ["unalias 0x10008000 0x4000"]);
+        log.lock().unwrap().clear();
+        // What is given back is not given back again.
+        m.unmap(0x1000_4000, 0x8000).unwrap();
+        assert_eq!(*log.lock().unwrap(), Vec::<String>::new());
+        // A fork's copy has none, and no host until given one.
+        let mut c = m.clone();
+        assert_eq!(c.alias_page(), None);
+        assert_eq!(c.alias_pages(0x3000_0000, 0x4000_0000, 0x4000), 0);
     }
 
     #[test]

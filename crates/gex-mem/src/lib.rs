@@ -122,6 +122,136 @@ impl GuestMemory {
     pub fn shared(&self) -> &SharedMemory {
         &self.inner
     }
+
+    /// The host's page size where [`Self::alias`] can make two ranges of
+    /// this memory one, else `None`.
+    pub fn alias_page() -> Option<u64> {
+        #[cfg(target_os = "macos")]
+        {
+            extern "C" {
+                fn sysconf(name: i32) -> i64;
+            }
+            const SC_PAGESIZE: i32 = 29;
+            // SAFETY: a read of a constant of the system's.
+            let page = unsafe { sysconf(SC_PAGESIZE) };
+            (page > 0 && (page as u64).is_power_of_two()).then_some(page as u64)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    /// Make `[dst, dst + len)` the same memory as `[src, src + len)`: the
+    /// host's pages of `src` mapped at `dst` too, so a write through either
+    /// is in both at once (`mach_vm_remap`, sharing, not copying). What
+    /// `dst` held is gone. Both host-page aligned, within the memory, and
+    /// apart. False where it cannot be done, and nothing changed.
+    ///
+    /// How two `MAP_SHARED` mappings of one file in one process are one
+    /// memory, as a page cache makes them on Linux (ART's JIT keeps its
+    /// cache at two addresses, one writable and one not).
+    pub fn alias(&self, dst: u64, src: u64, len: u64) -> bool {
+        let Some(page) = Self::alias_page() else { return false };
+        let size = self.len() as u64;
+        let fits = |a: u64| a.is_multiple_of(page) && a.checked_add(len).is_some_and(|e| e <= size);
+        if len == 0 || !len.is_multiple_of(page) || !fits(dst) || !fits(src) || (dst < src + len && src < dst + len) {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            #[allow(non_upper_case_globals)]
+            extern "C" {
+                static mach_task_self_: u32;
+                fn mach_vm_remap(
+                    target: u32,
+                    address: *mut u64,
+                    size: u64,
+                    mask: u64,
+                    flags: i32,
+                    src_task: u32,
+                    src_address: u64,
+                    copy: i32,
+                    cur: *mut i32,
+                    max: *mut i32,
+                    inherit: u32,
+                ) -> i32;
+            }
+            const VM_FLAGS_FIXED: i32 = 0;
+            const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+            const VM_INHERIT_COPY: u32 = 1;
+            const RW: i32 = 3;
+            let base = self.inner.data().as_ptr() as u64;
+            let mut at = base + dst;
+            let (mut cur, mut max) = (0i32, 0i32);
+            // SAFETY: the task's own port, a constant of the process.
+            let task = unsafe { mach_task_self_ };
+            // SAFETY: both ranges are inside this memory's own mapping
+            // (checked above) and apart; the remap replaces `dst`'s pages
+            // with `src`'s in place, read and write as before (`cur`
+            // checked below), and moves nothing else. The guest may be
+            // using `dst` meanwhile, as it may any memory it maps over.
+            let kr = unsafe { mach_vm_remap(task, &mut at, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, task, base + src, 0, &mut cur, &mut max, VM_INHERIT_COPY) };
+            if kr != 0 || at != base + dst || cur & RW != RW {
+                eprintln!("gex: mach_vm_remap of {len:#x} bytes from {src:#x} to {dst:#x}: {kr} at {:#x}, protection {cur}", at.wrapping_sub(base));
+                return false;
+            }
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// Make `[start, start + len)` (host-page aligned) memory of its own
+    /// again, keeping what it holds: a range [`Self::alias`] made one with
+    /// another is copied out, mapped anew, and copied back. What another
+    /// thread writes into the range meanwhile may be lost; the kernel does
+    /// this to memory being unmapped or mapped over, or to the host page
+    /// around such memory.
+    pub fn unalias(&self, start: u64, len: u64) -> bool {
+        let Some(page) = Self::alias_page() else { return false };
+        if len == 0 || !start.is_multiple_of(page) || !len.is_multiple_of(page) || start.checked_add(len).is_none_or(|e| e > self.len() as u64) {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::c_void;
+            extern "C" {
+                fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
+            }
+            const PROT_RW: i32 = 1 | 2;
+            const MAP_PRIVATE: i32 = 2;
+            const MAP_FIXED: i32 = 0x10;
+            const MAP_ANON: i32 = 0x1000;
+            let (s, e) = (start as usize, (start + len) as usize);
+            let keep = self.bytes()[s..e].to_vec();
+            let at = self.bytes()[s..].as_mut_ptr() as *mut c_void;
+            // SAFETY: `[start, start + len)` is inside this memory's own
+            // mapping (checked above); fresh private pages replace it, read
+            // and write as the memory's accessible part is, and the bytes
+            // are put back below.
+            let r = unsafe { mmap(at, len as usize, PROT_RW, MAP_PRIVATE | MAP_FIXED | MAP_ANON, -1, 0) };
+            if r != at {
+                eprintln!("gex: mapping {len:#x} bytes at {start:#x} anew failed");
+                return false;
+            }
+            let bytes = self.bytes();
+            for (i, chunk) in keep.chunks(page as usize).enumerate() {
+                // A page of zeros stays untouched, and costs nothing.
+                if chunk.iter().any(|&b| b != 0) {
+                    let at = s + i * page as usize;
+                    bytes[at..at + chunk.len()].copy_from_slice(chunk);
+                }
+            }
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
 }
 
 pub mod alloc_tag;

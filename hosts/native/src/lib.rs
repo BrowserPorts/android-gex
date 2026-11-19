@@ -2905,6 +2905,17 @@ fn publish_vm(k: &Kernel, memory: &gex_mem::GuestMemory) {
     k.procs.set_vm(k.pid, Some(Arc::new(vm)));
     let held = memory.clone();
     k.mem.lock().set_resident(gex_kernel::mem::Resident(Arc::new(move |a, b| held.resident(a, b))));
+    // Two shared mappings of one file in the process as one memory, where
+    // the host can map its pages twice (`GEX_NO_ALIAS=1`: copies kept in
+    // step at system calls, as before).
+    if let Some(page) = gex_mem::GuestMemory::alias_page().filter(|_| std::env::var_os("GEX_NO_ALIAS").is_none()) {
+        let (a, u) = (memory.clone(), memory.clone());
+        k.mem.lock().set_host_alias(gex_kernel::mem::HostAlias {
+            page,
+            alias: Arc::new(move |dst, src, len| a.alias(dst, src, len)),
+            unalias: Arc::new(move |start, len| u.unalias(start, len)),
+        });
+    }
 }
 
 fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkRequest, inside: bool) -> Result<()> {
