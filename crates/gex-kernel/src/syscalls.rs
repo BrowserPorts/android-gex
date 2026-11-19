@@ -9828,7 +9828,12 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
     } else if n == nr::IOCTL {
         let r = match pty_peer_ioctl(f.io.fds, &f.path, a[0] as i32, a[1], a[2]) {
             Some(r) => r,
-            None => f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2]),
+            None => {
+                if f.io.hands_over_buffers(a[0] as i32, a[1]) {
+                    f.map.flush_all_shared(m);
+                }
+                f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2])
+            }
         };
         // A terminal's request may have signalled this process's own group
         // (`TIOCSIG`, `TIOCSWINSZ`): in now, to be delivered at the call's
@@ -14895,6 +14900,37 @@ fn is_record_lock(cmd: u64) -> bool {
 }
 
 impl FdIo<'_> {
+    /// `SYNC_IOC_MERGE` (`sync_file_ioctl_merge`): a new sync file of
+    /// `sync`'s fences and `fd2`'s, close-on-exec, its number written back.
+    fn sync_merge(&self, m: &mut GuestMem<'_>, sync: &crate::syncfile::SyncFile, arg: u64) -> SysResult {
+        let mut data = m.read(arg, 48)?.to_vec();
+        if data[40..48].iter().any(|b| *b != 0) {
+            return Err(Errno::EINVAL);
+        }
+        let fd2 = i32::from_le_bytes(data[32..36].try_into().unwrap());
+        let other = self.fds.get(fd2).ok().and_then(|f| Arc::clone(&f.handle).as_syncfile()).ok_or(Errno::ENOENT)?;
+        data[31] = 0;
+        let name = String::from_utf8_lossy(&data[..data[..32].iter().position(|b| *b == 0).unwrap_or(31)]).into_owned();
+        let file = sync.merge(&other, &name).open();
+        let fd = self.fds.insert(file, true)?;
+        data[36..40].copy_from_slice(&(fd as i32).to_le_bytes());
+        if let Err(e) = m.write(arg, &data) {
+            let _ = self.fds.close(fd as i32);
+            return Err(e);
+        }
+        Ok(0)
+    }
+
+    /// Whether an `ioctl` hands a buffer's contents to another process
+    /// (a virtio-gpu atomic commit, a dma-buf's end of CPU access): this
+    /// process's shared mappings are written back first, as a futex wake
+    /// writes them back ([`crate::drm`]).
+    pub fn hands_over_buffers(&self, fd: i32, req: u64) -> bool {
+        let Ok(f) = self.fds.get(fd) else { return false };
+        let req = req & 0xffff_ffff;
+        (req & 0xff == 0xbc && (req >> 8) & 0xff == 0x64 && Arc::clone(&f.handle).as_drm().is_some()) || (req == 0x4008_6200 && Arc::clone(&f.handle).as_dmabuf().is_some())
+    }
+
     /// `ioctl`: the device's own requests, the descriptor's, and the
     /// terminal's. No kernel lock: the table, the process table, the
     /// terminal and every device synchronise themselves.
@@ -14923,6 +14959,21 @@ impl FdIo<'_> {
                 if md.file_type == FileType::BlockDevice { Ok(md.rdev) } else { Err(Errno::ENOTBLK) }
             };
             return dm.ioctl(m, req, arg, &resolve);
+        }
+        // A DRM node's (`drm_ioctl`), whose PRIME calls make and look up
+        // descriptors; and a sync file's merge, which makes one.
+        if let Ok(f) = self.fds.get(fd) {
+            if let Some(drm) = Arc::clone(&f.handle).as_drm() {
+                if (req >> 8) & 0xff == 0x64 {
+                    let cx = crate::drm::Caller { fds: self.fds, admin: self.creds.capable(21), pid: self.pid };
+                    return drm.ioctl(&cx, m, req, arg);
+                }
+            }
+            if let Some(sync) = Arc::clone(&f.handle).as_syncfile() {
+                if req == crate::syncfile::IOC_MERGE {
+                    return self.sync_merge(m, &sync, arg);
+                }
+            }
         }
         // A block device's: the block layer's and its driver's, which may
         // name a descriptor of the caller's (a loop device's file).
@@ -15432,6 +15483,9 @@ impl Kernel {
         }
         if let Some(r) = pty_peer_ioctl(&self.fds, &self.path_io(), fd, req, arg) {
             return r;
+        }
+        if self.fd_io().hands_over_buffers(fd, req) {
+            self.map_io().flush_all_shared(m);
         }
         self.fd_io().ioctl(m, &self.procs, &self.tty, fd, req, arg)
     }

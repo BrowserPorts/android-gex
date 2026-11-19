@@ -681,6 +681,19 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_memfd(self: Arc<Self>) -> Option<Arc<crate::unix::MemFd>> {
         None
     }
+    /// An open DRM node ([`crate::drm`]), whose `ioctl`s need the caller's
+    /// descriptors.
+    fn as_drm(self: Arc<Self>) -> Option<Arc<crate::drm::DrmFile>> {
+        None
+    }
+    /// A dma-buf, which a DRM device imports.
+    fn as_dmabuf(self: Arc<Self>) -> Option<Arc<crate::drm::DmaBuf>> {
+        None
+    }
+    /// A sync file ([`crate::syncfile`]).
+    fn as_syncfile(self: Arc<Self>) -> Option<Arc<crate::syncfile::SyncFile>> {
+        None
+    }
     /// A signalfd, whose mask `signalfd4` on it changes.
     fn as_signalfd(self: Arc<Self>) -> Option<Arc<crate::signalfd::SignalFd>> {
         None

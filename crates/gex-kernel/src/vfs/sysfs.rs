@@ -50,6 +50,33 @@ pub trait Attributes: Send + Sync + std::fmt::Debug {
         let _ = path;
         None
     }
+    /// `DEVNAME`, where its node is not named as it is (`dri/card0`).
+    fn devname(&self) -> Option<String> {
+        None
+    }
+}
+
+/// A DRM minor's (`drm_sysfs.c`): its node under `dri/`, and
+/// `DEVTYPE=drm_minor`; no mode of its own.
+#[derive(Debug)]
+struct DrmMinor(&'static str);
+
+impl Attributes for DrmMinor {
+    fn vars(&self) -> Vec<(String, String)> {
+        vec![("DEVTYPE".to_string(), "drm_minor".to_string())]
+    }
+    fn list(&self, dir: &str) -> Option<Vec<(String, FileType)>> {
+        dir.is_empty().then(Vec::new)
+    }
+    fn read(&self, _path: &str) -> Option<(u32, String)> {
+        None
+    }
+    fn write(&self, _path: &str, _data: &[u8]) -> Result<(), Errno> {
+        Err(Errno::EACCES)
+    }
+    fn devname(&self) -> Option<String> {
+        Some(format!("dri/{}", self.0))
+    }
 }
 
 /// A device as the device model has it.
@@ -85,7 +112,8 @@ impl Device {
         if self.is_net() {
             return self.attrs.as_ref().map(|a| a.vars()).unwrap_or_default();
         }
-        let mut v = vec![("MAJOR".to_string(), self.major.to_string()), ("MINOR".to_string(), self.minor.to_string()), ("DEVNAME".to_string(), self.name.clone())];
+        let devname = self.attrs.as_ref().and_then(|a| a.devname()).unwrap_or_else(|| self.name.clone());
+        let mut v = vec![("MAJOR".to_string(), self.major.to_string()), ("MINOR".to_string(), self.minor.to_string()), ("DEVNAME".to_string(), devname)];
         if let Some(mode) = self.mode {
             v.push(("DEVMODE".to_string(), format!("{mode:04o}")));
         }
@@ -170,6 +198,11 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
             ("misc", "device-mapper", 10, 236, None),
         ];
         let mut all: Vec<Arc<Device>> = chars.iter().map(|(s, n, major, minor, mode)| Arc::new(Device { subsystem: s.to_string(), name: n.to_string(), major: *major, minor: *minor, mode: *mode, attrs: None })).collect();
+        // A virtio-gpu's minors, when there is one ([`crate::drm`]): the
+        // render node first, as `drm_dev_register` adds them.
+        for (name, minor) in crate::drm::minors() {
+            all.push(Arc::new(Device { subsystem: "drm".to_string(), name: name.to_string(), major: crate::drm::MAJOR, minor: *minor, mode: None, attrs: Some(Arc::new(DrmMinor(name))) }));
+        }
         // The network interfaces (`net/core/net-sysfs.c`): no device
         // number, and their own attributes.
         for (index, name, kind, flags, mtu, mac) in crate::netlink::interfaces_info() {
