@@ -858,7 +858,22 @@ impl ProcFs {
     /// others. Just the first where the table does not list it.
     fn tasks_of(&self, who: &str) -> Vec<i32> {
         let pid = if who == "self" { self.source.pid() } else { who.parse().unwrap_or(0) };
-        self.source.others().into_iter().find(|e| e.pid == pid).map_or_else(|| vec![pid], |e| e.tasks())
+        let tasks = self.source.others().into_iter().find(|e| e.pid == pid).map_or_else(|| vec![pid], |e| e.tasks());
+        // `GEX_TRACE_TASKS=1`: a process's own task list, when it has more
+        // than its first thread, at most every 10 s a process (the zygote
+        // reads it in a loop until only it is left, before it forks).
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if who == "self" && tasks.len() > 1 && *TRACE.get_or_init(|| std::env::var_os("GEX_TRACE_TASKS").is_some()) {
+            static SAID: std::sync::Mutex<Vec<(i32, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+            let mut said = SAID.lock().unwrap();
+            let due = said.iter().find(|(p, _)| *p == pid).is_none_or(|(_, at)| at.elapsed() >= std::time::Duration::from_secs(10));
+            if due {
+                said.retain(|(p, _)| *p != pid);
+                said.push((pid, std::time::Instant::now()));
+                eprintln!("gex: /proc/{pid}/task lists {tasks:?}");
+            }
+        }
+        tasks
     }
 
     /// Another process's `/proc/<pid>/…`: its entry and the rest of the path.
