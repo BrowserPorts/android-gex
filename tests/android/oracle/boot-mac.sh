@@ -60,7 +60,7 @@ export MallocLargeCache=0
 # emulator's phone size, its scanout written to frame-NAME.ppm.
 export GEX_VIRTIO_GPU=${GEX_VIRTIO_GPU:-1080x1920}
 export GEX_VIRTIO_GPU_FRAME=${GEX_VIRTIO_GPU_FRAME:-$OUT/frame-$NAME.ppm}
-export GEX_DENSE=1 GEX_HEAP_STATS=${GEX_HEAP_STATS:-300} GEX_LAZY_CATCH_UP=1 GEX_TIME_SCALE=8
+export GEX_DENSE=${GEX_DENSE:-1} GEX_HEAP_STATS=${GEX_HEAP_STATS:-300} GEX_LAZY_CATCH_UP=1 GEX_TIME_SCALE=8
 export GEX_CACHE_MAX_BYTES=${GEX_CACHE_MAX_BYTES:-8589934592} GEX_FIXED_RANDOM=1
 if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
     export GEX_CACHE_BUILD="$name"
