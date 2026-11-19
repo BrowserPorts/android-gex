@@ -70,6 +70,7 @@ const PROBES = {
   'rt-sockpass': [],
   'rt-clonecopy': [],
   'rt-stalebound': ['-pthread'],
+  'rt-killwait': ['-pthread'],
   'rt-repaint': [],
   'rt-deadclient': [],
   'rt-unix': [],

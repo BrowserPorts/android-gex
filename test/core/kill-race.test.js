@@ -4,7 +4,8 @@
 // armed by `debugpanic=prctl`), and its sibling sends it SIGKILL as soon as
 // it says it is about to, so the kill lands while the crashed child's
 // Worker is ending. Before, the kill's end claimed the process first and
-// the crash was never said.
+// the crash was never said. Then rt-killwait: SIGKILL ends a process whose
+// every thread is waiting.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 
@@ -29,6 +30,15 @@ export default async function (t) {
   for (const [, n, , pid, status] of rounds) {
     const c = crashes.find((x) => x.pid === pid);
     check(`round ${n}: pid ${pid} (status ${status}) is reported as a crash`, !!c, `crash reports: ${JSON.stringify(crashes)}`);
+  }
+  // A SIGKILL that was delivered ends the process, whatever its threads
+  // wait on (a futex, a pipe, poll, a sleep): conhost survived one.
+  const w = await sys.run(['rt-killwait', '4'], { env: { PATH: '/bin:/usr/bin' } });
+  const kw = w.stdout.split('\n').filter((l) => l.startsWith('killwait '));
+  eq('killwait: every round', kw.length, 4);
+  for (const l of kw) {
+    const [, n, how, ms] = l.split(' ').map(Number);
+    check(`killwait ${n}: SIGKILL ends a process whose threads all wait`, how === 137, `ended ${how} after ${ms} ms (-1: still running at 10 s)`);
   }
   await sys.shutdown();
 }
