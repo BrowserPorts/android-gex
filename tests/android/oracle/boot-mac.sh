@@ -22,7 +22,15 @@ SECS=${2:-7200}
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 GEXC=${GEXC:-/Volumes/GexBuild/android-gex-android/target/release/gexc}
 ROOT=${ROOT:-/Volumes/GexBuild/android-oracle/root}
-CONFIG=${CONFIG:-/Volumes/GexBuild/android-oracle/bootcfg}
+# The boot configuration: the emulator's guest rendering (ANGLE over
+# SwiftShader's vulkan.pastel, minigbm), which needs no host GPU; the
+# image's default GLES is the emulator's host pipe. swiftshader.sh puts
+# the driver in the tree; the configuration says, besides the usual,
+#   androidboot.hardwareegl = "angle"
+#   androidboot.hardware.vulkan = "pastel"
+#   androidboot.opengles.version = "196610"
+#   androidboot.hardware.gralloc = "minigbm"
+CONFIG=${CONFIG:-/Volumes/GexBuild/android-oracle/bootcfg-angle}
 OUT=${OUT:-/Volumes/GexBuild/android-oracle/boots}
 MAX_GB=${MAX_GB:-40}
 FIRST=$HERE/../bin/firststage
@@ -48,6 +56,10 @@ mkdir -p "$XDG_CACHE_HOME"
 # recycled. Without the large cache it is fresh zero memory each time (a
 # small threaded test: 1.0-1.5 GB of footprint at peak, 331 MB without).
 export MallocLargeCache=0
+# The display: gex's virtio-gpu (crates/gex-kernel/src/drm.rs) at the
+# emulator's phone size, its scanout written to frame-NAME.ppm.
+export GEX_VIRTIO_GPU=${GEX_VIRTIO_GPU:-1080x1920}
+export GEX_VIRTIO_GPU_FRAME=${GEX_VIRTIO_GPU_FRAME:-$OUT/frame-$NAME.ppm}
 export GEX_DENSE=1 GEX_HEAP_STATS=${GEX_HEAP_STATS:-300} GEX_LAZY_CATCH_UP=1 GEX_TIME_SCALE=8
 export GEX_CACHE_MAX_BYTES=${GEX_CACHE_MAX_BYTES:-8589934592} GEX_FIXED_RANDOM=1
 if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then

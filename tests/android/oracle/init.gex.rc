@@ -33,6 +33,15 @@ on early-init
     # invalid entry"; boot b81). Interpreted until mappings of one file
     # in one process are one memory here.
     setprop dalvik.vm.usejit false
+    # The display's density, which the emulator's host gives
+    # surfaceflinger (qemu.sf.lcd_density, read before ro.sf.lcd_density;
+    # the image's build properties set neither): the emulator's 420 for a
+    # 1080-wide phone, as GEX_VIRTIO_GPU=1080x1920 makes the display.
+    setprop qemu.sf.lcd_density 420
+    # The composer finds its displays through DRM (the virtio-gpu's
+    # connector) rather than asking the emulator's host, as a device with
+    # guest rendering and no host renderer has it configured.
+    setprop ro.vendor.hwcomposer.display_finder_mode drm
 
 on post-fs
     start gex_logcat
