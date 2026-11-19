@@ -2,7 +2,8 @@
 // kill anyone sent: wineserver ending a program and then its conhost had
 // the program's report name the conhost's kill ("from pid 3 to 70" in pid
 // 69's). Two children, both left to die of SIGKILL from their parent, A
-// first, B a moment after: A's line must name A.
+// first, B a moment after, then twenty SIGWINCHes the parent sends itself:
+// each child's line must name its own kill.
 import { guest } from '../lib/guest.mjs';
 
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 300 };
@@ -24,6 +25,11 @@ int main(void) {
     usleep(100000);
     kill(k[0], SIGKILL);
     kill(k[1], SIGKILL);
+    /* more kills after, to nobody that dies of them (SIGWINCH, ignored),
+     * while A's Worker is still on its way to its end: anybody's last kill
+     * is then never A's */
+    signal(SIGWINCH, SIG_IGN);
+    for (int i = 0; i < 20; i++) kill(getpid(), SIGWINCH);
     int st;
     waitpid(k[0], &st, 0);
     waitpid(k[1], &st, 0);
