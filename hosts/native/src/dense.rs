@@ -221,7 +221,16 @@ impl Blocks {
     }
 
     /// Point a module's slots at its entries, in this store's process's
-    /// memory: when the store installs it.
+    /// memory: when the store installs it. Not a slot a module published
+    /// after it points at already: dense bases are given in publish order,
+    /// so a word naming a higher entry is a later translation's (the page
+    /// translated again, or another thread's that won it), and stays.
+    ///
+    /// The maps are the process's, and its threads install modules in no
+    /// fixed order: a lazy thread takes a page's newest unit first and
+    /// older ones later. An older one written over the newer word sent
+    /// dispatch to a block whose page check had failed, which then failed
+    /// it for ever (the zygote, spinning before it forked `system_server`).
     pub(crate) fn write(&self, memory: &gex_mem::GuestMemory, s: &Section) -> Result<()> {
         for (j, &e) in s.entries.iter().enumerate() {
             let k = gex_abi::dispatch_entry_table(e);
@@ -233,7 +242,11 @@ impl Blocks {
             if map == 0 || slot >= dense::MAP_SLOTS {
                 bail!("dense slot {slot} of table {k} has no map");
             }
-            put(memory, map + 4 * slot, s.word(j))?;
+            let word = s.word(j);
+            if get(memory, map + 4 * slot).is_some_and(|old| old >> 8 > word >> 8) {
+                continue;
+            }
+            put(memory, map + 4 * slot, word)?;
         }
         Ok(())
     }
