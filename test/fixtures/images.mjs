@@ -223,12 +223,13 @@ export const images = {
     const keyFile = join(work, 'bb.key');
     writeFileSync(join(work, 'lazy.bin'), Buffer.alloc(3 << 20, 7));
     // The same for core/spawn-layers, which reads it, apart from core/dir-times's
-    // lazy.bin while the two may run at once; and core/lazy-plain's two.
+    // lazy.bin while the two may run at once.
     writeFileSync(join(work, 'lazy-program.bin'), Buffer.alloc(3 << 20, 7));
     // core/fs-persist-written's lazy file, one for each arch: it counts the
     // requests for it, which another test's or arch's reads would add to.
     for (const a of ['aarch64', 'x86']) writeFileSync(join(work, `lazy-written-${a}.bin`), Buffer.alloc(3 << 20, 7));
-    for (const n of ['lazy-plain.bin', 'lazy-plain2.bin']) writeFileSync(join(work, n), Buffer.alloc(3 << 20, 9));
+    // core/lazy-plain's two, for each arch: it counts their requests too.
+    for (const a of ['aarch64', 'x86']) for (const n of [`lazy-plain-${a}.bin`, `lazy-plain2-${a}.bin`]) writeFileSync(join(work, n), Buffer.alloc(3 << 20, 9));
     const have = existsSync(join(work, 'bb.tar.zst')) && existsSync(keyFile) && readFileSync(keyFile, 'utf8');
     // Without busybox here, what a run before made (a copy where there is no
     // gexcc); else only if made from the same inputs.
