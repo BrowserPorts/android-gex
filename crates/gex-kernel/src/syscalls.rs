@@ -5795,7 +5795,14 @@ impl MapIo<'_> {
             // stand (`SharedMaps::recall`).
             let shared = flags & crate::mem::flags::SHARED != 0;
             let before = if shared && len_aligned >= RECALL_MIN { file.handle.changes() } else { 0 };
-            let n = file.pread_mapped(offset, m.read_mut(start, len as usize)?)? as usize;
+            // Whole pages, as Linux maps them: the bytes of the last page
+            // past `len` are the file's too (zero only past its end). Read
+            // only to `len`, a 40-byte mapping of a zip entry left the rest
+            // of its page zero, and a `pread` of the next entry's header,
+            // which takes in what the process's shared mappings of the
+            // file hold, read those zeros: libziparchive found no header,
+            // and the package manager could not parse an APEX.
+            let n = file.pread_mapped(offset, m.read_mut(start, len_aligned as usize)?)? as usize;
             m.zero_dirty(start + n as u64, len_aligned as usize - n)?;
             // A shared mapping is written back at `msync` and `munmap` (where
             // a program that never calls `msync` expects its changes to land).
