@@ -1687,14 +1687,17 @@ async function handle(msg) {
     // The global kernel has no console of its own, so a panic there unwinds to
     // a bare `unreachable`. Its message is in its own memory, readable here
     // because this Worker made the instance.
+    // What the crash notice says of it (`gex_crash_line`): the panic's own
+    // words, its last line ("capacity overflow"), not its source path.
+    let kernelWhy = '';
     try {
       const k = gex.kernel;
       if (k?.k_panic_len?.()) {
         const n = k.k_panic_len() >>> 0;
         const at = k.k_panic_ptr() >>> 0;
-        where += ` -- the global kernel panicked: ${utf8(
-          new Uint8Array(msg.kernel.memory.buffer, at, n),
-        )}`;
+        const text = utf8(new Uint8Array(msg.kernel.memory.buffer, at, n));
+        where += ` -- the global kernel panicked: ${text}`;
+        kernelWhy = `the gex kernel failed: ${text.trim().split('\n').at(-1).slice(0, 200)}`;
       }
     } catch {
       // Nothing to add.
@@ -1712,6 +1715,17 @@ async function handle(msg) {
       // process runs on in its other Workers.
       if (!inert) {
         if (!outgrew) gex?.shim?.exports?.gex_dump_state?.();
+        const ex = gex?.shim?.exports;
+        if (kernelWhy && ex?.gex_crash_line && ex.gex_alloc) {
+          try {
+            const bytes = new TextEncoder().encode(kernelWhy);
+            const p = ex.gex_alloc(bytes.length) >>> 0;
+            new Uint8Array(gex.memory.buffer, p, bytes.length).set(bytes);
+            ex.gex_crash_line(p, bytes.length);
+          } catch {
+            // The notice keeps its plain words.
+          }
+        }
         const abandon = gex?.shim?.exports?.gex_abandon;
         // In the single-thread build the kernel's calls may suspend, which
         // needs a stack of its own (`WebAssembly.promising`).

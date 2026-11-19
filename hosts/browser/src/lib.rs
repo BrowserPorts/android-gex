@@ -21314,6 +21314,17 @@ pub extern "C" fn gex_dump_state() {
     })();
 }
 
+/// One more line for the crash of this Worker's process, which the Worker
+/// is about to abandon ([`gex_abandon`]): what failed, when the host knows
+/// (the global kernel's panic). `len` bytes of UTF-8 at `at`.
+#[no_mangle]
+pub extern "C" fn gex_crash_line(at: u32, len: u32) {
+    let Some(home) = sigs::home() else { return };
+    // SAFETY: the host wrote `len` bytes at `at`, in this module's memory.
+    let b = unsafe { core::slice::from_raw_parts(at as usize as *const u8, len as usize) };
+    home.procs().add_crash_line(home.pid(), &String::from_utf8_lossy(b));
+}
+
 /// Publish an exit for a process whose Worker is stopping without one.
 ///
 /// A process that stops existing must become collectable, however it stopped.
