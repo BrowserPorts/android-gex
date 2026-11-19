@@ -7,7 +7,10 @@
 // Loads and stores, single and pair, pre- and post-indexed; checked
 // against Linux 7.0. And a fault in a loop the translator keeps in
 // registers across its iterations: the handler's frame has every
-// register as the instruction before the fault left it.
+// register as the instruction before the fault left it. And many faults
+// whose handler returns, as the collector takes them: a translator that
+// took the handler's return for a branch that kept missing ended the
+// process after 64 of them.
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <linux/userfaultfd.h>
@@ -42,7 +45,8 @@ static const char expected[] =
     "ldr post-index from the missing page: value right, base moved by 8 (faults 1)\n"
     "str post-index into the missing page: stored right, base moved by 8 (faults 1)\n"
     "ldrb pre-index: value right, base moved by 200 (faults 1)\n"
-    "byte loop into the missing page: right, the frame's base at the fault 2 (faults 1)\n";
+    "byte loop into the missing page: right, the frame's base at the fault 2 (faults 1)\n"
+    "a store into a missing page 100000 times: 100000 faults handled\n";
 static char out_buf[2048];
 static size_t used;
 #include <stdarg.h>
@@ -107,6 +111,18 @@ int main(void) {
             "1: ldrb w9, [x1], #1\n subs x2, x2, #1\n strb w9, [x8], #1\n b.ne 1b\n"
             :: "r"(d), "r"(src) : "x1", "x2", "x8", "x9", "memory", "cc");
         SAY("byte loop into the missing page: %s, the frame's base at the fault %ld (faults %d)\n", !memcmp(d, src, 4) ? "right" : "wrong", (long)((unsigned char *)frame_x8 - d), faults);
+    }
+    // The page dropped and stored into again and again, each store a
+    // fault the handler fills and returns from.
+    {
+        long handled = 0;
+        for (int i = 0; i < 100000; i++) {
+            madvise(area, P, MADV_DONTNEED);
+            faults = 0;
+            ((volatile char *)area)[0] = 1;
+            handled += faults;
+        }
+        SAY("a store into a missing page 100000 times: %ld faults handled\n", handled);
     }
     if (strcmp(out_buf, expected) != 0) {
         printf("faultretry: not what Linux shows\n");
