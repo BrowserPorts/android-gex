@@ -5869,6 +5869,20 @@ impl MapIo<'_> {
     /// Write every shared mapping back (the changed pages): at `exit` and
     /// `execve`, where Linux's page cache keeps a mapping's stores for the
     /// file though nobody called `msync` or `munmap`.
+    /// Write back the shared mappings of graphics buffers (a DRM device's
+    /// objects, dma-bufs): what a process hands another over binder (a
+    /// frame queued to surfaceflinger, a client target to the composer)
+    /// with no `msync` or futex wake of its own on the way ([`crate::drm`]).
+    pub fn flush_buffers(&self, m: &GuestMem<'_>) {
+        let maps: Vec<SharedMap> = {
+            let mm = self.mem.lock();
+            mm.log.shared_maps.iter().filter(|map| Arc::clone(&map.file.handle).as_drm().is_some() || Arc::clone(&map.file.handle).as_dmabuf().is_some()).cloned().collect()
+        };
+        for map in maps {
+            let _ = write_back(m, &map, 0, u64::MAX);
+        }
+    }
+
     pub fn flush_all_shared(&self, m: &GuestMem<'_>) {
         if self.mem.lock().log.shared_maps.is_empty() {
             return;
@@ -15474,6 +15488,12 @@ impl Kernel {
         };
         // Whatever it queued may be what another thread waits for.
         self.fd_activity = true;
+        // A buffer it drew in, handed over by what it writes
+        // (`BINDER_WRITE_READ` with a write size).
+        const BINDER_WRITE_READ: u64 = 0xc030_6201;
+        if req & 0xffff_ffff == BINDER_WRITE_READ && m.read_u64(arg).is_ok_and(|n| n > 0) {
+            self.map_io().flush_buffers(m);
+        }
         Some(binder.ioctl(&cx, m, req, arg))
     }
 
