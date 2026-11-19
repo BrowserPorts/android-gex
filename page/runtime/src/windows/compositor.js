@@ -52,14 +52,51 @@ function backgroundOf(bg) {
   return { desktop, wallpaper };
 }
 
+/** The page's device pixels per CSS pixel, unrounded. */
+const dprNow = () => Math.max(1, Number(globalThis.devicePixelRatio) || 1);
+
+/**
+ * The canvas's backing store set to its content box in device pixels, before
+ * its control goes to the compositor's Worker (after that only `resize`
+ * reaches it). A canvas whose CSS size is its backing store's (no width or
+ * height of its own in any style) would grow with it every time: its CSS
+ * size is pinned first, to what it is now.
+ */
+function fitCanvas(canvas) {
+  if (typeof canvas.getBoundingClientRect !== 'function' || !canvas.isConnected) return;
+  const r = canvas.getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  const w0 = canvas.width, h0 = canvas.height;
+  canvas.width = w0 + 1;
+  canvas.height = h0 + 1;
+  const r1 = canvas.getBoundingClientRect();
+  canvas.width = w0;
+  canvas.height = h0;
+  if (r1.width !== r.width) canvas.style.width = `${r.width}px`;
+  if (r1.height !== r.height) canvas.style.height = `${r.height}px`;
+  const s = dprNow();
+  // Its content box: the border box less borders and padding.
+  const cs = getComputedStyle(canvas);
+  const px = (v) => parseFloat(v) || 0;
+  const cw = r.width - px(cs.borderLeftWidth) - px(cs.borderRightWidth) - px(cs.paddingLeft) - px(cs.paddingRight);
+  const ch = r.height - px(cs.borderTopWidth) - px(cs.borderBottomWidth) - px(cs.paddingTop) - px(cs.paddingBottom);
+  canvas.width = Math.max(1, Math.round(cw * s));
+  canvas.height = Math.max(1, Math.round(ch * s));
+}
+
 export class CompositorWindows extends EventTarget {
   #c = null;
 
   /**
-   * `canvas`: the output, its backing store the output's size in device
-   * pixels; `scale`: device pixels per CSS pixel (default devicePixelRatio,
-   * rounded), which clients are told. The canvas's control goes to the
-   * compositor's Worker. `x11`: 'rootless' (the default), each X window a
+   * `canvas`: the output. By default the runtime sizes its backing store:
+   * the canvas's content box in device pixels (devicePixelContentBoxSize),
+   * followed as the page lays it out, zooms or moves to another monitor, at
+   * the real devicePixelRatio (1.5 is 1.5), which clients are told: in
+   * 120ths to those that take a fractional scale, rounded up to the rest,
+   * whose pixels are then sampled down. `scale`, a number: that scale, and
+   * the page sizes the backing store itself (the output's size in device
+   * pixels) and calls `resize`; `scale: 1` is a page that is not HiDPI. The
+   * canvas's control goes to the compositor's Worker. `x11`: 'rootless' (the default), each X window a
    * window of the desktop, placed by the runtime's window manager; or
    * 'rootful', one X screen filling the output, run by the session's own
    * window manager (kwin_x11 and the like). `background`: the desktop
@@ -75,8 +112,11 @@ export class CompositorWindows extends EventTarget {
     const bg = backgroundOf(background);
     const i = internals(sys, 'CompositorWindows');
     i.attach('windows', this, { beforeBoot: true });
+    const auto = scale === undefined || scale === null || scale === 'auto';
+    if (auto) fitCanvas(canvas);
+    this.#scale = auto ? dprNow() : Math.max(1, Number(scale) || 1);
     i.devices(async (dev) => {
-      const wlScale = Math.max(1, Math.round(scale ?? globalThis.devicePixelRatio ?? 1));
+      const wlScale = this.#scale;
       // The single-thread build: the scene is drawn in its system Worker,
       // which holds the memories it reads; this side relays to it.
       if (dev.single) {
@@ -84,21 +124,80 @@ export class CompositorWindows extends EventTarget {
           width: canvas.width,
           height: canvas.height,
           scale: wlScale,
-          attach: async (k, listeners) => ({ compositor: (this.#c = await relayed(canvas, wlScale, k, listeners, bg)) }),
+          attach: async (k, listeners) => {
+            this.#c = await relayed(canvas, wlScale, k, listeners, bg);
+            if (auto) this.#follow(canvas);
+            return { compositor: this.#c };
+          },
         };
         return;
       }
       Object.assign(dev, await dev.rt.openWayland({ wl: canvas, wlScale, background: bg, say: (t) => dev.say(`${t}\n`) }));
       this.#c = dev.compositor;
+      if (auto) this.#follow(canvas);
     });
     const x = { rootful: x11 === 'rootful' };
     xOnDemand(i, x);
     this[INTERNAL] = {
       x,
       of: () => [],
-      shutdown: () => this.#c?.stop(),
+      shutdown: () => {
+        this.#unfollow?.();
+        this.#c?.stop();
+      },
       /** The compositor's window at a page point, with its block (drop.js). */
       windowAt: (x, y) => this.#c?.windowAt?.(x, y) ?? null,
+    };
+  }
+
+  #scale = 1;
+  #unfollow = null;
+
+  /** The canvas's device-pixel size and the page's scale, followed: a
+   *  ResizeObserver on its device-pixel content box (which a zoom or another
+   *  monitor changes as well as a layout), and a resolution query for a
+   *  scale that changes with no change of size. */
+  #follow(canvas) {
+    if (typeof ResizeObserver !== 'function') return;
+    let w = canvas.width, h = canvas.height, query = null;
+    const scaleNow = () => {
+      const s = dprNow();
+      if (s !== this.#scale) {
+        this.#scale = s;
+        this.#c?.setScale?.(s);
+      }
+    };
+    const watchScale = () => {
+      query?.removeEventListener('change', onScale);
+      query = globalThis.matchMedia?.(`(resolution: ${dprNow()}dppx)`) ?? null;
+      query?.addEventListener('change', onScale);
+    };
+    const onScale = () => {
+      scaleNow();
+      watchScale();
+    };
+    const ro = new ResizeObserver(([e]) => {
+      // Zoomed out below 1: the output stays at the CSS size (scale 1), and
+      // the browser shrinks it.
+      const box = (Number(globalThis.devicePixelRatio) || 1) >= 1 ? e.devicePixelContentBoxSize?.[0] : null;
+      const css = e.contentBoxSize?.[0];
+      const nw = box ? box.inlineSize : Math.round((css?.inlineSize ?? 0) * dprNow());
+      const nh = box ? box.blockSize : Math.round((css?.blockSize ?? 0) * dprNow());
+      scaleNow();
+      if (!nw || !nh || (nw === w && nh === h)) return;
+      w = nw;
+      h = nh;
+      this.#c?.resize(w, h);
+    });
+    try {
+      ro.observe(canvas, { box: 'device-pixel-content-box' });
+    } catch {
+      ro.observe(canvas);
+    }
+    watchScale();
+    this.#unfollow = () => {
+      ro.disconnect();
+      query?.removeEventListener('change', onScale);
     };
   }
 

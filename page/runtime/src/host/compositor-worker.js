@@ -584,6 +584,17 @@ class Compositor {
     this.#painter.textured(0, 0, W, H, tex, { opaque: 1, uv: [(1 - su) / 2, v0, su, sv] });
   }
 
+  /** A new scale (Compositor.setScale): the frames are drawn at it from the
+   *  next frame (setUiScale), and clients that connect after are told it. */
+  setScale(scale) {
+    setOutputSize(this.#channel, this.#outW, this.#outH, scale);
+    for (const [k, win] of this.#windows) {
+      if (win.role !== ROLE_TOPLEVEL) continue;
+      win.configuredAs = null;
+      this.#configure(win, this.#focus === k);
+    }
+  }
+
   resize(w, h) {
     this.#outW = Math.max(1, w | 0);
     this.#outH = Math.max(1, h | 0);
@@ -838,17 +849,21 @@ class Compositor {
         }
       }
       // Device pixels from here on. A surface's buffer is `bs` pixels per
-      // surface unit and its client was told `cs` device pixels per unit
-      // (wl_output.scale), so it covers width * cs / bs device pixels: 1:1
-      // when the client drew at the output's scale. X windows are cs = 1 and
-      // device pixels throughout (the X server is told the device size).
+      // surface unit, or its viewport's destination says its size in units,
+      // and a unit is `cs` device pixels: the real scale its client was told
+      // (wp_fractional_scale_v1, scale120 / 120), else the whole one
+      // (wl_output.scale). So it covers its size in units times cs device
+      // pixels: 1:1 when the client drew at the output's scale, sampled down
+      // when it drew at the whole scale above a fractional one. X windows are
+      // cs = 1 and device pixels throughout (the X server is told the device
+      // size).
       const bs = (s.flags >> 8) & 0xff || 1;
-      const cs = (s.flags >> 16) & 0xff || 1;
+      const cs = s.scale120 ? s.scale120 / 120 : (s.flags >> 16) & 0xff || 1;
       win.role = s.role;
       win.bs = bs;
       win.cs = cs;
-      win.width = Math.round((s.width * cs) / bs);
-      win.height = Math.round((s.height * cs) / bs);
+      win.width = Math.round((s.view ? s.view.w : s.width / bs) * cs);
+      win.height = Math.round((s.view ? s.view.h : s.height / bs) * cs);
       win.title = s.title;
       win.parent = s.parent;
       win.relX = s.relX * cs;
@@ -2027,6 +2042,8 @@ class Compositor {
       brightest,
       hash,
       output: `${this.#outW}x${this.#outH}`,
+      // Device pixels per CSS pixel the frames are drawn at (setUiScale).
+      scale: UI,
       // Direct present (`?direct=1`): the GL frame's size while it is the
       // output (then `lit`/`hash` describe the last composited scene).
       direct: this.#direct ? `${this.#direct.w}x${this.#direct.h}` : null,
@@ -2375,6 +2392,9 @@ const onMessage = ({ data: m }) => {
       glSurfaceFrame = -1;
     } else if (m.kind === 'resize') {
       comp?.resize(m.width, m.height);
+    } else if (m.kind === 'scale') {
+      setUiScale(m.scale || 1);
+      comp?.setScale(m.scale || 1);
     } else if (m.kind === 'pointer-move') {
       comp?.pointerMove(m.x, m.y, m.time);
     } else if (m.kind === 'pointer-lock') {

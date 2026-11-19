@@ -994,7 +994,7 @@ async function handle(msg) {
     gex.useWl(proxy);
     // The output size a toplevel is configured to, before the guest runs.
     const out = outputSize(msg.wlChannel);
-    gex.wlOutput(out.w, out.h, out.scale);
+    gex.wlOutput(out.w, out.h, out.scale, out.scale120);
     // Sent when the token is known, which is after load: `onLoaded` is the
     // first moment this process has a pid. With pixel buffers in the channel
     // (wl-bridge.mjs) the compositor never needs this process's memory --

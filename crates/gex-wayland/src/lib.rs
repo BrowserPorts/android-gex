@@ -308,6 +308,15 @@ pub struct SurfaceInfo {
     /// pixels per surface unit. The host draws a surface at
     /// `width * client_scale / buffer_scale` device pixels.
     pub client_scale: i32,
+    /// The real scale the client was told, in 120ths
+    /// (`wp_fractional_scale_v1`): device pixels per surface unit times 120.
+    /// The host draws a surface at its size in surface units times
+    /// `scale120 / 120`.
+    pub scale120: i32,
+    /// `wp_viewport.set_destination`: the surface's size in surface units,
+    /// when its client said (a fractional-scale client's buffer is in device
+    /// pixels, its destination in units).
+    pub view: Option<(i32, i32)>,
     /// Where the client says the surface is and what it is stacked under
     /// (`gex_window_placement_v1`), when it says so.
     pub placement: Placement,
@@ -466,6 +475,11 @@ pub fn push_record(out: &mut Vec<i32>, client: u32, info: &SurfaceInfo) {
     // Which X window this is, for a host that knows a drawable and not a
     // surface -- an OpenGL client naming what it draws into.
     r[17] = info.xid as i32;
+    // The real scale in 120ths, and the viewport's destination (`w | h <<
+    // 16`, 0 for none): the size the surface shows at is the destination, or
+    // the buffer over its scale, in surface units, times scale120 / 120.
+    r[18] = info.scale120;
+    r[19] = info.view.map_or(0, |(w, h)| (w & 0xffff) | ((h & 0xffff) << 16));
     // Where its client placed it, if it did (`gex_window_placement_v1`).
     r[28..33].copy_from_slice(&info.placement.record_words());
     // Where it takes the pointer, when its client said (`flags` bit 7).
@@ -598,6 +612,13 @@ const GLOBALS: &[(&str, u32)] = &[
     // grabs the pointer and hides it.
     ("zwp_relative_pointer_manager_v1", 1),
     ("zwp_pointer_constraints_v1", 1),
+    // A scale that is not a whole number (a page at devicePixelRatio 1.5):
+    // `preferred_scale` in 120ths. A client that takes it draws at device
+    // size and sets its viewport's destination in surface units, so it is
+    // shown 1:1; one that does not draws at `wl_output.scale` (the scale
+    // rounded up) and is sampled down to it. Last, so the names before it
+    // keep their numbers.
+    ("wp_fractional_scale_manager_v1", 1),
 ];
 
 /// What an object id currently is.
@@ -631,6 +652,8 @@ enum Object {
     Subsurface { surface: u32 },
     Viewporter,
     Viewport { surface: u32 },
+    FractionalScaleManager,
+    FractionalScale,
     DecorationManager,
     Decoration { surface: u32 },
     PlacementManager,
@@ -846,9 +869,14 @@ pub struct Client {
     /// Surfaces whose fullscreen state the client changed and the host has
     /// not taken yet ([`Client::take_fullscreen_changes`]), one entry each.
     fullscreen_changes: Vec<(u32, bool)>,
-    /// Device pixels per surface unit: what `wl_output.scale` says. A
-    /// toplevel's configure is in surface units, so `default_size / scale`.
+    /// Device pixels per surface unit, rounded up: what `wl_output.scale`
+    /// says.
     scale: i32,
+    /// Device pixels per surface unit in 120ths (`wp_fractional_scale_v1`'s
+    /// `preferred_scale`): the real scale, which surface units are in. A
+    /// toplevel's configure is in surface units, so `default_size * 120 /
+    /// scale120`.
+    scale120: i32,
     /// `wl_keyboard.repeat_info`: keys a second and the delay in ms (rate 0:
     /// the client repeats nothing, the host sends each repeat as a press).
     key_repeat: (i32, i32),
@@ -941,6 +969,7 @@ impl Client {
             default_size: (640, 480),
             fullscreen_changes: Vec::new(),
             scale: 1,
+            scale120: 120,
             key_repeat: (25, 600),
             wm_base_version: 0,
             placement_version: 0,
@@ -999,8 +1028,9 @@ impl Client {
     /// host draws around a window (a title bar and a border, `FRAME_*`).
     fn bounds(&self) -> (i32, i32) {
         let (w, h) = self.default_size;
-        let k = self.scale.max(1);
-        ((w - FRAME_W * k).max(k) / k, (h - FRAME_H * k).max(k) / k)
+        let k = self.scale120.max(120);
+        let unit = |px: i32| (px.max(1) * 120 / k).max(1);
+        (unit(w - FRAME_W * k / 120), unit(h - FRAME_H * k / 120))
     }
 
     /// The surfaces whose fullscreen state changed since the last call, and
@@ -1015,6 +1045,16 @@ impl Client {
     /// the client binds the output.
     pub fn set_scale(&mut self, scale: i32) {
         self.scale = scale.clamp(1, 8);
+        self.scale120 = self.scale * 120;
+    }
+
+    /// The real scale, in 120ths (180 for 1.5), for a host whose output is
+    /// in device pixels at a scale that need not be whole: surface units are
+    /// device pixels / (scale120 / 120), and `wl_output.scale` is that
+    /// rounded up. Set before the client binds the output.
+    pub fn set_scale120(&mut self, scale120: i32) {
+        self.scale120 = scale120.clamp(120, 960);
+        self.scale = (self.scale120 + 119) / 120;
     }
 
     /// The key repeat this client is told (`wl_keyboard.repeat_info`): `rate`
@@ -1176,6 +1216,8 @@ impl Client {
                 Object::Subcompositor => self.subcompositor(opcode, &mut r),
                 Object::Viewporter => self.viewporter(object, opcode, &mut r),
                 Object::Viewport { surface } => self.viewport(object, surface, opcode, &mut r),
+                Object::FractionalScaleManager => self.fractional_scale_manager(object, opcode, &mut r),
+                Object::FractionalScale => self.fractional_scale(object, opcode),
                 Object::Positioner => self.positioner(object, opcode, &mut r),
                 Object::Region => self.region(object, opcode, &mut r),
                 Object::Buffer(_) => {
@@ -1397,6 +1439,9 @@ impl Client {
             }
             "wp_viewporter" => {
                 self.objects.insert(id, Object::Viewporter);
+            }
+            "wp_fractional_scale_manager_v1" => {
+                self.objects.insert(id, Object::FractionalScaleManager);
             }
             "zxdg_decoration_manager_v1" => {
                 self.objects.insert(id, Object::DecorationManager);
@@ -2452,6 +2497,40 @@ impl Client {
         }
     }
 
+    /// `wp_fractional_scale_manager_v1`: destroy(0),
+    /// get_fractional_scale(1), whose object is told the scale at once
+    /// (`preferred_scale`), as there is one output and it does not change
+    /// under a client.
+    fn fractional_scale_manager(&mut self, object: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
+        match opcode {
+            0 => {
+                self.objects.remove(&object);
+                self.delete_id(object);
+                true
+            }
+            1 => {
+                let (Some(id), Some(_surface)) = (r.new_id(), r.object()) else {
+                    return false;
+                };
+                self.objects.insert(id, Object::FractionalScale);
+                let ev = Writer::new(id, 0).uint(self.scale120 as u32);
+                self.send(ev);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `wp_fractional_scale_v1`: destroy(0).
+    fn fractional_scale(&mut self, object: u32, opcode: u16) -> bool {
+        if opcode != 0 {
+            return false;
+        }
+        self.objects.remove(&object);
+        self.delete_id(object);
+        true
+    }
+
     /// `wp_viewport`: destroy(0), set_source(1), set_destination(2). The
     /// destination is recorded on the surface (-1, -1 unsets it).
     fn viewport(&mut self, object: u32, surface: u32, opcode: u16, r: &mut Reader<'_>) -> bool {
@@ -2830,6 +2909,8 @@ impl Client {
                 external: external.is_some(),
                 buffer_scale: s.buffer_scale.max(1),
                 client_scale: self.scale,
+                scale120: self.scale120,
+                view: s.viewport,
                 placement: s.placement,
                 input: s.input.clone(),
                 pointer_lock: self.wants_lock(*id),
@@ -4187,6 +4268,34 @@ mod tests {
         c.receive(&Writer::new(6, 6).finish(), &[], &pool);
         assert_eq!(input(&c), None);
         assert_eq!(c.scene().into_iter().find(|s| s.surface == 6).unwrap().flags() & 0x80, 0);
+    }
+
+    #[test]
+    fn a_fractional_scale_is_told_and_the_viewport_sizes_the_surface() {
+        // At devicePixelRatio 1.5: wl_output.scale 2, preferred_scale 180.
+        // winewayland binds the manager (the last global, name 13), gets a
+        // fractional scale for its window and a viewport, and sets the
+        // destination in surface units; the record carries both.
+        let pool = Placed(0x6000, 8192);
+        let (mut c, _) = placed_window(300, 150, 1200);
+        c.set_scale120(180);
+        assert_eq!(c.scale, 2);
+        c.take_outgoing();
+        c.receive(&Writer::new(2, 0).uint(13).string("wp_fractional_scale_manager_v1").uint(1).new_id(60).finish(), &[], &pool);
+        c.receive(&Writer::new(60, 1).new_id(61).object(6).finish(), &[], &pool);
+        let told = messages(&c.take_outgoing());
+        let scale = told.iter().find(|(id, op, _)| *id == 61 && *op == 0).expect("no preferred_scale");
+        assert_eq!(u32::from_ne_bytes(scale.2[..4].try_into().unwrap()), 180);
+        c.receive(&Writer::new(2, 0).uint(9).string("wp_viewporter").uint(1).new_id(50).finish(), &[], &pool);
+        c.receive(&Writer::new(50, 1).new_id(51).object(6).finish(), &[], &pool);
+        c.receive(&Writer::new(51, 2).int(200).int(100).finish(), &[], &pool);
+        let s = c.scene().into_iter().find(|s| s.surface == 6).expect("the window went away");
+        assert_eq!((s.scale120, s.view, s.client_scale), (180, Some((200, 100)), 2));
+        let mut rec = Vec::new();
+        push_record(&mut rec, 1, &s);
+        assert_eq!((rec[18], rec[19]), (180, 200 | (100 << 16)));
+        c.receive(&Writer::new(61, 0).finish(), &[], &pool);
+        assert!(!c.objects.contains_key(&61), "the fractional scale outlived its destroy");
     }
 
     #[test]

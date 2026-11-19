@@ -785,7 +785,13 @@ as a KDE or Xfce session does). `background` is the desktop behind the
 windows: a colour (`'#rrggbb'`) or `{ color, image, anchor }`, `image` a URL
 or a `Blob` covering the canvas, `anchor` the edge that always shows
 (`'top'`, `'center'`, the default, or `'bottom'`); the colour shows until the
-image is in. `env`, `resize(width, height)` (device pixels), `describe({ pixels })`
+image is in. The runtime sizes the canvas's backing store to its content box
+in device pixels and follows it (layout, zoom, another monitor), at the real
+`devicePixelRatio`: clients that take `wp_fractional_scale_v1` are told it in
+120ths and draw at device size, the rest are told it rounded up and sampled
+down. `scale`, a number, turns that off: that scale, the page sizing the
+backing store and calling `resize` (`scale: 1`: not HiDPI).
+`env`, `resize(width, height)` (device pixels), `describe({ pixels })`
 (the scene: `list`, a line per window with its title, `frames`, and, unless
 `pixels: false`, a hash of what is shown).
 

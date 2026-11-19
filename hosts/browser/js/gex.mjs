@@ -2705,6 +2705,7 @@ export class Gex {
     this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
     if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
     if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
+    if (this.#wlOut) this.#shim.exports.gex_set_wl_scale120?.(this.#wlScale120);
     // `kernel.net` is decided inside `gex_load` from this flag, so it must be
     // set before it (not merely in `useNetwork`, before the shim exists).
     this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
@@ -3348,6 +3349,7 @@ export class Gex {
       this.#shim.exports.gex_set_wl?.(this.#wl ? 1 : 0);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
+      if (this.#wlOut) this.#shim.exports.gex_set_wl_scale120?.(this.#wlScale120);
       this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
       // The processors, as `load` gives them: a forked or spawned child is
       // a process of its own, which would otherwise see one
@@ -8610,7 +8612,7 @@ export class Gex {
   }
 
   /** Say how large the compositor's output is, before the guest runs. */
-  wlOutput(w, h, scale = 1) {
+  wlOutput(w, h, scale = 1, scale120 = 0) {
     // Kept, and given again to every shim instance this process makes: a
     // fresh instance (a fork child's, an exec's) starts at the default
     // 640x480, and 32-bit Wine starts every Windows program by fork and exec.
@@ -8618,10 +8620,14 @@ export class Gex {
     this.#wlScale = Math.max(1, scale | 0);
     this.#shim?.exports?.gex_set_wl_output?.(w | 0, h | 0);
     this.#shim?.exports?.gex_set_wl_scale?.(this.#wlScale);
+    // The real scale in 120ths, when it is not whole (0: the whole one).
+    this.#wlScale120 = scale120 > 0 && scale120 !== this.#wlScale * 120 ? scale120 | 0 : 0;
+    this.#shim?.exports?.gex_set_wl_scale120?.(this.#wlScale120);
   }
 
   #wlOut = null;
   #wlScale = 1;
+  #wlScale120 = 0;
 
   /**
    * This process's name in the compositor's scene arena: its pid, which every

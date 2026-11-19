@@ -19,7 +19,7 @@ export async function openCompositor(width, height, scale, post) {
     import('../../../../hosts/browser/js/wl-bridge.mjs'),
   ]);
   const channel = makeWlChannel();
-  setOutputSize(channel, width, height, Math.max(1, Math.round(scale ?? 1)));
+  setOutputSize(channel, width, height, Math.max(1, Number(scale ?? 1) || 1));
   const stats = new Int32Array(4);
   const toWorker = inRealm(post);
   // The page's own stats and channel mean nothing here: these are the ones

@@ -6,7 +6,7 @@ export declare class CompositorWindows extends EventTarget {
   /** `background`: the desktop behind the windows, a colour ('#rrggbb') or `{ color, image (a URL
    *  or Blob), anchor }` (the edge of the image that always shows). */
   constructor(sys: System, options: {
-    canvas: HTMLCanvasElement; scale?: number; x11?: 'rootless' | 'rootful';
+    canvas: HTMLCanvasElement; /** Default: the canvas sized and followed in device pixels at the real devicePixelRatio. A number: that scale, sized by the page. */ scale?: number | 'auto'; x11?: 'rootless' | 'rootful';
     background?: string | { color?: string; image?: string | URL | Blob; anchor?: 'top' | 'center' | 'bottom' };
   });
   get env(): WindowEnv;

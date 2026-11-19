@@ -20,6 +20,11 @@ export class Compositor {
   #pending = new Map();
   #next = 1;
   #stats;
+  /** The output's size in device pixels: the canvas's backing store as the
+   *  worker has it. Kept here, as the element's own width and height stop
+   *  following once its control is the worker's. */
+  #outW = 0;
+  #outH = 0;
 
   /** `makeWorker`: what stands in for compositor-worker.js's Worker (the
    *  single-thread build's system Worker hosts it; see runtime.js).
@@ -97,6 +102,8 @@ export class Compositor {
       offscreen = canvas.transferControlToOffscreen();
     }
     this.#canvas = canvas;
+    this.#outW = canvas.width;
+    this.#outH = canvas.height;
     // Without a SharedArrayBuffer (the single-thread build) the counters are
     // a copy `makeWorker`'s stand-in keeps current.
     this.#stats = typeof SharedArrayBuffer === 'function' ? new SharedArrayBuffer(16) : new ArrayBuffer(16);
@@ -223,8 +230,8 @@ export class Compositor {
       return p;
     }
     const r = this.#canvas.getBoundingClientRect();
-    const sx = this.#canvas.width / Math.max(1, r.width);
-    const sy = this.#canvas.height / Math.max(1, r.height);
+    const sx = this.#outW / Math.max(1, r.width);
+    const sy = this.#outH / Math.max(1, r.height);
     return {
       x: Math.round((e.clientX - r.left) * sx),
       y: Math.round((e.clientY - r.top) * sy),
@@ -251,7 +258,7 @@ export class Compositor {
       if (this.#guestLock) {
         // Device pixels, as the output's are.
         const r = this.#canvas.getBoundingClientRect();
-        const k = this.#canvas.width / Math.max(1, r.width);
+        const k = this.#outW / Math.max(1, r.width);
         const dx = Math.round(e.movementX * k * 256);
         const dy = Math.round(e.movementY * k * 256);
         if (dx || dy) post({ kind: 'pointer-relative', dx, dy, time: now() });
@@ -365,7 +372,16 @@ export class Compositor {
   }
 
   resize(width, height) {
+    this.#outW = Math.max(1, width | 0);
+    this.#outH = Math.max(1, height | 0);
     this.#worker.postMessage({ kind: 'resize', width, height });
+  }
+
+  /** Device pixels per CSS pixel from now on (a zoom, another monitor): the
+   *  frames and titles are drawn at it, and clients that connect after are
+   *  told it. Those already there keep the scale they started with. */
+  setScale(scale) {
+    this.#worker.postMessage({ kind: 'scale', scale });
   }
 
   /** Frames drawn and windows mapped, without a round trip. */
@@ -413,8 +429,8 @@ export class Compositor {
    *  will be); or null. */
   windowAt(clientX, clientY) {
     const r = this.#canvas.getBoundingClientRect();
-    const x = Math.round((clientX - r.left) * (this.#canvas.width / Math.max(1, r.width)));
-    const y = Math.round((clientY - r.top) * (this.#canvas.height / Math.max(1, r.height)));
+    const x = Math.round((clientX - r.left) * (this.#outW / Math.max(1, r.width)));
+    const y = Math.round((clientY - r.top) * (this.#outH / Math.max(1, r.height)));
     const id = this.#next++;
     return new Promise((resolve) => {
       this.#pending.set(id, resolve);

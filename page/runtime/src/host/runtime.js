@@ -856,7 +856,9 @@ export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop =
   // A build without the scene compositor (gex-eject's `"compositor": false`)
   // has no compositor.js: the page passes an element instead (above).
   if (!GEX_COMPOSITOR) throw new Error('this build has no compositor: give `wl` an element (bare-desktop.js)');
-  setOutputSize(wlChannel, wl.width, wl.height, Math.max(1, Math.round(wlScale)));
+  // The real scale: clients are told it in 120ths (wp_fractional_scale_v1)
+  // and rounded up (wl_output.scale).
+  setOutputSize(wlChannel, wl.width, wl.height, Math.max(1, Number(wlScale) || 1));
   const { Compositor } = await import('./compositor.js');
   const compositor = await Compositor.create(wl, wlChannel, wlInput || wl, { scale: wlScale, background });
   globalThis.__gexCompositor = compositor;
