@@ -33,16 +33,17 @@ int main(void) {
     RegisterClassA(&wc);
     SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
     work_h = work.bottom - work.top;
-    printf("work area %ld,%ld-%ld,%ld\n", work.left, work.top, work.right, work.bottom);
-
-    /* 2000 px taller than the work area, its caption 500 px above it. */
-    w = make(0, WS_OVERLAPPEDWINDOW, "capkeep tall", work.left + 50, work.top - 500, 400, work_h + 2000);
+    /* 2000 px taller than the work area, its caption 100 px above it. CreateWindow cuts it to the screen's height
+     * plus its frame (WM_GETMINMAXINFO), so its caption must be near enough for the rest to stay on the monitor:
+     * one wholly above every monitor is parked, and left there. */
+    w = make(0, WS_OVERLAPPEDWINDOW, "capkeep tall", work.left + 50, work.top - 100, 400, work_h + 2000);
     ShowWindow(w, SW_SHOWNORMAL);
     GetWindowRect(w, &r);
     GetClientRect(w, &c);
     ClientToScreen(w, &o);
     CHECK("a tall window opens with its caption in the work area", r.top >= work.top && o.y <= work.bottom,
-          "window %ld,%ld-%ld,%ld client top %ld", r.left, r.top, r.right, r.bottom, o.y);
+          "window %ld,%ld-%ld,%ld client top %ld, work area %ld,%ld-%ld,%ld", r.left, r.top, r.right, r.bottom, o.y,
+          work.left, work.top, work.right, work.bottom);
     CHECK("and no taller than the work area", r.bottom - r.top <= work_h, "height %ld, work %d", r.bottom - r.top, work_h);
     CHECK("and at its own x", r.left == work.left + 50, "left %ld", r.left);
 
