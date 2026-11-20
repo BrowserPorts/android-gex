@@ -2919,13 +2919,19 @@ impl<'a> Lifter<'a> {
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
+            // The floating-point forms are fused, a rounding a lane: each
+            // lane is `fmadd`'s fused multiply-add ([`Self::fused_lanes`]).
+            VOp3::FMla | VOp3::FMls => {
+                let acc = self.b.read(GuestReg::V128(vd.0));
+                let r = self.fused_lanes(arr, acc, a, b, op == VOp3::FMls);
+                self.commit_vector(vd, arr, r);
+                Flow::Next
+            }
             // Multiply-accumulate reads the destination as a third operand.
-            VOp3::Mla | VOp3::Mls | VOp3::FMla | VOp3::FMls => {
+            VOp3::Mla | VOp3::Mls => {
                 let acc = self.b.read(GuestReg::V128(vd.0));
                 let prod = self.vmul(lane, a, b);
-                let add = matches!(op, VOp3::Mla | VOp3::FMla);
-                // The floating-point forms are fused on hardware; wasm has no
-                // vector FMA, so the product is rounded first.
+                let add = op == VOp3::Mla;
                 let r = self.b.def(Expr::VLaneBin {
                     op: if add {
                         VLaneBinOp::Add
@@ -4297,6 +4303,31 @@ impl<'a> Lifter<'a> {
 
     fn fp_bin(&mut self, op: FpBinOp, double: bool, a: Value, b: Value) -> Value {
         self.b.def(Expr::FpBin { op, double, a, b })
+    }
+
+    /// `fmla` and `fmls` on vectors: each lane `acc + a * b` (or `acc - a *
+    /// b`) with one rounding, as `fmadd` and `fmsub` are. Wasm has no vector
+    /// FMA, and the multiply and add it has round twice, which gave answers
+    /// a bit away from the hardware's (a cubic Bézier evaluated by libhwui
+    /// went backwards, and system_server's PathInterpolator threw); so each
+    /// lane is taken out and given the fused multiply-add `fmadd` has.
+    fn fused_lanes(&mut self, arr: VArr, acc: Value, a: Value, b: Value, subtract: bool) -> Value {
+        let double = arr.lane_bytes == 8;
+        let ty = if double { Ty::I64 } else { Ty::I32 };
+        let is_double = self.konst(Ty::I32, double as u64);
+        let mut out = acc;
+        for lane in 0..arr.lanes() {
+            let get = |l: &mut Self, v: Value| l.b.def(Expr::VExtract { a: v, lane, lane_bytes: arr.lane_bytes, signed: false, ty });
+            let (x, y, z) = (get(self, a), get(self, b), get(self, acc));
+            // Negating a factor is exact, so `fmls` is `fmla` of it.
+            let x = if subtract { self.b.def(Expr::FpUn { op: FpUnOp::Neg, double, a: x }) } else { x };
+            let wide = |l: &mut Self, v: Value| if double { v } else { l.b.def(Expr::Extend { a: v, signed: false }) };
+            let (x, y, z) = (wide(self, x), wide(self, y), wide(self, z));
+            let r = self.b.def(Expr::HostCall { func: HostFunc::Fma, args: vec![x, y, z, is_double], ty: Ty::I64 });
+            let r = if double { r } else { self.b.def(Expr::Wrap(r)) };
+            out = self.b.def(Expr::VReplace { a: out, lane, lane_bytes: arr.lane_bytes, val: r });
+        }
+        out
     }
 
     /// The scalar multiplies by one lane of a vector: `fmul` and `fmulx`
