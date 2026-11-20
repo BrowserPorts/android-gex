@@ -21,7 +21,10 @@
 // (SCM_CREDENTIALS: the sender's process, user and group), and so is one
 // written with write() on a connected socket, by whoever wrote it.
 // A stream and a seqpacket socket are listening when init says so
-// (SO_ACCEPTCONN), and a client that connects to the path is accepted.
+// (SO_ACCEPTCONN), and a client that connects to the path is accepted;
+// the accepted socket has SO_PASSCRED from the listener, and what the
+// client sends is read with who sent it (lmkd closes a connection whose
+// messages do not say).
 //
 // Needs root (a tmpfs of its own, and the owner it gives); exits 77
 // without.
@@ -104,8 +107,22 @@ static void service(int fd, int type, const char *path, int listening) {
         if (client < 0 || connect(client, (struct sockaddr *)&to, sizeof to)) die("a client's connect", type, errno);
         int peer = accept(fd, NULL, NULL);
         if (peer < 0 || write(client, "hi", 2) != 2) die("accept", type, errno);
+        int got = -1;
+        socklen_t n = sizeof got;
+        if (getsockopt(peer, SOL_SOCKET, SO_PASSCRED, &got, &n) || got != 1) die("SO_PASSCRED of the accepted socket", got, type);
         char buf[4];
-        if (read(peer, buf, sizeof buf) != 2 || memcmp(buf, "hi", 2)) die("what the client sent", type, errno);
+        union {
+            char bytes[CMSG_SPACE(sizeof(struct ucred))];
+            struct cmsghdr align;
+        } control;
+        struct iovec iov = {buf, sizeof buf};
+        struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control.bytes, .msg_controllen = sizeof control.bytes};
+        if (recvmsg(peer, &msg, 0) != 2 || memcmp(buf, "hi", 2)) die("what the client sent", type, errno);
+        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+        if (!c || c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_CREDENTIALS) die("who the client is, on the accepted socket", type, msg.msg_controllen);
+        struct ucred who;
+        memcpy(&who, CMSG_DATA(c), sizeof who);
+        if (who.pid != getpid() || who.uid != geteuid() || who.gid != getegid()) die("who sent to the accepted socket", who.pid, who.uid);
         close(peer);
         close(client);
     }

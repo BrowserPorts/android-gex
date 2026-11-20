@@ -6664,6 +6664,12 @@ fn unix_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
     // descriptor made from it is the same kind.
     if let Ok(listener) = io.remote_unix_of(fd) {
         let session = listener.accept()?;
+        // The listener's `SO_PASSCRED` is the new socket's
+        // (`unix_sock_inherit_flags`): lmkd's socket is made with it, and
+        // closes a connection whose messages say no sender.
+        if listener.passcred() {
+            session.set_passcred(true);
+        }
         // The peer's address: a client that never bound has an unnamed one,
         // as Linux reports it (the family alone), not the listener's path.
         Kernel::write_sockaddr_unnamed(m, addr, len_out)?;
@@ -6676,6 +6682,9 @@ fn unix_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out:
     }
     let listener = io.unix_of(fd)?;
     let session = listener.accept()?;
+    if listener.passcred() {
+        session.set_passcred(true);
+    }
     Kernel::write_sockaddr_unnamed(m, addr, len_out)?;
     let nonblock = flags & SOCK_NONBLOCK != 0;
     session.set_nonblocking(nonblock);
