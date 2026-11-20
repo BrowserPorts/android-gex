@@ -5331,6 +5331,14 @@ mod slots {
     /// the first time the slot is, and kept for its next holder, so the
     /// count costs nothing until that many threads are live at once.
     pub const COUNT: usize = 256;
+    /// Slots a `clone` never promises: kept for the spare Workers the host
+    /// starts ahead of a process's threads (host.mjs `SPARE_MAX`, at most
+    /// that many on the page before they claim). A spare claims a slot
+    /// promised to nobody, so one starting while every slot was held or
+    /// promised took a promised thread's, whose Worker then found none and
+    /// the thread never ran (test/x86-programs threads-many's second round
+    /// hung near 256 threads).
+    pub const SPARES: usize = 8;
     /// Words of the used-slot bitmap.
     pub const WORDS: usize = COUNT / 64;
     /// Bytes of guard pattern at the bottom of each stack.
@@ -5531,7 +5539,7 @@ fn thread_runner_take() -> bool {
     loop {
         let promised = PROMISED.load(Ordering::Acquire);
         let held: u32 = SLOT_USED.iter().map(|w| w.load(Ordering::Acquire).count_ones()).sum();
-        if (held + promised) as usize >= slots::COUNT {
+        if (held + promised) as usize >= slots::COUNT - slots::SPARES {
             return false;
         }
         if PROMISED.compare_exchange(promised, promised + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {

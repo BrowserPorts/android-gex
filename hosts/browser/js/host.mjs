@@ -194,7 +194,8 @@ const SAVE_WAIT_MS = 60_000;
  *  those processes ran, not more. */
 const RECYCLE_COUNT = 4;
 /** How many spare thread Workers (`#startSpare`) the page keeps waiting at
- *  once; past it the oldest is let go. */
+ *  once; past it the oldest is let go. The shim keeps as many of a
+ *  process's slots for them (lib.rs `slots::SPARES`): raise both together. */
 const SPARE_MAX = 8;
 /** How long output waits for a write numbered before it (`#inOrder`). */
 const OUTPUT_GAP_MS = 200;
