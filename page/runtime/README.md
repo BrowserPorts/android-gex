@@ -182,7 +182,7 @@ processes and memory.
   classic-script Workers build too. No file becomes a `data:` URL.
 - Served without a bundler, from any directory, the modules find their
   files beside themselves. `new System({ baseUrl })` takes them from a
-  directory of the page's instead, laid out as gex's own site has them
+  directory of the page's instead, laid out as the package has them
   (`gex/…`).
 - One system per page: a second `new System()` throws.
 - A system runs wasm32 programs (built with gexcc) and the programs of one

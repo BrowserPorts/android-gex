@@ -1,8 +1,9 @@
 # page
 
 The `@gexemu/runtime` package (`runtime/`, `runtime/README.md`, built by
-`make runtime PKG=DIR`), the internal modules it is made of (`src/`), and
-the builds of what it loads into `public/`:
+`make runtime PKG=DIR` with the tools `package.json` names), the internal
+modules it is made of (`runtime/src/`), and the builds of what it loads into
+`public/`:
 
 - the browser shim, the shared kernel module and the seed, from
   `hosts/browser` and `hosts/kernel` (`build-assets.sh`);

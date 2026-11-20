@@ -116,22 +116,29 @@ if [ $MODE = mp ]; then SP_CODE=false MP_CODE=true; else SP_CODE=true MP_CODE=fa
 printf 'export const SP_CODE = %s;\nexport const MP_CODE = %s;\n' $SP_CODE $MP_CODE > "$STAGE/mode.mjs"
 
 cat > "$CONFIG" <<CFG
-import base from '$WEB/vite.config.js';
 const mode = { name: 'gex-mode', enforce: 'pre', resolveId: (source) => /(^|\/)mode\.mjs\$/.test(source) ? '$STAGE/mode.mjs' : null };
+// The default build starts no single-thread system Worker: its construction
+// goes (kernel.js singleWorker throws before it), since a bundler emits a
+// Worker's chunk wherever \`new Worker(new URL(...))\` appears, dead branch or not.
+const single = "new Worker(new URL('./kernel-single-worker.js', import.meta.url), { type: 'module', name: 'gex-system' })";
+const noSingle = { name: 'gex-no-single', transform(code, id) {
+  if ('$MODE' !== 'mp' || !/\/runtime\/src\/kernel\.js\$/.test(id.split('?')[0])) return null;
+  if (!code.includes(single)) this.error('kernel.js no longer starts the single-thread Worker as page/runtime/build.sh expects');
+  return code.replace(single, 'null');
+} };
 export default {
-  ...base,
-  plugins: [...(base.plugins ?? []), mode],
+  plugins: [mode, noSingle],
   root: '$WEB',
   // Relative, so the package works wherever it is served from.
   base: './',
   publicDir: false,
   logLevel: 'warn',
-  define: { ...base.define, __GEX_RUNTIME_ASSETS__: 'null' },
-  resolve: { ...base.resolve, alias: { ...base.resolve?.alias, './runtime-files.js': '$STAGE/runtime-files.js' } },
+  define: { __GEX_RUNTIME_ASSETS__: 'null' },
+  resolve: { alias: { './runtime-files.js': '$STAGE/runtime-files.js' } },
   // No preload lists: they name the package's chunks, which an app's bundler
   // renames; the app's own build preloads what it keeps. Every file a file,
   // none inlined: the runtime fetches them.
-  build: { ...base.build, outDir: '$OUT', emptyOutDir: true, modulePreload: false, assetsInlineLimit: 0,
+  build: { target: 'es2022', chunkSizeWarningLimit: 2048, outDir: '$OUT', emptyOutDir: true, modulePreload: false, assetsInlineLimit: 0,
            rollupOptions: {
              input: { index: '$RT/src/index.js', fs: '$RT/src/fs.js', 'windows-host': '$RT/src/windows/host.js', 'windows-single': '$RT/src/windows/single.js', 'windows-compositor': '$RT/src/windows/compositor.js', 'net-wisp': '$RT/src/net/wisp.mjs', audio: '$RT/src/audio.js', drop: '$RT/src/drop.js', gl: '$RT/src/gl.js', input: '$RT/src/input.js' },
              preserveEntrySignatures: 'strict',
@@ -140,13 +147,12 @@ export default {
   // A Worker's build lists none of them (src/runtime-files.js as it is): the
   // system Worker takes the page's list (runtime.js pageGlobals), and a
   // second list would be a second copy of every file.
-  worker: { ...base.worker, plugins: () => [mode, { name: 'gex-runtime-files', enforce: 'pre', load: (id) => id === '$STAGE/runtime-files.js' ? 'export default null;' : null }],
+  // Workers as ES modules: worker.mjs awaits at its top level, which vite's
+  // default (iife) cannot express.
+  worker: { format: 'es', plugins: () => [mode, noSingle, { name: 'gex-runtime-files', enforce: 'pre', load: (id) => id === '$STAGE/runtime-files.js' ? 'export default null;' : null }],
             // Each Worker one file, with no imports: a page's bundler builds a
             // Worker as a classic script by default (vite's iife), which
             // cannot import a chunk.
-            // (In place of the page's own rolldownOptions, which vite takes
-            // before rollupOptions: with the page's, the Workers would go to
-            // assets/ under the page's names.)
             rolldownOptions: { output: { entryFileNames: '[name]-[hash].mjs', chunkFileNames: '[name]-[hash].mjs', assetFileNames: '[name]-[hash][extname]', codeSplitting: false } } },
 };
 CFG

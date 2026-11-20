@@ -99,7 +99,7 @@ gexc:
 # ---- the runtime's files (page/public) and its package ----
 # Mesa, and the Khronos registry guest/gl/build.sh generates the GL tables from
 MESA_CHECKOUT = git -C $(ROOT) submodule update --init third_party/mesa third_party/opengl-registry
-# vite and the page's other npm packages, at package-lock.json's versions
+# vite and wisp-js, which page/runtime/build.sh builds the package with, at package-lock.json's versions
 NPM_CI = [ $(ROOT)/page/node_modules/.package-lock.json -nt $(ROOT)/page/package-lock.json ] || (cd $(ROOT)/page && npm ci --no-audit --no-fund)
 # The page's guest-side cross compilers (toolchain/pins), unpacked once in
 # CACHE/toolchains; GEX_TOOLCHAIN= / GEX_X86_TOOLCHAIN= name others.

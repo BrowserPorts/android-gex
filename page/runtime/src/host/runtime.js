@@ -49,12 +49,6 @@ function archInfix() {
 export function archAsset(path) {
   return guestArch() === 'x86' ? path.replace(/^\/(rootfs|closure|fs)\//, '/$1/x86/') : path;
 }
-/** Whether this build has the scene compositor (compositor.js and its
- *  worker). gex-eject's feature selection (crates/gex-eject/README.md, "Features") builds
- *  the page with `__GEX_COMPOSITOR__` defined false, and everything behind
- *  this constant drops out of the bundle; anything else has it. */
-const GEX_COMPOSITOR = typeof __GEX_COMPOSITOR__ === 'undefined' ? true : __GEX_COMPOSITOR__;
-
 /** Debian's multiarch directory name for the guest. */
 export function multiarch() {
   return guestArch() === 'x86' ? 'x86_64-linux-gnu' : 'aarch64-linux-gnu';
@@ -301,7 +295,7 @@ function flag(name) {
  *
  * Everything guest processes share and no single process can own: the process
  * table, the filesystem, the pipes. Its memory is a `SharedArrayBuffer`, so the
- * page has to be cross-origin isolated (COOP/COEP headers in `vite.config.js`).
+ * page has to be cross-origin isolated (served with COOP/COEP headers).
  * A page that is not gets no kernel and one process, which still runs anything
  * that does not fork.
  */
@@ -859,9 +853,6 @@ export async function openWayland({ wl, wlInput = null, wlScale = 1, onDesktop =
     return { wlChannel, compositor, dom: true };
   }
   if (typeof wl.getContext !== 'function') return { wlChannel, compositor: null, dom: false };
-  // A build without the scene compositor (gex-eject's `"compositor": false`)
-  // has no compositor.js: the page passes an element instead (above).
-  if (!GEX_COMPOSITOR) throw new Error('this build has no compositor: give `wl` an element (bare-desktop.js)');
   // The real scale: clients are told it in 120ths (wp_fractional_scale_v1)
   // and rounded up (wl_output.scale).
   setOutputSize(wlChannel, wl.width, wl.height, Math.max(1, Number(wlScale) || 1));
