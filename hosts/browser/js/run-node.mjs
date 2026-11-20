@@ -58,6 +58,12 @@ import { makeGlChannel } from './gl-bridge.mjs';
 /** GEX_DEBUG_EXIT's account of a process's runtime heap: what the arena
  *  gave it and its largest single claim (`gex_arena_spent_mib`), and its
  *  command line. */
+/** The memory grown beyond what was asked, ahead of need (lib.rs
+ *  `grow_memory_to`'s headroom), said after the rest: address space only. */
+function headroomSaid(m) {
+  return m.headroomMib ? ` (headroom ${m.headroomMib} MiB)` : '';
+}
+
 function arenaSaid(m) {
   return (m.touchedMib !== undefined ? `, resident ${m.touchedMib} MiB` : '') + (m.guestMib !== undefined ? `, guest maps ${m.guestMib} MiB` : '') + (m.arena ? `, arena heap ${m.arena[1]} MiB, largest claim ${m.arena[3] ?? '?'} MiB` : '') + (m.cmdline ? ` {${m.cmdline}}` : '');
 }
@@ -685,7 +691,7 @@ const host = new ProcessHost({
     spGuard: !!process.env.GEX_SP_GUARD,
     // TEST: GEX_DEBUG_PANIC=plain|nested|long makes the shim panic on purpose
     // before the guest runs.
-    debugPanic: { plain: 1, nested: 2, long: 3 }[process.env.GEX_DEBUG_PANIC ?? ''] ?? 0,
+    debugPanic: { plain: 1, nested: 2, long: 3, prctl: 4 }[process.env.GEX_DEBUG_PANIC ?? ''] ?? 0,
     // GEX_TRAP_PC=0xADDR: plant a diagnostic breakpoint at that guest pc that
     // dumps the live registers (x30 = caller) and continues. Aimed at
     // __stack_chk_fail to name the smashed function.
@@ -693,6 +699,9 @@ const host = new ProcessHost({
     // GEX_PREGROW: grow guest memory to a large floor up front so runtime
     // memory.grow stops during startup -- probes the stale-bound-after-grow race.
     pregrow: !!process.env.GEX_PREGROW,
+    // GEX_NO_HEADROOM: the shared memory grows to what is asked only, with no
+    // headroom ahead (lib.rs `headroom`), for a test that reads its size.
+    noHeadroom: !!process.env.GEX_NO_HEADROOM,
     // GEX_HOT dumps the guest's hottest back edges on exit -- the browser's
     // answer to `--sample`, since a host profile is all `wasm-function[N]`.
     hot: !!process.env.GEX_HOT,
@@ -763,8 +772,8 @@ const host = new ProcessHost({
     }
     if (pid !== 1) {
       if (process.env.GEX_DEBUG_EXIT) {
-        const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB${m.headroomMib ? ` (headroom ${m.headroomMib} MiB)` : ''}`;
-        process.stderr.write(`[gex] process ${pid} exited ${m.status}${mem}${arenaSaid(m)}\n`);
+        const mem = m.memoryMib === undefined ? '' : `, memory ${m.memoryMib} MiB`;
+        process.stderr.write(`[gex] process ${pid} exited ${m.status}${mem}${arenaSaid(m)}${headroomSaid(m)}\n`);
       }
       return;
     }
@@ -776,7 +785,7 @@ const host = new ProcessHost({
     }
     // What this process's memory grew to; a run costs this times its process count.
     if (process.env.GEX_DEBUG_EXIT && m.memoryMib !== undefined) {
-      process.stderr.write(`[gex] memory ${m.memoryMib} MiB${m.headroomMib ? ` (headroom ${m.headroomMib} MiB)` : ''}${arenaSaid(m)}\n`);
+      process.stderr.write(`[gex] memory ${m.memoryMib} MiB${arenaSaid(m)}${headroomSaid(m)}\n`);
     }
     if (process.env.GEX_HOT) {
       // An empty answer is a question about the run, not a crash.

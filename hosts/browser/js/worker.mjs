@@ -872,6 +872,9 @@ async function handle(msg) {
   }
   // Which flavours the page runs, for an exec's choice (vfork.rs `exec_target`).
   if (msg.pageFlavours !== undefined) globalThis.GEX_PAGE_FLAVOURS = msg.pageFlavours;
+  // A test's: no headroom (lib.rs `headroom`), from the runtime's start, since
+  // the loader grows the memory.
+  if (msg.noHeadroom) globalThis.GEX_NO_HEADROOM = 1;
   otherGate(msg);
   if (msg.wasmDlls) Gex.wasmDlls = msg.wasmDlls;
   if (msg.elfUnits) Gex.elfUnits = msg.elfUnits;
@@ -941,6 +944,8 @@ async function handle(msg) {
     throw e;
   }
   if (gex === pre?.gex) gex.setEnv(new WorkerEnv());
+  // A runtime made ahead of the message (`preattach`) has its shim already.
+  if (msg.noHeadroom) gex.shim?.exports.gex_set_no_headroom?.(1);
   // Module-scope, so a `sharedModule` message (which arrives outside this
   // handler's run/adopt/thread path) can reach this Worker's runtime.
   workerGex = gex;
@@ -1383,7 +1388,8 @@ async function handle(msg) {
     if (msg.debugExit) {
       // Before the guest runs an instruction: memory decides how many processes
       // a browser holds, so whether the cost is placing the image or running it.
-      port.post({ kind: 'loaded', memoryMib: gex.memory.buffer.byteLength / (1 << 20) });
+      // Without the headroom (lib.rs `grow_memory_to`), as the exit line.
+      port.post({ kind: 'loaded', memoryMib: gex.memory.buffer.byteLength / (1 << 20) - (gex.shim.exports.gex_headroom_mib?.() ?? 0) });
     }
     // Around `gex.run` alone: everything before it is loading and module
     // compilation, so a codegen A/B measured through the total is a third
@@ -1595,10 +1601,11 @@ async function handle(msg) {
       // How much of this process's memory the shim used: a memory per process
       // decides how many processes a browser holds at once.
       heapKib: Number(gex.shim.exports.gex_heap_used_kib?.() ?? -1),
-      // What this process's memory grew to -- the question is whether a forked
-      // child pays the same again.
-      memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)),
-      // Of that, what was grown ahead of what was asked for (lib.rs
+      // What this process's memory grew to for what it asked -- the question
+      // is whether a forked child pays the same again. Without the headroom
+      // (below), so the number means what it did before there was any.
+      memoryMib: Math.round(gex.memory.buffer.byteLength / (1 << 20)) - (gex.shim.exports.gex_headroom_mib?.() ?? 0),
+      // And beyond that, what was grown ahead of what was asked for (lib.rs
       // `grow_memory_to`'s headroom): address space, not use.
       headroomMib: gex.shim.exports.gex_headroom_mib?.(),
       // And what of it holds anything: its pages not all zero, MiB, which is
@@ -1712,6 +1719,9 @@ async function handle(msg) {
       if (!inert) {
         if (!outgrew) gex?.shim?.exports?.gex_dump_state?.();
         const ex = gex?.shim?.exports;
+        // A crash in the runtime is said first, so that a kill of the
+        // process at the same moment does not end it as a plain SIGKILL.
+        if (e?.gexRuntimeTrap) ex?.gex_trap_crash?.();
         if (kernelWhy && ex?.gex_crash_line && ex.gex_alloc) {
           try {
             const bytes = new TextEncoder().encode(kernelWhy);

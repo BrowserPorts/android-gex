@@ -7354,6 +7354,10 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
                 procs.set_crash(io.pid, &note);
                 Ok(0)
             }
+            // TEST: a panic in the runtime, on purpose (armed only)
+            crate::proc::PR_GEX_DEBUG_TRAP if crate::proc::debug_trap_armed() => {
+                panic!("gex debug panic: the process asked (PR_GEX_DEBUG_TRAP)")
+            }
             // Why the process cannot work as it should, while it runs (a
             // need no memory gex has can meet): a notice, once.
             crate::proc::PR_GEX_NOTICE => {

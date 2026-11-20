@@ -63,7 +63,7 @@ const ROOT = join(HERE, '..', '..');
 
 /** The probe programs and the libraries each links. */
 const PROBES = {
-  'rt-probe': ['-lm'],
+  'rt-probe': ['-lm', '-pthread'],
   'rt-wl': ['-lwayland-client', '-lffi'],
   'rt-joy': [],
   'rt-truncate': [],
@@ -71,6 +71,7 @@ const PROBES = {
   'rt-sockpass': [],
   'rt-clonecopy': [],
   'rt-stalebound': ['-pthread'],
+  'rt-killwait': ['-pthread'],
   'rt-repaint': [],
   'rt-deadclient': [],
   'rt-unix': [],

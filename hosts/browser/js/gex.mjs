@@ -2665,6 +2665,9 @@ export class Gex {
       gex_k: this.#kernelImports(shimMod),
     });
     noteM64Tables(this.#shim.exports);
+    // A test's (worker.mjs): no headroom, before anything grows the memory.
+    // (A static's store: safe before `gex_worker_init`.)
+    if (globalThis.GEX_NO_HEADROOM) this.#shim.exports.gex_set_no_headroom?.(1);
     this.#u8 = null;
     // First, before any call into the shim: `gex_worker_init` gives this Worker
     // its thread-local block, and until it runs `__tls_base` is zero, so a shim
@@ -3263,6 +3266,8 @@ export class Gex {
     this.#shimInstantiateMs = performance.now() - tShimI;
     noteM64Tables(this.#shim.exports);
     _at('shim instantiated');
+    // A test's (worker.mjs): no headroom, before anything grows the memory.
+    if (globalThis.GEX_NO_HEADROOM) this.#shim.exports.gex_set_no_headroom?.(1);
     this.#u8 = null;
     // The stack pointer is a per-instance global, so every Worker has its own
     // and must be told where it goes. Not yet for a runtime made ahead of
@@ -7873,7 +7878,10 @@ export class Gex {
     Atomics.store(i32, (a + 4) >> 2, 1);
     Atomics.notify(i32, a >> 2);
     this.#doorKick();
-    while (Atomics.load(i32, (a + 4) >> 2) !== 2) Atomics.wait(i32, (a + 4) >> 2, 1, 5);
+    for (let n = 0; Atomics.load(i32, (a + 4) >> 2) !== 2; n++) {
+      Atomics.wait(i32, (a + 4) >> 2, 1, 5);
+      if (n % 200 === 199) this.#stillRunning(() => `in a door call, its syscall ${nr} proxied to the wineserver's pump and not answered (proxy state ${Atomics.load(i32, (a + 4) >> 2)}, door lock ${Atomics.load(i32, a >> 2)} held by tid ${i32[(a + 116) >> 2]})`);
+    }
     const r = i32[(a + 36) >> 2];
     Atomics.store(i32, (a + 4) >> 2, 0);
     if (tp) { st.tProxy += performance.now() - tp; (st.byNr[nr] = (st.byNr[nr] ?? 0) + 1); }
@@ -7881,6 +7889,21 @@ export class Gex {
   }
 
   #doorScratch = 0;
+
+  /** A thread of a process that ended seconds ago still running here,
+   *  in a wait of the host's (a door's): said once per thread, with where,
+   *  since nothing else will (a rare event, so said by default). */
+  #stillSaid = false;
+  #stillRunning(where) {
+    if (this.#stillSaid) return;
+    const e = this.#shim?.exports;
+    const age = e?.gex_end_age_ms?.() ?? -1;
+    if (age < 5000) return;
+    this.#stillSaid = true;
+    const pid = e.gex_my_pid?.() ?? "?", tid = this.#threadTid ?? pid, code = e.gex_end_code?.() ?? 0;
+    const how = code < 0 ? (code === -9 ? 'SIGKILL' : `signal ${-code}`) : `exit ${code}`;
+    console.error(`[gex] pid ${pid}: ${tid === pid ? 'main thread' : `thread ${tid}`} still running ${Math.round(age / 1000)} s after ${how}: ${where()}`);
+  }
 
   /** `gex.wake_write` inside a door: a client's wait pipe written from this
    *  Worker (the pipes are the global kernel's), not proxied to the pump. */
@@ -8086,6 +8109,7 @@ export class Gex {
       if (this.#snapRec && this.#kernel?.k_snap_pending?.()) return false;
       if (v === 1 && Atomics.compareExchange(i32, L, 1, 2) !== 1) continue;
       Atomics.wait(i32, L, 2, 1);
+      if (waitedMs % 1000 === 999) this.#stillRunning(() => `waiting for the wineserver's door lock, held by tid ${i32[(a + 116) >> 2]} of pid ${i32[(a + 120) >> 2]} (proxy state ${i32[(a + 4) >> 2]})`);
       // A lock held this long is a stuck door (a Worker ended inside one,
       // or a deadlock): say who holds it, every 5 s of waiting.
       if (++waitedMs % 5000 === 0) {
@@ -8927,14 +8951,14 @@ export class Gex {
               `, ${this.#installs} modules installed`
             );
           });
-          throw new Error(
+          throw Object.assign(new Error(
             `the gex runtime trapped inside the shim (${this.#thrownName(err)}${at}${lr}${nr}` +
               `${code}${heap}${where}` +
               `${this.#shim.exports.gex_panic_reporting?.() ? '; it panicked again inside the panic report, whose message is lost (the first is above)' : ''}` +
               `). That is a crash in the runtime, not a guest exit; ` +
               'anything printed above is all the guest managed to do first.'
               + (globalThis.GEX_TRAP_STACK ? `\n${err.stack ?? ''}` : ''),
-          );
+          ), { gexRuntimeTrap: true });
         }
         // A trap abandons the engine's frames without running the epilogues
         // that restore the shim's shadow-stack global, leaking a few dozen
