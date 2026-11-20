@@ -1395,7 +1395,8 @@ async function handle(msg) {
     if (msg.debugExit) {
       // Before the guest runs an instruction: memory decides how many processes
       // a browser holds, so whether the cost is placing the image or running it.
-      port.post({ kind: 'loaded', memoryMib: gex.memory.buffer.byteLength / (1 << 20) });
+      // Without the headroom (lib.rs `grow_memory_to`), as the exit line.
+      port.post({ kind: 'loaded', memoryMib: gex.memory.buffer.byteLength / (1 << 20) - (gex.shim.exports.gex_headroom_mib?.() ?? 0) });
     }
     // Around `gex.run` alone: everything before it is loading and module
     // compilation, so a codegen A/B measured through the total is a third

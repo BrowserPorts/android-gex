@@ -8744,7 +8744,8 @@ fn growth_note() {
     if !on {
         return;
     }
-    let have = warch::memory_size(0) as u64 * 65536;
+    // What was asked of the memory: the headroom is said apart.
+    let have = used_top();
     let step = have >> 26;
     if SAID.fetch_max(step, Ordering::Relaxed) >= step {
         return;
