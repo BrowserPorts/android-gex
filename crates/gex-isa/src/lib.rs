@@ -1305,6 +1305,24 @@ pub enum VOp3 {
     UMaxP,
     SMinP,
     UMinP,
+    /// The register shifts that round (`srshl`, `urshl`), saturate (`sqshl`,
+    /// `uqshl`) or both (`sqrshl`, `uqrshl`): by the signed low byte of each
+    /// lane of the second operand, right when it is negative.
+    SRShl,
+    URShl,
+    SqShl,
+    UqShl,
+    SqRShl,
+    UqRShl,
+    /// `saba`/`uaba`: absolute difference, accumulated.
+    SAba,
+    UAba,
+    /// `pmul`: polynomial (carry-less) multiply of bytes.
+    PMul,
+    /// `sqdmulh`/`sqrdmulh`: the high half of twice the product, saturated
+    /// (and rounded).
+    SqDMulH,
+    SqRDMulH,
     /// Shift left by a signed per-lane amount; a negative amount shifts
     /// right. The rounding and saturating variants are not here.
     SShl,
@@ -1378,6 +1396,17 @@ pub enum VOp2 {
     FRSqrtE,
     /// `frecpx`: the reciprocal exponent (scalar only).
     FRecpx,
+    /// `sqabs`/`sqneg`: saturating (the most negative value gives the most
+    /// positive).
+    SqAbs,
+    SqNeg,
+    /// `suqadd` (an unsigned value into a signed accumulator) and `usqadd`
+    /// (signed into unsigned), saturating.
+    SuqAdd,
+    UsqAdd,
+    /// `urecpe`/`ursqrte`: the unsigned fixed-point estimates.
+    URecpe,
+    URSqrtE,
     FrintN,
     FrintP,
     FrintM,
@@ -1446,6 +1475,11 @@ pub enum VWidenOp {
     AbdL,
     /// `sabal`: as `abdl`, accumulating.
     AbaL,
+    /// `sqdmull`: twice the product, saturated; `sqdmlal`/`sqdmlsl` add it to
+    /// the destination or take it away, saturating again.
+    SqDMulL,
+    SqDMlaL,
+    SqDMlsL,
 }
 
 /// Across-lane reductions.
@@ -1526,6 +1560,20 @@ pub enum VShiftImmOp {
     /// `2^shift` and truncate.
     Fcvtzs,
     Fcvtzu,
+    /// Saturating left shifts: `sqshl`/`uqshl`, and `sqshlu` (signed in,
+    /// unsigned saturation).
+    SqShl,
+    UqShl,
+    SqShlU,
+    /// Saturating narrowing right shifts (and rounding, with `R`): the
+    /// source lanes twice as wide as `arr`'s; `un` saturates a signed source
+    /// to unsigned.
+    SqShrn,
+    UqShrn,
+    SqRShrn,
+    UqRShrn,
+    SqShrun,
+    SqRShrun,
 }
 
 /// Bitwise vector operations on the `v` register file.

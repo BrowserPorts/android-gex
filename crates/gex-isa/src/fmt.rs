@@ -1312,6 +1312,15 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 VShiftImmOp::Ucvtf => "ucvtf",
                 VShiftImmOp::Fcvtzs => "fcvtzs",
                 VShiftImmOp::Fcvtzu => "fcvtzu",
+                VShiftImmOp::SqShl => "sqshl",
+                VShiftImmOp::UqShl => "uqshl",
+                VShiftImmOp::SqShlU => "sqshlu",
+                VShiftImmOp::SqShrn => "sqshrn",
+                VShiftImmOp::UqShrn => "uqshrn",
+                VShiftImmOp::SqRShrn => "sqrshrn",
+                VShiftImmOp::UqRShrn => "uqrshrn",
+                VShiftImmOp::SqShrun => "sqshrun",
+                VShiftImmOp::SqRShrun => "sqrshrun",
             };
             // The width-changing forms name two arrangements: the wide one
             // is always a full 128 bits, and `sxtl`/`uxtl` are the aliases
@@ -1346,14 +1355,25 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                         )
                     }
                 }
-                VShiftImmOp::Shrn => format!(
+                VShiftImmOp::Shrn
+                | VShiftImmOp::Rshrn
+                | VShiftImmOp::SqShrn
+                | VShiftImmOp::UqShrn
+                | VShiftImmOp::SqRShrn
+                | VShiftImmOp::UqRShrn
+                | VShiftImmOp::SqShrun
+                | VShiftImmOp::SqRShrun
+                    if !arr.scalar =>
+                {
+                    format!(
                     "{m}{} v{}.{}, v{}.{}, #{shift}",
                     if arr.q { "2" } else { "" },
                     vd.0,
                     arr.suffix(),
                     vn.0,
                     wide.suffix()
-                ),
+                    )
+                }
                 _ => {
                     format!("{m} {}, {}, #{shift}", areg(vd, arr), areg(vn, arr))
                 }
@@ -1408,6 +1428,9 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
                 VWidenOp::MlsL => "mlsl",
                 VWidenOp::AbdL => "abdl",
                 VWidenOp::AbaL => "abal",
+                VWidenOp::SqDMulL => "qdmull",
+                VWidenOp::SqDMlaL => "qdmlal",
+                VWidenOp::SqDMlsL => "qdmlsl",
             };
             let wide = VArr {
                 lane_bytes: arr.lane_bytes * 2,
@@ -1829,6 +1852,17 @@ fn vop3_name(op: VOp3) -> &'static str {
         VOp3::FMinNmP => "fminnmp",
         VOp3::FAcGe => "facge",
         VOp3::FAcGt => "facgt",
+        VOp3::SRShl => "srshl",
+        VOp3::URShl => "urshl",
+        VOp3::SqShl => "sqshl",
+        VOp3::UqShl => "uqshl",
+        VOp3::SqRShl => "sqrshl",
+        VOp3::UqRShl => "uqrshl",
+        VOp3::SAba => "saba",
+        VOp3::UAba => "uaba",
+        VOp3::PMul => "pmul",
+        VOp3::SqDMulH => "sqdmulh",
+        VOp3::SqRDMulH => "sqrdmulh",
         VOp3::FAddP => "faddp",
         VOp3::FMla => "fmla",
         VOp3::FMls => "fmls",
@@ -1861,6 +1895,12 @@ fn vop2_name(op: VOp2) -> &'static str {
         VOp2::FRecpe => "frecpe",
         VOp2::FRSqrtE => "frsqrte",
         VOp2::FRecpx => "frecpx",
+        VOp2::SqAbs => "sqabs",
+        VOp2::SqNeg => "sqneg",
+        VOp2::SuqAdd => "suqadd",
+        VOp2::UsqAdd => "usqadd",
+        VOp2::URecpe => "urecpe",
+        VOp2::URSqrtE => "ursqrte",
         VOp2::FrintN => "frintn",
         VOp2::FrintP => "frintp",
         VOp2::FrintM => "frintm",

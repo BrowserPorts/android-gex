@@ -1646,6 +1646,62 @@ impl<'a> Lifter<'a> {
                 vm,
                 index,
             } => {
+                // The saturating doubling multiplies, and the absolute
+                // differences from 32-bit lanes (wasm has no 64-bit lane
+                // max or min): a lane at a time, in 64-bit arithmetic.
+                if matches!(op, VWidenOp::SqDMulL | VWidenOp::SqDMlaL | VWidenOp::SqDMlsL)
+                    || (matches!(op, VWidenOp::AbdL | VWidenOp::AbaL) && arr.lane_bytes == 4)
+                {
+                    let lb = arr.lane_bytes;
+                    let bits = lb * 8;
+                    let n = self.b.read(GuestReg::V128(vn.0));
+                    let m = self.b.read(GuestReg::V128(vm.0));
+                    let acc = self.b.read(GuestReg::V128(vd.0));
+                    let count = 8 / lb;
+                    let base = if upper { count } else { 0 };
+                    let doubling = matches!(op, VWidenOp::SqDMulL | VWidenOp::SqDMlaL | VWidenOp::SqDMlsL);
+                    let sgn = doubling || signed;
+                    let mut out = self.zero_vector();
+                    for l in 0..count {
+                        let x = self.lane_i64(n, base + l, lb, sgn);
+                        let y = self.lane_i64(m, index.unwrap_or(base + l), lb, sgn);
+                        let r = if doubling {
+                            // Twice the product, saturated to the wide lane:
+                            // only the most negative value squared goes past.
+                            let p = self.bin64(BinOp::Mul, x, y);
+                            let p2 = self.bin64(BinOp::Add, p, p);
+                            let p2 = if bits < 32 {
+                                self.clamp_signed(p2, bits * 2)
+                            } else {
+                                let xm = self.cmp64k(CmpOp::Eq, x, Self::smin64(32));
+                                let ym = self.cmp64k(CmpOp::Eq, y, Self::smin64(32));
+                                let both = self.b.bin(BinOp::And, Ty::I32, xm, ym);
+                                let maxv = self.k64(Self::smax64(64));
+                                self.sel64(both, maxv, p2)
+                            };
+                            if op == VWidenOp::SqDMulL {
+                                p2
+                            } else {
+                                let d = self.lane_i64(acc, l, lb * 2, true);
+                                self.sat_add_sub(d, p2, bits * 2, true, op == VWidenOp::SqDMlsL)
+                            }
+                        } else {
+                            let gt = self.b.cmp(if signed { CmpOp::GtS } else { CmpOp::GtU }, Ty::I64, x, y);
+                            let xy = self.bin64(BinOp::Sub, x, y);
+                            let yx = self.bin64(BinOp::Sub, y, x);
+                            let d = self.sel64(gt, xy, yx);
+                            if op == VWidenOp::AbaL {
+                                let prev = self.lane_i64(acc, l, lb * 2, false);
+                                self.bin64(BinOp::Add, prev, d)
+                            } else {
+                                d
+                            }
+                        };
+                        out = self.put_lane_i64(out, l, lb * 2, r);
+                    }
+                    self.b.write(GuestReg::V128(vd.0), out);
+                    return Flow::Next;
+                }
                 // Everything here is "widen the narrow operands, then do an
                 // ordinary lane-wise operation at the wider size". The `w`
                 // forms simply skip widening their first operand.
@@ -1692,6 +1748,7 @@ impl<'a> Lifter<'a> {
                 };
                 let b = widen(self, raw_m);
                 let r = match op {
+                    VWidenOp::SqDMulL | VWidenOp::SqDMlaL | VWidenOp::SqDMlsL => unreachable!("the doubling forms leave earlier"),
                     VWidenOp::AddL | VWidenOp::AddW => self.b.def(Expr::VLaneBin {
                         op: VLaneBinOp::Add,
                         lane,
@@ -2793,6 +2850,71 @@ impl<'a> Lifter<'a> {
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
 
+        // Integer forms with no wasm lane operation: the register shifts that
+        // round or saturate, saturating arithmetic on 32- and 64-bit lanes
+        // (wasm saturates only bytes and halves), accumulated absolute
+        // differences, the polynomial multiply and the doubling multiplies.
+        // A lane at a time, in 64-bit arithmetic.
+        let lane_wise = !arr.float
+            && (matches!(
+                op,
+                VOp3::SRShl | VOp3::URShl | VOp3::SqShl | VOp3::UqShl | VOp3::SqRShl | VOp3::UqRShl | VOp3::SAba | VOp3::UAba | VOp3::PMul | VOp3::SqDMulH | VOp3::SqRDMulH
+            ) || (matches!(op, VOp3::SqAdd | VOp3::UqAdd | VOp3::SqSub | VOp3::UqSub) && arr.lane_bytes >= 4));
+        if lane_wise {
+            let lb = arr.lane_bytes;
+            let bits = lb * 8;
+            let signed = matches!(op, VOp3::SRShl | VOp3::SqShl | VOp3::SqRShl | VOp3::SAba | VOp3::SqDMulH | VOp3::SqRDMulH | VOp3::SqAdd | VOp3::SqSub);
+            let acc = if matches!(op, VOp3::SAba | VOp3::UAba) { Some(self.b.read(GuestReg::V128(vd.0))) } else { None };
+            let mut out = self.zero_vector();
+            for l in 0..arr.lanes() {
+                let x = self.lane_i64(a, l, lb, signed);
+                let y = self.lane_i64(b, l, lb, signed);
+                let r = match op {
+                    VOp3::SRShl | VOp3::URShl => self.shift_by_register(x, y, bits, signed, true, false),
+                    VOp3::SqShl | VOp3::UqShl => self.shift_by_register(x, y, bits, signed, false, true),
+                    VOp3::SqRShl | VOp3::UqRShl => self.shift_by_register(x, y, bits, signed, true, true),
+                    VOp3::SqAdd | VOp3::UqAdd => self.sat_add_sub(x, y, bits, signed, false),
+                    VOp3::SqSub | VOp3::UqSub => self.sat_add_sub(x, y, bits, signed, true),
+                    VOp3::SAba | VOp3::UAba => {
+                        let gt = self.b.cmp(if signed { CmpOp::GtS } else { CmpOp::GtU }, Ty::I64, x, y);
+                        let xy = self.bin64(BinOp::Sub, x, y);
+                        let yx = self.bin64(BinOp::Sub, y, x);
+                        let d = self.sel64(gt, xy, yx);
+                        let prev = self.lane_i64(acc.unwrap(), l, lb, false);
+                        self.bin64(BinOp::Add, prev, d)
+                    }
+                    // Carry-less: each set bit of y adds (exclusive or) x
+                    // shifted to it.
+                    VOp3::PMul => {
+                        let mut r = self.k64(0);
+                        for i in 0..8u64 {
+                            let bit = self.bin64k(BinOp::ShrU, y, i);
+                            let bit = self.bin64k(BinOp::And, bit, 1);
+                            let set = self.cmp64k(CmpOp::Ne, bit, 0);
+                            let sh = self.bin64k(BinOp::Shl, x, i);
+                            let zero = self.k64(0);
+                            let term = self.sel64(set, sh, zero);
+                            r = self.bin64(BinOp::Xor, r, term);
+                        }
+                        r
+                    }
+                    // The high half of twice the product, `(2ab [+ 2^(e-1)]) >>
+                    // e`, as `(ab [+ 2^(e-2)]) >> (e-1)` so that nothing
+                    // overflows; only the most negative value squared goes past
+                    // the largest result, and saturates.
+                    _ => {
+                        let p = self.bin64(BinOp::Mul, x, y);
+                        let p = if op == VOp3::SqRDMulH { self.bin64k(BinOp::Add, p, 1 << (bits - 2)) } else { p };
+                        let r = self.bin64k(BinOp::ShrS, p, (bits - 1) as u64);
+                        self.clamp_signed(r, bits)
+                    }
+                };
+                out = self.put_lane_i64(out, l, lb, r);
+            }
+            self.commit_vector(vd, arr, out);
+            return Flow::Next;
+        }
+
         // Floating-point forms with no wasm lane operation that gives the
         // hardware's answer: a lane at a time.
         if arr.float {
@@ -3214,6 +3336,101 @@ impl<'a> Lifter<'a> {
     ) -> Flow {
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
+
+        if matches!(op, VOp2::SqAbs | VOp2::SqNeg | VOp2::SuqAdd | VOp2::UsqAdd | VOp2::Cls | VOp2::URecpe | VOp2::URSqrtE) {
+            let lb = arr.lane_bytes;
+            let bits = lb * 8;
+            let acc = if matches!(op, VOp2::SuqAdd | VOp2::UsqAdd) { Some(self.b.read(GuestReg::V128(vd.0))) } else { None };
+            let mut out = self.zero_vector();
+            for l in 0..arr.lanes() {
+                let r = match op {
+                    VOp2::SqAbs | VOp2::SqNeg => {
+                        let x = self.lane_i64(a, l, lb, true);
+                        let zero = self.k64(0);
+                        let negx = self.bin64(BinOp::Sub, zero, x);
+                        let v = if op == VOp2::SqAbs {
+                            let neg = self.cmp64k(CmpOp::LtS, x, 0);
+                            self.sel64(neg, negx, x)
+                        } else {
+                            negx
+                        };
+                        // Only the most negative value has no positive
+                        // counterpart; it gives the largest.
+                        let min = self.cmp64k(CmpOp::Eq, x, Self::smin64(bits));
+                        let maxv = self.k64(Self::smax64(bits));
+                        self.sel64(min, maxv, v)
+                    }
+                    // An unsigned operand into a signed accumulator.
+                    VOp2::SuqAdd => {
+                        let d = self.lane_i64(acc.unwrap(), l, lb, true);
+                        let n = self.lane_i64(a, l, lb, false);
+                        if bits < 64 {
+                            let sum = self.bin64(BinOp::Add, d, n);
+                            self.clamp_signed(sum, bits)
+                        } else {
+                            let maxv = self.k64(Self::smax64(64));
+                            let room = self.bin64(BinOp::Sub, maxv, d);
+                            let over = self.b.cmp(CmpOp::GtU, Ty::I64, n, room);
+                            let sum = self.bin64(BinOp::Add, d, n);
+                            self.sel64(over, maxv, sum)
+                        }
+                    }
+                    // A signed operand into an unsigned accumulator.
+                    VOp2::UsqAdd => {
+                        let d = self.lane_i64(acc.unwrap(), l, lb, false);
+                        let n = self.lane_i64(a, l, lb, true);
+                        if bits < 64 {
+                            let sum = self.bin64(BinOp::Add, d, n);
+                            self.clamp_unsigned(sum, bits)
+                        } else {
+                            let sum = self.bin64(BinOp::Add, d, n);
+                            let neg = self.cmp64k(CmpOp::LtS, n, 0);
+                            let carry = self.b.cmp(CmpOp::LtU, Ty::I64, sum, d);
+                            let ones = self.k64(u64::MAX);
+                            let up = self.sel64(carry, ones, sum);
+                            let zero = self.k64(0);
+                            let mag = self.bin64(BinOp::Sub, zero, n);
+                            let under = self.b.cmp(CmpOp::LtU, Ty::I64, d, mag);
+                            let down = self.sel64(under, zero, sum);
+                            self.sel64(neg, down, up)
+                        }
+                    }
+                    // Leading bits equal to the sign, the sign itself not
+                    // counted.
+                    VOp2::Cls => {
+                        let x = self.lane_i64(a, l, lb, true);
+                        let sign = self.bin64k(BinOp::ShrS, x, 63);
+                        let y = self.bin64(BinOp::Xor, x, sign);
+                        let lz = self.b.def(Expr::Un { op: UnOp::Clz, ty: Ty::I64, a: y });
+                        self.bin64k(BinOp::Sub, lz, (64 - bits + 1) as u64)
+                    }
+                    // The unsigned fixed-point estimates of 32-bit lanes: the
+                    // top nine bits, through RecipEstimate or
+                    // RecipSqrtEstimate; all ones for an operand below the
+                    // range (0.5, or 0.25).
+                    _ => {
+                        let x = self.lane_i64(a, l, lb, false);
+                        let top = self.bin64k(BinOp::ShrU, x, 23);
+                        let (est, small) = if op == VOp2::URecpe {
+                            let e = self.recip_estimate_int(top);
+                            let hi = self.bin64k(BinOp::ShrU, x, 31);
+                            (e, self.cmp64k(CmpOp::Eq, hi, 0))
+                        } else {
+                            let e = self.rsqrt_estimate_int(top);
+                            let hi = self.bin64k(BinOp::ShrU, x, 30);
+                            (e, self.cmp64k(CmpOp::Eq, hi, 0))
+                        };
+                        let est = self.bin64k(BinOp::And, est, 0x1ff);
+                        let r = self.bin64k(BinOp::Shl, est, 23);
+                        let ones = self.k64(0xffff_ffff);
+                        self.sel64(small, ones, r)
+                    }
+                };
+                out = self.put_lane_i64(out, l, lb, r);
+            }
+            self.commit_vector(vd, arr, out);
+            return Flow::Next;
+        }
 
         if op == VOp2::FRecpx {
             let double = arr.lane_bytes == 8;
@@ -3718,6 +3935,67 @@ impl<'a> Lifter<'a> {
         ) {
             return self.fixed_convert(op, arr, vd, vn, shift);
         }
+        // The saturating forms: a lane at a time, in 64-bit arithmetic.
+        if matches!(op, VShiftImmOp::SqShl | VShiftImmOp::UqShl | VShiftImmOp::SqShlU) {
+            let src = self.b.read(GuestReg::V128(vn.0));
+            let bits = arr.lane_bytes * 8;
+            let mut out = self.zero_vector();
+            for l in 0..arr.lanes() {
+                let x = self.lane_i64(src, l, arr.lane_bytes, op != VShiftImmOp::UqShl);
+                let n = self.k64(shift as u64);
+                let r = match op {
+                    VShiftImmOp::SqShl => self.shift_left_i64(x, n, bits, true, true),
+                    VShiftImmOp::UqShl => self.shift_left_i64(x, n, bits, false, true),
+                    // `sqshlu`: a signed operand saturated to the unsigned
+                    // range; a negative one is 0.
+                    _ => {
+                        let r = self.shift_left_i64(x, n, bits, false, true);
+                        let neg = self.cmp64k(CmpOp::LtS, x, 0);
+                        let zero = self.k64(0);
+                        self.sel64(neg, zero, r)
+                    }
+                };
+                out = self.put_lane_i64(out, l, arr.lane_bytes, r);
+            }
+            self.commit_vector(vd, arr, out);
+            return Flow::Next;
+        }
+        if matches!(
+            op,
+            VShiftImmOp::SqShrn
+                | VShiftImmOp::UqShrn
+                | VShiftImmOp::SqRShrn
+                | VShiftImmOp::UqRShrn
+                | VShiftImmOp::SqShrun
+                | VShiftImmOp::SqRShrun
+        ) {
+            // Each source lane twice the width of a result lane, shifted
+            // right (rounded for the `R` forms) and saturated to the result's
+            // width: signed, unsigned, or signed to unsigned (`un`).
+            let src = self.b.read(GuestReg::V128(vn.0));
+            let nb = arr.lane_bytes;
+            let bits = nb * 8;
+            let signed_src = !matches!(op, VShiftImmOp::UqShrn | VShiftImmOp::UqRShrn);
+            let round = matches!(op, VShiftImmOp::SqRShrn | VShiftImmOp::UqRShrn | VShiftImmOp::SqRShrun);
+            // `2` forms write the upper half and keep the lower; the scalar
+            // forms are one lane, the rest zero.
+            let upper = arr.q && !arr.scalar;
+            let count = if arr.scalar { 1 } else { 8 / nb };
+            let mut out = if upper { self.b.read(GuestReg::V128(vd.0)) } else { self.zero_vector() };
+            for l in 0..count {
+                let x = self.lane_i64(src, l, nb * 2, signed_src);
+                let n = self.k64(shift as u64);
+                let r = self.shift_right_i64(x, n, signed_src, round);
+                let r = match op {
+                    VShiftImmOp::SqShrn | VShiftImmOp::SqRShrn => self.clamp_signed(r, bits),
+                    _ => self.clamp_unsigned(r, bits),
+                };
+                let at = if upper { l + count } else { l };
+                out = self.put_lane_i64(out, at, nb, r);
+            }
+            self.b.write(GuestReg::V128(vd.0), out);
+            return Flow::Next;
+        }
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
         // A right shift by the whole element width is legal on AArch64 (every
@@ -3995,6 +4273,15 @@ impl<'a> Lifter<'a> {
             | VShiftImmOp::Ucvtf
             | VShiftImmOp::Fcvtzs
             | VShiftImmOp::Fcvtzu => unreachable!("fixed-point converts leave earlier"),
+            VShiftImmOp::SqShl
+            | VShiftImmOp::UqShl
+            | VShiftImmOp::SqShlU
+            | VShiftImmOp::SqShrn
+            | VShiftImmOp::UqShrn
+            | VShiftImmOp::SqRShrn
+            | VShiftImmOp::UqRShrn
+            | VShiftImmOp::SqShrun
+            | VShiftImmOp::SqRShrun => unreachable!("the saturating shifts leave earlier"),
         };
         let r = self.b.def(Expr::VShift {
             op: sop,
@@ -4453,12 +4740,7 @@ impl<'a> Lifter<'a> {
         // scaled = '1':fraction<51:44>, then RecipEstimate.
         let hi = self.bin64k(BinOp::ShrU, frac, 44);
         let scaled = self.bin64k(BinOp::Or, hi, 256);
-        let a2 = self.bin64k(BinOp::Shl, scaled, 1);
-        let a2 = self.bin64k(BinOp::Or, a2, 1);
-        let num = self.k64(1 << 19);
-        let b = self.bin64(BinOp::DivU, num, a2);
-        let b = self.bin64k(BinOp::Add, b, 1);
-        let est = self.bin64k(BinOp::ShrU, b, 1);
+        let est = self.recip_estimate_int(scaled);
         let base = self.k64(base);
         let rexp = self.bin64(BinOp::Sub, base, exp);
         // fraction = estimate<7:0>:Zeros(44), denormalised for a result
@@ -4530,25 +4812,7 @@ impl<'a> Lifter<'a> {
         let hi7 = self.bin64k(BinOp::ShrU, frac, 45);
         let quarter_up = self.bin64k(BinOp::Or, hi7, 128);
         let a = self.sel64(odd, quarter_up, half_up);
-        // RecipSqrtEstimate's `a`: in units of 1/512 below 256, of 1/256
-        // (its bottom bit dropped) from there.
-        let low = self.cmp64k(CmpOp::LtU, a, 256);
-        let a_low = self.bin64k(BinOp::Shl, a, 1);
-        let a_low = self.bin64k(BinOp::Or, a_low, 1);
-        let a_high = self.bin64k(BinOp::ShrU, a, 1);
-        let a_high = self.bin64k(BinOp::Shl, a_high, 2);
-        let a_high = self.bin64k(BinOp::Add, a_high, 2);
-        let a = self.sel64(low, a_low, a_high);
-        let lim = self.k64((1 << 28) - 1);
-        let q = self.bin64(BinOp::DivU, lim, a);
-        let qf = self.b.def(Expr::FpCvt { kind: FpConvert::IntToFp { signed: false }, src_wide: true, dst_wide: true, a: q });
-        let root = self.b.def(Expr::FpUn { op: FpUnOp::Sqrt, double: true, a: qf });
-        let k = self.b.def(Expr::FpCvt { kind: FpConvert::FpToInt { signed: false }, src_wide: true, dst_wide: true, a: root });
-        let floor = self.cmp64k(CmpOp::LtU, k, 512);
-        let five12 = self.k64(512);
-        let b = self.sel64(floor, five12, k);
-        let b = self.bin64k(BinOp::Add, b, 1);
-        let est = self.bin64k(BinOp::ShrU, b, 1);
+        let est = self.rsqrt_estimate_int(a);
         let base = self.k64(base);
         let rexp = self.bin64(BinOp::Sub, base, exp);
         let rexp = self.bin64k(BinOp::ShrS, rexp, 1);
@@ -4572,6 +4836,205 @@ impl<'a> Lifter<'a> {
         let quieted = self.bin64k(BinOp::Or, x, quiet);
         let r = self.sel64(is_nan, quieted, r);
         self.fp_narrow64(double, r)
+    }
+
+    /// A lane of `v` as an `I64`, sign- or zero-extended.
+    fn lane_i64(&mut self, v: Value, lane: u32, lane_bytes: u32, signed: bool) -> Value {
+        if lane_bytes == 8 {
+            return self.b.def(Expr::VExtract { a: v, lane, lane_bytes, signed: false, ty: Ty::I64 });
+        }
+        let x = self.b.def(Expr::VExtract { a: v, lane, lane_bytes, signed, ty: Ty::I32 });
+        self.b.def(Expr::Extend { a: x, signed })
+    }
+
+    /// `v` (an `I64`) into a lane of `out`, truncated to the lane.
+    fn put_lane_i64(&mut self, out: Value, lane: u32, lane_bytes: u32, v: Value) -> Value {
+        let val = if lane_bytes == 8 { v } else { self.b.def(Expr::Wrap(v)) };
+        self.b.def(Expr::VReplace { a: out, lane, lane_bytes, val })
+    }
+
+    fn zero_vector(&mut self) -> Value {
+        self.b.def(Expr::VConst(Box::new([0u8; 16])))
+    }
+
+    /// `v`, a signed `I64`, clamped to a signed `bits`-bit range (`bits` < 64).
+    fn clamp_signed(&mut self, v: Value, bits: u32) -> Value {
+        let max = (1u64 << (bits - 1)) - 1;
+        let min = (-(1i64 << (bits - 1))) as u64;
+        let hi = self.cmp64k(CmpOp::GtS, v, max);
+        let maxv = self.k64(max);
+        let v = self.sel64(hi, maxv, v);
+        let lo = self.cmp64k(CmpOp::LtS, v, min);
+        let minv = self.k64(min);
+        self.sel64(lo, minv, v)
+    }
+
+    /// `v`, a signed `I64`, clamped to an unsigned `bits`-bit range
+    /// (`bits` < 64): a negative value is 0.
+    fn clamp_unsigned(&mut self, v: Value, bits: u32) -> Value {
+        let max = (1u64 << bits) - 1;
+        let hi = self.cmp64k(CmpOp::GtS, v, max);
+        let maxv = self.k64(max);
+        let v = self.sel64(hi, maxv, v);
+        let lo = self.cmp64k(CmpOp::LtS, v, 0);
+        let zero = self.k64(0);
+        self.sel64(lo, zero, v)
+    }
+
+    fn smin64(bits: u32) -> u64 {
+        (-(1i128 << (bits - 1))) as u64
+    }
+
+    fn smax64(bits: u32) -> u64 {
+        ((1u128 << (bits - 1)) - 1) as u64
+    }
+
+    /// Saturating add or subtract of two lanes of `bits` bits, extended to
+    /// `I64` as `signed` says (SatQ of the exact result). Below 64 bits the
+    /// exact result fits; at 64 the overflow is read from the signs.
+    fn sat_add_sub(&mut self, a: Value, b: Value, bits: u32, signed: bool, sub: bool) -> Value {
+        let r = self.bin64(if sub { BinOp::Sub } else { BinOp::Add }, a, b);
+        if bits < 64 {
+            return if signed { self.clamp_signed(r, bits) } else { self.clamp_unsigned(r, bits) };
+        }
+        if signed {
+            // Overflow: the operands' signs (for a subtract, a's and not
+            // b's) agree and the result's differs.
+            let ar = self.bin64(BinOp::Xor, a, r);
+            let other = if sub { self.bin64(BinOp::Xor, a, b) } else { self.bin64(BinOp::Xor, b, r) };
+            let both = self.bin64(BinOp::And, ar, other);
+            let over = self.cmp64k(CmpOp::LtS, both, 0);
+            let neg = self.cmp64k(CmpOp::LtS, a, 0);
+            let (minv, maxv) = (self.k64(Self::smin64(64)), self.k64(Self::smax64(64)));
+            let sat = self.sel64(neg, minv, maxv);
+            self.sel64(over, sat, r)
+        } else if sub {
+            let under = self.b.cmp(CmpOp::LtU, Ty::I64, a, b);
+            let zero = self.k64(0);
+            self.sel64(under, zero, r)
+        } else {
+            let carry = self.b.cmp(CmpOp::LtU, Ty::I64, r, a);
+            let ones = self.k64(u64::MAX);
+            self.sel64(carry, ones, r)
+        }
+    }
+
+    /// `a >> n` (arithmetic or logical as `signed`), for any `n` from 1 up:
+    /// shifts of 64 and more give the sign or nothing. With `round`, the
+    /// last bit shifted out is added back, which is `(a + 2^(n-1)) >> n`
+    /// without the add that could overflow.
+    fn shift_right_i64(&mut self, a: Value, n: Value, signed: bool, round: bool) -> Value {
+        let by = |l: &mut Self, k: Value| -> Value {
+            if signed {
+                let big = l.cmp64k(CmpOp::GtU, k, 63);
+                let k63 = l.k64(63);
+                let k = l.sel64(big, k63, k);
+                l.bin64(BinOp::ShrS, a, k)
+            } else {
+                let big = l.cmp64k(CmpOp::GtU, k, 63);
+                let k = l.bin64k(BinOp::And, k, 63);
+                let v = l.bin64(BinOp::ShrU, a, k);
+                let zero = l.k64(0);
+                l.sel64(big, zero, v)
+            }
+        };
+        let r = by(self, n);
+        if !round {
+            return r;
+        }
+        let n1 = self.bin64k(BinOp::Sub, n, 1);
+        let last = by(self, n1);
+        let bit = self.bin64k(BinOp::And, last, 1);
+        self.bin64(BinOp::Add, r, bit)
+    }
+
+    /// `a << n` for `n` from 0 up, saturated to `bits` bits as `signed` says
+    /// when `sat` (SatQ: a zero stays zero; a shift that loses bits gives
+    /// the largest value of the operand's sign), else truncated (0 when `n`
+    /// reaches the width).
+    fn shift_left_i64(&mut self, a: Value, n: Value, bits: u32, signed: bool, sat: bool) -> Value {
+        let big = self.cmp64k(CmpOp::GeU, n, bits as u64);
+        let n6 = self.bin64k(BinOp::And, n, 63);
+        let sh = self.bin64(BinOp::Shl, a, n6);
+        let zero = self.k64(0);
+        if !sat {
+            return self.sel64(big, zero, sh);
+        }
+        let lost = if bits < 64 {
+            // The operand is extended and the shift below the width, so the
+            // exact result fits in 64 bits: out of range is the loss.
+            let (lo, hi) = if signed { (Self::smin64(bits), Self::smax64(bits)) } else { (0, (1u64 << bits) - 1) };
+            let above = if signed { self.cmp64k(CmpOp::GtS, sh, hi) } else { self.cmp64k(CmpOp::GtU, sh, hi) };
+            let below = if signed { self.cmp64k(CmpOp::LtS, sh, lo) } else { self.konst(Ty::I32, 0) };
+            self.b.bin(BinOp::Or, Ty::I32, above, below)
+        } else {
+            let back = self.bin64(if signed { BinOp::ShrS } else { BinOp::ShrU }, sh, n6);
+            self.b.cmp(CmpOp::Ne, Ty::I64, back, a)
+        };
+        let over = self.b.bin(BinOp::Or, Ty::I32, lost, big);
+        let sat_v = if signed {
+            let neg = self.cmp64k(CmpOp::LtS, a, 0);
+            let (minv, maxv) = (self.k64(Self::smin64(bits)), self.k64(Self::smax64(bits)));
+            self.sel64(neg, minv, maxv)
+        } else {
+            self.k64(if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 })
+        };
+        let r = self.sel64(over, sat_v, sh);
+        let is_zero = self.cmp64k(CmpOp::Eq, a, 0);
+        self.sel64(is_zero, zero, r)
+    }
+
+    /// The register shifts by the signed low byte of `count`: left when it
+    /// is positive, right when negative (`srshl` and the rest).
+    fn shift_by_register(&mut self, a: Value, count: Value, bits: u32, signed: bool, round: bool, sat: bool) -> Value {
+        let c = self.b.def(Expr::Wrap(count));
+        let k24 = self.konst(Ty::I32, 24);
+        let c = self.b.bin(BinOp::Shl, Ty::I32, c, k24);
+        let c = self.b.bin(BinOp::ShrS, Ty::I32, c, k24);
+        let s = self.b.def(Expr::Extend { a: c, signed: true });
+        let neg = self.cmp64k(CmpOp::LtS, s, 0);
+        let zero = self.k64(0);
+        let n = self.bin64(BinOp::Sub, zero, s);
+        let right = self.shift_right_i64(a, n, signed, round);
+        let left = self.shift_left_i64(a, s, bits, signed, sat);
+        self.sel64(neg, right, left)
+    }
+
+    /// RecipEstimate: `a` in 256..512 (a fixed-point number in [0.5, 1)) to
+    /// its reciprocal in 256..512, rounded as the architecture rounds.
+    fn recip_estimate_int(&mut self, a: Value) -> Value {
+        let a2 = self.bin64k(BinOp::Shl, a, 1);
+        let a2 = self.bin64k(BinOp::Or, a2, 1);
+        let num = self.k64(1 << 19);
+        let b = self.bin64(BinOp::DivU, num, a2);
+        let b = self.bin64k(BinOp::Add, b, 1);
+        self.bin64k(BinOp::ShrU, b, 1)
+    }
+
+    /// RecipSqrtEstimate: `a` in 128..512 (in [0.25, 1)) to its reciprocal
+    /// square root in 256..512. The search for the largest `b` with
+    /// `a * (b + 1)^2 < 2^28` is the integer square root of `(2^28 - 1) / a`,
+    /// at least 512.
+    fn rsqrt_estimate_int(&mut self, a: Value) -> Value {
+        // `a` in units of 1/512 below 256, of 1/256 (its bottom bit
+        // dropped) from there.
+        let low = self.cmp64k(CmpOp::LtU, a, 256);
+        let a_low = self.bin64k(BinOp::Shl, a, 1);
+        let a_low = self.bin64k(BinOp::Or, a_low, 1);
+        let a_high = self.bin64k(BinOp::ShrU, a, 1);
+        let a_high = self.bin64k(BinOp::Shl, a_high, 2);
+        let a_high = self.bin64k(BinOp::Add, a_high, 2);
+        let a = self.sel64(low, a_low, a_high);
+        let lim = self.k64((1 << 28) - 1);
+        let q = self.bin64(BinOp::DivU, lim, a);
+        let qf = self.b.def(Expr::FpCvt { kind: FpConvert::IntToFp { signed: false }, src_wide: true, dst_wide: true, a: q });
+        let root = self.b.def(Expr::FpUn { op: FpUnOp::Sqrt, double: true, a: qf });
+        let k = self.b.def(Expr::FpCvt { kind: FpConvert::FpToInt { signed: false }, src_wide: true, dst_wide: true, a: root });
+        let floor = self.cmp64k(CmpOp::LtU, k, 512);
+        let five12 = self.k64(512);
+        let b = self.sel64(floor, five12, k);
+        let b = self.bin64k(BinOp::Add, b, 1);
+        self.bin64k(BinOp::ShrU, b, 1)
     }
 
     /// `x * y + z` with one rounding, on bit patterns: the host's fused

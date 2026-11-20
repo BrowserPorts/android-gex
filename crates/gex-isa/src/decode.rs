@@ -1731,6 +1731,9 @@ fn scalar_form_exists(inst: &Inst) -> bool {
     match *inst {
         Inst::VThreeSame { op, arr, .. } => match op {
             VOp3::SqAdd | VOp3::UqAdd | VOp3::SqSub | VOp3::UqSub => true,
+            VOp3::SqShl | VOp3::UqShl | VOp3::SqRShl | VOp3::UqRShl => true,
+            VOp3::SRShl | VOp3::URShl => arr.lane_bytes == 8,
+            VOp3::SqDMulH | VOp3::SqRDMulH => true,
             VOp3::CmGt
             | VOp3::CmGe
             | VOp3::CmHi
@@ -1761,6 +1764,7 @@ fn scalar_form_exists(inst: &Inst) -> bool {
             | VOp2::Abs
             | VOp2::Neg => arr.lane_bytes == 8,
             VOp2::SqXtn | VOp2::UqXtn | VOp2::SqXtun => true,
+            VOp2::SqAbs | VOp2::SqNeg | VOp2::SuqAdd | VOp2::UsqAdd => true,
             VOp2::FCmEqZero
             | VOp2::FCmGtZero
             | VOp2::FCmGeZero
@@ -1791,6 +1795,15 @@ fn scalar_form_exists(inst: &Inst) -> bool {
             VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Shrn | VShiftImmOp::Rshrn => {
                 false
             }
+            VShiftImmOp::SqShl
+            | VShiftImmOp::UqShl
+            | VShiftImmOp::SqShlU
+            | VShiftImmOp::SqShrn
+            | VShiftImmOp::UqShrn
+            | VShiftImmOp::SqRShrn
+            | VShiftImmOp::UqRShrn
+            | VShiftImmOp::SqShrun
+            | VShiftImmOp::SqRShrun => true,
             _ => arr.lane_bytes == 8,
         },
         _ => true,
@@ -1962,8 +1975,13 @@ fn decode_simd_three_different(raw: u32, q: bool, u: u32) -> Option<Inst> {
                 vm: VReg(bits(raw, 20, 16) as u8),
             });
         }
-        // The saturating-doubling and polynomial forms share this space but
-        // do something else entirely.
+        // The saturating doubling forms: signed only, from h or s lanes.
+        0b1001 | 0b1011 | 0b1101 if u == 0 && matches!(bits(raw, 23, 22), 0b01 | 0b10) => match bits(raw, 15, 12) {
+            0b1001 => VWidenOp::SqDMlaL,
+            0b1011 => VWidenOp::SqDMlsL,
+            _ => VWidenOp::SqDMulL,
+        },
+        // The polynomial forms share this space but do something else.
         _ => return None,
     };
     // A 64-bit source lane would give a 128-bit result, which does not exist.
@@ -2129,6 +2147,17 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
         (0b10100, _) => VOp3::UMaxP,
         (0b10101, 0) => VOp3::SMinP,
         (0b10101, _) => VOp3::UMinP,
+        (0b01001, 0) => VOp3::SqShl,
+        (0b01001, _) => VOp3::UqShl,
+        (0b01010, 0) => VOp3::SRShl,
+        (0b01010, _) => VOp3::URShl,
+        (0b01011, 0) => VOp3::SqRShl,
+        (0b01011, _) => VOp3::UqRShl,
+        (0b01111, 0) => VOp3::SAba,
+        (0b01111, _) => VOp3::UAba,
+        (0b10011, _) if size == 0 => VOp3::PMul,
+        (0b10110, 0) if size == 0b01 || size == 0b10 => VOp3::SqDMulH,
+        (0b10110, _) if size == 0b01 || size == 0b10 => VOp3::SqRDMulH,
         _ => return Inst::Unknown { raw },
     };
     // Doubleword lanes exist only for add, sub, the comparisons, the
@@ -2148,6 +2177,12 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
                     | VOp3::CmTst
                     | VOp3::SShl
                     | VOp3::UShl
+                    | VOp3::SRShl
+                    | VOp3::URShl
+                    | VOp3::SqShl
+                    | VOp3::UqShl
+                    | VOp3::SqRShl
+                    | VOp3::UqRShl
                     | VOp3::SqAdd
                     | VOp3::UqAdd
                     | VOp3::SqSub
@@ -2222,6 +2257,8 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
             (0b11100, _, false) => VOp2::FcvtAu,
             (0b11101, 0, false) => VOp2::Scvtf,
             (0b11101, _, false) => VOp2::Ucvtf,
+            (0b11100, 0, true) if lane_bytes == 4 => VOp2::URecpe,
+            (0b11100, _, true) if lane_bytes == 4 => VOp2::URSqrtE,
             (0b11101, 0, true) => VOp2::FRecpe,
             (0b11101, _, true) => VOp2::FRSqrtE,
             // U=0 is `frecpx`, which only the scalar group has.
@@ -2293,6 +2330,10 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
         (0b10100, 0) => VOp2::SqXtn,
         (0b10100, _) => VOp2::UqXtn,
         (0b10011, 1) => VOp2::Shll,
+        (0b00011, 0) => VOp2::SuqAdd,
+        (0b00011, _) => VOp2::UsqAdd,
+        (0b00111, 0) => VOp2::SqAbs,
+        (0b00111, _) => VOp2::SqNeg,
         _ => return Inst::Unknown { raw },
     };
     // The reverse family reverses elements within a fixed-width group, so an
@@ -2322,6 +2363,10 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
                     | VOp2::CmLeZero
                     | VOp2::Abs
                     | VOp2::Neg
+                    | VOp2::SqAbs
+                    | VOp2::SqNeg
+                    | VOp2::SuqAdd
+                    | VOp2::UsqAdd
             ))
     {
         return Inst::Undefined { raw };
@@ -2435,6 +2480,15 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         // The fixed-point conversions. They are not shifts, but the scale
         // lives in the same `immh:immb` field and counts down from the
         // element width exactly as a right shift does.
+        (0b01110, 0) => VShiftImmOp::SqShl,
+        (0b01110, _) => VShiftImmOp::UqShl,
+        (0b01100, 1) => VShiftImmOp::SqShlU,
+        (0b10010, 0) => VShiftImmOp::SqShrn,
+        (0b10010, _) => VShiftImmOp::UqShrn,
+        (0b10011, 0) => VShiftImmOp::SqRShrn,
+        (0b10011, _) => VShiftImmOp::UqRShrn,
+        (0b10000, 1) => VShiftImmOp::SqShrun,
+        (0b10001, 1) => VShiftImmOp::SqRShrun,
         (0b11100, 0) => VShiftImmOp::Scvtf,
         (0b11100, _) => VShiftImmOp::Ucvtf,
         (0b11111, 0) => VShiftImmOp::Fcvtzs,
@@ -2457,7 +2511,16 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
         && (!q
             || matches!(
                 op,
-                VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Shrn | VShiftImmOp::Rshrn
+                VShiftImmOp::SShll
+                    | VShiftImmOp::UShll
+                    | VShiftImmOp::Shrn
+                    | VShiftImmOp::Rshrn
+                    | VShiftImmOp::SqShrn
+                    | VShiftImmOp::UqShrn
+                    | VShiftImmOp::SqRShrn
+                    | VShiftImmOp::UqRShrn
+                    | VShiftImmOp::SqShrun
+                    | VShiftImmOp::SqRShrun
             ))
     {
         return Inst::Undefined { raw };
@@ -2465,7 +2528,13 @@ fn decode_simd_shift_imm(raw: u32, q: bool, u: u32, immh: u32, immb: u32) -> Ins
     // Left shifts count up from the element size; right shifts count down.
     let left = matches!(
         op,
-        VShiftImmOp::Shl | VShiftImmOp::SShll | VShiftImmOp::UShll | VShiftImmOp::Sli
+        VShiftImmOp::Shl
+            | VShiftImmOp::SShll
+            | VShiftImmOp::UShll
+            | VShiftImmOp::Sli
+            | VShiftImmOp::SqShl
+            | VShiftImmOp::UqShl
+            | VShiftImmOp::SqShlU
     );
     let shift = if left {
         imm.wrapping_sub(esize)
@@ -2502,6 +2571,9 @@ fn decode_simd_by_element(raw: u32, q: bool, u: u32) -> Option<Inst> {
         0b1010 => Some(VWidenOp::MulL),
         0b0010 => Some(VWidenOp::MlaL),
         0b0110 => Some(VWidenOp::MlsL),
+        0b1011 if u == 0 => Some(VWidenOp::SqDMulL),
+        0b0011 if u == 0 => Some(VWidenOp::SqDMlaL),
+        0b0111 if u == 0 => Some(VWidenOp::SqDMlsL),
         _ => None,
     };
     if let Some(wop) = widen {
@@ -2540,6 +2612,8 @@ fn decode_simd_by_element(raw: u32, q: bool, u: u32) -> Option<Inst> {
         (0, 0b0101) => VOp3::FMls,
         (0, 0b1001) => VOp3::FMul,
         (1, 0b1001) => VOp3::FMulx,
+        (0, 0b1100) => VOp3::SqDMulH,
+        (0, 0b1101) => VOp3::SqRDMulH,
         (0, 0b1000) => VOp3::Mul,
         (1, 0b0000) => VOp3::Mla,
         (1, 0b0100) => VOp3::Mls,
@@ -3029,6 +3103,60 @@ fn expand_simd_immediate(imm8: u32, cmode: u32, op: bool, q: bool) -> Option<u12
 
 #[cfg(test)]
 mod tests {
+
+    /// Integer and floating-point Advanced SIMD instructions gex once could
+    /// not decode (tests/android/src/simdops.c and fpops.c found them), as
+    /// llvm-objdump prints them.
+    #[test]
+    fn simd_instructions_found_missing_decode() {
+        for (raw, want) in [
+            (0x4ea1_2c00u32, "sqsub v0.4s, v0.4s, v1.4s"),
+            (0x6ee1_2c00u32, "uqsub v0.2d, v0.2d, v1.2d"),
+            (0x4e61_b400u32, "sqdmulh v0.8h, v0.8h, v1.8h"),
+            (0x6ea1_b400u32, "sqrdmulh v0.4s, v0.4s, v1.4s"),
+            (0x4ea1_5400u32, "srshl v0.4s, v0.4s, v1.4s"),
+            (0x6e21_5400u32, "urshl v0.16b, v0.16b, v1.16b"),
+            (0x4e61_4c00u32, "sqshl v0.8h, v0.8h, v1.8h"),
+            (0x6ea1_4c00u32, "uqshl v0.4s, v0.4s, v1.4s"),
+            (0x4e21_5c00u32, "sqrshl v0.16b, v0.16b, v1.16b"),
+            (0x6ee1_5c00u32, "uqrshl v0.2d, v0.2d, v1.2d"),
+            (0x6e21_9c00u32, "pmul v0.16b, v0.16b, v1.16b"),
+            (0x4e62_7c20u32, "saba v0.8h, v1.8h, v2.8h"),
+            (0x6e22_7c20u32, "uaba v0.16b, v1.16b, v2.16b"),
+            (0x0ea2_9020u32, "sqdmlal v0.2d, v1.2s, v2.2s"),
+            (0x0e61_d000u32, "sqdmull v0.4s, v0.4h, v1.4h"),
+            (0x6ea1_7000u32, "uabdl2 v0.2d, v0.4s, v1.4s"),
+            (0x4ea0_7800u32, "sqabs v0.4s, v0.4s"),
+            (0x6ee0_7800u32, "sqneg v0.2d, v0.2d"),
+            (0x4ea0_4800u32, "cls v0.4s, v0.4s"),
+            (0x4ea1_c800u32, "urecpe v0.4s, v0.4s"),
+            (0x6ea1_c800u32, "ursqrte v0.4s, v0.4s"),
+            (0x4e20_3800u32, "suqadd v0.16b, v0.16b"),
+            (0x6e60_3800u32, "usqadd v0.8h, v0.8h"),
+            (0x4f27_7420u32, "sqshl v0.4s, v1.4s, #7"),
+            (0x6f0a_7420u32, "uqshl v0.16b, v1.16b, #2"),
+            (0x6f19_6420u32, "sqshlu v0.8h, v1.8h, #9"),
+            (0x0f21_9420u32, "sqshrn v0.2s, v1.2d, #31"),
+            (0x2f0f_9420u32, "uqshrn v0.8b, v1.8h, #1"),
+            (0x0f17_9c20u32, "sqrshrn v0.4h, v1.4s, #9"),
+            (0x2f20_9c20u32, "uqrshrn v0.2s, v1.2d, #32"),
+            (0x2f0c_8420u32, "sqshrun v0.8b, v1.8h, #4"),
+            (0x2f1f_8c20u32, "sqrshrun v0.4h, v1.4s, #1"),
+            (0x4f15_9c20u32, "sqrshrn2 v0.8h, v1.4s, #11"),
+            (0x4f72_c820u32, "sqdmulh v0.8h, v1.8h, v2.h[7]"),
+            (0x4fa2_d020u32, "sqrdmulh v0.4s, v1.4s, v2.s[1]"),
+            (0x5ee1_0c03u32, "sqadd d3, d0, d1"),
+            (0x5e21_dc00u32, "fmulx s0, s0, s1"),
+            (0x5ea1_f800u32, "frecpx s0, s0"),
+            (0x6e20_f421u32, "fmaxp v1.4s, v1.4s, v0.4s"),
+            (0x6ea0_f421u32, "fminp v1.4s, v1.4s, v0.4s"),
+            (0x6e20_ec21u32, "facge v1.4s, v1.4s, v0.4s"),
+            (0x1e23_c000u32, "fcvt h0, s0"),
+            (0x1ee2_4000u32, "fcvt s0, h0"),
+        ] {
+            assert_eq!(crate::fmt::disasm(&decode(raw, 0), 0), want, "{raw:#x}");
+        }
+    }
 
     /// The scalar multiplies by a vector's element, as llvm-objdump prints
     /// them; half precision and a doubleword with L set are no instruction
