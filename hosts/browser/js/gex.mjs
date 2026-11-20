@@ -2661,6 +2661,9 @@ export class Gex {
       gex_k: this.#kernelImports(shimMod),
     });
     noteM64Tables(this.#shim.exports);
+    // A test's (worker.mjs): no headroom, before anything grows the memory.
+    // (A static's store: safe before `gex_worker_init`.)
+    if (globalThis.GEX_NO_HEADROOM) this.#shim.exports.gex_set_no_headroom?.(1);
     this.#u8 = null;
     // First, before any call into the shim: `gex_worker_init` gives this Worker
     // its thread-local block, and until it runs `__tls_base` is zero, so a shim
@@ -3258,6 +3261,8 @@ export class Gex {
     this.#shimInstantiateMs = performance.now() - tShimI;
     noteM64Tables(this.#shim.exports);
     _at('shim instantiated');
+    // A test's (worker.mjs): no headroom, before anything grows the memory.
+    if (globalThis.GEX_NO_HEADROOM) this.#shim.exports.gex_set_no_headroom?.(1);
     this.#u8 = null;
     // The stack pointer is a per-instance global, so every Worker has its own
     // and must be told where it goes. Not yet for a runtime made ahead of

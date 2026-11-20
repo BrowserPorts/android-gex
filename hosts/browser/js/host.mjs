@@ -2294,9 +2294,11 @@ export class ProcessHost {
               // What this process's memory grew to. One memory per process, so
               // this times the number live at once is what the tab costs.
               // Its size, not what is used: a memory64 is 8 GiB from the start.
-              (m.memoryMib !== undefined ? `, memory size ${m.memoryMib} MiB${m.headroomMib ? ` (headroom ${m.headroomMib} MiB)` : ''}` : '') +
+              (m.memoryMib !== undefined ? `, memory size ${m.memoryMib} MiB` : '') +
               // Its pages that hold anything: what the browser keeps resident.
               (m.touchedMib !== undefined ? `, resident ${m.touchedMib} MiB` : '') +
+              // The memory grown beyond that, ahead of need (address space only).
+              (m.headroomMib ? `, headroom ${m.headroomMib} MiB` : '') +
               // And what that memory went on, which is the only way to tell a
               // guest that really maps a lot from a runtime spending it: the
               // guest's accessible mappings (its VmRSS, in either memory

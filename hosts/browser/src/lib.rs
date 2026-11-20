@@ -2822,15 +2822,37 @@ fn grow_memory_to(end: u64) -> bool {
 /// it, at least 64 MiB and at most 512 MiB.
 /// None without shared memory: one Worker, so no length to go stale.
 fn headroom(have: u64) -> u64 {
-    if cfg!(feature = "shared-memory") && !UNSHARED.load(std::sync::atomic::Ordering::Relaxed) {
+    if cfg!(feature = "shared-memory")
+        && !UNSHARED.load(std::sync::atomic::Ordering::Relaxed)
+        && !NO_HEADROOM.load(std::sync::atomic::Ordering::Relaxed)
+    {
         (have / 8).clamp(64 << 20, 512 << 20) & !0xffff
     } else {
         0
     }
 }
 
+/// `gex_set_no_headroom(1)` (run-node's GEX_NO_HEADROOM=1): no headroom, the
+/// memory grown to what is asked only. For a test that reads a process's
+/// memory size as where its runtime placed things (test/gexcc/noplace-floor).
+static NO_HEADROOM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[no_mangle]
+pub extern "C" fn gex_set_no_headroom(on: u32) {
+    NO_HEADROOM.store(on != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The highest end anyone has asked the memory to cover ([`grow_memory_to`]).
 static ASKED_TOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The end of the memory anything has asked for or grown itself: its size
+/// less the headroom ([`grow_memory_to`]), which nothing holds.
+fn used_top() -> u64 {
+    let have = warch::memory_size(0) as u64 * 65536;
+    match ASKED_TOP.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => have,
+        asked => asked.min(have),
+    }
+}
 
 /// MiB of the memory grown ahead of what was asked for (the headroom of
 /// [`grow_memory_to`]): part of its size, not of its use.
@@ -2906,6 +2928,8 @@ fn foreign(start: u64, end: u64) {
         return;
     }
     FOREIGN_BYTES.fetch_add(end - start, std::sync::atomic::Ordering::Relaxed);
+    // Someone else's grow is in use to its end, headroom or not.
+    ASKED_TOP.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
     GROW_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     memmap::claim(memmap::Kind::Foreign, 0, start, end, "grown outside the arena (std's System allocator?)");
     static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2935,6 +2959,7 @@ fn note_foreign_growth() {
         // The first look: everything already there (the loader's, a forked
         // child's image) is accounted for elsewhere.
         let _ = OWN_TOP.compare_exchange(0, mem, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed);
+        ASKED_TOP.fetch_max(mem, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     if mem > known && OWN_TOP.compare_exchange(known, mem, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok() {
@@ -3462,7 +3487,8 @@ fn arena_take_for(len: u64, guest: bool) -> Option<u64> {
         } else {
             // Not forked: the memory is its own and nothing else is in it. Kept
             // as the floor rather than assumed, since the loader grows it.
-            gex_kernel::mem::arena_bottom().max(warch::memory_size(0) as u64 * 65536)
+            // What was asked of it, not its size: the headroom above is free.
+            gex_kernel::mem::arena_bottom().max(used_top())
         }
     } else {
         cur
