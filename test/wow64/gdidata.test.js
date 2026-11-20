@@ -4,7 +4,7 @@
 // address GetProcAddress gives (gdidata.c). In a 64-bit memory, where the
 // export table's 32-bit RVA reaches only the 4 GiB above the image, and in a
 // 32-bit one; gex says nothing of an RVA out of reach.
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { wow64 } from '../lib/winerun.mjs';
 
@@ -14,7 +14,11 @@ export default async function (t) {
   const w = wow64(t);
   const exe = await w.mingw('gdidata', { x64: true, flags: ['-Wall'], libs: ['-lgdi32'] });
   const pin = (p) => writeFileSync(join(p, 'dll-bases'), '11bc0000 /wine32/lib/wine/x86_64-windows/gdi32.dll\n');
-  for (const mem64 of [true, false]) {
+  // The memory64 leg needs the install's memory64 twin (WINE64_TWIN=1),
+  // which a plain WoW64 install has not: said, and the wasm32 leg alone.
+  const twin = existsSync(join(process.env.GEX_TEST_WOW64_DIST, 'lib/wine/x86_64-unix/wine.m64'));
+  if (!twin) t.say('memory64: skipped, the WoW64 install has no memory64 twin (WINE64_TWIN=1)');
+  for (const mem64 of twin ? [true, false] : [false]) {
     const leg = mem64 ? 'memory64' : 'wasm32';
     const r = await w.page(['Z:\\t\\gdidata.exe'], {
       files: { '/t/gdidata.exe': exe }, cwd: '/t', name: `gdidata-${leg}`, setup: pin,
