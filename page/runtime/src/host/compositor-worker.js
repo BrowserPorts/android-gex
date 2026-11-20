@@ -871,8 +871,13 @@ class Compositor {
       win.height = Math.round((s.view ? s.view.h : s.height / bs) * cs);
       win.title = s.title;
       win.parent = s.parent;
-      win.relX = s.relX * cs;
-      win.relY = s.relY * cs;
+      // A subsurface's or popup's offset is in its parent's units; a placed
+      // window's position (gex_window_placement_v1) is its client's screen
+      // coordinates, which are the output's device pixels (Windows'
+      // coordinates are the screen's pixels): scaled again, a Win32 taskbar
+      // at the bottom of a 1.5x screen was drawn half a screen below it.
+      win.relX = s.placed ? s.relX : s.relX * cs;
+      win.relY = s.placed ? s.relY : s.relY * cs;
       // A cursor's hotspot, in its surface's units (CSS pixels for the page).
       win.hotX = s.relX;
       win.hotY = s.relY;
