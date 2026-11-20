@@ -98,7 +98,9 @@ stop() {
 while kill -0 "$GROUP" 2>/dev/null; do
     sleep 15
     t=$(( $(date +%s) - start ))
-    pid=$(pgrep -g "$GROUP" -x gexc | head -1)
+    # By the binary's own name, which GEXC may give another (a copy kept
+    # for the boot while gexc is rebuilt).
+    pid=$(pgrep -g "$GROUP" -x "$(basename "$GEXC")" | head -1)
     # The footprint macOS counts (resident and compressed), in MB.
     fp=$( [ -n "$pid" ] && footprint -p "$pid" 2>/dev/null | awk '/phys_footprint:/{v=$2; u=$3; if (u ~ /GB/) v*=1024; else if (u ~ /KB/) v/=1024; print int(v); exit}' )
     disk=$(df -g / | awk 'NR==2{print $4}')
