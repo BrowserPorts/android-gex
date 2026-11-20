@@ -1924,11 +1924,14 @@ impl<'a> Lifter<'a> {
                 // because the rounded value is already integral.
                 let rounded = match round {
                     FpRound::Zero => a,
-                    FpRound::Nearest | FpRound::Away => self.b.def(Expr::FpUn {
+                    FpRound::Nearest => self.b.def(Expr::FpUn {
                         op: FpUnOp::RoundNearest,
                         double,
                         a,
                     }),
+                    // `fcvtas`/`fcvtau` break ties away from zero, as FRINTA
+                    // does; wasm's `nearest` breaks them to even.
+                    FpRound::Away => self.round_away(double, a),
                     FpRound::Plus => self.b.def(Expr::FpUn {
                         op: FpUnOp::Ceil,
                         double,
@@ -3478,7 +3481,12 @@ impl<'a> Lifter<'a> {
                     op,
                     VOp2::FcvtNs | VOp2::FcvtAs | VOp2::FcvtPs | VOp2::FcvtMs
                 );
-                let rounded = self.b.def(Expr::VLaneUn { op: round, lane, a });
+                // The `A` forms break ties away from zero, as FRINTA does.
+                let rounded = if matches!(op, VOp2::FcvtAs | VOp2::FcvtAu) {
+                    self.round_away_lanes(lane, a)
+                } else {
+                    self.b.def(Expr::VLaneUn { op: round, lane, a })
+                };
                 let r = self.lane_convert(arr, rounded, FpConvert::FpToInt { signed }, signed);
                 self.commit_vector(vd, arr, r);
                 Flow::Next
