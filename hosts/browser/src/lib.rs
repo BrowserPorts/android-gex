@@ -17069,6 +17069,16 @@ pub extern "C" fn gex_cache_op(_ctx: i32, _pc: i64, op: i32, addr: i64) {
     if op == gex_abi::cache_op::LOW_ACCESS {
         low_access("a locked access", addr as u64, _ctx, _pc as u64);
     }
+    if op == gex_abi::cache_op::TEAR_LOAD || op == gex_abi::cache_op::TEAR_STORE {
+        warn_line(&format!(
+            "gex: pid {} tear: a plain misaligned 8-byte {} at {:#x} (block {:#x})\n",
+            my_pid(),
+            if op == gex_abi::cache_op::TEAR_LOAD { "load" } else { "store" },
+            addr as u64,
+            _pc as u64
+        ));
+        return;
+    }
     if op == gex_abi::cache_op::SPLIT_LOCK {
         let gm = guest();
         let c = _ctx as u32 as u64;
@@ -22146,6 +22156,21 @@ pub extern "C" fn gex_set_tso2(on: i32) {
     if on != 0 {
         crate::cgen::set_tso();
     }
+}
+
+/// Debug (`?tear=`, GEX_TEAR): 1 counts the guest's plain misaligned 8-byte
+/// loads and stores, 2 also does each as two 4-byte halves (gex_emit::tier1
+/// `TEAR`). Default 0, nothing emitted.
+#[no_mangle]
+pub extern "C" fn gex_set_tear(mode: i32) {
+    gex_xlate::set_tear(mode.clamp(0, 2) as u8);
+}
+
+/// The tear switch's count of this process's plain misaligned 8-byte loads
+/// (`which` 0) or stores (1), from `gex_abi::TEAR_COUNTS`.
+#[no_mangle]
+pub extern "C" fn gex_tear_count(which: u32) -> i64 {
+    guest().read_u64(gex_abi::TEAR_COUNTS + 8 * (which.min(1) as u64)).unwrap_or(0) as i64
 }
 
 /// Diagnostic: at each safepoint, check the running thread's SP against the

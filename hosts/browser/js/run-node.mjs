@@ -684,6 +684,9 @@ const host = new ProcessHost({
     // so shared reads stay coherent under true parallelism (V8 can't hoist a
     // plain wasm load across a guest fence). Tests whether the GTK startup race
     // is plain-load coherence at guest fences. Default off.
+    // GEX_TEAR=1|2: count plain misaligned 8-byte guest accesses; 2 also
+    // splits each into 4-byte halves (tier1.rs `TEAR`). Debug, default off.
+    tear: Number(process.env.GEX_TEAR) || 0,
     coherentLoads: process.env.GEX_TSO === "2" ? 2 : !!(process.env.GEX_COHERENT_LOADS || (process.env.GEX_TSO && process.env.GEX_TSO !== "0")),
     // GEX_SP_GUARD: at each safepoint, catch a worker thread whose SP has strayed
     // into the MAIN thread's stack (it would smash a canary the main thread only

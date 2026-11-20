@@ -1360,6 +1360,9 @@ async function handle(msg) {
     // their dispatch); on keeps tables small across a many-fork run like apt.
     if (msg.claimPages !== undefined) ex.gex_set_claim_pages?.(msg.claimPages);
     if (msg.copyLoop) ex.gex_set_copy_loop?.(1);
+    // `?tear=1|2`, GEX_TEAR (tier1.rs `TEAR`): count plain misaligned 8-byte
+    // accesses, and at 2 split each into 4-byte halves.
+    if (msg.tear) ex.gex_set_tear?.(msg.tear | 0);
     if (msg.coherentLoads === 2 && ex.gex_set_tso2) ex.gex_set_tso2(1);
     else if (msg.coherentLoads) ex.gex_set_coherent_loads?.(1);
     // A memory that is not shared (the single-thread build): the shim never
@@ -1512,6 +1515,12 @@ async function handle(msg) {
     // `close` before reporting: it drops the tick channel, a live handle that
     // would otherwise keep a Node Worker up.
     gex.close?.();
+    // The tear debug switch's counts (`?tear=`, GEX_TEAR): the process's plain
+    // misaligned 8-byte loads and stores, said at its end when there were any.
+    if (!thread && msg.tear) {
+      const n = [0, 1].map((i) => Number(ex.gex_tear_count?.(i) ?? 0));
+      if (n[0] || n[1]) console.warn(`[gex] pid ${ex.gex_my_pid?.() ?? '?'}: tear=${msg.tear}: ${n[0]} plain misaligned 8-byte loads, ${n[1]} stores`);
+    }
     // A thread of a program an `execve` replaced: the shim's state is the new
     // program's (its heap and JIT state started again), so nothing more is
     // read from it here.

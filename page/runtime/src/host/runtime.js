@@ -186,7 +186,8 @@ export function xcacheName() {
     + (flag('tso') === 'arm' && tso() ? '&tsohost=1' : '')
     // Named only when on: the cache of a page without it keeps its name.
     + (globalThis.GEX_NULL_GUARD ? '&nullguard=1' : '')
-    + (globalThis.GEX_MXCSR ? '&mxcsr=1' : '');
+    + (globalThis.GEX_MXCSR ? '&mxcsr=1' : '')
+    + (/^[12]$/.test(flag('tear') ?? '') ? `&tear=${flag('tear')}` : '');
   const flavour = globalThis.GEX_FLAVOUR ?? (typeof __GEX_FLAVOUR__ !== 'undefined' ? __GEX_FLAVOUR__ : '');
   // The page's path, which a system Worker is told (`pageGlobals`): its own
   // is the Worker's script, the same for every page. And the cache's own
@@ -757,6 +758,9 @@ export async function makeProcessHost({
     // `extra` for every Worker.
     // TEST `debugpanic=prctl`: a process's prctl(PR_GEX_DEBUG_TRAP) panics in the kernel
     debugPanic: flag('debugpanic') === 'prctl' ? 4 : undefined,
+    // `?tear=1|2`: count plain misaligned 8-byte guest accesses; 2 also splits
+    // each into 4-byte halves, as an arm64 host may tear them (tier1.rs `TEAR`)
+    tear: Number(flag('tear')) || undefined,
     // `tso=2`: the debug flavour, misaligned and vector accesses too (tier1.rs `TSO2`)
     coherentLoads: tso() ? (flag('tso') === '2' ? 2 : 1) : undefined,
     // `?wltrace=1` turns on gex-wayland protocol tracing (buffers, commits,
