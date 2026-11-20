@@ -3,25 +3,36 @@
 // (qemu_pipe_guest.cpp): a stream to the host (CID 2) at port 5000, the
 // emulator's pipe services, and port 5001, which the host always resets.
 //
-// What any such guest sees, checked against Linux 7.0 under a host with no
-// service at those ports:
+// What any such guest sees, checked against Linux 7.0 (as root, which a
+// child's setuid needs) under a host with no service at those ports:
 // - socket(AF_VSOCK, SOCK_STREAM) with protocol 0 or AF_VSOCK; another
 //   protocol is EPROTONOSUPPORT;
 // - unbound, getsockname gives CID and port -1; getpeername is ENOTCONN;
 //   reads and writes are ENOTCONN; shutdown is ENOTCONN;
 // - connect with a short address, another family, or unknown flags is
 //   EINVAL; to a port the host resets, ECONNRESET, with the socket bound to
-//   an ephemeral port above 1023 all the same, which a second connect keeps.
+//   an ephemeral port above 1023 all the same, which a second connect keeps;
+//   a socket bound so binds no more (EINVAL) but may listen;
+// - bind: a CID not the guest's EADDRNOTAVAIL, a port up to 1023 EACCES
+//   without CAP_NET_BIND_SERVICE, a bound port EADDRINUSE until its socket
+//   is closed; listen and accept EINVAL unless bound and listening; a
+//   listener polls as nothing, its accept is EAGAIN without waiting and
+//   waits otherwise, and connect, getpeername, shutdown, read and write on
+//   it are EINVAL or ENOTCONN.
 // Then, where the host is the emulator (port 5000 accepts): the sensors
 // service, as the image's sensors HAL asks it, says it has no sensors;
 // after a shutdown, reads are 0 and writes EPIPE.
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include <linux/vm_sockets.h>
 
@@ -42,6 +53,68 @@ static struct sockaddr_vm to(unsigned cid, unsigned port) {
 static int connect_to(int fd, unsigned cid, unsigned port) {
     struct sockaddr_vm a = to(cid, port);
     return connect(fd, (struct sockaddr *)&a, sizeof a);
+}
+
+static int bind_to(int fd, unsigned cid, unsigned port) {
+    struct sockaddr_vm a = to(cid, port);
+    return bind(fd, (struct sockaddr *)&a, sizeof a);
+}
+
+static void sleep_ms(long ms) {
+    struct timespec t = {ms / 1000, (ms % 1000) * 1000000};
+    nanosleep(&t, 0);
+}
+
+// A listener, as adbd makes its `vsock:5555`.
+static void listener(void) {
+    int s = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (listen(s, 4) == 0 || errno != EINVAL) die("listen, unbound", 0, errno);
+    if (accept(s, 0, 0) != -1 || errno != EINVAL) die("accept, not listening", 0, errno);
+    struct sockaddr_vm a = to(VMADDR_CID_ANY, 15555);
+    if (bind(s, (struct sockaddr *)&a, sizeof a - 1) == 0 || errno != EINVAL) die("bind, a short address", 0, errno);
+    if (bind_to(s, VMADDR_CID_HOST, 15555) == 0 || errno != EADDRNOTAVAIL) die("bind, the host's CID", 0, errno);
+    if (bind_to(s, 0x12345, 15555) == 0 || errno != EADDRNOTAVAIL) die("bind, a CID not the guest's", 0, errno);
+    pid_t child = fork();
+    if (child == 0) {
+        if (setuid(65534)) _exit(2);
+        int u = socket(AF_VSOCK, SOCK_STREAM, 0);
+        _exit(bind_to(u, VMADDR_CID_ANY, 555) == -1 && errno == EACCES ? 0 : 1);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) die("bind, a reserved port unprivileged", status, 0);
+    if (bind_to(s, VMADDR_CID_ANY, 15555)) die("bind", 0, errno);
+    struct sockaddr_vm name;
+    socklen_t len = sizeof name;
+    if (getsockname(s, (struct sockaddr *)&name, &len) || name.svm_cid != VMADDR_CID_ANY || name.svm_port != 15555) die("getsockname, bound", name.svm_cid, name.svm_port);
+    if (bind_to(s, VMADDR_CID_ANY, 15556) == 0 || errno != EINVAL) die("bind, bound", 0, errno);
+    int t = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (bind_to(t, VMADDR_CID_ANY, 15555) == 0 || errno != EADDRINUSE) die("bind, a port in use", 0, errno);
+    if (listen(s, 4) || listen(s, 8)) die("listen", 0, errno);
+    struct pollfd p = {s, POLLIN | POLLOUT, 0};
+    if (poll(&p, 1, 0) != 0) die("poll, listening", p.revents, 0);
+    if (accept4(s, 0, 0, 0x40000000) != -1 || errno != EINVAL) die("accept4, unknown flags", 0, errno);
+    if (connect_to(s, VMADDR_CID_HOST, 5000) == 0 || errno != EINVAL) die("connect, listening", 0, errno);
+    len = sizeof name;
+    if (getpeername(s, (struct sockaddr *)&name, &len) == 0 || errno != ENOTCONN) die("getpeername, listening", 0, errno);
+    if (shutdown(s, SHUT_RDWR) == 0 || errno != ENOTCONN) die("shutdown, listening", 0, errno);
+    char c;
+    if (read(s, &c, 1) != -1 || errno != ENOTCONN) die("read, listening", 0, errno);
+    if (write(s, "x", 1) != -1 || errno != ENOTCONN) die("write, listening", 0, errno);
+    // An accept that waits, waits.
+    child = fork();
+    if (child == 0) {
+        accept(s, 0, 0);
+        _exit(3);
+    }
+    sleep_ms(300);
+    if (waitpid(child, &status, WNOHANG) != 0) die("accept did not wait", status, 0);
+    kill(child, SIGKILL);
+    waitpid(child, &status, 0);
+    fcntl(s, F_SETFL, O_NONBLOCK);
+    if (accept(s, 0, 0) != -1 || errno != EAGAIN) die("accept, not waiting", 0, errno);
+    close(s);
+    if (bind_to(t, VMADDR_CID_ANY, 15555)) die("bind, a port let go", 0, errno);
+    close(t);
 }
 
 static int read_fully(int fd, char *buf, int n) {
@@ -95,7 +168,11 @@ int main(void) {
     if (connect_to(fd, VMADDR_CID_HOST, 5001) == 0 || errno != ECONNRESET) die("connect again", 0, errno);
     len = sizeof name;
     if (getsockname(fd, (struct sockaddr *)&name, &len) || name.svm_port != port) die("the port kept", port, name.svm_port);
+    if (bind_to(fd, VMADDR_CID_ANY, VMADDR_PORT_ANY) == 0 || errno != EINVAL) die("bind, bound by connect", 0, errno);
+    if (listen(fd, 1)) die("listen, bound by connect", 0, errno);
     close(fd);
+
+    listener();
 
     // The emulator's services, if this host is the emulator.
     fd = socket(AF_VSOCK, SOCK_STREAM, 0);
@@ -106,6 +183,8 @@ int main(void) {
         len = sizeof name;
         if (getpeername(fd, (struct sockaddr *)&name, &len) || name.svm_cid != VMADDR_CID_HOST || name.svm_port != 5000) die("getpeername", name.svm_cid, name.svm_port);
         if (connect_to(fd, VMADDR_CID_HOST, 5000) == 0 || errno != EISCONN) die("connect, connected", 0, errno);
+        if (listen(fd, 1) == 0 || errno != EINVAL) die("listen, connected", 0, errno);
+        if (accept(fd, 0, 0) != -1 || errno != EINVAL) die("accept, connected", 0, errno);
         static const char hello[] = "pipe:qemud:sensors";
         if (write(fd, hello, sizeof hello) != sizeof hello) die("the connection string", 0, errno);
         if (write(fd, "000clist-sensors", 16) != 16) die("list-sensors", 0, errno);

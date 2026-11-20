@@ -2247,7 +2247,7 @@ impl FdIo<'_> {
             nr::READV => {
                 let file = self.fds.get(a[0] as i32).ok()?;
                 // (a terminal's polling read answers 0 instead: `polling_read`)
-                if !file.would_block() || file.handle.empty_read_returns() {
+                if !file.would_block() || file.handle.empty_read_returns() || vsock_listener(&file.handle) {
                     return None;
                 }
                 let (buf, len) = self.first_iovec(m, a)?;
@@ -2262,7 +2262,7 @@ impl FdIo<'_> {
             }
             nr::READ => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                if !file.would_block() || file.handle.empty_read_returns() {
+                if !file.would_block() || file.handle.empty_read_returns() || vsock_listener(&file.handle) {
                     return None;
                 }
                 Some(BlockOp::ReadStream {
@@ -6120,7 +6120,21 @@ impl NetIo<'_> {
                 Ok(0)
             }
             nr::SHUTDOWN if io.vsock_of(fd).is_ok() => io.vsock_of(fd)?.shutdown(a[1]),
-            nr::BIND | nr::LISTEN | nr::ACCEPT | nr::ACCEPT4 if io.vsock_of(fd).is_ok() => Err(crate::vsock::not_here("bind, listen and accept", Errno::EOPNOTSUPP)),
+            nr::BIND if io.vsock_of(fd).is_ok() => {
+                let sock = io.vsock_of(fd)?;
+                let addr = m.read(a[1], (a[2] as usize).min(128))?.to_vec();
+                sock.bind(&addr, io.creds.capable(crate::vsock::CAP_NET_BIND_SERVICE)).map(|_| 0)
+            }
+            nr::LISTEN if io.vsock_of(fd).is_ok() => io.vsock_of(fd)?.listen(),
+            // No connection is ever accepted: the host connects to nothing
+            // (crate::vsock). A caller that waits parks on the listener,
+            // which is never readable.
+            nr::ACCEPT | nr::ACCEPT4 if io.vsock_of(fd).is_ok() => {
+                if n == nr::ACCEPT4 && a[3] & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                io.vsock_of(fd)?.accept()
+            }
             nr::CONNECT if io.netlink_of(fd).is_ok() => {
                 let sock = io.netlink_of(fd)?;
                 // To `AF_UNSPEC`: connected to nothing again.
@@ -6348,6 +6362,15 @@ impl NetIo<'_> {
                 }
                 let socket: Arc<dyn crate::vfs::FileHandle> = Arc::clone(&file.handle);
                 if !file.would_block() || socket.poll_readable() {
+                    return None;
+                }
+                // Refused at once, readable or not: flags accept4 does not
+                // know (`__sys_accept4` checks them first), and a vsock
+                // socket that is not listening.
+                if n == nr::ACCEPT4 && a[3] & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
+                    return None;
+                }
+                if Arc::clone(&socket).as_vsock().is_some_and(|v| v.listening() == (n == nr::RECVFROM)) {
                     return None;
                 }
                 Some(BlockOp::AcceptWait { socket })
@@ -6682,7 +6705,17 @@ fn inet_connect(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, addr: u64, len: u64) -
 }
 
 /// `accept`: a unix listener's, else a TCP listener's (`net::Socket`).
+/// Whether `handle` is a listening vsock socket, which is never readable (a
+/// parked `accept` waits on that), yet whose read is `ENOTCONN` at once.
+fn vsock_listener(handle: &Arc<dyn crate::vfs::FileHandle>) -> bool {
+    Arc::clone(handle).as_vsock().is_some_and(|v| v.listening())
+}
+
 fn accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
+    // `__sys_accept4`: flags it does not know, before anything else.
+    if flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
+        return Err(Errno::EINVAL);
+    }
     match unix_accept(io, m, fd, addr, len_out, flags) {
         Err(Errno::ENOTSOCK) => inet_accept(io, m, fd, addr, len_out, flags),
         other => other,
@@ -13930,6 +13963,15 @@ impl Kernel {
                 if !file.would_block() || socket.poll_readable() {
                     return None;
                 }
+                // Refused at once: flags accept4 does not know
+                // (`__sys_accept4` checks them first), and a vsock socket
+                // that is not listening.
+                if n == nr::ACCEPT4 && a[3] & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
+                    return None;
+                }
+                if Arc::clone(&socket).as_vsock().is_some_and(|v| !v.listening()) {
+                    return None;
+                }
                 let flags = if n == nr::ACCEPT4 { a[3] } else { 0 };
                 self.retry_accept = Some((a[0] as i32, a[1], a[2], flags));
                 Some(BlockOp::AcceptWait { socket })
@@ -13948,7 +13990,7 @@ impl Kernel {
             // does (by `retry_transfer`). It had answered EAGAIN.
             nr::RECVFROM => {
                 let file = self.fds.get(a[0] as i32).ok()?;
-                if a[3] & Self::MSG_DONTWAIT != 0 || !file.would_block() {
+                if a[3] & Self::MSG_DONTWAIT != 0 || !file.would_block() || vsock_listener(&file.handle) {
                     return None;
                 }
                 self.retry_transfer = Some((n, a));

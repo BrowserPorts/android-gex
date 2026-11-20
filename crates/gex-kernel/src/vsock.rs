@@ -25,12 +25,24 @@
 //!   the emulator does: reads are 0 and writes `EPIPE`.
 //! - `poll`: `POLLOUT` while connected and not shut down, or never
 //!   connected; `POLLIN` with something to read or once shut; `POLLHUP`
-//!   once shut.
+//!   once shut. A listening socket says none of them.
+//! - `bind` (`__vsock_bind`): an address as `connect` checks it, else
+//!   `EINVAL`; a socket bound already (by `connect` too) `EINVAL`; a CID that
+//!   is not `VMADDR_CID_ANY` or the guest's own `EADDRNOTAVAIL` (a guest has
+//!   no host-side transport, so not the host's either); a port at or below
+//!   1023 takes `CAP_NET_BIND_SERVICE` (`EACCES`); a port bound by any socket
+//!   is `EADDRINUSE`, and `VMADDR_PORT_ANY` takes the next free ephemeral
+//!   one. A port is free again when its socket is closed.
+//! - `listen` on a bound socket that is not connected; else `EINVAL`.
+//!   `accept` on anything but a listening socket is `EINVAL`; on one, it
+//!   waits for a connection from the host (or `EAGAIN`). The emulator's
+//!   host here connects to nothing, so it waits for good, as a guest's
+//!   listener does under a host that never connects (adbd's `vsock:5555`).
+//!   `connect` on a listening socket is `EINVAL`.
 //!
 //! Not here, and said when asked: datagram and seqpacket sockets, a
-//! connect that does not wait (`O_NONBLOCK`), `bind`, `listen` and
-//! `accept`, the local CIDs (1, and the guest's own, 3), and `sendmsg` and
-//! `recvmsg`.
+//! connect that does not wait (`O_NONBLOCK`), the local CID (1) and
+//! connections to the guest's own CID (3), and `sendmsg` and `recvmsg`.
 //!
 //! Off unless asked: `GEX_EMULATOR_HOST=1`. Without it `socket(AF_VSOCK)`
 //! is `EAFNOSUPPORT`, as on a kernel without vsock.
@@ -38,6 +50,7 @@
 use crate::emuhost::Connection;
 use crate::errno::{Errno, SysResult};
 use crate::vfs::{FileHandle, FileType, Metadata};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -85,28 +98,62 @@ pub fn sockaddr(cid: u32, port: u32) -> [u8; SOCKADDR_LEN] {
     a
 }
 
-/// The next ephemeral port (`__vsock_bind_connectible`: one counter, from
-/// a random start above the reserved ports).
-fn ephemeral_port() -> u32 {
+/// The ports bound by the system's vsock sockets (the kernel's bound
+/// table). With only `VMADDR_CID_ANY` and the guest's own CID to bind, two
+/// sockets with one port always collide (`__vsock_find_bound_socket`).
+static BOUND: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+
+/// `CAP_NET_BIND_SERVICE`, for a port at or below [`LAST_RESERVED_PORT`].
+pub const CAP_NET_BIND_SERVICE: u64 = 10;
+
+/// How many ports the ephemeral search tries (`MAX_PORT_RETRIES`).
+const MAX_PORT_RETRIES: u32 = 24;
+
+/// Binds `port`, or with `None` the next free ephemeral port
+/// (`__vsock_bind_connectible`: one counter, from a random start above the
+/// reserved ports, passing over ports bound).
+fn bind_port(port: Option<u32>) -> Result<u32, Errno> {
     static NEXT: AtomicU32 = AtomicU32::new(0);
+    let mut bound = BOUND.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(port) = port {
+        if !bound.insert(port) {
+            return Err(Errno::EADDRINUSE);
+        }
+        return Ok(port);
+    }
     if NEXT.load(Ordering::Relaxed) == 0 {
         let mut b = [0u8; 4];
         crate::vfs::devfs::fill_random(&mut b);
         let start = LAST_RESERVED_PORT + 1 + u32::from_le_bytes(b) % (u32::MAX - LAST_RESERVED_PORT - 1);
         let _ = NEXT.compare_exchange(0, start, Ordering::Relaxed, Ordering::Relaxed);
     }
-    loop {
-        let port = NEXT.fetch_add(1, Ordering::Relaxed);
-        if port != VMADDR_PORT_ANY && port > LAST_RESERVED_PORT {
-            return port;
+    for _ in 0..MAX_PORT_RETRIES {
+        let mut port = NEXT.fetch_add(1, Ordering::Relaxed);
+        if port == VMADDR_PORT_ANY || port <= LAST_RESERVED_PORT {
+            port = LAST_RESERVED_PORT + 1;
+            NEXT.store(port + 1, Ordering::Relaxed);
         }
-        let _ = NEXT.compare_exchange(port.wrapping_add(1), LAST_RESERVED_PORT + 1, Ordering::Relaxed, Ordering::Relaxed);
+        if bound.insert(port) {
+            return Ok(port);
+        }
     }
+    Err(Errno::EADDRNOTAVAIL)
+}
+
+/// An address `connect` and `bind` take (`vsock_addr_cast`), as CID and
+/// port; anything else is `EINVAL` to both.
+fn parse(addr: &[u8]) -> Result<(u32, u32), Errno> {
+    if addr.len() < SOCKADDR_LEN || u16::from_le_bytes([addr[0], addr[1]]) as u64 != AF_VSOCK || addr[12] & !VMADDR_FLAG_TO_HOST != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok((u32::from_le_bytes(addr[8..12].try_into().unwrap()), u32::from_le_bytes(addr[4..8].try_into().unwrap())))
 }
 
 #[derive(Debug)]
 enum State {
     Unconnected,
+    /// Listening (`TCP_LISTEN`): bound, never connected.
+    Listening,
     Connected { peer: (u32, u32), host: Connection },
     /// Shut down, and so closed by the host.
     Shut { peer: (u32, u32) },
@@ -115,7 +162,9 @@ enum State {
 #[derive(Debug)]
 struct Inner {
     state: State,
+    /// The bound port, and the CID it was bound with.
     port: Option<u32>,
+    cid: u32,
 }
 
 /// One vsock stream socket.
@@ -127,7 +176,7 @@ pub struct Socket {
 
 impl Socket {
     pub fn new() -> Arc<Socket> {
-        Arc::new(Socket { inner: Mutex::new(Inner { state: State::Unconnected, port: None }), queue: crate::wait::Queue::new() })
+        Arc::new(Socket { inner: Mutex::new(Inner { state: State::Unconnected, port: None, cid: VMADDR_CID_ANY }), queue: crate::wait::Queue::new() })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -139,19 +188,15 @@ impl Socket {
         let mut inner = self.lock();
         match inner.state {
             State::Connected { .. } => return Err(Errno::EISCONN),
-            State::Shut { .. } => return Err(Errno::EINVAL),
+            State::Shut { .. } | State::Listening => return Err(Errno::EINVAL),
             State::Unconnected => {}
         }
-        if addr.len() < SOCKADDR_LEN || u16::from_le_bytes([addr[0], addr[1]]) as u64 != AF_VSOCK || addr[12] & !VMADDR_FLAG_TO_HOST != 0 {
-            return Err(Errno::EINVAL);
-        }
-        let port = u32::from_le_bytes(addr[4..8].try_into().unwrap());
-        let cid = u32::from_le_bytes(addr[8..12].try_into().unwrap());
+        let (cid, port) = parse(addr)?;
         if cid == VMADDR_CID_LOCAL || cid == GUEST_CID {
             return Err(not_here("a connection within the guest (CID 1 or 3)", Errno::ENODEV));
         }
         if inner.port.is_none() {
-            inner.port = Some(ephemeral_port());
+            inner.port = Some(bind_port(None)?);
         }
         if port != DATA_PORT {
             return Err(Errno::ECONNRESET);
@@ -160,16 +205,71 @@ impl Socket {
         Ok(())
     }
 
+    /// `bind`, `reserved` saying whether the caller may bind a port at or
+    /// below 1023.
+    pub fn bind(&self, addr: &[u8], reserved: bool) -> Result<(), Errno> {
+        let (cid, port) = parse(addr)?;
+        let mut inner = self.lock();
+        if inner.port.is_some() {
+            return Err(Errno::EINVAL);
+        }
+        if cid == VMADDR_CID_LOCAL {
+            return Err(not_here("binding the local CID (1)", Errno::EADDRNOTAVAIL));
+        }
+        if cid != VMADDR_CID_ANY && cid != GUEST_CID {
+            return Err(Errno::EADDRNOTAVAIL);
+        }
+        let port = if port == VMADDR_PORT_ANY {
+            bind_port(None)?
+        } else {
+            if port <= LAST_RESERVED_PORT && !reserved {
+                return Err(Errno::EACCES);
+            }
+            bind_port(Some(port))?
+        };
+        inner.port = Some(port);
+        inner.cid = cid;
+        Ok(())
+    }
+
+    /// `listen` (`vsock_listen`; the backlog is kept by nothing, since no
+    /// connection ever comes).
+    pub fn listen(&self) -> SysResult {
+        let mut inner = self.lock();
+        match inner.state {
+            State::Unconnected if inner.port.is_some() => inner.state = State::Listening,
+            State::Listening => {}
+            _ => return Err(Errno::EINVAL),
+        }
+        Ok(0)
+    }
+
+    /// Whether the socket is listening.
+    pub fn listening(&self) -> bool {
+        matches!(self.lock().state, State::Listening)
+    }
+
+    /// `accept` (`vsock_accept`): `EINVAL` unless listening; a listener's
+    /// queue stays empty, the host connecting to nothing, so `EAGAIN`, which
+    /// a caller that waits waits on (the socket is never readable).
+    pub fn accept(&self) -> SysResult {
+        if !self.listening() {
+            return Err(Errno::EINVAL);
+        }
+        Err(Errno::EAGAIN)
+    }
+
     /// `getsockname`'s `sockaddr_vm`.
     pub fn name(&self) -> [u8; SOCKADDR_LEN] {
-        sockaddr(VMADDR_CID_ANY, self.lock().port.unwrap_or(VMADDR_PORT_ANY))
+        let inner = self.lock();
+        sockaddr(inner.cid, inner.port.unwrap_or(VMADDR_PORT_ANY))
     }
 
     /// `getpeername`'s, or `ENOTCONN`.
     pub fn peer_name(&self) -> Result<[u8; SOCKADDR_LEN], Errno> {
         match self.lock().state {
             State::Connected { peer, .. } | State::Shut { peer } => Ok(sockaddr(peer.0, peer.1)),
-            State::Unconnected => Err(Errno::ENOTCONN),
+            State::Unconnected | State::Listening => Err(Errno::ENOTCONN),
         }
     }
 
@@ -180,7 +280,7 @@ impl Socket {
         }
         let mut inner = self.lock();
         match inner.state {
-            State::Unconnected => return Err(Errno::ENOTCONN),
+            State::Unconnected | State::Listening => return Err(Errno::ENOTCONN),
             State::Connected { peer, .. } => inner.state = State::Shut { peer },
             State::Shut { .. } => {}
         }
@@ -193,7 +293,7 @@ impl Socket {
     pub fn recv(&self, buf: &mut [u8], peek: bool) -> SysResult {
         let mut inner = self.lock();
         match &mut inner.state {
-            State::Unconnected => Err(Errno::ENOTCONN),
+            State::Unconnected | State::Listening => Err(Errno::ENOTCONN),
             State::Shut { .. } => Ok(0),
             State::Connected { .. } if buf.is_empty() => Ok(0),
             State::Connected { host, .. } => {
@@ -212,6 +312,15 @@ impl Socket {
     }
 }
 
+impl Drop for Socket {
+    /// The port is free again (`vsock_remove_bound`).
+    fn drop(&mut self) {
+        if let Some(port) = self.lock().port {
+            BOUND.lock().unwrap_or_else(|e| e.into_inner()).remove(&port);
+        }
+    }
+}
+
 impl FileHandle for Socket {
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         self.recv(buf, false)
@@ -221,7 +330,7 @@ impl FileHandle for Socket {
         let mut inner = self.lock();
         let answered = match &mut inner.state {
             State::Shut { .. } => return Err(Errno::EPIPE),
-            State::Unconnected => return Err(Errno::ENOTCONN),
+            State::Unconnected | State::Listening => return Err(Errno::ENOTCONN),
             State::Connected { host, .. } => host.send(buf),
         };
         drop(inner);
@@ -236,10 +345,12 @@ impl FileHandle for Socket {
     }
 
     /// Whether a read returns now: with something to read, once shut, or
-    /// never connected (its `ENOTCONN`).
+    /// never connected (its `ENOTCONN`). A listener is never: what waits on
+    /// it is `accept`, for a connection that does not come.
     fn poll_readable(&self) -> bool {
         match &self.lock().state {
             State::Connected { host, .. } => host.pending() > 0,
+            State::Listening => false,
             _ => true,
         }
     }
@@ -248,12 +359,12 @@ impl FileHandle for Socket {
         match &self.lock().state {
             State::Connected { host, .. } => host.pending() > 0,
             State::Shut { .. } => true,
-            State::Unconnected => false,
+            State::Unconnected | State::Listening => false,
         }
     }
 
     fn poll_out(&self) -> bool {
-        !matches!(self.lock().state, State::Shut { .. })
+        !matches!(self.lock().state, State::Shut { .. } | State::Listening)
     }
 
     fn poll_hup(&self) -> bool {
@@ -338,8 +449,48 @@ mod tests {
 
     #[test]
     fn ephemeral_ports_count_up_above_the_reserved_ones() {
-        let a = ephemeral_port();
-        let b = ephemeral_port();
+        let a = bind_port(None).unwrap();
+        let b = bind_port(None).unwrap();
         assert!(a > LAST_RESERVED_PORT && b > LAST_RESERVED_PORT && a != b);
+        assert_eq!(bind_port(Some(a)), Err(Errno::EADDRINUSE));
+        let mut bound = BOUND.lock().unwrap();
+        bound.remove(&a);
+        bound.remove(&b);
+    }
+
+    /// adbd's `vsock:5555`: bind, listen, and an accept that waits.
+    #[test]
+    fn a_listener_binds_its_port_and_waits() {
+        let s = Socket::new();
+        assert_eq!(s.listen(), Err(Errno::EINVAL));
+        assert_eq!(s.accept(), Err(Errno::EINVAL));
+        assert_eq!(s.bind(&addr(2, 15555), true), Err(Errno::EADDRNOTAVAIL));
+        assert_eq!(s.bind(&addr(7, 15555), true), Err(Errno::EADDRNOTAVAIL));
+        assert_eq!(s.bind(&addr(u32::MAX, 555), false), Err(Errno::EACCES));
+        assert_eq!(s.bind(&addr(u32::MAX, 15555)[..15], true), Err(Errno::EINVAL));
+        assert_eq!(s.bind(&addr(GUEST_CID, 15555), false), Ok(()));
+        assert_eq!(s.name(), sockaddr(GUEST_CID, 15555));
+        assert_eq!(s.bind(&addr(u32::MAX, 15556), false), Err(Errno::EINVAL));
+        let t = Socket::new();
+        assert_eq!(t.bind(&addr(u32::MAX, 15555), false), Err(Errno::EADDRINUSE));
+        assert_eq!(s.listen(), Ok(0));
+        assert_eq!(s.listen(), Ok(0));
+        assert!(!s.poll_readable() && !s.poll_in() && !s.poll_out() && !s.poll_hup());
+        assert_eq!(s.accept(), Err(Errno::EAGAIN));
+        assert_eq!(s.connect(&addr(2, 5000)), Err(Errno::EINVAL));
+        assert_eq!(s.peer_name(), Err(Errno::ENOTCONN));
+        assert_eq!(s.shutdown(2), Err(Errno::ENOTCONN));
+        let mut buf = [0u8; 4];
+        assert_eq!(s.read_at(0, &mut buf), Err(Errno::ENOTCONN));
+        assert_eq!(s.write_at(0, b"x"), Err(Errno::ENOTCONN));
+        drop(s);
+        assert_eq!(t.bind(&addr(u32::MAX, 15555), false), Ok(()));
+
+        // A connected socket neither listens nor accepts.
+        let c = Socket::new();
+        c.connect(&addr(2, 5000)).unwrap();
+        assert_eq!(c.listen(), Err(Errno::EINVAL));
+        assert_eq!(c.accept(), Err(Errno::EINVAL));
+        assert_eq!(c.bind(&addr(u32::MAX, u32::MAX), true), Err(Errno::EINVAL));
     }
 }
