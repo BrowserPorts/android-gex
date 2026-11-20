@@ -942,7 +942,7 @@ impl ProcTable {
             if let Some((&UNLESS_SAID, rest)) = note.split_first() {
                 let mut parts = rest.split(|&b| b == 0).map(|b| String::from_utf8_lossy(b).into_owned());
                 let (name, reason) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
-                let c = Crash { pid, name, reason: if reason.is_empty() { "crashed".into() } else { reason }, code: 137, signal: 9, notice: false };
+                let c = Crash { pid, name, reason: if reason.is_empty() { "crashed".into() } else { reason }, code: 137, signal: 9, notice: false, cmdline: String::new() };
                 if let Some(f) = CRASH_HOOK.get() {
                     f(&c);
                 }
