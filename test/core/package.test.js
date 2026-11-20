@@ -10,7 +10,7 @@ export default async function (t) {
   const pkg = t.work('pkg/');
   const { System } = await import(/* @vite-ignore */ `${pkg}index.mjs`);
   const { MemoryFilesystem } = await import(/* @vite-ignore */ `${pkg}fs.mjs`);
-  const sys = new System();
+  const sys = new System({ arch: t.arch });
   const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const t0 = performance.now();

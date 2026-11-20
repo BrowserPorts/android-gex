@@ -187,8 +187,10 @@ processes and memory.
 - One system per page: a second `new System()` throws.
 - A system runs wasm32 programs (built with gexcc) and the programs of one
   translated architecture, x86-64 or aarch64: the one `new System({ arch })`
-  names, else the tree's programs' at boot (`/bin/sh` first); aarch64 when
-  the tree has none. Naming it lets the kernel and runtime load while the
+  names, else the tree's programs' at boot (its first x86-64 or aarch64
+  ELF; with none, its first Windows program). A tree with neither (wasm32
+  programs only, a 32-bit Wine's with no Windows program yet) must name it:
+  `boot()` fails otherwise. Naming it lets the kernel and runtime load while the
   page's files are got ready, so a page that knows its programs' says. The
   kernel is built for one, so this is fixed for the system's life: a program
   of the other one fails to start (`ENOEXEC`).

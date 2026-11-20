@@ -64,35 +64,55 @@ let made = false;
 /** The guest architectures a page may name (`arch`), as `describe()` says them. */
 const ARCHES = { x86: 'x86', aarch64: 'aarch64' };
 
-/** ELF's machine numbers, as the guest's programs are built for them. */
+/** ELF's machine numbers of 64-bit programs, as the guest's are built for them. */
 const EM = { 62: 'x86', 183: 'aarch64' };
 
-/** The machine of the 64-bit ELF whose bytes start at `at` in `b`, or null
- *  (a gexcc program, wasm32, runs on either and says nothing). */
+/** PE's machine numbers (Windows programs): i386 and x86-64 run on x86's
+ *  kernel, arm64 on aarch64's. */
+const PE = { 0x14c: 'x86', 0x8664: 'x86', 0xaa64: 'aarch64' };
+
+/** The machine of the 64-bit ELF whose bytes start at `at` in `b`, or null.
+ *  A 32-bit ELF says nothing: a gexcc program, wasm32, is one (i386 by its
+ *  header) and runs on either. */
 function machine(b, at = 0) {
   return b && b.length >= at + 20 && b[at] === 0x7f && b[at + 1] === 0x45 && b[at + 2] === 0x4c && b[at + 3] === 0x46 && b[at + 4] === 2
     ? EM[b[at + 18] | (b[at + 19] << 8)] ?? null
     : null;
 }
 
+/** The machine of the Windows program (PE) whose bytes start at `at` in `b`
+ *  (`size` long), or null. */
+function peMachine(b, at = 0, size = b?.length ?? 0) {
+  if (!b || size < 0x40 || b.length < at + 0x40 || b[at] !== 0x4d || b[at + 1] !== 0x5a) return null;
+  const pe = b[at + 0x3c] | (b[at + 0x3d] << 8) | (b[at + 0x3e] << 16) | (b[at + 0x3f] << 24);
+  if (pe < 0x40 || pe + 6 > size || b.length < at + pe + 6) return null;
+  if (b[at + pe] !== 0x50 || b[at + pe + 1] !== 0x45 || b[at + pe + 2] || b[at + pe + 3]) return null;
+  return PE[b[at + pe + 4] | (b[at + pe + 5] << 8)] ?? null;
+}
+
 /**
  * The guest architecture a tar's programs are built for: the machine of its
- * first native (non-wasm32) ELF, read from the headers up to that entry,
- * with no file's bytes but an ELF header read. Null for none: a wasm32 tree
- * whose native packages are still to come.
+ * first native 64-bit ELF, read from the headers up to that entry, with no
+ * file's bytes but a program's header read; with none, of its first Windows
+ * program (a 32-bit Wine tree's Unix side is wasm32 and says nothing). Null
+ * for neither: a wasm32 tree whose native packages are still to come.
  */
 function tarArch(tarEntries, b) {
-  let found = null;
-  tarEntries(b, ({ type, body }) => {
-    if (type === '0' || type === '\0' || type === '7') found = machine(b, body);
+  let found = null, pe = null;
+  tarEntries(b, ({ type, body, size }) => {
+    if (type === '0' || type === '\0' || type === '7') {
+      found = machine(b, body);
+      if (!found && !pe) pe = peMachine(b, body, size);
+    }
     return !!found;
   });
-  return found;
+  return found ?? pe;
 }
 
 /** [`tarArch`] of single files (`{ path: bytes }`), in the order given. */
 function filesArch(files = {}) {
   for (const d of Object.values(files)) if (machine(d)) return machine(d);
+  for (const d of Object.values(files)) if (peMachine(d)) return peMachine(d);
   return null;
 }
 
@@ -437,12 +457,12 @@ export class System extends EventTarget {
 
     // The translated architecture, beside which wasm32 programs run: the
     // global kernel is built for one (its syscall ABI, struct layouts, signal
-    // frame), so it is chosen here, from the tree's first native program; a
-    // wasm32 /bin/sh says nothing. A tree with none yet (wasm32 only, its
-    // native packages to come) gets aarch64, Debian's arm64 being the usual
-    // second architecture of a wasm32 tree, so apt can install them later.
-    // A program of the other one does not run.
-    const arch = given ?? (await layersArch(opts.layers)) ?? 'aarch64';
+    // frame), so it is chosen here, from the tree's first native program
+    // (a 64-bit ELF; else a Windows program); a wasm32 /bin/sh says nothing.
+    // A tree with neither (wasm32 only, its native packages to come) needs
+    // the page to name one. A program of the other one does not run.
+    const arch = given ?? (await layersArch(opts.layers));
+    if (!arch) throw new Error("boot: the tree's programs do not say which architecture to run (no x86-64 or aarch64 program, no Windows program): name it, new System({ arch: 'x86' }) or { arch: 'aarch64' }");
     const { setGlobals } = await import('./host/page-globals.js');
     setGlobals((name) => q.get(name), { arch });
     const rt = await import('./host/runtime.js');
