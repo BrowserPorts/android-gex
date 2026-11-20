@@ -174,6 +174,10 @@ $ out/gexcc/bin/gexcc -O2 -o hello hello.c && target/x86/release/gexc run hello
 
 - the Rust toolchain from `rust-toolchain.toml` (it installs the
   `wasm32-unknown-unknown` target);
+- nightly Rust with `rust-src`, for the shared kernel (`make page`,
+  `hosts/kernel/build.sh` builds std with `-Z build-std`):
+  `rustup toolchain install nightly --component rust-src`. Without nightly
+  the page build goes on with the kernel it already has;
 - clang and `wasm-ld` (LLVM 22), and Node.js 22;
 - for the page: Emscripten (`emsdk`) and `wasm-tools`
   (`cargo install wasm-tools`);

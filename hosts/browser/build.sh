@@ -137,6 +137,10 @@ fi
 if [ -x hosts/kernel/build.sh ]; then
     if ! rustup toolchain list 2>/dev/null | grep -q nightly; then
         echo "  kernel: NOT rebuilt (no nightly toolchain) -- imports may not match"
+    elif ! rustup component list --toolchain nightly --installed 2>/dev/null | grep -q '^rust-src'; then
+        echo "  kernel: nightly has no rust-src (-Z build-std needs it):" >&2
+        echo "    rustup component add rust-src --toolchain nightly" >&2
+        exit 1
     elif kerr=$(GEX_ARCH="${GEX_ARCH:-}" hosts/kernel/build.sh 2>&1); then
         echo "  kernel: rebuilt alongside the shim"
     else
