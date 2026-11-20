@@ -4,7 +4,7 @@ import type { WindowEnv } from './windows-host';
 /** Every window drawn into one positioned element. Made before boot.
  *  Events: `change`. */
 export declare class SingleCanvas extends EventTarget {
-  constructor(sys: System, options: { container: HTMLElement });
+  constructor(sys: System, options: { container: HTMLElement; x11?: 'rootless' | null });
   get env(): WindowEnv;
   /** After the page resized the container. */
   resized(): void;

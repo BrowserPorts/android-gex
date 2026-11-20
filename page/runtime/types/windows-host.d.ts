@@ -1,9 +1,9 @@
 import type { System } from './index';
 
+/** And `DISPLAY` with the `x11` option. */
 export interface WindowEnv extends Record<string, string> {
   XDG_RUNTIME_DIR: string;
   WAYLAND_DISPLAY: string;
-  DISPLAY: string;
 }
 
 /** Events: `title`, `resized`, `position`, `restack` (`below`), `request`
@@ -33,7 +33,7 @@ export declare class GuestWindow extends EventTarget {
 /** Each window handed to the page to frame and place. Made before boot.
  *  Events: `window` (`window`), `cursor` (`css`). */
 export declare class HostWindows extends EventTarget {
-  constructor(sys: System, options?: { width?: number; height?: number; scale?: number });
+  constructor(sys: System, options?: { width?: number; height?: number; scale?: number; x11?: 'rootless' | null });
   get env(): WindowEnv;
   setOutputSize(width: number, height: number, scale?: number): void;
   windows(): GuestWindow[];

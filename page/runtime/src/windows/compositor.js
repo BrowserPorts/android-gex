@@ -4,7 +4,7 @@
 // testing. For a page that wants a desktop without being a window manager.
 
 import { INTERNAL, internals } from '../internal.js';
-import { xOnDemand } from './x11.js';
+import { xEnv, xOnDemand } from './x11.js';
 
 /** The page's compositor (page/runtime/src/host/compositor.js) for one whose scene is in
  *  the single-thread build's system Worker `k`: what it would post to its
@@ -86,6 +86,7 @@ function fitCanvas(canvas) {
 
 export class CompositorWindows extends EventTarget {
   #c = null;
+  #x11;
 
   /**
    * `canvas`: the output. By default the runtime sizes its backing store:
@@ -96,19 +97,20 @@ export class CompositorWindows extends EventTarget {
    * whose pixels are then sampled down. `scale`, a number: that scale, and
    * the page sizes the backing store itself (the output's size in device
    * pixels) and calls `resize`; `scale: 1` is a page that is not HiDPI. The
-   * canvas's control goes to the compositor's Worker. `x11`: 'rootless' (the default), each X window a
-   * window of the desktop, placed by the runtime's window manager; or
-   * 'rootful', one X screen filling the output, run by the session's own
+   * canvas's control goes to the compositor's Worker. `x11`: X11 programs'
+   * display, none unless asked (no `DISPLAY` in `env`): 'rootless', each X
+   * window a window of the desktop, placed by the runtime's window manager;
+   * or 'rootful', one X screen filling the output, run by the session's own
    * window manager (kwin_x11 and the like). `background`: the desktop
    * behind the windows, a colour ('#rrggbb') or `{ color, image, anchor }`:
    * `image` a URL or a Blob, covering the output, `anchor` the edge that
    * always shows ('top', 'center', the default, or 'bottom'); the colour
    * shows until the image is in.
    */
-  constructor(sys, { canvas, scale, x11 = 'rootless', background = null } = {}) {
+  constructor(sys, { canvas, scale, x11 = null, background = null } = {}) {
     super();
     if (typeof canvas?.getContext !== 'function') throw new TypeError('CompositorWindows: a canvas');
-    if (x11 !== 'rootless' && x11 !== 'rootful') throw new TypeError("CompositorWindows: x11 is 'rootless' or 'rootful'");
+    if (x11 !== null && x11 !== 'rootless' && x11 !== 'rootful') throw new TypeError("CompositorWindows: x11 is 'rootless', 'rootful' or null");
     const bg = backgroundOf(background);
     const i = internals(sys, 'CompositorWindows');
     i.attach('windows', this, { beforeBoot: true });
@@ -137,7 +139,8 @@ export class CompositorWindows extends EventTarget {
       if (auto) this.#follow(canvas);
     });
     const x = { rootful: x11 === 'rootful' };
-    xOnDemand(i, x);
+    if (x11) xOnDemand(i, x);
+    this.#x11 = !!x11;
     this[INTERNAL] = {
       x,
       of: () => [],
@@ -215,9 +218,10 @@ export class CompositorWindows extends EventTarget {
     };
   }
 
-  /** What a program needs to reach this compositor and the X display. */
+  /** What a program needs to reach this compositor, and the X display when
+   *  there is one. */
   get env() {
-    return { XDG_RUNTIME_DIR: '/tmp', WAYLAND_DISPLAY: 'wayland-0', DISPLAY: ':0' };
+    return xEnv(this.#x11);
   }
 
   /** The output's new size, in device pixels. */

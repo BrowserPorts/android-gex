@@ -19,7 +19,7 @@ export default async function (t) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
   new MemoryFilesystem(sys).addTar(t.work('bb.tar.zst'));
   const canvas = document.getElementById('out');
-  const out = new CompositorWindows(sys, { canvas });
+  const out = new CompositorWindows(sys, { canvas, x11: 'rootless' });
   await timeout(sys.boot(), 60000, 'boot');
   const p = sys.spawn(['rt-x11', 'clicked', 'at'], { env: { PATH: '/bin', HOME: '/root', ...out.env } });
   const said = lines(p);

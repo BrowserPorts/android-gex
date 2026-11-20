@@ -13,7 +13,7 @@ export default async function (t) {
   const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
   const app = document.getElementById('app');
-  const out = new SingleCanvas(sys, { container: app });
+  const out = new SingleCanvas(sys, { container: app, x11: 'rootless' });
   await timeout(sys.boot(), 60000, 'boot');
   const env = { PATH: '/bin', ...out.env };
   const p = sys.spawn(['rt-wl', 'single'], { env });

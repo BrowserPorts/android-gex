@@ -26,7 +26,6 @@ export default async function (t) {
   new MesaGl(sys);
   await t.time('boot', () => t.timeout(sys.boot(), 120000, 'boot'));
   const env = { ...out.env, HOME: '/root', PATH: '/usr/bin:/bin', SHELL: '/bin/bash', TERM: 'xterm-256color' };
-  delete env.DISPLAY;
   const id = await sys.run(['/usr/bin/id'], { env });
   say(`id: ${id.stdout.trim()}`);
   const p = sys.spawn(['/usr/bin/fresnel-gpui'], { env });

@@ -36,7 +36,6 @@ export default async function (t) {
   eq('apt-get update', (await run(['apt-get', 'update'])).code, 0);
   eq('apt-get install fresnel', (await t.time('install', () => run(['apt-get', 'install', '-y', 'fresnel']))).code, 0);
   const env = { ...out.env, ...base, SHELL: '/bin/bash', TERM: 'xterm-256color' };
-  delete env.DISPLAY;
   const p = sys.spawn(['/usr/bin/fresnel-gpui'], { env });
   const o = t.lines(p);
   const err = t.lines(p, p.stderr);

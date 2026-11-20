@@ -19,7 +19,7 @@ export async function glWindow(t, probe, more = () => {}) {
   if (!(await fetch(t.work('gl-probes-x86.tar'), { method: 'HEAD' })).ok) return t.skip('no gl-probes-x86.tar (fixtures/images.mjs)');
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
   new MemoryFilesystem(sys).addTar(t.work('gl-probes-x86.tar'));
-  const hw = new HostWindows(sys, { width: 800, height: 600, scale: 1 });
+  const hw = new HostWindows(sys, { width: 800, height: 600, scale: 1, x11: 'rootless' });
   new MesaGl(sys);
   const desk = document.getElementById('desk');
   const wins = [];

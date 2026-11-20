@@ -25,7 +25,6 @@ export default async function (t) {
   new MesaGl(sys);
   await t.time('boot', () => t.timeout(sys.boot(), 120000, 'boot'));
   const env = { ...out.env, HOME: '/root', PATH: '/usr/bin:/bin', SHELL: '/bin/bash', TERM: 'xterm-256color', ZED_ALLOW_EMULATED_GPU: '1', ZED_ALLOW_ROOT: 'true', ZED_LOG: 'info' };
-  delete env.DISPLAY;
   const p = sys.spawn(['/usr/bin/zed', '/work/hello.rs'], { env });
   const o = t.lines(p);
   const err = t.lines(p, p.stderr);

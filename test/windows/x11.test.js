@@ -12,7 +12,7 @@ export default async function (t) {
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
   const fs = new MemoryFilesystem(sys);
   fs.addTar(t.work('bb.tar.zst'));
-  const hw = new HostWindows(sys, { width: 800, height: 600, scale: 1 });
+  const hw = new HostWindows(sys, { width: 800, height: 600, scale: 1, x11: 'rootless' });
   const desk = document.getElementById('desk');
   const wins = [];
   hw.addEventListener('window', (e) => {

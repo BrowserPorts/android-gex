@@ -110,7 +110,7 @@ const PHASES = [
   } },
   { blocks: [15], windows: true, pre: 'new', check: async (t, v) => {
     t.eq('windows: running', v.sys.state.phase, 'running');
-    t.check('windows: hw.env', !!v.hw.env.WAYLAND_DISPLAY, JSON.stringify(v.hw.env));
+    t.check('windows: hw.env, with no X display unless asked', !!v.hw.env.WAYLAND_DISPLAY && !('DISPLAY' in v.hw.env), JSON.stringify(v.hw.env));
   } },
   { blocks: [16], pre: 'booted', single: 'the drop Worker needs the shared kernel',
     page: "const { HostDrop } = M['@gexemu/runtime/drop']; const windows = undefined;", check: async (t, v) => {

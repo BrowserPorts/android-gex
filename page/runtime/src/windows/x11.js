@@ -3,6 +3,13 @@
 // runtime.js `startXServer`) started on those sockets, where the client
 // waits.
 
+/** A windows part's `env`: its compositor's, and display :0 when it has X
+ *  (its `x11` option; a program finding `DISPLAY` would try X first, Wine's
+ *  driver among them, and wait for the server). */
+export function xEnv(x11) {
+  return x11 ? { XDG_RUNTIME_DIR: '/tmp', WAYLAND_DISPLAY: 'wayland-0', DISPLAY: ':0' } : { XDG_RUNTIME_DIR: '/tmp', WAYLAND_DISPLAY: 'wayland-0' };
+}
+
 /** Arm it for a system's internals `i`, once the system runs. `x`: what a
  *  preset asks of the server (a test page's runProgram): `rootful`, one
  *  fullscreen X screen under the session's own window manager (hostx.js). */

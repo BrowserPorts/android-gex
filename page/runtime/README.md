@@ -53,7 +53,7 @@ const sys = new System({ xcache: true });              // translated code kept a
 const fs = new OPFSFilesystem(sys, { name: 'debian' }); // the root, kept in the page's OPFS
 fs.addTar('/gex-trees/debian.tar.zst', { lazy: '/gex-trees/debian-lazy.json' });
 sys.network = new Wisp('wss://wisp.example/');        // connections out (see Network)
-const hw = new HostWindows(sys, { width: innerWidth, height: innerHeight });
+const hw = new HostWindows(sys, { width: innerWidth, height: innerHeight, x11: 'rootless' });
 await sys.boot();
 ```
 
@@ -106,8 +106,10 @@ Then wire it to the desktop's window manager:
   `pid` its program (`process.windows()` goes the other way), so a taskbar
   groups windows and matches them to the launcher's entries.
 
-An X11 program needs nothing more: `DISPLAY` is in `hw.env`, and the
-runtime starts its X server for the first client. When the desktop's work
+An X11 program needs `x11: 'rootless'`, as above: `DISPLAY` is then in
+`hw.env`, and the runtime starts its X server for the first client. Without
+it there is no X display, and a program that tries X first (Wine's driver)
+goes straight to Wayland. When the desktop's work
 area changes, call `hw.setOutputSize(width, height)`.
 
 **The desktop's files.** `fs.mount('/mnt/desktop', provider)` shows a
@@ -740,9 +742,9 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 
 | Member | Does |
 | --- | --- |
-| `new HostWindows(sys, { width, height, scale })` | The output programs see as their screen, in CSS pixels (default the viewport) and device pixels per CSS pixel (default `devicePixelRatio`, rounded). |
+| `new HostWindows(sys, { width, height, scale, x11 })` | The output programs see as their screen, in CSS pixels (default the viewport) and device pixels per CSS pixel (default `devicePixelRatio`, rounded). `x11: 'rootless'` gives X11 programs a display; none by default. |
 | `setOutputSize(width, height, scale)` | When the page's desktop changes size. |
-| `env` | `{ XDG_RUNTIME_DIR, WAYLAND_DISPLAY, DISPLAY }` for `spawn`. |
+| `env` | `{ XDG_RUNTIME_DIR, WAYLAND_DISPLAY }` for `spawn`, and `DISPLAY` with `x11`. |
 | `windows()`, `focused` | Every window; the one with the keyboard. |
 | `keyEvent(e, pressed)` | A `keydown`/`keyup` heard elsewhere (the frame), for the window with the keyboard. |
 | `window` event | `{ window }`: a new `GuestWindow`. A `cursor` event (`css`) when the client's cursor changes; it is also set on every window's canvas. |
@@ -767,21 +769,23 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 
 ### SingleCanvas (`@gexemu/runtime/windows/single`)
 
-`new SingleCanvas(sys, { container })`: the windows drawn straight into one
+`new SingleCanvas(sys, { container, x11 })`: the windows drawn straight into one
 positioned element, unframed, the first at its corner, popups over their
 parents, a window its client places (Wine's) where it says. The element's size
 is the output's; call `resized()` after changing it. For a page that is one
-program (a game, a Win32 program that draws its own frames). `env`,
+program (a game, a Win32 program that draws its own frames). `x11: 'rootless'`
+gives X11 programs a display, none by default. `env`,
 `describe()` and a `change` event as windows come and go.
 
 ### CompositorWindows (`@gexemu/runtime/windows/compositor`)
 
 `new CompositorWindows(sys, { canvas, scale, x11, background })`: the whole desktop in one
 canvas, drawn by gex's scene compositor on WebGPU in a Worker: frames, title
-bars, stacking, the cursor. `x11` is `'rootless'` (the default: each X window
-is a desktop window, placed by the runtime's window manager) or `'rootful'`
-(one X screen fills the canvas and the session runs its own window manager,
-as a KDE or Xfce session does). `background` is the desktop behind the
+bars, stacking, the cursor. `x11` gives X11 programs a display (none by
+default, and no `DISPLAY` in `env`): `'rootless'` (each X window is a desktop
+window, placed by the runtime's window manager) or `'rootful'` (one X screen
+fills the canvas and the session runs its own window manager, as a KDE or
+Xfce session does). `background` is the desktop behind the
 windows: a colour (`'#rrggbb'`) or `{ color, image, anchor }`, `image` a URL
 or a `Blob` covering the canvas, `anchor` the edge that always shows
 (`'top'`, `'center'`, the default, or `'bottom'`); the colour shows until the

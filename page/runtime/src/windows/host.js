@@ -5,7 +5,7 @@
 // into their own canvases, input taken from each.
 
 import { INTERNAL, internals } from '../internal.js';
-import { xOnDemand } from './x11.js';
+import { xEnv, xOnDemand } from './x11.js';
 import { mirrored } from './mirrored.js';
 
 const KINDS = { 1: 'toplevel', 2: 'popup', 3: 'subsurface' };
@@ -174,6 +174,7 @@ export class HostWindows extends EventTarget {
   #mount = null;
   #size;
   #wins = new Map();
+  #x11;
 
   /**
    * The guest's windows, each handed to the page (`window` event) to frame
@@ -181,17 +182,20 @@ export class HostWindows extends EventTarget {
    * program asking for the screen's size sees (default the viewport);
    * `scale`: device pixels per CSS pixel (default devicePixelRatio, not
    * rounded: 1.5 is 1.5).
-   * X11 programs' windows come as any other, through the runtime's X server,
-   * started for the first of them.
+   * `x11`: 'rootless' for X11 programs, whose windows then come as any
+   * other, through the runtime's X server, started for the first of them;
+   * none unless asked (no `DISPLAY` in `env`).
    */
-  constructor(sys, { width, height, scale } = {}) {
+  constructor(sys, { width, height, scale, x11 = null } = {}) {
     super();
     const i = internals(sys, 'HostWindows');
     i.attach('windows', this, { beforeBoot: true });
     this.#i = i;
     this.#size = this.#fit(width, height, scale);
+    if (x11 !== null && x11 !== 'rootless') throw new TypeError("HostWindows: x11 is 'rootless' or null");
     const x = {};
-    xOnDemand(i, x);
+    if (x11) xOnDemand(i, x);
+    this.#x11 = !!x11;
     i.devices(async (dev) => {
       // DomDesktop's element: where it would listen for keys and set the
       // cursor. Out of sight: the windows are the page's, wherever it puts
@@ -235,10 +239,10 @@ export class HostWindows extends EventTarget {
     };
   }
 
-  /** The environment a program needs to reach this compositor and the X
-   *  display: add it to `spawn`'s `env`. */
+  /** The environment a program needs to reach this compositor, and the X
+   *  display when there is one: add it to `spawn`'s `env`. */
   get env() {
-    return { XDG_RUNTIME_DIR: '/tmp', WAYLAND_DISPLAY: 'wayland-0', DISPLAY: ':0' };
+    return xEnv(this.#x11);
   }
 
   /** The output's new size (CSS pixels) and scale, when the page's desktop
