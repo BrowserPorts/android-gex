@@ -523,6 +523,11 @@ class Compositor {
   /** Uploads made and their bytes, those of whole buffers among them, and
    *  damage left out as unchanged (`describe().uploads`). */
   #uploadStats = { n: 0, bytes: 0, same: 0, full: 0, fullBytes: 0 };
+  // Frames acked so far (`#ack`). A texture's `at` is the count when it was
+  // last brought up to its surface's commit: one made current in the frame
+  // of the last ack has every commit up to that ack, and the bridge merges
+  // the damage of the commits published since (wl-bridge's mergeDamage).
+  #acks = 0;
   /** A short history of what the scene did, for when a picture is not enough. */
   #log = [];
   /**
@@ -1051,7 +1056,7 @@ class Compositor {
       t = null;
     }
     if (!t) {
-      t = { tex: gpuTexture(this.#device, w, h), w, h, serial: 0, version: 0, last: null };
+      t = { tex: gpuTexture(this.#device, w, h), w, h, serial: 0, version: 0, last: null, at: -1 };
       this.#textures.set(k, t);
     }
     return t;
@@ -1076,7 +1081,14 @@ class Compositor {
     const mem = this.#pixelsOf(s);
     if (!mem) return false;
     const t = this.#texture(k, s.width, s.height);
-    const full = s.damage.w <= 0 || s.damage.h <= 0 || t.serial === 0 || s.serial !== t.serial + 1;
+    // A commit or more the compositor did not see (two between its frames,
+    // or a single-thread page's mirror that coalesced them) is no reason for
+    // the whole buffer: the record's damage is all of theirs since the last
+    // ack, which covers them if the texture was current at that ack. One
+    // that was not (an upload that could not read, a frame presented
+    // directly) takes the whole buffer.
+    const missed = s.serial !== t.serial + 1 && !(s.serial > t.serial && t.at === this.#acks - 1);
+    const full = s.damage.w <= 0 || s.damage.h <= 0 || t.serial === 0 || missed;
     let x = 0;
     let y = 0;
     let w = s.width;
@@ -1089,6 +1101,7 @@ class Compositor {
     }
     if (w <= 0 || h <= 0) {
       t.serial = s.serial;
+      t.at = this.#acks;
       return true;
     }
     const start = s.addr + y * s.stride + x * 4;
@@ -1135,6 +1148,7 @@ class Compositor {
       if (l && l.x === x && l.y === y && l.w === w && l.h === h && sameBytes(l.px, view)) {
         this.#uploadStats.same++;
         t.serial = s.serial;
+        t.at = this.#acks;
         return true;
       }
       if (l && l.px.length === packed) l.px.set(view);
@@ -1164,6 +1178,7 @@ class Compositor {
     }
     t.version++;
     t.serial = s.serial;
+    t.at = this.#acks;
     return true;
   }
 
@@ -1320,6 +1335,12 @@ class Compositor {
     return sceneStill(this.#channel, this.#marks);
   }
 
+  /** Say the arena's blocks up to their `gen`s are drawn (`#acks`). */
+  #ack(blocks) {
+    for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+    this.#acks++;
+  }
+
   #mark(blocks) {
     sceneMark(this.#marks, blocks);
     this.#markedTouch = this.#touched;
@@ -1385,7 +1406,7 @@ class Compositor {
       this.#note(`direct present ${d.w}x${d.h} (${d.k})`);
     }
     this.#direct = { k: d.k, w: d.w, h: d.h, ox: d.ox, oy: d.oy };
-    for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+    this.#ack(blocks);
     this.#mark(blocks);
     if (d.gl.serial === this.#directSerial) {
       this.#skipped++;
@@ -1527,7 +1548,10 @@ class Compositor {
     for (const [k, s] of byKey) {
       if (s.role === ROLE_CURSOR) continue; // the page's cursor, not a texture
       const t = this.#textures.get(k);
-      if (t && t.serial === s.serial) continue;
+      if (t && t.serial === s.serial) {
+        t.at = this.#acks;
+        continue;
+      }
       if (!this.#upload(k, s)) unread = true;
     }
     // Nothing on the output changed (no new GL frame either): draw nothing,
@@ -1536,7 +1560,7 @@ class Compositor {
     // wasted work everywhere else.
     const sig = this.#signature();
     if (sig !== null && sig === this.#lastSig) {
-      for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+      this.#ack(blocks);
       if (!unread) this.#mark(blocks);
       this.#skipped++;
       return;
@@ -1568,7 +1592,7 @@ class Compositor {
     // so there is one pointer on the screen and it moves at the browser's rate.
     this.#painter.end();
     console.timeStamp('gex:drawn');
-    for (const b of blocks) ackBlock(this.#channel, b.block, b.gen);
+    this.#ack(blocks);
     if (!unread) this.#mark(blocks);
     this.#frames++;
     if (this.#stats) {
