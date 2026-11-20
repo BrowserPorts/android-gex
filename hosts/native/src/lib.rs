@@ -4095,6 +4095,7 @@ fn mount_filesystems(
     }
     // A native host has real sockets, so the guest gets a real network.
     kernel.net = Some(Arc::new(HostNet));
+    forward_host_ports(&kernel.ports)?;
     // The process's own: every process has a /proc made of its own state.
     kernel.vfs.mount_own(
         "/proc",
@@ -4454,6 +4455,112 @@ fn sampler_for(opts: &RunOptions) -> Option<Arc<Sampler>> {
             Some(s)
         })
         .clone()
+}
+
+/// `GEX_HOST_FORWARD=PORT[:GUEST_PORT],...`: the host listens on
+/// 127.0.0.1:PORT and takes each connection to the guest's listener on
+/// GUEST_PORT (the same by default), as the emulator forwards a host port to
+/// the guest's adbd. Guests' listeners are the kernel's own (`net::Ports`);
+/// without this nothing off the guest reaches them. A connection made while
+/// nothing listens there is closed at once, as a refused one.
+fn forward_host_ports(ports: &Arc<gex_kernel::net::Ports>) -> Result<()> {
+    let Ok(spec) = std::env::var("GEX_HOST_FORWARD") else {
+        return Ok(());
+    };
+    for item in spec.split(',').filter(|s| !s.is_empty()) {
+        let (host, guest) = item.split_once(':').unwrap_or((item, item));
+        let (Ok(host), Ok(guest)) = (host.parse::<u16>(), guest.parse::<u16>()) else {
+            bail!("GEX_HOST_FORWARD: '{item}' is not PORT or PORT:GUEST_PORT");
+        };
+        let listener = std::net::TcpListener::bind(("127.0.0.1", host)).with_context(|| format!("GEX_HOST_FORWARD: listening on 127.0.0.1:{host}"))?;
+        eprintln!("[gex] forwarding 127.0.0.1:{host} to the guest's port {guest}");
+        let ports = Arc::clone(ports);
+        std::thread::Builder::new().name(format!("gex-forward-{host}")).spawn(move || {
+            for stream in listener.incoming().flatten() {
+                match ports.connect_from_host(guest) {
+                    Ok(end) => {
+                        let _ = std::thread::Builder::new().name(format!("gex-forward-{host}-conn")).spawn(move || pump_forward(stream, end));
+                    }
+                    Err(_) => drop(stream),
+                }
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Carries one forwarded connection both ways until both directions have
+/// ended. The guest's end is polled, as every loopback end is (it has no
+/// wait queue); a pass that moved nothing sleeps a moment.
+fn pump_forward(mut stream: std::net::TcpStream, end: Arc<gex_kernel::net::LoopEnd>) {
+    use gex_kernel::errno::Errno;
+    use gex_kernel::net::Transport;
+    use std::io::{ErrorKind, Read, Write};
+    if stream.set_nonblocking(true).is_err() {
+        end.close();
+        return;
+    }
+    let mut buf = vec![0u8; 64 << 10];
+    let (mut host_done, mut guest_done) = (false, false);
+    // What the guest has not taken yet, and what the host has not.
+    let (mut to_guest, mut to_host): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+    while !(host_done && guest_done) || !to_host.is_empty() {
+        let mut moved = false;
+        if !host_done && to_guest.is_empty() {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    host_done = true;
+                    let _ = end.shutdown(1);
+                    moved = true;
+                }
+                Ok(n) => {
+                    to_guest.extend_from_slice(&buf[..n]);
+                    moved = true;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        if !to_guest.is_empty() {
+            match end.send(&to_guest) {
+                Ok(n) => {
+                    to_guest.drain(..n);
+                    moved |= n > 0;
+                }
+                Err(Errno::EAGAIN) => {}
+                Err(_) => break,
+            }
+        }
+        if !guest_done && to_host.is_empty() {
+            match end.recv(&mut buf) {
+                Ok(0) => {
+                    guest_done = true;
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    moved = true;
+                }
+                Ok(n) => {
+                    to_host.extend_from_slice(&buf[..n]);
+                    moved = true;
+                }
+                Err(Errno::EAGAIN) => {}
+                Err(_) => break,
+            }
+        }
+        if !to_host.is_empty() {
+            match stream.write(&to_host) {
+                Ok(n) => {
+                    to_host.drain(..n);
+                    moved |= n > 0;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        if !moved {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    end.close();
 }
 
 /// The guest's network, as the host's real sockets. The kernel does its own

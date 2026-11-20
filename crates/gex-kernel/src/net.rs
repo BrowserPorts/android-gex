@@ -570,6 +570,22 @@ impl Ports {
         self.listeners.lock().unwrap().get(&port).and_then(|w| w.upgrade())
     }
 
+    /// A connection from the host to a port a guest listens on: the host
+    /// forwarding a port of its own in, as the emulator forwards adb's. The
+    /// guest's end is queued for the listener's `accept`, from an ephemeral
+    /// port of the loopback; the host's end is returned. `ECONNREFUSED` when
+    /// nothing listens there.
+    pub fn connect_from_host(&self, port: u16) -> Result<Arc<LoopEnd>, Errno> {
+        let listener = self.listener(port).ok_or(Errno::ECONNREFUSED)?;
+        let (mine, theirs) = LoopEnd::pair();
+        let from = self.ephemeral();
+        match &mut *listener.backlog.lock().unwrap() {
+            Some(q) => q.push_back((theirs, from)),
+            None => return Err(Errno::ECONNREFUSED),
+        }
+        Ok(mine)
+    }
+
     fn udp_at(&self, port: u16) -> Option<Arc<Socket>> {
         self.udp.lock().unwrap().get(&port).and_then(|w| w.upgrade())
     }

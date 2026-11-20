@@ -51,6 +51,45 @@ check() {
     fi
 }
 
+# hostfwd <program>: fwdecho, with this script as the host connecting to it.
+hostfwd() {
+    port=18555
+    out="$ERR/$1.out"
+    : >"$out"
+    if [ "$GEXC" = native ]; then
+        "$HERE/bin/$1" "$port" >"$out" 2>"$ERR/$1.err" &
+    else
+        GEX_HOST_FORWARD=$port "$GEXC" run "$HERE/bin/$1" "$port" >"$out" 2>"$ERR/$1.err" &
+    fi
+    pid=$!
+    i=0
+    until grep -q listening "$out" || [ $i -ge 600 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    got=$(python3 -I -c '
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=30)
+s.sendall(b"hello, guest")
+s.shutdown(socket.SHUT_WR)
+d = b""
+while True:
+    b = s.recv(4096)
+    if not b:
+        break
+    d += b
+print(d.decode())
+' "$port" 2>>"$ERR/$1.err")
+    wait "$pid"
+    status=$?
+    last=$(tail -1 "$out")
+    if [ "$status" -eq 0 ] && [ "$last" = "fwdecho ok 12" ] && [ "$got" = "HELLO, GUEST" ]; then
+        echo "PASS $1"
+    else
+        echo "FAIL $1: exit $status, last line '$last', the host got '$got'; stderr in $ERR/$1.err"
+        fail=1
+    fi
+}
 # run <program>, or low/<program> for the one linked at the default base
 # gtest <name>: one of AOSP's tests (aosp/build.sh), with binderhost as
 # the context manager a device would have. It passes when it exits 0 and
@@ -146,6 +185,9 @@ run() {
     ctlsock) check "$1" "ctlsock ok" 0 root ;;
     # The emulator's services over vsock are the kernel's only when asked.
     vsock) GEX_EMULATOR_HOST=1 check "$1" "vsock ok" 0 ;;
+    # A guest's listener reached from the host: natively by connecting to
+    # it, under gex through the host's forward of a port (GEX_HOST_FORWARD).
+    fwdecho) hostfwd "$1" ;;
     psi) check "$1" "psi ok" 0 root ;;
     ctty) check "$1" "ctty ok" 0 ;;
     apexns) check "$1" "apexns ok" 0 root ;;
@@ -200,7 +242,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock fwdecho"
     for p in $all; do
         run "$p"
     done
