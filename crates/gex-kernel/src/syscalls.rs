@@ -2457,6 +2457,9 @@ impl FdIo<'_> {
     /// `sendmsg`, which is how glibc writes to a socket, and the only way to
     /// pass a descriptor to another process.
     pub fn sendmsg(&self, m: &GuestMem<'_>, fd: i32, msg: u64) -> SysResult {
+        if self.vsock_of(fd).is_ok() {
+            return Err(crate::vsock::not_here("sendmsg", Errno::EOPNOTSUPP));
+        }
         // `msg_name` is where this one goes, and a reply has to be reported
         // as having come from there or a resolver drops it as spoofed.
         let name = self.msg_rd(m, msg, 0)?;
@@ -2670,6 +2673,9 @@ impl FdIo<'_> {
     }
 
     pub fn recvmsg(&self, m: &mut GuestMem<'_>, fd: i32, msg: u64, flags: u64) -> SysResult {
+        if self.vsock_of(fd).is_ok() {
+            return Err(crate::vsock::not_here("recvmsg", Errno::EOPNOTSUPP));
+        }
         let peek = flags & Kernel::MSG_PEEK != 0;
         let iov = self.msg_rd(m, msg, 2)?;
         let iovlen = self.msg_rd(m, msg, 3)?;
@@ -2871,6 +2877,10 @@ impl FdIo<'_> {
     }
 
     /// The netlink socket behind a descriptor.
+    pub(crate) fn vsock_of(&self, fd: i32) -> Result<Arc<crate::vsock::Socket>, Errno> {
+        Arc::clone(&self.fds.get(fd)?.handle).as_vsock().ok_or(Errno::ENOTSOCK)
+    }
+
     pub(crate) fn netlink_of(&self, fd: i32) -> Result<Arc<crate::netlink::Socket>, Errno> {
         Arc::clone(&self.fds.get(fd)?.handle).as_netlink().ok_or(Errno::ENOTSOCK)
     }
@@ -6092,6 +6102,25 @@ impl NetIo<'_> {
             // A unix socket and an internet socket are different concrete
             // types behind the same descriptor, so which `connect` this is
             // depends on what the descriptor turned out to be.
+            // A vsock stream (crate::vsock): to the emulator's services.
+            nr::CONNECT if io.vsock_of(fd).is_ok() => {
+                let sock = io.vsock_of(fd)?;
+                if io.fds.get(fd)?.flags() & oflags::O_NONBLOCK != 0 {
+                    return Err(crate::vsock::not_here("a connect that does not wait", Errno::EINPROGRESS));
+                }
+                let addr = m.read(a[1], (a[2] as usize).min(128))?.to_vec();
+                sock.connect(&addr).map(|_| 0)
+            }
+            nr::GETSOCKNAME | nr::GETPEERNAME if io.vsock_of(fd).is_ok() => {
+                let sock = io.vsock_of(fd)?;
+                let name = if n == nr::GETSOCKNAME { sock.name() } else { sock.peer_name()? };
+                let len = m.read_u32(a[2])? as usize;
+                m.write(a[1], &name[..len.min(name.len())])?;
+                m.write_u32(a[2], name.len() as u32)?;
+                Ok(0)
+            }
+            nr::SHUTDOWN if io.vsock_of(fd).is_ok() => io.vsock_of(fd)?.shutdown(a[1]),
+            nr::BIND | nr::LISTEN | nr::ACCEPT | nr::ACCEPT4 if io.vsock_of(fd).is_ok() => Err(crate::vsock::not_here("bind, listen and accept", Errno::EOPNOTSUPP)),
             nr::CONNECT if io.netlink_of(fd).is_ok() => {
                 let sock = io.netlink_of(fd)?;
                 // To `AF_UNSPEC`: connected to nothing again.
@@ -6356,6 +6385,21 @@ impl NetIo<'_> {
             sock.set_nonblocking(nonblock);
             let flags = if nonblock { oflags::O_NONBLOCK } else { 0 };
             return install_unix(io, sock, flags, ty & SOCK_CLOEXEC != 0);
+        }
+        // AF_VSOCK (crate::vsock): streams to the emulator's services, when
+        // the kernel has them.
+        if domain == crate::vsock::AF_VSOCK && crate::vsock::enabled() {
+            const SOCK_STREAM: u64 = 1;
+            if protocol != 0 && protocol != crate::vsock::AF_VSOCK {
+                return Err(Errno::EPROTONOSUPPORT);
+            }
+            if ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != SOCK_STREAM {
+                return Err(crate::vsock::not_here("a vsock socket that is not a stream", Errno::ESOCKTNOSUPPORT));
+            }
+            let handle: Arc<dyn crate::vfs::FileHandle> = crate::vsock::Socket::new();
+            let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
+            let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+            return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
         }
         // AF_NETLINK (crate::netlink): NETLINK_ROUTE, which answers its
         // interface and address dumps (musl's if_nameindex and getifaddrs,
@@ -6704,6 +6748,14 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
         };
         return d.send_to(&data, to.as_deref(), Some(io.cred()));
     }
+    // A vsock stream takes no destination (`vsock_connectible_sendmsg`).
+    if let Ok(sock) = io.vsock_of(fd) {
+        if dest != 0 && dest_len != 0 {
+            return Err(if sock.connected() { Errno::EISCONN } else { Errno::EOPNOTSUPP });
+        }
+        let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
+        return crate::vfs::FileHandle::write_at(&*sock, 0, &data);
+    }
     if let Ok(sock) = io.netlink_of(fd) {
         let to = if dest != 0 && dest_len != 0 { Some(FdIo::read_sockaddr_nl(m, dest, dest_len)?) } else { None };
         let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
@@ -6740,6 +6792,15 @@ fn recvfrom(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, fl
         }
         const MSG_TRUNC: u64 = 0x20;
         return Ok(if flags & MSG_TRUNC != 0 { whole } else { n } as u64);
+    }
+    // A vsock stream: its peer's name is not given (`msg_namelen` 0).
+    if let Ok(sock) = io.vsock_of(fd) {
+        let n = sock.recv(&mut tmp, flags & Kernel::MSG_PEEK != 0)? as usize;
+        m.write(buf, &tmp[..n])?;
+        if addr != 0 && addrlen != 0 {
+            m.write_u32(addrlen, 0)?;
+        }
+        return Ok(n as u64);
     }
     if let Ok(sock) = io.netlink_of(fd) {
         const MSG_TRUNC: u64 = 0x20;
@@ -6879,6 +6940,9 @@ fn socket_family_type(io: &FdIo<'_>, fd: i32) -> Result<(u64, u32), Errno> {
     }
     if let Ok(s) = io.netlink_of(fd) {
         return Ok((16, s.kind()));
+    }
+    if io.vsock_of(fd).is_ok() {
+        return Ok((crate::vsock::AF_VSOCK, SOCK_STREAM));
     }
     if let Ok(s) = io.unix_of(fd) {
         const SOCK_SEQPACKET: u32 = 5;

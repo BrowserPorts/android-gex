@@ -44,6 +44,8 @@ pub mod block;
 pub mod loopdev;
 pub mod dm;
 pub mod drm;
+pub mod emuhost;
+pub mod vsock;
 pub mod drm_modes;
 pub mod syncfile;
 pub mod file;

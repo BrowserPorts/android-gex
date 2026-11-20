@@ -694,6 +694,10 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_syncfile(self: Arc<Self>) -> Option<Arc<crate::syncfile::SyncFile>> {
         None
     }
+    /// A vsock socket ([`crate::vsock`]).
+    fn as_vsock(self: Arc<Self>) -> Option<Arc<crate::vsock::Socket>> {
+        None
+    }
     /// A signalfd, whose mask `signalfd4` on it changes.
     fn as_signalfd(self: Arc<Self>) -> Option<Arc<crate::signalfd::SignalFd>> {
         None

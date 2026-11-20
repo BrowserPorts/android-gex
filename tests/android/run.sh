@@ -144,6 +144,8 @@ run() {
     rndbits) check "$1" "rndbits ok" 0 root ;;
     oomadj) check "$1" "oomadj ok" 0 root ;;
     ctlsock) check "$1" "ctlsock ok" 0 root ;;
+    # The emulator's services over vsock are the kernel's only when asked.
+    vsock) GEX_EMULATOR_HOST=1 check "$1" "vsock ok" 0 ;;
     psi) check "$1" "psi ok" 0 root ;;
     ctty) check "$1" "ctty ok" 0 ;;
     apexns) check "$1" "apexns ok" 0 root ;;
@@ -198,7 +200,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock"
     for p in $all; do
         run "$p"
     done
