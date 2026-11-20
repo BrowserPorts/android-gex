@@ -18,6 +18,8 @@
 # only root reads: gexc is run on it as root (compare.sh and the rest do),
 # and then says of each file the owner the image gave it. It leaves /proc
 # mounted and /dev bound in the root: unmount both before removing it.
+# WORK/owners.txt gets every file's owner, which owners-to-xattr.py reads
+# for a copy of the tree on a host gexc does not run on as root.
 set -eu
 HERE=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 IMAGE=$1
@@ -57,4 +59,5 @@ sudo env -i PATH=/system/bin /usr/sbin/chroot "$ROOT" /apex/com.android.runtime/
 # As init.rc makes them: /data/local for root, /data/local/tmp for shell.
 sudo install -d -o 0 -g 0 -m 0751 "$ROOT/data/local"
 sudo install -d -o 2000 -g 2000 -m 0771 "$ROOT/data/local/tmp"
+(cd "$ROOT" && sudo find . -xdev -printf '%U %G %p\n') >"$WORK/owners.txt"
 echo "$ROOT"

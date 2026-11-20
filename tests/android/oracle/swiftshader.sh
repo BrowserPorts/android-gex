@@ -6,7 +6,7 @@
 #   androidboot.hardwareegl = "angle"
 #   androidboot.hardware.vulkan = "pastel"
 #   androidboot.opengles.version = "196610"
-# (boot-mac.sh with CONFIG naming a boot configuration that says so). The
+# (bootconfig, which boot.sh uses, says so). The
 # image's own GLES (libEGL_emulation, vulkan.ranchu) is the emulator's
 # host-GPU pipe, which gex does not have.
 #
