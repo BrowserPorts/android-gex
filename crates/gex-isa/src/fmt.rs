@@ -856,6 +856,13 @@ pub fn disasm(inst: &Inst, _pc: u64) -> String {
         Inst::FpConvertPrecision { from, to, vd, vn } => {
             format!("fcvt {}, {}", freg(vd, to), freg(vn, from))
         }
+        Inst::FpConvertHalf { to_half, other, vd, vn } => {
+            if to_half {
+                format!("fcvt h{}, {}", vd.0, freg(vn, other))
+            } else {
+                format!("fcvt {}, h{}", freg(vd, other), vn.0)
+            }
+        }
         Inst::FpFromInt {
             sz,
             int_sz,
@@ -1816,6 +1823,12 @@ fn vop3_name(op: VOp3) -> &'static str {
         VOp3::FMin => "fmin",
         VOp3::FMaxNm => "fmaxnm",
         VOp3::FMinNm => "fminnm",
+        VOp3::FMaxP => "fmaxp",
+        VOp3::FMinP => "fminp",
+        VOp3::FMaxNmP => "fmaxnmp",
+        VOp3::FMinNmP => "fminnmp",
+        VOp3::FAcGe => "facge",
+        VOp3::FAcGt => "facgt",
         VOp3::FAddP => "faddp",
         VOp3::FMla => "fmla",
         VOp3::FMls => "fmls",
@@ -1847,6 +1860,7 @@ fn vop2_name(op: VOp2) -> &'static str {
         VOp2::FSqrt => "fsqrt",
         VOp2::FRecpe => "frecpe",
         VOp2::FRSqrtE => "frsqrte",
+        VOp2::FRecpx => "frecpx",
         VOp2::FrintN => "frintn",
         VOp2::FrintP => "frintp",
         VOp2::FrintM => "frintm",

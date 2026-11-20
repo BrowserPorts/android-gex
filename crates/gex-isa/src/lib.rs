@@ -745,6 +745,14 @@ pub enum Inst {
         vd: VReg,
         vn: VReg,
     },
+    /// `fcvt` between half precision (`h` registers) and single or double:
+    /// to half when `to_half`, from it otherwise.
+    FpConvertHalf {
+        to_half: bool,
+        other: FpSz,
+        vd: VReg,
+        vn: VReg,
+    },
     /// `scvtf`/`ucvtf`: integer register to float register.
     /// `scvtf`/`ucvtf`. With `fbits` non-zero this is the fixed-point form:
     /// the integer is read as a value scaled by `2^fbits`.
@@ -1317,6 +1325,15 @@ pub enum VOp3 {
     FMin,
     FMaxNm,
     FMinNm,
+    /// Pairwise `fmaxp`/`fminp`, and `fmaxnmp`/`fminnmp` with a quiet NaN
+    /// losing to a number.
+    FMaxP,
+    FMinP,
+    FMaxNmP,
+    FMinNmP,
+    /// `facge`/`facgt`: compare absolute values.
+    FAcGe,
+    FAcGt,
     FAddP,
     FMla,
     FMls,
@@ -1359,6 +1376,8 @@ pub enum VOp2 {
     /// Reciprocal square-root estimate, `~1/sqrt(x)`; lifted as exact
     /// `1/sqrt(x)` for the same reason. libpixman/Qt geometry math reach it.
     FRSqrtE,
+    /// `frecpx`: the reciprocal exponent (scalar only).
+    FRecpx,
     FrintN,
     FrintP,
     FrintM,

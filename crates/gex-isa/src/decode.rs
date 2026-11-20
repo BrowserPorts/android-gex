@@ -1576,7 +1576,11 @@ fn decode_simd_fp(raw: u32) -> Inst {
         }
         if bit(raw, 21) == 1 {
             if bits(raw, 21, 17) == 0b10000 && bits(raw, 11, 10) == 0b10 {
-                return decode_simd_two_misc(raw, q, u);
+                return match decode_simd_two_misc(raw, q, u) {
+                    // Unallocated as a vector instruction.
+                    Inst::VTwoMisc { op: VOp2::FRecpx, .. } => Inst::Undefined { raw },
+                    inst => inst,
+                };
             }
             if bits(raw, 21, 17) == 0b11000 && bits(raw, 11, 10) == 0b10 {
                 return decode_simd_across(raw, q, u);
@@ -1743,6 +1747,8 @@ fn scalar_form_exists(inst: &Inst) -> bool {
             | VOp3::FCmGt
             | VOp3::FRecps
             | VOp3::FRSqrts
+            | VOp3::FAcGe
+            | VOp3::FAcGt
             | VOp3::FAbd => true,
             _ => false,
         },
@@ -1773,7 +1779,8 @@ fn scalar_form_exists(inst: &Inst) -> bool {
             | VOp2::Scvtf
             | VOp2::Ucvtf
             | VOp2::FRecpe
-            | VOp2::FRSqrtE => true,
+            | VOp2::FRSqrtE
+            | VOp2::FRecpx => true,
             _ => false,
         },
         Inst::VShiftImm { op, arr, .. } => match op {
@@ -2049,8 +2056,15 @@ fn decode_simd_three_same(raw: u32, q: bool, u: u32) -> Inst {
             (0, 0b11100, false) => VOp3::FCmEq,
             (0, 0b11110, false) => VOp3::FMax,
             (0, 0b11110, true) => VOp3::FMin,
+            (0, 0b11011, false) => VOp3::FMulx,
             (0, 0b11111, false) => VOp3::FRecps,
             (0, 0b11111, true) => VOp3::FRSqrts,
+            (1, 0b11000, false) => VOp3::FMaxNmP,
+            (1, 0b11000, true) => VOp3::FMinNmP,
+            (1, 0b11101, false) => VOp3::FAcGe,
+            (1, 0b11101, true) => VOp3::FAcGt,
+            (1, 0b11110, false) => VOp3::FMaxP,
+            (1, 0b11110, true) => VOp3::FMinP,
             (1, 0b11010, false) => VOp3::FAddP,
             (1, 0b11010, true) => VOp3::FAbd,
             (1, 0b11011, false) => VOp3::FMul,
@@ -2210,6 +2224,8 @@ fn decode_simd_two_misc(raw: u32, q: bool, u: u32) -> Inst {
             (0b11101, _, false) => VOp2::Ucvtf,
             (0b11101, 0, true) => VOp2::FRecpe,
             (0b11101, _, true) => VOp2::FRSqrtE,
+            // U=0 is `frecpx`, which only the scalar group has.
+            (0b11111, 0, true) => VOp2::FRecpx,
             (0b11111, _, true) => VOp2::FSqrt,
             _ => return Inst::Unknown { raw },
         };
@@ -2589,6 +2605,19 @@ fn decode_scalar_fp(raw: u32) -> Inst {
             ) as u8),
         };
     }
+    // `fcvt` from half precision (ptype 11, in the one-source group): the
+    // one instruction of that precision decoded here.
+    if bits(raw, 23, 22) == 0b11 && bit(raw, 31) == 0 && bit(raw, 21) == 1 && bits(raw, 14, 10) == 0b10000 && bits(raw, 20, 17) == 0b0001 {
+        let Some(other) = fp_size(bits(raw, 16, 15)) else {
+            return Inst::Undefined { raw };
+        };
+        return Inst::FpConvertHalf {
+            to_half: false,
+            other,
+            vd: VReg(bits(raw, 4, 0) as u8),
+            vn: VReg(bits(raw, 9, 5) as u8),
+        };
+    }
     let Some(sz) = fp_size(bits(raw, 23, 22)) else {
         return Inst::Unknown { raw };
     };
@@ -2702,6 +2731,14 @@ fn decode_fp_one_source(raw: u32, sz: FpSz, vd: VReg, vn: VReg) -> Inst {
     let opcode = bits(raw, 20, 15);
     // `fcvt` between precisions shares this group.
     if opcode >> 2 == 0b0001 {
+        if opcode & 0b11 == 0b11 {
+            return Inst::FpConvertHalf {
+                to_half: true,
+                other: sz,
+                vd,
+                vn,
+            };
+        }
         let Some(to) = fp_size(opcode & 0b11) else {
             return Inst::Unknown { raw };
         };

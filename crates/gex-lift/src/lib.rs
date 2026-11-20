@@ -1373,12 +1373,12 @@ impl<'a> Lifter<'a> {
                     FpOp2::Sub => self.fp_bin(FpBinOp::Sub, double, a, b),
                     FpOp2::Mul => self.fp_bin(FpBinOp::Mul, double, a, b),
                     FpOp2::Div => self.fp_bin(FpBinOp::Div, double, a, b),
-                    // Wasm's min/max propagate NaN, matching FMIN/FMAX. The
-                    // FMINNM/FMAXNM "number" variants instead return the
-                    // non-NaN operand; that difference only shows up with a
-                    // NaN input, and modelling it needs a select chain.
-                    FpOp2::Min | FpOp2::MinNum => self.fp_bin(FpBinOp::Min, double, a, b),
-                    FpOp2::Max | FpOp2::MaxNum => self.fp_bin(FpBinOp::Max, double, a, b),
+                    // Wasm's min/max propagate NaN, matching FMIN/FMAX; the
+                    // FMINNM/FMAXNM "number" forms let a quiet NaN lose.
+                    FpOp2::Min => self.fp_bin(FpBinOp::Min, double, a, b),
+                    FpOp2::Max => self.fp_bin(FpBinOp::Max, double, a, b),
+                    FpOp2::MinNum => self.min_max_num(false, double, a, b),
+                    FpOp2::MaxNum => self.min_max_num(true, double, a, b),
                     FpOp2::NMul => {
                         let p = self.fp_bin(FpBinOp::Mul, double, a, b);
                         self.b.def(Expr::FpUn {
@@ -1769,12 +1769,37 @@ impl<'a> Lifter<'a> {
                 vd,
                 vn,
             } => {
-                // Only single <-> double is reachable; half precision has no
-                // wasm lane type and stays undecoded.
-                if narrow_bytes != 4 {
-                    return Flow::End(Term::Illegal { raw: self.raw, pc });
-                }
                 let src = self.b.read(GuestReg::V128(vn.0));
+                // Half precision has no wasm lane type: a lane at a time, in
+                // integer arithmetic (`fcvtl` exact, `fcvtn` rounded to
+                // nearest).
+                if narrow_bytes == 2 {
+                    let base = if upper { 4 } else { 0 };
+                    let out = if widen {
+                        let mut out = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                        for i in 0..4 {
+                            let h = self.b.def(Expr::VExtract { a: src, lane: base + i, lane_bytes: 2, signed: false, ty: Ty::I32 });
+                            let single = self.half_to_single(h);
+                            out = self.b.def(Expr::VReplace { a: out, lane: i, lane_bytes: 4, val: single });
+                        }
+                        out
+                    } else {
+                        // `fcvtn2` keeps the destination's lower half.
+                        let mut out = if upper {
+                            self.b.read(GuestReg::V128(vd.0))
+                        } else {
+                            self.b.def(Expr::VConst(Box::new([0u8; 16])))
+                        };
+                        for i in 0..4 {
+                            let x = self.b.def(Expr::VExtract { a: src, lane: i, lane_bytes: 4, signed: false, ty: Ty::I32 });
+                            let h = self.to_half(false, x);
+                            out = self.b.def(Expr::VReplace { a: out, lane: base + i, lane_bytes: 2, val: h });
+                        }
+                        out
+                    };
+                    self.b.write(GuestReg::V128(vd.0), out);
+                    return Flow::Next;
+                }
                 if widen {
                     // `fcvtl2` promotes the upper two singles, and wasm can
                     // only promote the lower pair, so move them down first.
@@ -1868,6 +1893,29 @@ impl<'a> Lifter<'a> {
                 let ty = if sz.is_double() { Ty::I64 } else { Ty::I32 };
                 let v = self.konst(ty, bits);
                 self.wr_fp(vd, sz, v);
+                Flow::Next
+            }
+
+            Inst::FpConvertHalf { to_half, other, vd, vn } => {
+                let double = other.is_double();
+                if to_half {
+                    let a = self.rd_fp(vn, other);
+                    let h = self.to_half(double, a);
+                    // An `h` register: everything above its 16 bits is zero.
+                    let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                    let out = self.b.def(Expr::VReplace { a: zero, lane: 0, lane_bytes: 2, val: h });
+                    self.b.write(GuestReg::V128(vd.0), out);
+                } else {
+                    let src = self.b.read(GuestReg::V128(vn.0));
+                    let h = self.b.def(Expr::VExtract { a: src, lane: 0, lane_bytes: 2, signed: false, ty: Ty::I32 });
+                    let single = self.half_to_single(h);
+                    let v = if double {
+                        self.b.def(Expr::FpCvt { kind: FpConvert::FpToFp, src_wide: false, dst_wide: true, a: single })
+                    } else {
+                        single
+                    };
+                    self.wr_fp(vd, other, v);
+                }
                 Flow::Next
             }
 
@@ -2257,6 +2305,23 @@ impl<'a> Lifter<'a> {
                 Flow::Next
             }
 
+            Inst::VAcross { op, arr, vd, vn } if matches!(op, VAcrossOp::FMaxNm | VAcrossOp::FMinNm) => {
+                // `fmaxnmv`/`fminnmv` and the scalar `fmaxnmp`/`fminnmp`: the
+                // halves reduced and then combined (Reduce), each step
+                // FPMaxNum or FPMinNum, which is an order a signalling NaN
+                // can tell from another.
+                let src = self.b.read(GuestReg::V128(vn.0));
+                let lb = arr.lane_bytes;
+                let ty = if lb == 8 { Ty::I64 } else { Ty::I32 };
+                let n = if arr.scalar { 2 } else { arr.lanes() };
+                let lanes: Vec<Value> = (0..n).map(|l| self.b.def(Expr::VExtract { a: src, lane: l, lane_bytes: lb, signed: false, ty })).collect();
+                let r = self.min_max_num_tree(op == VAcrossOp::FMaxNm, lb == 8, &lanes);
+                let zero = self.b.def(Expr::VConst(Box::new([0u8; 16])));
+                let out = self.b.def(Expr::VReplace { a: zero, lane: 0, lane_bytes: lb, val: r });
+                self.b.write(GuestReg::V128(vd.0), out);
+                Flow::Next
+            }
+
             Inst::VAcross { op, arr, vd, vn } => {
                 // Wasm has no horizontal reduction, so fold the vector in
                 // half repeatedly: log2(lanes) shuffles and lane-wise ops
@@ -2264,12 +2329,11 @@ impl<'a> Lifter<'a> {
                 let lane = Self::lane_of(arr);
                 let bin = match op {
                     VAcrossOp::Add => VLaneBinOp::Add,
-                    // As with the three-same forms, the `nm` variants share a
-                    // lowering with the plain ones: wasm's max/min already
-                    // propagate NaN like FMAX, and differ from FMAXNM only when
-                    // an input is NaN. See README's fidelity notes.
-                    VAcrossOp::SMax | VAcrossOp::FMax | VAcrossOp::FMaxNm => VLaneBinOp::MaxS,
-                    VAcrossOp::SMin | VAcrossOp::FMin | VAcrossOp::FMinNm => VLaneBinOp::MinS,
+                    // wasm's max/min propagate NaN as FMAX/FMIN do (the `nm`
+                    // forms are above).
+                    VAcrossOp::SMax | VAcrossOp::FMax => VLaneBinOp::MaxS,
+                    VAcrossOp::SMin | VAcrossOp::FMin => VLaneBinOp::MinS,
+                    VAcrossOp::FMaxNm | VAcrossOp::FMinNm => unreachable!("the number forms are lifted above"),
                     VAcrossOp::UMax => VLaneBinOp::MaxU,
                     VAcrossOp::UMin => VLaneBinOp::MinU,
                     VAcrossOp::SAddL | VAcrossOp::UAddL => unreachable!("the widening sums are lifted above"),
@@ -2729,24 +2793,69 @@ impl<'a> Lifter<'a> {
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
 
+        // Floating-point forms with no wasm lane operation that gives the
+        // hardware's answer: a lane at a time.
+        if arr.float {
+            let double = arr.lane_bytes == 8;
+            if matches!(op, VOp3::FMaxNm | VOp3::FMinNm | VOp3::FMulx | VOp3::FRecps | VOp3::FRSqrts) {
+                let r = self.per_lane(arr, a, b, |l, x, y| match op {
+                    VOp3::FMaxNm => l.min_max_num(true, double, x, y),
+                    VOp3::FMinNm => l.min_max_num(false, double, x, y),
+                    VOp3::FMulx => l.fmulx(double, x, y),
+                    VOp3::FRecps => l.recip_step(double, false, x, y),
+                    _ => l.recip_step(double, true, x, y),
+                });
+                self.commit_vector(vd, arr, r);
+                return Flow::Next;
+            }
+            // `facge`/`facgt`: the compares, of absolute values.
+            if matches!(op, VOp3::FAcGe | VOp3::FAcGt) {
+                let abs_a = self.b.def(Expr::VLaneUn { op: VLaneUnOp::Abs, lane, a });
+                let abs_b = self.b.def(Expr::VLaneUn { op: VLaneUnOp::Abs, lane, a: b });
+                let r = self.b.def(Expr::VLaneBin {
+                    op: if op == VOp3::FAcGe { VLaneBinOp::GeS } else { VLaneBinOp::GtS },
+                    lane,
+                    a: abs_a,
+                    b: abs_b,
+                });
+                self.commit_vector(vd, arr, r);
+                return Flow::Next;
+            }
+            // Pairwise maxima and minima: the concatenation deinterleaved,
+            // then combined as `fmax` or `fmaxnm` would.
+            if matches!(op, VOp3::FMaxP | VOp3::FMinP | VOp3::FMaxNmP | VOp3::FMinNmP) {
+                let (evens, odds) = pairwise_patterns(arr);
+                let e = self.b.def(Expr::VShuffle { a, b, lanes: Box::new(evens) });
+                let o = self.b.def(Expr::VShuffle { a, b, lanes: Box::new(odds) });
+                let r = match op {
+                    VOp3::FMaxP => self.b.def(Expr::VLaneBin { op: VLaneBinOp::MaxS, lane, a: e, b: o }),
+                    VOp3::FMinP => self.b.def(Expr::VLaneBin { op: VLaneBinOp::MinS, lane, a: e, b: o }),
+                    _ => {
+                        let max = op == VOp3::FMaxNmP;
+                        self.per_lane(arr, e, o, |l, x, y| l.min_max_num(max, double, x, y))
+                    }
+                };
+                self.commit_vector(vd, arr, r);
+                return Flow::Next;
+            }
+        }
+
         let simple = |op| Some(op);
         let bin: Option<VLaneBinOp> = match op {
             VOp3::Add | VOp3::FAdd => simple(VLaneBinOp::Add),
             VOp3::Sub | VOp3::FSub => simple(VLaneBinOp::Sub),
-            // `fmulx` shares this lowering: it differs only for zero times
-            // infinity, which gex does not model. See README's fidelity notes.
             // Byte lanes have no wasm multiply; see `vmul`.
             VOp3::Mul if lane == VLane::I8 => None,
-            VOp3::Mul | VOp3::FMul | VOp3::FMulx => simple(VLaneBinOp::Mul),
+            VOp3::Mul | VOp3::FMul => simple(VLaneBinOp::Mul),
             VOp3::FDiv => simple(VLaneBinOp::Div),
             VOp3::SMax => simple(VLaneBinOp::MaxS),
             VOp3::SMin => simple(VLaneBinOp::MinS),
             VOp3::UMax => simple(VLaneBinOp::MaxU),
             VOp3::UMin => simple(VLaneBinOp::MinU),
             // NEON's FMAX/FMIN propagate NaN, which is what wasm's
-            // f32x4.max/min do; the "number" forms differ only on NaN.
-            VOp3::FMax | VOp3::FMaxNm => simple(VLaneBinOp::MaxS),
-            VOp3::FMin | VOp3::FMinNm => simple(VLaneBinOp::MinS),
+            // f32x4.max/min do (the "number" forms are above).
+            VOp3::FMax => simple(VLaneBinOp::MaxS),
+            VOp3::FMin => simple(VLaneBinOp::MinS),
             VOp3::SqAdd => simple(VLaneBinOp::AddSatS),
             VOp3::UqAdd => simple(VLaneBinOp::AddSatU),
             VOp3::SqSub => simple(VLaneBinOp::SubSatS),
@@ -2778,51 +2887,6 @@ impl<'a> Lifter<'a> {
         // `frsqrts(a,b) = (3 - a*b)/2`, per lane. gex's `frecpe`/`frsqrte`
         // already return exact values so these steps just reproduce them, but
         // implementing them faithfully keeps any independent use correct.
-        if matches!(op, VOp3::FRecps | VOp3::FRSqrts) {
-            let splat = |val: f64| -> Box<[u8; 16]> {
-                let mut c = [0u8; 16];
-                if arr.lane_bytes == 8 {
-                    let bytes = val.to_le_bytes();
-                    for i in [0usize, 8] {
-                        c[i..i + 8].copy_from_slice(&bytes);
-                    }
-                } else {
-                    let bytes = (val as f32).to_le_bytes();
-                    for i in [0usize, 4, 8, 12] {
-                        c[i..i + 4].copy_from_slice(&bytes);
-                    }
-                }
-                Box::new(c)
-            };
-            let prod = self.b.def(Expr::VLaneBin {
-                op: VLaneBinOp::Mul,
-                lane,
-                a,
-                b,
-            });
-            let top = self
-                .b
-                .def(Expr::VConst(splat(if matches!(op, VOp3::FRSqrts) { 3.0 } else { 2.0 })));
-            let diff = self.b.def(Expr::VLaneBin {
-                op: VLaneBinOp::Sub,
-                lane,
-                a: top,
-                b: prod,
-            });
-            let r = if matches!(op, VOp3::FRSqrts) {
-                let half = self.b.def(Expr::VConst(splat(0.5)));
-                self.b.def(Expr::VLaneBin {
-                    op: VLaneBinOp::Mul,
-                    lane,
-                    a: diff,
-                    b: half,
-                })
-            } else {
-                diff
-            };
-            self.commit_vector(vd, arr, r);
-            return Flow::Next;
-        }
 
         // The halving add/sub have no single wasm op (only the rounding
         // *unsigned* add, `avgr_u` = `UrHAdd` above). The SWAR identities hold
@@ -3151,6 +3215,13 @@ impl<'a> Lifter<'a> {
         let lane = Self::lane_of(arr);
         let a = self.b.read(GuestReg::V128(vn.0));
 
+        if op == VOp2::FRecpx {
+            let double = arr.lane_bytes == 8;
+            let r = self.per_lane(arr, a, a, |l, x, _| l.frecpx(double, x));
+            self.commit_vector(vd, arr, r);
+            return Flow::Next;
+        }
+
         let un: Option<VLaneUnOp> = match op {
             VOp2::Neg | VOp2::FNeg => Some(VLaneUnOp::Neg),
             VOp2::Abs | VOp2::FAbs => Some(VLaneUnOp::Abs),
@@ -3180,32 +3251,9 @@ impl<'a> Lifter<'a> {
             // `frecps`/`frsqrts` converges the same, and code that uses the
             // estimate directly gets better precision than the hardware.
             VOp2::FRecpe | VOp2::FRSqrtE => {
-                let mut one = [0u8; 16];
-                if arr.lane_bytes == 8 {
-                    // 1.0f64 = 0x3ff0000000000000, little-endian, per 8-byte lane.
-                    for i in [0usize, 8] {
-                        one[i + 6] = 0xf0;
-                        one[i + 7] = 0x3f;
-                    }
-                } else {
-                    // 1.0f32 = 0x3f800000, little-endian, per 4-byte lane.
-                    for i in [0usize, 4, 8, 12] {
-                        one[i + 2] = 0x80;
-                        one[i + 3] = 0x3f;
-                    }
-                }
-                let ones = self.b.def(Expr::VConst(Box::new(one)));
-                let denom = if matches!(op, VOp2::FRSqrtE) {
-                    self.b.def(Expr::VLaneUn { op: VLaneUnOp::Sqrt, lane, a })
-                } else {
-                    a
-                };
-                let r = self.b.def(Expr::VLaneBin {
-                    op: VLaneBinOp::Div,
-                    lane,
-                    a: ones,
-                    b: denom,
-                });
+                let double = arr.lane_bytes == 8;
+                let sqrt = op == VOp2::FRSqrtE;
+                let r = self.per_lane(arr, a, a, |l, x, _| if sqrt { l.rsqrt_estimate(double, x) } else { l.recip_estimate(double, x) });
                 self.commit_vector(vd, arr, r);
                 Flow::Next
             }
@@ -4322,25 +4370,518 @@ impl<'a> Lifter<'a> {
     fn fused_lanes(&mut self, arr: VArr, acc: Value, a: Value, b: Value, subtract: bool) -> Value {
         let double = arr.lane_bytes == 8;
         let ty = if double { Ty::I64 } else { Ty::I32 };
-        let is_double = self.konst(Ty::I32, double as u64);
         let mut out = acc;
         for lane in 0..arr.lanes() {
             let get = |l: &mut Self, v: Value| l.b.def(Expr::VExtract { a: v, lane, lane_bytes: arr.lane_bytes, signed: false, ty });
             let (x, y, z) = (get(self, a), get(self, b), get(self, acc));
             // Negating a factor is exact, so `fmls` is `fmla` of it.
             let x = if subtract { self.b.def(Expr::FpUn { op: FpUnOp::Neg, double, a: x }) } else { x };
-            let wide = |l: &mut Self, v: Value| if double { v } else { l.b.def(Expr::Extend { a: v, signed: false }) };
-            let (x, y, z) = (wide(self, x), wide(self, y), wide(self, z));
-            let r = self.b.def(Expr::HostCall { func: HostFunc::Fma, args: vec![x, y, z, is_double], ty: Ty::I64 });
-            let r = if double { r } else { self.b.def(Expr::Wrap(r)) };
+            let r = self.fma(double, x, y, z);
             out = self.b.def(Expr::VReplace { a: out, lane, lane_bytes: arr.lane_bytes, val: r });
         }
         out
     }
 
+    fn k64(&mut self, v: u64) -> Value {
+        self.konst(Ty::I64, v)
+    }
+
+    fn bin64(&mut self, op: BinOp, a: Value, b: Value) -> Value {
+        self.b.bin(op, Ty::I64, a, b)
+    }
+
+    fn bin64k(&mut self, op: BinOp, a: Value, k: u64) -> Value {
+        let k = self.k64(k);
+        self.b.bin(op, Ty::I64, a, k)
+    }
+
+    fn cmp64k(&mut self, op: CmpOp, a: Value, k: u64) -> Value {
+        let k = self.k64(k);
+        self.b.cmp(op, Ty::I64, a, k)
+    }
+
+    fn sel64(&mut self, cond: Value, a: Value, b: Value) -> Value {
+        self.b.def(Expr::Select { cond, a, b, ty: Ty::I64 })
+    }
+
+    /// A float's bits as an `I64`, and its fraction placed as a double's
+    /// 52 bits (the pseudocode's `fraction`), with its biased exponent.
+    fn fp_parts64(&mut self, double: bool, x: Value) -> (Value, Value, Value) {
+        let x = if double { x } else { self.b.def(Expr::Extend { a: x, signed: false }) };
+        let (fbits, emask) = if double { (52u64, 0x7ffu64) } else { (23, 0xff) };
+        let f = self.bin64k(BinOp::And, x, (1u64 << fbits) - 1);
+        let f = self.bin64k(BinOp::Shl, f, 52 - fbits);
+        let e = self.bin64k(BinOp::ShrU, x, fbits);
+        let e = self.bin64k(BinOp::And, e, emask);
+        (x, f, e)
+    }
+
+    /// Back to the lane's width from an `I64` of its bits.
+    fn fp_narrow64(&mut self, double: bool, v: Value) -> Value {
+        if double { v } else { self.b.def(Expr::Wrap(v)) }
+    }
+
+    /// `frecpe` (FPRecipEstimate, with FPCR's defaults: round to nearest,
+    /// no flush to zero, no extra precision): the reciprocal to eight bits
+    /// as the architecture defines them (RecipEstimate), so that the
+    /// Newton-Raphson steps a program takes from it give the hardware's
+    /// answers.
+    fn recip_estimate(&mut self, double: bool, x: Value) -> Value {
+        let (sign_bit, mag_mask, inf, quiet, tiny, base, emask, fshift) = if double {
+            (1u64 << 63, u64::MAX >> 1, 0x7ff0_0000_0000_0000u64, 0x0008_0000_0000_0000u64, 0x0004_0000_0000_0000u64, 2045u64, 0x7ffu64, 0u64)
+        } else {
+            (0x8000_0000, 0x7fff_ffff, 0x7f80_0000, 0x0040_0000, 0x0020_0000, 253, 0xff, 29)
+        };
+        let (x, frac, exp) = self.fp_parts64(double, x);
+        let sign = self.bin64k(BinOp::And, x, sign_bit);
+        let mag = self.bin64k(BinOp::And, x, mag_mask);
+        // A subnormal operand: its fraction normalised by one or two places.
+        let top = self.bin64k(BinOp::ShrU, frac, 51);
+        let top_clear = self.cmp64k(CmpOp::Eq, top, 0);
+        let mask52 = (1u64 << 52) - 1;
+        let by2 = self.bin64k(BinOp::Shl, frac, 2);
+        let by2 = self.bin64k(BinOp::And, by2, mask52);
+        let by1 = self.bin64k(BinOp::Shl, frac, 1);
+        let by1 = self.bin64k(BinOp::And, by1, mask52);
+        let sub_frac = self.sel64(top_clear, by2, by1);
+        let minus_one = self.k64(u64::MAX);
+        let zero = self.k64(0);
+        let sub_exp = self.sel64(top_clear, minus_one, zero);
+        let exp_zero = self.cmp64k(CmpOp::Eq, exp, 0);
+        let frac = self.sel64(exp_zero, sub_frac, frac);
+        let exp = self.sel64(exp_zero, sub_exp, exp);
+        // scaled = '1':fraction<51:44>, then RecipEstimate.
+        let hi = self.bin64k(BinOp::ShrU, frac, 44);
+        let scaled = self.bin64k(BinOp::Or, hi, 256);
+        let a2 = self.bin64k(BinOp::Shl, scaled, 1);
+        let a2 = self.bin64k(BinOp::Or, a2, 1);
+        let num = self.k64(1 << 19);
+        let b = self.bin64(BinOp::DivU, num, a2);
+        let b = self.bin64k(BinOp::Add, b, 1);
+        let est = self.bin64k(BinOp::ShrU, b, 1);
+        let base = self.k64(base);
+        let rexp = self.bin64(BinOp::Sub, base, exp);
+        // fraction = estimate<7:0>:Zeros(44), denormalised for a result
+        // exponent of 0 or -1.
+        let est8 = self.bin64k(BinOp::And, est, 0xff);
+        let rfrac = self.bin64k(BinOp::Shl, est8, 44);
+        let d1 = self.bin64k(BinOp::ShrU, rfrac, 1);
+        let d1 = self.bin64k(BinOp::Or, d1, 1 << 51);
+        let d2 = self.bin64k(BinOp::ShrU, rfrac, 2);
+        let d2 = self.bin64k(BinOp::Or, d2, 1 << 50);
+        let rexp_zero = self.cmp64k(CmpOp::Eq, rexp, 0);
+        let rexp_m1 = self.cmp64k(CmpOp::Eq, rexp, u64::MAX);
+        let rfrac = self.sel64(rexp_zero, d1, rfrac);
+        let rfrac = self.sel64(rexp_m1, d2, rfrac);
+        let rexp = self.sel64(rexp_m1, zero, rexp);
+        let rexp = self.bin64k(BinOp::And, rexp, emask);
+        let rexp = self.bin64k(BinOp::Shl, rexp, 52 - fshift);
+        let rfrac = self.bin64k(BinOp::ShrU, rfrac, fshift);
+        let normal = self.bin64(BinOp::Or, sign, rexp);
+        let normal = self.bin64(BinOp::Or, normal, rfrac);
+        // The special cases: a NaN quieted, infinity to zero, zero and what
+        // is too small to have a finite reciprocal to infinity.
+        let infv = self.k64(inf);
+        let signed_inf = self.bin64(BinOp::Or, sign, infv);
+        let too_small = self.cmp64k(CmpOp::LtU, mag, tiny);
+        let r = self.sel64(too_small, signed_inf, normal);
+        let is_inf = self.cmp64k(CmpOp::Eq, mag, inf);
+        let r = self.sel64(is_inf, sign, r);
+        let is_nan = self.cmp64k(CmpOp::GtU, mag, inf);
+        let quieted = self.bin64k(BinOp::Or, x, quiet);
+        let r = self.sel64(is_nan, quieted, r);
+        self.fp_narrow64(double, r)
+    }
+
+    /// `frsqrte` (FPRSqrtEstimate, FPCR's defaults as `recip_estimate`):
+    /// the reciprocal square root to eight bits (RecipSqrtEstimate), whose
+    /// search for the largest `b` with `a * (b + 1)^2 < 2^28` is the
+    /// integer square root of `(2^28 - 1) / a`, at least 512.
+    fn rsqrt_estimate(&mut self, double: bool, x: Value) -> Value {
+        let (sign_bit, mag_mask, inf, quiet, dnan, base, emask, fshift) = if double {
+            (1u64 << 63, u64::MAX >> 1, 0x7ff0_0000_0000_0000u64, 0x0008_0000_0000_0000u64, 0x7ff8_0000_0000_0000u64, 3068u64, 0x7ffu64, 0u64)
+        } else {
+            (0x8000_0000, 0x7fff_ffff, 0x7f80_0000, 0x0040_0000, 0x7fc0_0000, 380, 0xff, 29)
+        };
+        let (x, frac, exp) = self.fp_parts64(double, x);
+        let sign = self.bin64k(BinOp::And, x, sign_bit);
+        let mag = self.bin64k(BinOp::And, x, mag_mask);
+        // A subnormal operand: shifted until its leading one is bit 51, the
+        // exponent down by as much, then the leading one dropped.
+        let lz = self.b.def(Expr::Un { op: UnOp::Clz, ty: Ty::I64, a: frac });
+        let s = self.bin64k(BinOp::Sub, lz, 12);
+        let sh = self.bin64k(BinOp::Add, s, 1);
+        let mask52 = (1u64 << 52) - 1;
+        let sub_frac = self.bin64(BinOp::Shl, frac, sh);
+        let sub_frac = self.bin64k(BinOp::And, sub_frac, mask52);
+        let zero = self.k64(0);
+        let sub_exp = self.bin64(BinOp::Sub, zero, s);
+        let exp_zero = self.cmp64k(CmpOp::Eq, exp, 0);
+        let frac = self.sel64(exp_zero, sub_frac, frac);
+        let exp = self.sel64(exp_zero, sub_exp, exp);
+        // scaled: in [0.25, 0.5) ('01':fraction<51:45>) when the true
+        // exponent is even, which with the odd biases (127, 1023) is an odd
+        // biased one, else in [0.5, 1) ('1':fraction<51:44>). (Linux 7.0's
+        // arm64 CPU is the reference: 1.0's estimate is 0.998.)
+        let odd = self.bin64k(BinOp::And, exp, 1);
+        let odd = self.cmp64k(CmpOp::Ne, odd, 0);
+        let hi8 = self.bin64k(BinOp::ShrU, frac, 44);
+        let half_up = self.bin64k(BinOp::Or, hi8, 256);
+        let hi7 = self.bin64k(BinOp::ShrU, frac, 45);
+        let quarter_up = self.bin64k(BinOp::Or, hi7, 128);
+        let a = self.sel64(odd, quarter_up, half_up);
+        // RecipSqrtEstimate's `a`: in units of 1/512 below 256, of 1/256
+        // (its bottom bit dropped) from there.
+        let low = self.cmp64k(CmpOp::LtU, a, 256);
+        let a_low = self.bin64k(BinOp::Shl, a, 1);
+        let a_low = self.bin64k(BinOp::Or, a_low, 1);
+        let a_high = self.bin64k(BinOp::ShrU, a, 1);
+        let a_high = self.bin64k(BinOp::Shl, a_high, 2);
+        let a_high = self.bin64k(BinOp::Add, a_high, 2);
+        let a = self.sel64(low, a_low, a_high);
+        let lim = self.k64((1 << 28) - 1);
+        let q = self.bin64(BinOp::DivU, lim, a);
+        let qf = self.b.def(Expr::FpCvt { kind: FpConvert::IntToFp { signed: false }, src_wide: true, dst_wide: true, a: q });
+        let root = self.b.def(Expr::FpUn { op: FpUnOp::Sqrt, double: true, a: qf });
+        let k = self.b.def(Expr::FpCvt { kind: FpConvert::FpToInt { signed: false }, src_wide: true, dst_wide: true, a: root });
+        let floor = self.cmp64k(CmpOp::LtU, k, 512);
+        let five12 = self.k64(512);
+        let b = self.sel64(floor, five12, k);
+        let b = self.bin64k(BinOp::Add, b, 1);
+        let est = self.bin64k(BinOp::ShrU, b, 1);
+        let base = self.k64(base);
+        let rexp = self.bin64(BinOp::Sub, base, exp);
+        let rexp = self.bin64k(BinOp::ShrS, rexp, 1);
+        let rexp = self.bin64k(BinOp::And, rexp, emask);
+        let rexp = self.bin64k(BinOp::Shl, rexp, 52 - fshift);
+        let est8 = self.bin64k(BinOp::And, est, 0xff);
+        let rfrac = self.bin64k(BinOp::Shl, est8, 44 - fshift);
+        let normal = self.bin64(BinOp::Or, rexp, rfrac);
+        // The special cases: a NaN quieted; zero to infinity; anything
+        // negative the default NaN; +infinity to +0.
+        let is_inf = self.cmp64k(CmpOp::Eq, mag, inf);
+        let r = self.sel64(is_inf, zero, normal);
+        let negative = self.cmp64k(CmpOp::Ne, sign, 0);
+        let dnan = self.k64(dnan);
+        let r = self.sel64(negative, dnan, r);
+        let is_zero = self.cmp64k(CmpOp::Eq, mag, 0);
+        let infv = self.k64(inf);
+        let signed_inf = self.bin64(BinOp::Or, sign, infv);
+        let r = self.sel64(is_zero, signed_inf, r);
+        let is_nan = self.cmp64k(CmpOp::GtU, mag, inf);
+        let quieted = self.bin64k(BinOp::Or, x, quiet);
+        let r = self.sel64(is_nan, quieted, r);
+        self.fp_narrow64(double, r)
+    }
+
+    /// `x * y + z` with one rounding, on bit patterns: the host's fused
+    /// multiply-add, which tier 1 emits inline.
+    fn fma(&mut self, double: bool, x: Value, y: Value, z: Value) -> Value {
+        let is_double = self.konst(Ty::I32, double as u64);
+        let wide = |l: &mut Self, v: Value| if double { v } else { l.b.def(Expr::Extend { a: v, signed: false }) };
+        let (x, y, z) = (wide(self, x), wide(self, y), wide(self, z));
+        let r = self.b.def(Expr::HostCall { func: HostFunc::Fma, args: vec![x, y, z, is_double], ty: Ty::I64 });
+        if double {
+            r
+        } else {
+            self.b.def(Expr::Wrap(r))
+        }
+    }
+
+    /// Each lane of `a` and `b` (as bit patterns) combined by `f`, at the
+    /// arrangement's lanes, into a vector `commit_vector` takes.
+    fn per_lane(&mut self, arr: VArr, a: Value, b: Value, mut f: impl FnMut(&mut Self, Value, Value) -> Value) -> Value {
+        let ty = if arr.lane_bytes == 8 { Ty::I64 } else { Ty::I32 };
+        let mut out = a;
+        for lane in 0..arr.lanes() {
+            let x = self.b.def(Expr::VExtract { a, lane, lane_bytes: arr.lane_bytes, signed: false, ty });
+            let y = self.b.def(Expr::VExtract { a: b, lane, lane_bytes: arr.lane_bytes, signed: false, ty });
+            let r = f(self, x, y);
+            out = self.b.def(Expr::VReplace { a: out, lane, lane_bytes: arr.lane_bytes, val: r });
+        }
+        out
+    }
+
+    /// A float's bit pattern masked to its magnitude, compared with `k`.
+    fn fp_magnitude_is(&mut self, double: bool, v: Value, op: CmpOp, k: u64) -> Value {
+        let ty = if double { Ty::I64 } else { Ty::I32 };
+        let mag = self.konst(ty, if double { u64::MAX >> 1 } else { 0x7fff_ffff });
+        let m = self.b.bin(BinOp::And, ty, v, mag);
+        let k = self.konst(ty, k);
+        self.b.cmp(op, ty, m, k)
+    }
+
+    fn fp_inf_bits(double: bool) -> u64 {
+        if double { 0x7ff0_0000_0000_0000 } else { 0x7f80_0000 }
+    }
+
+    fn fp_is_nan(&mut self, double: bool, v: Value) -> Value {
+        self.fp_magnitude_is(double, v, CmpOp::GtU, Self::fp_inf_bits(double))
+    }
+
+    fn fp_is_inf(&mut self, double: bool, v: Value) -> Value {
+        self.fp_magnitude_is(double, v, CmpOp::Eq, Self::fp_inf_bits(double))
+    }
+
+    fn fp_is_zero(&mut self, double: bool, v: Value) -> Value {
+        self.fp_magnitude_is(double, v, CmpOp::Eq, 0)
+    }
+
+    /// A quiet NaN: a NaN with the top fraction bit set.
+    fn fp_is_quiet_nan(&mut self, double: bool, v: Value) -> Value {
+        let quiet = if double { 0x7ff8_0000_0000_0000 } else { 0x7fc0_0000 };
+        self.fp_magnitude_is(double, v, CmpOp::GeU, quiet)
+    }
+
+    /// `fminnm`/`fmaxnm` (FPMinNum, FPMaxNum): a quiet NaN against a number
+    /// gives way to it, so the minimum or maximum is the number; a
+    /// signalling NaN, or two NaNs, give NaN as `fmin`/`fmax` do. wasm's min
+    /// and max propagate any NaN, so a quiet one is first replaced by the
+    /// other operand.
+    fn min_max_num(&mut self, max: bool, double: bool, a: Value, b: Value) -> Value {
+        let ty = if double { Ty::I64 } else { Ty::I32 };
+        let one = self.konst(Ty::I32, 1);
+        let (an, bn) = (self.fp_is_nan(double, a), self.fp_is_nan(double, b));
+        let (aq, bq) = (self.fp_is_quiet_nan(double, a), self.fp_is_quiet_nan(double, b));
+        let b_number = self.b.bin(BinOp::Xor, Ty::I32, bn, one);
+        let a_number = self.b.bin(BinOp::Xor, Ty::I32, an, one);
+        let take_b = self.b.bin(BinOp::And, Ty::I32, aq, b_number);
+        let take_a = self.b.bin(BinOp::And, Ty::I32, bq, a_number);
+        let a2 = self.b.def(Expr::Select { cond: take_b, a: b, b: a, ty });
+        let b2 = self.b.def(Expr::Select { cond: take_a, a, b, ty });
+        self.fp_bin(if max { FpBinOp::Max } else { FpBinOp::Min }, double, a2, b2)
+    }
+
+    /// `values` reduced by FPMaxNum or FPMinNum as Reduce does: each half,
+    /// then the two.
+    fn min_max_num_tree(&mut self, max: bool, double: bool, values: &[Value]) -> Value {
+        if values.len() == 1 {
+            return values[0];
+        }
+        let (lo, hi) = values.split_at(values.len() / 2);
+        let a = self.min_max_num_tree(max, double, lo);
+        let b = self.min_max_num_tree(max, double, hi);
+        self.min_max_num(max, double, a, b)
+    }
+
+    /// Whether one of `a` and `b` is zero and the other infinite.
+    fn zero_times_inf(&mut self, double: bool, a: Value, b: Value) -> Value {
+        let (az, bz) = (self.fp_is_zero(double, a), self.fp_is_zero(double, b));
+        let (ai, bi) = (self.fp_is_inf(double, a), self.fp_is_inf(double, b));
+        let l = self.b.bin(BinOp::And, Ty::I32, az, bi);
+        let r = self.b.bin(BinOp::And, Ty::I32, ai, bz);
+        self.b.bin(BinOp::Or, Ty::I32, l, r)
+    }
+
+    fn fp_bits_of(double: bool, v: f64) -> u64 {
+        if double { v.to_bits() } else { (v as f32).to_bits() as u64 }
+    }
+
+    /// `fmulx` (FPMulX): `fmul`, except that zero times infinity is 2 with
+    /// the sign of the product rather than NaN.
+    fn fmulx(&mut self, double: bool, a: Value, b: Value) -> Value {
+        let ty = if double { Ty::I64 } else { Ty::I32 };
+        let special = self.zero_times_inf(double, a, b);
+        let prod = self.fp_bin(FpBinOp::Mul, double, a, b);
+        let sign_bit = self.konst(ty, if double { 1 << 63 } else { 0x8000_0000 });
+        let x = self.b.bin(BinOp::Xor, ty, a, b);
+        let sign = self.b.bin(BinOp::And, ty, x, sign_bit);
+        let two = self.konst(ty, Self::fp_bits_of(double, 2.0));
+        let two = self.b.bin(BinOp::Or, ty, two, sign);
+        self.b.def(Expr::Select { cond: special, a: two, b: prod, ty })
+    }
+
+    /// `frecps` (FPRecipStepFused): `2 - a * b` with one rounding, and 2 for
+    /// zero times infinity. `frsqrts` (FPRSqrtStepFused): `(3 - a * b) / 2`
+    /// with one rounding, and 1.5 for zero times infinity; the larger factor
+    /// is halved first, which is exact (the smaller is subnormal only when
+    /// the product cannot move 1.5), so the one rounding is the fused
+    /// multiply-add's and a product past the largest float halves back.
+    fn recip_step(&mut self, double: bool, sqrt: bool, a: Value, b: Value) -> Value {
+        let ty = if double { Ty::I64 } else { Ty::I32 };
+        let special = self.zero_times_inf(double, a, b);
+        let (x, y, top) = if sqrt {
+            let mag = self.konst(ty, if double { u64::MAX >> 1 } else { 0x7fff_ffff });
+            let ma = self.b.bin(BinOp::And, ty, a, mag);
+            let mb = self.b.bin(BinOp::And, ty, b, mag);
+            let a_bigger = self.b.cmp(CmpOp::GeU, ty, ma, mb);
+            let half = self.konst(ty, Self::fp_bits_of(double, 0.5));
+            let ha = self.fp_bin(FpBinOp::Mul, double, a, half);
+            let hb = self.fp_bin(FpBinOp::Mul, double, b, half);
+            let x = self.b.def(Expr::Select { cond: a_bigger, a: ha, b: a, ty });
+            let y = self.b.def(Expr::Select { cond: a_bigger, a: b, b: hb, ty });
+            (x, y, 1.5)
+        } else {
+            (a, b, 2.0)
+        };
+        let nx = self.b.def(Expr::FpUn { op: FpUnOp::Neg, double, a: x });
+        let top = self.konst(ty, Self::fp_bits_of(double, top));
+        let r = self.fma(double, nx, y, top);
+        let fixed = self.konst(ty, Self::fp_bits_of(double, if sqrt { 1.5 } else { 2.0 }));
+        self.b.def(Expr::Select { cond: special, a: fixed, b: r, ty })
+    }
+
+    /// `frecpx` (FPRecpX): the sign kept, the fraction cleared, and the
+    /// exponent inverted (all ones less one for a zero or subnormal); a NaN
+    /// is quieted.
+    fn frecpx(&mut self, double: bool, a: Value) -> Value {
+        let ty = if double { Ty::I64 } else { Ty::I32 };
+        let (sign, exp, quiet, max_exp) = if double {
+            (1u64 << 63, 0x7ff0_0000_0000_0000u64, 0x0008_0000_0000_0000u64, 0x7fe0_0000_0000_0000u64)
+        } else {
+            (0x8000_0000, 0x7f80_0000, 0x0040_0000, 0x7f00_0000)
+        };
+        let nan = self.fp_is_nan(double, a);
+        let quiet = self.konst(ty, quiet);
+        let quieted = self.b.bin(BinOp::Or, ty, a, quiet);
+        let sign = self.konst(ty, sign);
+        let s = self.b.bin(BinOp::And, ty, a, sign);
+        let exp = self.konst(ty, exp);
+        let e = self.b.bin(BinOp::And, ty, a, exp);
+        let inverted = self.b.bin(BinOp::Xor, ty, e, exp);
+        let zero = self.konst(ty, 0);
+        let tiny = self.b.cmp(CmpOp::Eq, ty, e, zero);
+        let max_exp = self.konst(ty, max_exp);
+        let e2 = self.b.def(Expr::Select { cond: tiny, a: max_exp, b: inverted, ty });
+        let r = self.b.bin(BinOp::Or, ty, s, e2);
+        self.b.def(Expr::Select { cond: nan, a: quieted, b: r, ty })
+    }
+
+    /// Half precision to single (exactly), from the low 16 bits of `h`
+    /// (an `I32`): FPConvert with the bits rebuilt in integer arithmetic,
+    /// wasm having no half type. A subnormal half is a normal single; a NaN
+    /// is quieted, its payload kept in the top fraction bits.
+    fn half_to_single(&mut self, h: Value) -> Value {
+        let t = Ty::I32;
+        let k = |l: &mut Self, v: u64| l.konst(t, v);
+        let (c13, c0x7c00, c0x3ff, c0x8000, c16, c0x7f800000, c0x400000) =
+            (k(self, 13), k(self, 0x7c00), k(self, 0x3ff), k(self, 0x8000), k(self, 16), k(self, 0x7f80_0000), k(self, 0x40_0000));
+        let sign = self.b.bin(BinOp::And, t, h, c0x8000);
+        let sign = self.b.bin(BinOp::Shl, t, sign, c16);
+        let e = self.b.bin(BinOp::And, t, h, c0x7c00);
+        let f = self.b.bin(BinOp::And, t, h, c0x3ff);
+        let zero = k(self, 0);
+        // Normal: exponent rebiased (15 to 127), fraction moved up 13.
+        let kc1 = k(self, 0x7fff);
+        let ef = self.b.bin(BinOp::And, t, h, kc1);
+        let moved = self.b.bin(BinOp::Shl, t, ef, c13);
+        let rebias = k(self, 112 << 23);
+        let normal = self.b.bin(BinOp::Add, t, moved, rebias);
+        // Infinity or NaN: all-ones exponent, fraction moved up (a NaN
+        // quieted).
+        let fm = self.b.bin(BinOp::Shl, t, f, c13);
+        let special = self.b.bin(BinOp::Or, t, c0x7f800000, fm);
+        let f_nonzero = self.b.cmp(CmpOp::Ne, t, f, zero);
+        let q = self.b.def(Expr::Select { cond: f_nonzero, a: c0x400000, b: zero, ty: t });
+        let special = self.b.bin(BinOp::Or, t, special, q);
+        // Subnormal: f * 2^-24 exactly, as an integer-to-float conversion
+        // scaled (f < 2^10, so both steps are exact).
+        let as_float = self.b.def(Expr::FpCvt { kind: FpConvert::IntToFp { signed: false }, src_wide: false, dst_wide: false, a: f });
+        let scale = k(self, (2.0f32).powi(-24).to_bits() as u64);
+        let sub = self.fp_bin(FpBinOp::Mul, false, as_float, scale);
+        let is_max = self.b.cmp(CmpOp::Eq, t, e, c0x7c00);
+        let is_zero_e = self.b.cmp(CmpOp::Eq, t, e, zero);
+        let r = self.b.def(Expr::Select { cond: is_max, a: special, b: normal, ty: t });
+        let r = self.b.def(Expr::Select { cond: is_zero_e, a: sub, b: r, ty: t });
+        self.b.bin(BinOp::Or, t, r, sign)
+    }
+
+    /// Single or double to half (FPConvert, rounding to nearest with ties
+    /// to even): the bits built in integer arithmetic from the value's sign,
+    /// exponent and fraction, with overflow to infinity, subnormal halves,
+    /// and a NaN quieted with its payload's top bits kept. A double goes
+    /// through its own bits, not through single, which would round twice.
+    fn to_half(&mut self, double: bool, a: Value) -> Value {
+        let t = if double { Ty::I64 } else { Ty::I32 };
+        let (fbits, ebias) = if double { (52u64, 1023u64) } else { (23, 127) };
+        let k = |l: &mut Self, v: u64| l.konst(t, v);
+        let mag_mask = k(self, if double { u64::MAX >> 1 } else { 0x7fff_ffff });
+        let mag = self.b.bin(BinOp::And, t, a, mag_mask);
+        let sign_shift = k(self, if double { 48 } else { 16 });
+        let sign = self.b.bin(BinOp::ShrU, t, a, sign_shift);
+        let kc2 = k(self, 0x8000);
+        let sign = self.b.bin(BinOp::And, t, sign, kc2);
+        let fshift = k(self, fbits);
+        let e = self.b.bin(BinOp::ShrU, t, mag, fshift);
+        let fmask = k(self, (1u64 << fbits) - 1);
+        let f = self.b.bin(BinOp::And, t, mag, fmask);
+        // The significand with its hidden bit, and the half exponent it
+        // would have.
+        let hidden = k(self, 1u64 << fbits);
+        let sig = self.b.bin(BinOp::Or, t, f, hidden);
+        let kc3 = k(self, ebias - 15);
+        let he = self.b.bin(BinOp::Sub, t, e, kc3);
+        // Bits to drop from the significand: fbits - 10 for a normal half,
+        // more for a subnormal one (1 - he more), capped where everything
+        // is dropped.
+        let one = k(self, 1);
+        let base = fbits - 10;
+        let sub_extra = self.b.bin(BinOp::Sub, t, one, he);
+        let kc4 = k(self, 0);
+        let he_pos = self.b.cmp(CmpOp::GtS, t, he, kc4);
+        let zero = k(self, 0);
+        let extra = self.b.def(Expr::Select { cond: he_pos, a: zero, b: sub_extra, ty: t });
+        let kc5 = k(self, base);
+        let drop = self.b.bin(BinOp::Add, t, extra, kc5);
+        let cap = k(self, fbits + 2);
+        let too_far = self.b.cmp(CmpOp::GtS, t, drop, cap);
+        let drop = self.b.def(Expr::Select { cond: too_far, a: cap, b: drop, ty: t });
+        // Round to nearest, ties to even, on the dropped bits.
+        let kept = self.b.bin(BinOp::ShrU, t, sig, drop);
+        let low_mask = self.b.bin(BinOp::Shl, t, one, drop);
+        let low_mask = self.b.bin(BinOp::Sub, t, low_mask, one);
+        let rest = self.b.bin(BinOp::And, t, sig, low_mask);
+        let half_way = self.b.bin(BinOp::Sub, t, drop, one);
+        let half_way = self.b.bin(BinOp::Shl, t, one, half_way);
+        let above = self.b.cmp(CmpOp::GtU, t, rest, half_way);
+        let tie = self.b.cmp(CmpOp::Eq, t, rest, half_way);
+        let odd = self.b.bin(BinOp::And, t, kept, one);
+        let odd = self.b.cmp(CmpOp::Ne, t, odd, zero);
+        let tie_up = self.b.bin(BinOp::And, Ty::I32, tie, odd);
+        let up = self.b.bin(BinOp::Or, Ty::I32, above, tie_up);
+        let up = if double { self.b.def(Expr::Extend { a: up, signed: false }) } else { up };
+        let rounded = self.b.bin(BinOp::Add, t, kept, up);
+        // A normal half: (exponent << 10) + significand less its hidden bit,
+        // which a carry out of the significand moves into the exponent as it
+        // should (and up to infinity at the top). A subnormal one is the
+        // significand alone, which a carry makes the smallest normal.
+        let he_or_zero = self.b.def(Expr::Select { cond: he_pos, a: he, b: zero, ty: t });
+        let kc6 = k(self, 10);
+        let e_field = self.b.bin(BinOp::Shl, t, he_or_zero, kc6);
+        let kc7 = k(self, 0x400);
+        let sub_hidden = self.b.def(Expr::Select { cond: he_pos, a: kc7, b: zero, ty: t });
+        let body = self.b.bin(BinOp::Sub, t, rounded, sub_hidden);
+        let finite = self.b.bin(BinOp::Add, t, e_field, body);
+        // Past the largest half (exponent 31 or more after rounding):
+        // infinity.
+        let inf = k(self, 0x7c00);
+        let over = self.b.cmp(CmpOp::GeU, t, finite, inf);
+        let finite = self.b.def(Expr::Select { cond: over, a: inf, b: finite, ty: t });
+        // A zero of either width stays zero (its significand has no hidden
+        // bit); infinity and NaN keep their class.
+        let is_zero = self.b.cmp(CmpOp::Eq, t, mag, zero);
+        let finite = self.b.def(Expr::Select { cond: is_zero, a: zero, b: finite, ty: t });
+        let emax = k(self, if double { 0x7ff } else { 0xff });
+        let is_special = self.b.cmp(CmpOp::Eq, t, e, emax);
+        let payload_shift = k(self, base);
+        let payload = self.b.bin(BinOp::ShrU, t, f, payload_shift);
+        let f_nonzero = self.b.cmp(CmpOp::Ne, t, f, zero);
+        let kc8 = k(self, 0x200);
+        let quiet = self.b.def(Expr::Select { cond: f_nonzero, a: kc8, b: zero, ty: t });
+        let special = self.b.bin(BinOp::Or, t, inf, payload);
+        let special = self.b.bin(BinOp::Or, t, special, quiet);
+        let r = self.b.def(Expr::Select { cond: is_special, a: special, b: finite, ty: t });
+        let r = self.b.bin(BinOp::Or, t, r, sign);
+        if double {
+            self.b.def(Expr::Wrap(r))
+        } else {
+            r
+        }
+    }
+
     /// The scalar multiplies by one lane of a vector: `fmul` and `fmulx`
-    /// (which differs from it only for zero times infinity, not modelled
-    /// here either), and `fmla` and `fmls`, which add the product to the
+    /// (which differs from it only for zero times infinity), and `fmla` and
+    /// `fmls`, which add the product to the
     /// destination, or take it away, with one rounding. Wasm has no fused
     /// multiply-add, so those two ask the host as `fmadd` does. The result
     /// is a scalar: everything above it in the register is zero.
@@ -4366,6 +4907,7 @@ impl<'a> Lifter<'a> {
                     self.b.def(Expr::Wrap(r))
                 }
             }
+            VOp3::FMulx => self.fmulx(double, a, b),
             _ => self.fp_bin(FpBinOp::Mul, double, a, b),
         };
         self.wr_fp(vd, sz, v);
