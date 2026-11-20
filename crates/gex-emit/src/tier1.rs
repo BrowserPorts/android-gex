@@ -4987,11 +4987,15 @@ impl<'a> Emitter<'a> {
         self.f.byte(0xa0);
         self.f.local_set(tl);
 
-        // if t != 0 and s is even, step s one ulp toward t.
+        // if t is a number other than zero and s is even, step s one ulp
+        // toward t. (An infinite or NaN sum has a NaN t, and is the result.)
         self.f.local_get(tl);
         self.f64_const(0.0);
-        self.f.byte(0x61); // f64.eq
-        self.f.byte(0x45); // i32.eqz -> t != 0
+        self.f.byte(0x64); // f64.gt
+        self.f.local_get(tl);
+        self.f64_const(0.0);
+        self.f.byte(0x63); // f64.lt
+        self.f.byte(0x72); // i32.or -> t > 0 or t < 0
         self.f.local_get(sl);
         self.f.byte(0xbd); // i64.reinterpret_f64
         self.f.i64_const(1);

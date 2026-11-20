@@ -384,7 +384,7 @@ GEX_INLINE uint64_t gex_fmaf(uint64_t a, uint64_t b, uint64_t c) {
     double bb = s - p;
     double t = (p - (s - bb)) + (cc - bb);
     double r = s;
-    if ((t != 0.0) & ((gex_b64(s) & 1) == 0))
+    if (((t > 0.0) | (t < 0.0)) & ((gex_b64(s) & 1) == 0))
         r = gex_f64(gex_b64(s) + (((t > 0.0) == (s > 0.0)) ? 1ull : (uint64_t)-1));
     return (uint64_t)gex_b32((float)r);
 }

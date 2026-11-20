@@ -57,6 +57,9 @@ pub fn fma_soft(a: f64, b: f64, c: f64) -> f64 {
 /// two `f32` is exact in `f64`, so only the sum rounds. Round-to-odd on that
 /// sum stops the narrowing to `f32` from breaking a halfway tie the wrong way
 /// -- the step must go *toward the error's sign*, not simply up in magnitude.
+/// The step is taken only for an error that is a number other than zero: an
+/// infinite or NaN sum makes the error NaN, and stepping an infinity's bits
+/// made a NaN of `-inf * x + y`.
 pub fn fmaf_soft(a: f32, b: f32, c: f32) -> f32 {
     let (a, b, c) = (a as f64, b as f64, c as f64);
     let p = a * b;
@@ -65,7 +68,7 @@ pub fn fmaf_soft(a: f32, b: f32, c: f32) -> f32 {
     let bb = s - p;
     let t = (p - (s - bb)) + (c - bb);
 
-    let s = if t != 0.0 && s.to_bits() & 1 == 0 {
+    let s = if (t > 0.0 || t < 0.0) && s.to_bits() & 1 == 0 {
         let up = (t > 0.0) == (s > 0.0);
         f64::from_bits(if up { s.to_bits() + 1 } else { s.to_bits() - 1 })
     } else {
@@ -183,6 +186,27 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Infinities, which random bit patterns almost never give: an infinite
+    /// operand or addend is an infinite result (Linux 7.0's arm64 `fmadd`
+    /// gave these), and opposite infinities NaN.
+    #[test]
+    fn single_precision_infinities_stay_infinite() {
+        let inf = f32::INFINITY;
+        for (a, b, c, want) in [
+            (-inf, 3.0711798e-31, -1.0032007e12, -inf),
+            (inf, -3.158_017_6, 1.3194940e-4, -inf),
+            (-2.324_963_6, 1.809_122_8, -inf, -inf),
+            (6.187_916e-31, -inf, 1.616_094_5e-8, -inf),
+            (2.0, 3.0, inf, inf),
+            (inf, 1.0, inf, inf),
+        ] {
+            assert_eq!(fmaf_soft(a, b, c).to_bits(), want.to_bits(), "fmaf({a:e}, {b:e}, {c:e})");
+        }
+        assert!(fmaf_soft(inf, 1.0, -inf).is_nan());
+        assert!(fmaf_soft(inf, 0.0, 1.0).is_nan());
+        assert!(fmaf_soft(f32::NAN, 1.0, 1.0).is_nan());
     }
 
     /// The band is not so narrow that ordinary magnitudes miss the fast path.
