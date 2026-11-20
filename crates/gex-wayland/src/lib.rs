@@ -838,6 +838,16 @@ struct SurfaceState {
     /// whole surface), and the committed region (`None`: the whole surface).
     pending_input: Option<Option<Region>>,
     input: Option<Region>,
+    /// Whether the client has committed this surface at all. One it never
+    /// committed is not mapped and takes no pointer, though a host may show
+    /// it: a surface whose frames are the host's GL (`external`) is listed
+    /// from its attach on, before its client's first commit, which carries
+    /// its input region (Wine's GL subsurface sets an empty one at create and
+    /// commits it only with a frame). Listed with no region it took every
+    /// click over its window while its program had not drawn: MuseScore's
+    /// telemetry dialog, whose GL child presented nothing, was dead to the
+    /// mouse.
+    committed: bool,
 }
 
 /// Whether a surface's pixels are the host's. A free function because the
@@ -1734,6 +1744,10 @@ impl Client {
     fn commit(&mut self, surface: u32, buffers: &dyn Buffers) {
         // The buffer scale is double-buffered state like the rest.
         if let Some(s) = self.surfaces.get_mut(&surface) {
+            if !s.committed {
+                s.committed = true;
+                self.dirty = true;
+            }
             if let Some(k) = s.pending_scale.take() {
                 if k != s.buffer_scale.max(1) {
                     self.dirty = true;
@@ -2912,7 +2926,8 @@ impl Client {
                 scale120: self.scale120,
                 view: s.viewport,
                 placement: s.placement,
-                input: s.input.clone(),
+                // Not committed yet: not mapped, so no input anywhere.
+                input: if s.committed { s.input.clone() } else { Some(Region::default()) },
                 pointer_lock: self.wants_lock(*id),
             });
         }
@@ -4234,6 +4249,32 @@ mod tests {
         assert_eq!(sub.role, Role::Subsurface);
         assert_eq!(sub.parent, 6);
         assert_eq!((sub.rel_x, sub.rel_y), (12, 7));
+    }
+
+    #[test]
+    fn a_gl_subsurface_never_committed_takes_no_pointer() {
+        let pool = Placed(0x6000, 8192);
+        let (mut c, _) = placed_window(200, 100, 800);
+        // Wine's GL child: a subsurface of the window with an empty input
+        // region set, then the GL device's attach -- and no commit, as when
+        // the program has not presented a frame yet.
+        c.receive(&Writer::new(2, 0).uint(7).string("wl_subcompositor").uint(1).new_id(30).finish(), &[], &pool);
+        c.receive(&Writer::new(3, 0).new_id(31).finish(), &[], &pool);
+        c.receive(&Writer::new(3, 1).new_id(40).finish(), &[], &pool);
+        c.receive(&Writer::new(31, 5).object(40).finish(), &[], &pool);
+        c.receive(&Writer::new(40, 0).finish(), &[], &pool);
+        c.receive(&Writer::new(30, 1).new_id(32).object(31).object(6).finish(), &[], &pool);
+        c.attach_external(31, 200, 100);
+        let sub = |c: &Client| c.scene().into_iter().find(|s| s.surface == 31).expect("the GL subsurface is not listed");
+        let input = sub(&c).input.expect("an uncommitted surface takes the pointer everywhere");
+        assert!(!input.contains(0, 0) && !input.contains(100, 50), "an uncommitted surface takes the pointer");
+        // Its first commit applies the region it set: still none.
+        c.receive(&Writer::new(31, 6).finish(), &[], &pool);
+        assert!(!sub(&c).input.expect("the empty region lost at the commit").contains(100, 50));
+        // A committed surface with no region is the whole surface, as before.
+        c.receive(&Writer::new(31, 5).object(0).finish(), &[], &pool);
+        c.receive(&Writer::new(31, 6).finish(), &[], &pool);
+        assert_eq!(sub(&c).input, None);
     }
 
     #[test]
