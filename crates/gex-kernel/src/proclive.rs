@@ -33,6 +33,8 @@ struct Live {
     vfs: Weak<VfsView>,
     /// The process's fs_struct: its working directory.
     fs: Weak<crate::syscalls::FsCwd>,
+    /// Its resource limits.
+    rlimits: Weak<crate::syscalls::Rlimits>,
     exe: String,
     argv: Vec<String>,
     envp: Vec<String>,
@@ -297,6 +299,13 @@ impl ProcSource for KernelProcSource {
         let vm = self.0.get()?.procs.vm(pid).ok()?;
         Some(vm.fs.as_ref()?.upgrade()?.umask())
     }
+    fn rlimits(&self) -> Option<[[u64; 2]; crate::syscalls::RLIM_NLIMITS]> {
+        Some(self.0.get()?.rlimits.upgrade()?.get())
+    }
+    fn rlimits_of(&self, pid: i32) -> Option<[[u64; 2]; crate::syscalls::RLIM_NLIMITS]> {
+        let vm = self.0.get()?.procs.vm(pid).ok()?;
+        Some(vm.rlimits.as_ref()?.upgrade()?.get())
+    }
     fn task_owner(&self, id: i32) -> Option<i32> {
         self.0.get()?.procs.task_owner(id)
     }
@@ -379,6 +388,7 @@ impl Kernel {
                 && o.argv == self.argv
                 && o.envp == self.envp
                 && Arc::ptr_eq(&o.creds, &self.creds)
+                && o.rlimits.ptr_eq(&Arc::downgrade(&self.rlimits))
                 && Arc::ptr_eq(&o.threads, &self.thread_signals)
                 && Arc::ptr_eq(&o.thread, self.signals.thread())
                 && Arc::ptr_eq(&o.process, self.signals.process())
@@ -397,6 +407,7 @@ impl Kernel {
             fds: Arc::downgrade(&self.fds),
             vfs: Arc::downgrade(self.vfs.view()),
             fs: Arc::downgrade(&self.proc_fs),
+            rlimits: Arc::downgrade(&self.rlimits),
             exe: self.exe_path.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),

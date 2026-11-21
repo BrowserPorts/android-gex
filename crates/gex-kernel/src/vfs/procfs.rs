@@ -78,6 +78,14 @@ pub trait ProcSource: Send + Sync {
     fn umask_of(&self, _pid: i32) -> Option<u32> {
         None
     }
+    /// The process's resource limits (soft, hard), for its `limits`.
+    fn rlimits(&self) -> Option<[[u64; 2]; crate::syscalls::RLIM_NLIMITS]> {
+        None
+    }
+    /// Another process's, the same.
+    fn rlimits_of(&self, _pid: i32) -> Option<[[u64; 2]; crate::syscalls::RLIM_NLIMITS]> {
+        None
+    }
     /// Every process on the system, this one included, for `/proc/<pid>`
     /// and the listing of `/proc` (what `ps` and `htop` read). Empty where
     /// the kernel knows only this process.
@@ -176,6 +184,41 @@ pub fn stat_text(sys: &System, cpus: u64, wall_s: u64) -> String {
 pub fn loadavg_text(sys: &System) -> String {
     let l = |h: u32| format!("{}.{:02}", h / 100, h % 100);
     format!("{} {} {} 1/{} {}\n", l(sys.load[0]), l(sys.load[1]), l(sys.load[2]), sys.procs.max(1), sys.last_pid)
+}
+
+/// `/proc/<pid>/limits` as `proc_pid_limits` writes it: a header, then a
+/// line a resource, soft and hard limits (`unlimited` for infinity) and its
+/// unit, in columns 25, 20, 20 and 10 wide.
+fn limits_text(rl: &[[u64; 2]; crate::syscalls::RLIM_NLIMITS]) -> String {
+    const NAMES: [(&str, &str); 16] = [
+        ("Max cpu time", "seconds"),
+        ("Max file size", "bytes"),
+        ("Max data size", "bytes"),
+        ("Max stack size", "bytes"),
+        ("Max core file size", "bytes"),
+        ("Max resident set", "bytes"),
+        ("Max processes", "processes"),
+        ("Max open files", "files"),
+        ("Max locked memory", "bytes"),
+        ("Max address space", "bytes"),
+        ("Max file locks", "locks"),
+        ("Max pending signals", "signals"),
+        ("Max msgqueue size", "bytes"),
+        ("Max nice priority", ""),
+        ("Max realtime priority", ""),
+        ("Max realtime timeout", "us"),
+    ];
+    let value = |v: u64| if v == u64::MAX { "unlimited".to_string() } else { v.to_string() };
+    let mut out = format!("{:<25} {:<20} {:<20} {:<10}\n", "Limit", "Soft Limit", "Hard Limit", "Units");
+    for (i, (name, unit)) in NAMES.iter().enumerate() {
+        let [soft, hard] = rl.get(i).copied().unwrap_or([u64::MAX, u64::MAX]);
+        out += &format!("{name:<25} {:<20} {:<20} ", value(soft), value(hard));
+        if !unit.is_empty() {
+            out += &format!("{unit:<10}");
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// `/proc/<pid>/statm`, in pages: the size, what is resident, and nothing
@@ -898,6 +941,7 @@ impl ProcFs {
             "status" => status_text(id, e.pid, &comm, state, e.ppid, threads, &e.creds, &usage, self.source.umask_of(e.pid)).into_bytes(),
             "cgroup" => crate::cgroup::proc_file(e.pid),
             "statm" => statm_text(&e.usage).into_bytes(),
+            "limits" => limits_text(&self.source.rlimits_of(e.pid)?).into_bytes(),
             "cmdline" => e.cmdline().to_vec(),
             "comm" => format!("{comm}\n").into_bytes(),
             // Another process's memory and environment are not ours to show.
@@ -921,6 +965,7 @@ impl ProcFs {
             "self/stat" => s.stat(id, self.tasks_of("self").len(), task().as_ref()).into_bytes(),
             "self/status" => s.status(id, self.tasks_of("self").len(), task().as_ref()).into_bytes(),
             "self/statm" => statm_text(&s.usage()).into_bytes(),
+            "self/limits" => limits_text(&s.rlimits()?).into_bytes(),
             "self/mountinfo" => mountinfo(&s.mount_table()).into_bytes(),
             "self/mounts" | "mounts" => mounts(&s.mount_table()).into_bytes(),
             p if p.starts_with("self/fdinfo/") => s.fd_info(p["self/fdinfo/".len()..].parse().ok()?)?.into_bytes(),
@@ -1128,7 +1173,7 @@ impl FileSystem for ProcFs {
             }
             "self" => vec![
                 "maps", "cmdline", "environ", "auxv", "stat", "status", "statm", "comm", "exe", "cwd", "fd",
-                "fdinfo", "task", "mountinfo", "mounts", "attr", "oom_score_adj", "cgroup",
+                "fdinfo", "task", "mountinfo", "mounts", "attr", "oom_score_adj", "cgroup", "limits",
             ],
             "self/fd" => {
                 let mut out = base_entries();

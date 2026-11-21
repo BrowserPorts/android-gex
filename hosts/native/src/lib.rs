@@ -2901,7 +2901,7 @@ impl gex_kernel::proc::PeerMem for PeerMemory {
 /// Publish `k`'s process's address space, `memory` and its map, for other
 /// processes (`ProcTable::set_vm`): at its start, a fork, and each `execve`.
 fn publish_vm(k: &Kernel, memory: &gex_mem::GuestMemory) {
-    let vm = gex_kernel::proc::PeerVm { mm: k.mem.shared(), mem: Arc::new(PeerMemory(memory.clone())), fs: Some(Arc::downgrade(&k.proc_fs)) };
+    let vm = gex_kernel::proc::PeerVm { mm: k.mem.shared(), mem: Arc::new(PeerMemory(memory.clone())), fs: Some(Arc::downgrade(&k.proc_fs)), rlimits: Some(Arc::downgrade(&k.rlimits)) };
     k.procs.set_vm(k.pid, Some(Arc::new(vm)));
     let held = memory.clone();
     k.mem.lock().set_resident(gex_kernel::mem::Resident(Arc::new(move |a, b| held.resident(a, b))));

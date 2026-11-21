@@ -423,6 +423,9 @@ pub struct PeerVm {
     /// Its fs_struct, for the umask its `status` says; `None` where the
     /// host has not given it.
     pub fs: Option<std::sync::Weak<crate::syscalls::FsCwd>>,
+    /// Its resource limits, for its `limits`; `None` where the host has
+    /// not given them.
+    pub rlimits: Option<std::sync::Weak<crate::syscalls::Rlimits>>,
 }
 
 /// `prctl` option gex adds: the calling process has crashed (`arg2` the
