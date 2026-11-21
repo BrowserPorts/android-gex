@@ -3676,7 +3676,7 @@ fn exec_program(
     // programs (the kernel's `strace_exe`).
     let trace = opts.trace
         || (std::env::var_os("GEX_STRACE_ONLY").is_none()
-            && std::env::var("GEX_STRACE_EXE").is_ok_and(|s| !s.is_empty() && kernel.exe_path.contains(&s)));
+            && std::env::var("GEX_STRACE_EXE").is_ok_and(|s| gex_kernel::syscalls::strace_exe_matches(&s, &kernel.exe_path)));
     let opts = RunOptions {
         // (a program its interpreter maps: the interpreter's command line
         // for it, gex_ld::Program::direct)

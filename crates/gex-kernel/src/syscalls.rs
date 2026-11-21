@@ -16270,10 +16270,18 @@ fn is_ptimer(n: u64) -> bool {
 
 /// `GEX_STRACE_EXE=app_process64`: [`strace_only`]'s calls only for the
 /// processes whose program's path holds that text (all when unset): one
-/// program's calls out of a whole boot's.
+/// program's calls out of a whole boot's. Several, separated by commas
+/// (`app_process64,/apex/com.android.art/bin/`), match any of them.
 fn strace_exe(exe: &str) -> bool {
     static EXE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    EXE.get_or_init(|| std::env::var("GEX_STRACE_EXE").ok().filter(|v| !v.is_empty())).as_deref().is_none_or(|want| exe.contains(want))
+    EXE.get_or_init(|| std::env::var("GEX_STRACE_EXE").ok().filter(|v| !v.is_empty()))
+        .as_deref()
+        .is_none_or(|want| strace_exe_matches(want, exe))
+}
+
+/// Whether `exe` holds one of `want`'s comma-separated texts.
+pub fn strace_exe_matches(want: &str, exe: &str) -> bool {
+    want.split(',').map(str::trim).filter(|w| !w.is_empty()).any(|w| exe.contains(w))
 }
 
 /// `prlimit64(pid, resource, new, old)`, for the calling process (gex's

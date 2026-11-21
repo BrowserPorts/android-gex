@@ -144,6 +144,13 @@ mod abi {
 use abi::*;
 
 /// Who is making an ioctl.
+/// `GEX_TRACE_BINDER_FDS=1`: each descriptor a transaction puts in its
+/// receiver, and each one a freed buffer closes, said on standard error.
+fn trace_fds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GEX_TRACE_BINDER_FDS").is_some())
+}
+
 pub struct Caller<'a> {
     pub pid: i32,
     pub tid: i32,
@@ -1465,6 +1472,9 @@ impl State {
                         // the thread goes back to its program for that.
                         let fds: Vec<i32> = b.objects.iter().filter_map(|o| if let Object::ArrayFd(fd) = o { Some(*fd) } else { None }).collect();
                         for &fd in &fds {
+                            if trace_fds() {
+                                eprintln!("[gex] binder: pid {} tid {} frees a buffer: closes fd {fd}", cx.pid, cx.tid);
+                            }
                             let _ = cx.fds.close(fd);
                         }
                         if !fds.is_empty() {
@@ -1842,9 +1852,19 @@ impl State {
         let mut installed = Vec::new();
         let mut ok = true;
         let mut in_arrays = Vec::new();
+        let (sender, reply, code) = (t.sender_pid, t.is_reply, t.code);
         for (at, file, array) in std::mem::take(&mut t.fds) {
+            let path = trace_fds().then(|| file.path.clone());
             match cx.fds.insert(file, true) {
                 Ok(fd) => {
+                    if let Some(path) = path {
+                        eprintln!(
+                            "[gex] binder: pid {} tid {} got fd {fd} ({path}) in a {} from pid {sender}, code {code}",
+                            cx.pid,
+                            cx.tid,
+                            if reply { "reply" } else { "call" }
+                        );
+                    }
                     t.bytes[at..at + 4].copy_from_slice(&(fd as u32).to_le_bytes());
                     installed.push(fd as i32);
                     if array {
