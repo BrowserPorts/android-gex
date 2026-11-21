@@ -488,6 +488,30 @@ impl Clone for FdTable {
     }
 }
 
+/// A table that has just refused a descriptor for being full (`EMFILE`):
+/// what fills it, by kind of file, said on standard error the first time a
+/// table refuses one, since a full table is most often a leak and this says
+/// of what. A file's kind is its path with numbers and names after its
+/// directory left out (`pipe:[N]`, `socket:[N]`, `/data/system/…`).
+fn say_full(t: &Table, limit: usize) {
+    static SAID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= 4 {
+        return;
+    }
+    let mut kinds: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for f in t.entries.iter().flatten() {
+        let kind = match f.path.rfind('/') {
+            Some(i) if f.path.starts_with('/') => format!("{}/…", &f.path[..i]),
+            _ => f.path.chars().map(|c| if c.is_ascii_digit() { 'N' } else { c }).collect(),
+        };
+        *kinds.entry(kind).or_default() += 1;
+    }
+    let mut by: Vec<(usize, String)> = kinds.into_iter().map(|(k, n)| (n, k)).collect();
+    by.sort_by(|a, b| b.cmp(a));
+    let top: Vec<String> = by.iter().take(8).map(|(n, k)| format!("{n} {k}")).collect();
+    eprintln!("[gex] tid {}: no descriptor left under RLIMIT_NOFILE {limit} (EMFILE); open: {}", crate::sync::me(), top.join(", "));
+}
+
 impl FdTable {
     pub fn new() -> FdTable {
         FdTable::from_parts(Table::default(), 0, NOFILE_SOFT)
@@ -670,9 +694,13 @@ impl FdTable {
                 .map(|p| p + min);
             let idx = match slot {
                 Some(i) if i < limit => i,
-                Some(_) => return Err(Errno::EMFILE),
+                Some(_) => {
+                    say_full(t, limit);
+                    return Err(Errno::EMFILE);
+                }
                 None => {
                     if t.entries.len() >= limit {
+                        say_full(t, limit);
                         return Err(Errno::EMFILE);
                     }
                     t.entries.push(None);
