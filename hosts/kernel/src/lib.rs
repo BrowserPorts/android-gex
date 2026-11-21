@@ -2099,6 +2099,20 @@ pub extern "C" fn k_proc_add_task_cpu(tid: i32, ns: u64) {
     procs().add_task_cpu(tid, ns);
 }
 
+/// How task `tid` is scheduled, or -1 for no such task
+/// (`ProcTable::sched_of`).
+#[no_mangle]
+pub extern "C" fn k_proc_sched_of(tid: i32) -> i64 {
+    procs().sched_of(tid).map_or(-1, |w| w as i64)
+}
+
+/// Task `tid` is now scheduled as `word` says: 0, or -1 for no such task
+/// (`ProcTable::set_sched`).
+#[no_mangle]
+pub extern "C" fn k_proc_set_sched(tid: i32, word: u64) -> i32 {
+    if procs().set_sched(tid, word) { 0 } else { -1 }
+}
+
 /// Task `tid`'s name, `len` bytes at `at` (`ProcTable::set_task_name`).
 #[no_mangle]
 pub extern "C" fn k_proc_set_task_name(tid: i32, at: gex_kmem::PAddr, len: u32) {

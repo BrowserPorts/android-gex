@@ -3704,7 +3704,7 @@ export class Gex {
       .filter((i) => i.module === 'gex_k' && i.kind === 'function')
       .map((i) => i.name);
     // Some of these return an i64, which JS has to answer with a BigInt.
-    const BIG = new Set(['k_inet_op', 'k_wait', 'k_take_signals', 'k_take_kill_signals', 'k_take_thread_signal', 'k_tty_winsize']);
+    const BIG = new Set(['k_inet_op', 'k_wait', 'k_take_signals', 'k_take_kill_signals', 'k_take_thread_signal', 'k_tty_winsize', 'k_proc_sched_of']);
     const out = { k_present: () => (k ? 1 : 0) };
     for (const n of NAMES) {
       // Some `gex_k` imports are answered here, not by the kernel (`k_present`

@@ -193,6 +193,8 @@ pub mod raw {
     pub const SCHED_GETSCHEDULER: u64 = 145;
     pub const SCHED_GET_PRIORITY_MAX: u64 = 146;
     pub const SCHED_GET_PRIORITY_MIN: u64 = 147;
+    pub const IOPRIO_SET: u64 = 251;
+    pub const IOPRIO_GET: u64 = 252;
     pub const MREMAP: u64 = 25;
     pub const MSYNC: u64 = 26;
     pub const MADVISE: u64 = 28;
@@ -488,6 +490,8 @@ pub fn translate(
         x::SCHED_GETSCHEDULER => nr::SCHED_GETSCHEDULER,
         x::SCHED_GET_PRIORITY_MAX => nr::SCHED_GET_PRIORITY_MAX,
         x::SCHED_GET_PRIORITY_MIN => nr::SCHED_GET_PRIORITY_MIN,
+        x::IOPRIO_SET => nr::IOPRIO_SET,
+        x::IOPRIO_GET => nr::IOPRIO_GET,
         x::MREMAP => nr::MREMAP,
         x::MSYNC => nr::MSYNC,
         x::MADVISE => nr::MADVISE,

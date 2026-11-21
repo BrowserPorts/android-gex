@@ -93,6 +93,10 @@ pub struct Remote {
     pub add_task_cpu: extern "C" fn(tid: i32, ns: u64),
     /// See [`ProcTable::set_task_name`].
     pub set_task_name: extern "C" fn(tid: i32, at: crate::PAddr, len: u32),
+    /// See [`ProcTable::sched_of`]: the word, or -1 for no such task.
+    pub sched_of: extern "C" fn(tid: i32) -> i64,
+    /// See [`ProcTable::set_sched`]: 0, or -1 for no such task.
+    pub set_sched: extern "C" fn(tid: i32, word: u64) -> i32,
     /// See [`ProcTable::cpu_total`].
     pub cpu_total: extern "C" fn() -> u64,
     /// See [`ProcTable::loadavg`], the three packed by [`pack_load`].
@@ -126,11 +130,13 @@ pub struct Usage {
 /// processor time it has used, as its host said ([`ProcTable::add_task_cpu`]),
 /// and the name it gave itself (`prctl(PR_SET_NAME)`, which
 /// `pthread_setname_np` makes): NUL-padded, all NULs for none, when it goes
-/// by its process's.
+/// by its process's. And how it is scheduled, as a [`crate::sched::Sched`]
+/// word (0: `SCHED_NORMAL` at nice 0).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TaskUsage {
     pub cpu_ns: u64,
     pub name: [u8; 16],
+    pub sched: u64,
 }
 
 impl TaskUsage {
@@ -294,6 +300,7 @@ pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
             let u = e.task_usage.get(i).copied().unwrap_or_default();
             out.extend_from_slice(&u.cpu_ns.to_le_bytes());
             out.extend_from_slice(&u.name);
+            out.extend_from_slice(&u.sched.to_le_bytes());
         }
         out.extend_from_slice(&e.info);
         out.extend_from_slice(&e.creds);
@@ -309,7 +316,7 @@ pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
     let word = |b: &[u8], i: usize| i32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
     let long = |b: &[u8], i: usize| u64::from_le_bytes(b[32 + i * 8..40 + i * 8].try_into().unwrap());
     const HEAD: usize = 32 + 5 * 8;
-    const TASK: usize = 8 + 16;
+    const TASK: usize = 8 + 16 + 8;
     while b.len() >= HEAD {
         let (t, n, c) = (word(b, 5).max(0) as usize, word(b, 6).max(0) as usize, word(b, 7).max(0) as usize);
         let tasks = HEAD + 4 * t;
@@ -320,7 +327,7 @@ pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
         let task_usage = (0..=t)
             .map(|i| {
                 let o = tasks + TASK * i;
-                TaskUsage { cpu_ns: u64::from_le_bytes(b[o..o + 8].try_into().unwrap()), name: b[o + 8..o + 24].try_into().unwrap() }
+                TaskUsage { cpu_ns: u64::from_le_bytes(b[o..o + 8].try_into().unwrap()), name: b[o + 8..o + 24].try_into().unwrap(), sched: u64::from_le_bytes(b[o + 24..o + 32].try_into().unwrap()) }
             })
             .collect();
         out.push(ProcEntry {
@@ -1233,6 +1240,35 @@ impl ProcTable {
             u.name = [0; 16];
             u.name[..end].copy_from_slice(name);
         }
+    }
+
+    /// How task `tid` is scheduled ([`crate::sched::Sched`]'s word), `None`
+    /// when no task has that id. A zombie's is still there, as Linux finds
+    /// a task until it is reaped.
+    pub fn sched_of(&self, tid: i32) -> Option<u64> {
+        if let Some(r) = self.remote {
+            let w = (r.sched_of)(tid);
+            return (w >= 0).then_some(w as u64);
+        }
+        let t = self.lock();
+        if !(t.procs.iter().any(|p| p.pid == tid) || t.threads.contains_key(&tid)) {
+            return None;
+        }
+        Some(t.tasks.get(&tid).map_or(0, |u| u.sched))
+    }
+
+    /// Task `tid` is now scheduled as `word` says; `false` when no task has
+    /// that id.
+    pub fn set_sched(&self, tid: i32, word: u64) -> bool {
+        if let Some(r) = self.remote {
+            return (r.set_sched)(tid, word) == 0;
+        }
+        let mut t = self.lock();
+        if !(t.procs.iter().any(|p| p.pid == tid) || t.threads.contains_key(&tid)) {
+            return false;
+        }
+        t.tasks.entry(tid).or_default().sched = word;
+        true
     }
 
     /// The processor time every process has used, those gone included:

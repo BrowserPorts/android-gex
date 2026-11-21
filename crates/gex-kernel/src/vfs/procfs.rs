@@ -287,16 +287,18 @@ pub fn mounts(table: &[crate::vfs::MountLine]) -> String {
 /// library error, reap"). `id` is the task's: the pid for a process, a
 /// thread's id in its `task/<tid>/stat`; `threads` counts the process's.
 /// The times, start and sizes are the process's `u`: all of its processor
-/// time counts as user time, a thread's as its process's.
+/// time counts as user time, a thread's as its process's. `sched` is the
+/// task's ([`crate::sched`]): its priority, nice value, real-time priority
+/// and policy.
 #[allow(clippy::too_many_arguments)]
-pub fn stat_line(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>, threads: usize, u: &Usage) -> String {
-    stat_line_at(id, comm, state, ppid, pgid, sid, tty, threads, u, 0)
+pub fn stat_line(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>, threads: usize, u: &Usage, sched: crate::sched::Sched) -> String {
+    stat_line_at(id, comm, state, ppid, pgid, sid, tty, threads, u, 0, sched)
 }
 
 /// [`stat_line`] with `startstack`, where the process's stack began, which
 /// a process knows of itself (0: not known, another process's).
 #[allow(clippy::too_many_arguments)]
-pub fn stat_line_at(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>, threads: usize, u: &Usage, start_stack: u64) -> String {
+pub fn stat_line_at(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid: i32, tty: Option<(u32, i32)>, threads: usize, u: &Usage, start_stack: u64, sched: crate::sched::Sched) -> String {
     let (tty_nr, tpgid) = tty.map_or((0, -1), |(n, fg)| (crate::pty::tty_nr(n), if fg > 0 { fg } else { -1 }));
     // pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
     // majflt cmajflt utime stime cutime cstime priority nice num_threads
@@ -307,9 +309,10 @@ pub fn stat_line_at(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid:
     // env_start env_end exit_code
     let (utime, cutime, start) = (u.cpu_ns / TICK_NS, u.child_cpu_ns / TICK_NS, u.start_ns / TICK_NS);
     let (vsize, rss) = (u.vsize, u.rss / 4096);
+    let (prio, nice, rt, policy) = (sched.prio(), sched.nice, sched.rt_priority, sched.policy);
     format!(
-        "{id} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} 4194560 0 0 0 0 {utime} 0 {cutime} 0 20 0 {threads} 0 {start} {vsize} {rss} \
-         18446744073709551615 0 0 {start_stack} 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+        "{id} ({comm}) {state} {ppid} {pgid} {sid} {tty_nr} {tpgid} 4194560 0 0 0 0 {utime} 0 {cutime} 0 {prio} {nice} {threads} 0 {start} {vsize} {rss} \
+         18446744073709551615 0 0 {start_stack} 0 0 0 0 0 0 0 0 0 17 0 {rt} {policy} 0 0 0 0 0 0 0 0 0 0 0\n"
     )
 }
 
@@ -937,7 +940,7 @@ impl ProcFs {
             (e.comm(), e.usage)
         };
         Some(match rest {
-            "stat" => stat_line(id, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid), threads, &usage).into_bytes(),
+            "stat" => stat_line(id, &comm, state, e.ppid, e.pgid, e.sid, self.source.tty_of(e.sid), threads, &usage, crate::sched::Sched::from_word(e.task(id).sched)).into_bytes(),
             "status" => status_text(id, e.pid, &comm, state, e.ppid, threads, &e.creds, &usage, self.source.umask_of(e.pid)).into_bytes(),
             "cgroup" => crate::cgroup::proc_file(e.pid),
             "statm" => statm_text(&e.usage).into_bytes(),
@@ -1463,7 +1466,7 @@ mod tests {
             vec![(0, "/dev/tty".into()), (3, "/tmp/x".into())]
         }
         fn stat(&self, tid: i32, threads: usize, _task: Option<&TaskUsage>) -> String {
-            stat_line(tid, "prog", 'R', 7, 42, 1, None, threads, &Usage::default())
+            stat_line(tid, "prog", 'R', 7, 42, 1, None, threads, &Usage::default(), Default::default())
         }
         fn status(&self, tid: i32, threads: usize, _task: Option<&TaskUsage>) -> String {
             status_text(tid, 42, "prog", 'R', 7, threads, &[], &Usage::default(), None)
@@ -1488,7 +1491,7 @@ mod tests {
             io[..2].copy_from_slice(b"io");
             let mut xterm = e(7, 1, b"xterm\nxterm\0-e\0bash\0", &[8, 9]);
             xterm.usage.cpu_ns = 4_000_000_000;
-            xterm.task_usage = vec![TaskUsage::default(), TaskUsage { cpu_ns: 2_500_000_000, name: io }, TaskUsage { cpu_ns: 1_500_000_000, name: [0; 16] }];
+            xterm.task_usage = vec![TaskUsage::default(), TaskUsage { cpu_ns: 2_500_000_000, name: io, sched: 0 }, TaskUsage { cpu_ns: 1_500_000_000, name: [0; 16], sched: 0 }];
             vec![e(1, 0, b"bash\n/bin/bash\0/etc/session\0", &[]), xterm, e(42, 7, b"prog\n", &[43])]
         }
     }
@@ -1567,17 +1570,26 @@ mod tests {
     fn this_process_keeps_its_own_view() {
         // Its own pid is `self`, served from its own state, not the table's.
         assert_eq!(read(&fs(), "42/cmdline"), "/bin/prog\0arg\0");
-        assert_eq!(stat_line(1, "x", 'R', 0, 1, 1, None, 1, &Usage::default()).split_whitespace().count(), 52);
+        assert_eq!(stat_line(1, "x", 'R', 0, 1, 1, None, 1, &Usage::default(), Default::default()).split_whitespace().count(), 52);
         // startstack is the 28th field.
-        assert_eq!(stat_line_at(1, "x", 'R', 0, 1, 1, None, 1, &Usage::default(), 0x57f_f000).split_whitespace().nth(27), Some("92270592"));
-        let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, Some((3, 7)), 1, &Usage::default()).split_whitespace().map(String::from).collect();
+        assert_eq!(stat_line_at(1, "x", 'R', 0, 1, 1, None, 1, &Usage::default(), 0x57f_f000, Default::default()).split_whitespace().nth(27), Some("92270592"));
+        let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, Some((3, 7)), 1, &Usage::default(), Default::default()).split_whitespace().map(String::from).collect();
         assert_eq!((f[6].as_str(), f[7].as_str()), ("34819", "7"), "tty_nr is 136:3, tpgid the foreground group");
+        // priority and nice (18, 19), rt_priority and policy (40, 41), as
+        // `do_task_stat` writes them: a real-time task's priority is
+        // -1 - rt_priority, another's 20 + nice
+        let rr = crate::sched::Sched { nice: -3, policy: 2, rt_priority: 5, reset_on_fork: false, ioprio: 0 };
+        let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, None, 1, &Usage::default(), rr).split_whitespace().map(String::from).collect();
+        assert_eq!([&f[17], &f[18], &f[39], &f[40]], ["-6", "-3", "5", "2"]);
+        let batch = crate::sched::Sched { nice: 7, policy: 3, rt_priority: 0, reset_on_fork: false, ioprio: 0 };
+        let f: Vec<String> = stat_line(5, "sh", 'S', 1, 5, 5, None, 1, &Usage::default(), batch).split_whitespace().map(String::from).collect();
+        assert_eq!([&f[17], &f[18], &f[39], &f[40]], ["27", "7", "0", "3"]);
     }
 
     #[test]
     fn the_times_and_sizes_are_the_processes_own() {
         let u = Usage { cpu_ns: 2_340_000_000, child_cpu_ns: 50_000_000, rss: 8 << 20, vsize: 64 << 20, start_ns: 12_000_000_000 };
-        let f: Vec<String> = stat_line(9, "btop", 'R', 1, 9, 1, None, 2, &u).split_whitespace().map(String::from).collect();
+        let f: Vec<String> = stat_line(9, "btop", 'R', 1, 9, 1, None, 2, &u, Default::default()).split_whitespace().map(String::from).collect();
         assert_eq!(f.len(), 52);
         // utime stime cutime cstime (14-17), starttime (22), vsize, rss (pages)
         assert_eq!(&f[13..17], ["234", "0", "5", "0"]);

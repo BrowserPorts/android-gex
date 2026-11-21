@@ -62,6 +62,7 @@ pub mod pipe;
 pub mod phase;
 pub mod pidfd;
 pub mod prctl;
+pub mod sched;
 pub mod ptimer;
 pub mod seccomp;
 pub mod proc;

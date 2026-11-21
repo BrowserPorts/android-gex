@@ -141,6 +141,8 @@ pub mod raw {
     pub const SCHED_GETSCHEDULER: u64 = 157;
     pub const SCHED_GET_PRIORITY_MAX: u64 = 159;
     pub const SCHED_GET_PRIORITY_MIN: u64 = 160;
+    pub const IOPRIO_SET: u64 = 289;
+    pub const IOPRIO_GET: u64 = 290;
     pub const NANOSLEEP: u64 = 162;
     pub const MREMAP: u64 = 163;
     pub const POLL: u64 = 168;
@@ -1062,6 +1064,8 @@ pub fn translate(
         x::SCHED_GETPARAM => nr::SCHED_GETPARAM,
         x::SCHED_SETSCHEDULER => nr::SCHED_SETSCHEDULER,
         x::SCHED_GETSCHEDULER => nr::SCHED_GETSCHEDULER,
+        x::IOPRIO_SET => nr::IOPRIO_SET,
+        x::IOPRIO_GET => nr::IOPRIO_GET,
         x::SCHED_GET_PRIORITY_MAX => nr::SCHED_GET_PRIORITY_MAX,
         x::SCHED_GET_PRIORITY_MIN => nr::SCHED_GET_PRIORITY_MIN,
         x::SCHED_GETAFFINITY => nr::SCHED_GETAFFINITY,

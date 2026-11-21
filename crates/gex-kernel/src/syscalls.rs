@@ -118,6 +118,8 @@ pub mod nr {
     pub const MOUNT: u64 = 40;
     pub const GETITIMER: u64 = 102;
     pub const SETITIMER: u64 = 103;
+    pub const IOPRIO_SET: u64 = 30;
+    pub const IOPRIO_GET: u64 = 31;
     pub const SCHED_SETPARAM: u64 = 118;
     pub const SCHED_SETSCHEDULER: u64 = 119;
     pub const SCHED_GETSCHEDULER: u64 = 120;
@@ -956,6 +958,8 @@ pub const RLIMIT_NPROC: usize = 6;
 pub const RLIMIT_MEMLOCK: usize = 8;
 pub const RLIMIT_SIGPENDING: usize = 11;
 pub const RLIMIT_MSGQUEUE: usize = 12;
+pub const RLIMIT_NICE: usize = 13;
+pub const RLIMIT_RTPRIO: usize = 14;
 pub const RLIM_INFINITY: u64 = u64::MAX;
 
 /// A process's resource limits, behind their own lock: `prlimit64` sets
@@ -994,6 +998,10 @@ pub fn default_rlimits() -> [[u64; 2]; RLIM_NLIMITS] {
     l[RLIMIT_MEMLOCK] = [8 << 20, 8 << 20];
     l[RLIMIT_SIGPENDING] = [63_000, 63_000];
     l[RLIMIT_MSGQUEUE] = [819_200, 819_200];
+    // `INIT_RLIMITS`: no nice value below 20 - 0 and no real-time priority
+    // without `CAP_SYS_NICE` (`crate::sched`).
+    l[RLIMIT_NICE] = [0, 0];
+    l[RLIMIT_RTPRIO] = [0, 0];
     l
 }
 
@@ -7630,7 +7638,7 @@ pub fn process_vm(procs: &ProcTable, m: &mut GuestMem<'_>, compat: bool, write: 
 pub fn is_fd_misc(n: u64) -> bool {
     matches!(
         n,
-        nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::TRUNCATE | nr::FADVISE64 | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SYSINFO | nr::PRLIMIT64
+        nr::EPOLL_CTL | nr::PIPE2 | nr::FTRUNCATE | nr::TRUNCATE | nr::FADVISE64 | nr::STATFS | nr::FSTATFS | nr::GETPRIORITY | nr::SETPRIORITY | nr::SCHED_SETSCHEDULER | nr::SCHED_SETPARAM | nr::SCHED_GETSCHEDULER | nr::SCHED_GETPARAM | nr::IOPRIO_SET | nr::IOPRIO_GET | nr::SYSINFO | nr::PRLIMIT64
             | nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV
     )
 }
@@ -7658,10 +7666,6 @@ pub fn is_quiet(n: u64, compat: bool) -> bool {
             | nr::GET_ROBUST_LIST
             | nr::RSEQ
             | nr::SCHED_GETAFFINITY
-            | nr::SCHED_GETSCHEDULER
-            | nr::SCHED_GETPARAM
-            | nr::SCHED_SETPARAM
-            | nr::SCHED_SETSCHEDULER
             | nr::SCHED_GET_PRIORITY_MAX
             | nr::SCHED_GET_PRIORITY_MIN
             | nr::GETCPU
@@ -8370,6 +8374,8 @@ fn clone3_args(m: &GuestMem<'_>, c: u64, compat: bool) -> Result<[u64; 6], Errno
 pub struct ThreadMaker<'a> {
     pub procs: &'a ProcTable,
     pub pid: i32,
+    /// The creating thread, whose scheduling the new one starts with.
+    pub creator_tid: i32,
     pub compat: bool,
     /// The register-context slots (`Kernel::next_ctx_slot`).
     pub slots: &'a CtxSlots,
@@ -8521,6 +8527,7 @@ impl ThreadMaker<'_> {
         let child = ctx_addr(slot);
         // Numbered with the processes (`ProcTable::new_tid`).
         let tid = self.procs.new_tid(self.pid);
+        crate::sched::inherit(self.procs, self.creator_tid, tid);
         for off in (0..ctx::SIZE).step_by(8) {
             let v = m.read_u64(parent + off as u64)?;
             m.write_u64(child + off as u64, v)?;
@@ -9342,23 +9349,10 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
             }
             Ok(8)
         }
-        // Scheduling policy: every guest thread runs SCHED_OTHER at
-        // priority 0, which is what these report. Setting a normal policy
-        // is accepted; a real-time one is refused as for an unprivileged
-        // process. Mono treats a failed priority query as fatal.
-        nr::SCHED_GETSCHEDULER => Ok(0),
-        nr::SCHED_GETPARAM => {
-            m.write_u32(a[1], 0)?;
-            Ok(0)
-        }
-        nr::SCHED_SETPARAM => Ok(0),
-        nr::SCHED_SETSCHEDULER => match a[1] & 0xff {
-            1 | 2 => Err(Errno::EPERM),
-            0 | 3 | 5 => Ok(0),
-            _ => Err(Errno::EINVAL),
-        },
-        nr::SCHED_GET_PRIORITY_MAX => Ok(if matches!(a[0], 1 | 2) { 99 } else { 0 }),
-        nr::SCHED_GET_PRIORITY_MIN => Ok(if matches!(a[0], 1 | 2) { 1 } else { 0 }),
+        // The policies' priority ranges; the policies themselves are the
+        // full path's (`crate::sched`).
+        nr::SCHED_GET_PRIORITY_MAX => crate::sched::priority_bound(a[0] as i32 as i64, true),
+        nr::SCHED_GET_PRIORITY_MIN => crate::sched::priority_bound(a[0] as i32 as i64, false),
         // getcpu(cpu, node, tcache): a single scheduling domain, CPU 0.
         nr::GETCPU => {
             if a[0] != 0 {
@@ -9578,6 +9572,12 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::FSTATFS64 => nr::FSTATFS,
             x::GETPRIORITY => nr::GETPRIORITY,
             x::SETPRIORITY => nr::SETPRIORITY,
+            x::SCHED_SETPARAM => nr::SCHED_SETPARAM,
+            x::SCHED_GETPARAM => nr::SCHED_GETPARAM,
+            x::SCHED_SETSCHEDULER => nr::SCHED_SETSCHEDULER,
+            x::SCHED_GETSCHEDULER => nr::SCHED_GETSCHEDULER,
+            x::IOPRIO_SET => nr::IOPRIO_SET,
+            x::IOPRIO_GET => nr::IOPRIO_GET,
             x::SYSINFO => nr::SYSINFO,
             x::PROCESS_VM_READV => nr::PROCESS_VM_READV,
             x::PROCESS_VM_WRITEV => nr::PROCESS_VM_WRITEV,
@@ -9683,6 +9683,12 @@ fn free_number(raw: u64, compat: bool) -> Option<u64> {
             x::FSTATFS => nr::FSTATFS,
             x::GETPRIORITY => nr::GETPRIORITY,
             x::SETPRIORITY => nr::SETPRIORITY,
+            x::SCHED_SETPARAM => nr::SCHED_SETPARAM,
+            x::SCHED_GETPARAM => nr::SCHED_GETPARAM,
+            x::SCHED_SETSCHEDULER => nr::SCHED_SETSCHEDULER,
+            x::SCHED_GETSCHEDULER => nr::SCHED_GETSCHEDULER,
+            x::IOPRIO_SET => nr::IOPRIO_SET,
+            x::IOPRIO_GET => nr::IOPRIO_GET,
             x::SYSINFO => nr::SYSINFO,
             x::PROCESS_VM_READV => nr::PROCESS_VM_READV,
             x::PROCESS_VM_WRITEV => nr::PROCESS_VM_WRITEV,
@@ -10094,6 +10100,7 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
         let maker = ThreadMaker {
             procs: f.procs,
             pid: f.pid,
+            creator_tid: f.futex.tid as i32,
             compat,
             slots: f.slots,
             live: f.live,
@@ -10206,9 +10213,10 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
             nr::FADVISE64 => f.io.fadvise(a[0] as i32, a[1], a[2], a[3]),
             nr::STATFS => f.path.at_path(m, AT_FDCWD, a[0]).and_then(|p| f.io.ns.fs_magic(&p)).and_then(|magic| statfs(m, compat, magic, a[1])),
             nr::FSTATFS => f.io.fds.get(a[0] as i32).and_then(|file| statfs(m, compat, f.io.ns.fs_magic_of_open(&file.path), a[1])),
-            // As the kernel's arms: nice 0, and a change taken and ignored.
-            nr::GETPRIORITY => Ok(20),
-            nr::SETPRIORITY => Ok(0),
+            nr::GETPRIORITY | nr::SETPRIORITY | nr::SCHED_SETSCHEDULER | nr::SCHED_SETPARAM | nr::SCHED_GETSCHEDULER | nr::SCHED_GETPARAM | nr::IOPRIO_SET | nr::IOPRIO_GET => {
+                let cx = crate::sched::Cx { procs: f.procs, pid: f.pid, tid: f.futex.tid as i32, creds: f.creds, rlimits: f.rlimits.get() };
+                sched_call(&cx, m, n, a)
+            }
             nr::SYSINFO => sysinfo(m, compat, a[0], f.procs, f.futex.clock),
             nr::PROCESS_VM_READV | nr::PROCESS_VM_WRITEV => process_vm(f.procs, m, compat, n == nr::PROCESS_VM_WRITEV, a),
             _ => prlimit(f.rlimits, f.io.fds, f.creds.capable(CAP_SYS_RESOURCE), m, a[1], a[2], a[3]),
@@ -12918,13 +12926,16 @@ impl Kernel {
     /// the entry is made, so a refused call makes no process.
     fn spawn_with_pidfd(&self, m: &mut GuestMem<'_>, flags: u64, at: u64) -> Result<i32, Errno> {
         if flags & clone_flags::PIDFD == 0 {
-            return Ok(self.procs.spawn(self.pid));
+            let pid = self.procs.spawn(self.pid);
+            crate::sched::inherit(&self.procs, self.tid, pid);
+            return Ok(pid);
         }
         if at == u64::MAX {
             return Err(Errno::EINVAL);
         }
         m.write_u32(at, u32::MAX).map_err(|_| Errno::EFAULT)?;
         let pid = self.procs.spawn(self.pid);
+        crate::sched::inherit(&self.procs, self.tid, pid);
         let fd = self.fds.insert(crate::pidfd::open_file(pid, &self.procs, false), true)?;
         let _ = m.write_u32(at, fd as u32);
         Ok(pid)
@@ -13059,6 +13070,7 @@ impl Kernel {
         ThreadMaker {
             procs: &self.procs,
             pid: self.pid,
+            creator_tid: self.tid,
             compat: self.compat,
             slots: &self.next_ctx_slot,
             live: &self.live_threads,
@@ -14290,12 +14302,12 @@ impl Kernel {
                 std::thread::yield_now();
                 Ok(0)
             }
-            // Scheduling niceness: we run every guest thread at the default
-            // priority, so report nice 0 and accept any set as a no-op. The
-            // raw getpriority ABI returns `20 - nice` (kept non-negative so a
-            // real nice value is never mistaken for an -errno), i.e. 20 here.
-            nr::GETPRIORITY => Ok(20),
-            nr::SETPRIORITY => Ok(0),
+            // Each thread's nice value, policy and real-time priority, kept
+            // as Linux keeps them and set by its rules (`crate::sched`).
+            nr::GETPRIORITY | nr::SETPRIORITY | nr::SCHED_SETSCHEDULER | nr::SCHED_SETPARAM | nr::SCHED_GETSCHEDULER | nr::SCHED_GETPARAM | nr::IOPRIO_SET | nr::IOPRIO_GET => {
+                let cx = self.sched_cx();
+                sched_call(&cx, m, n, a)
+            }
             nr::TIMES => self.sys_times(m, a[0]),
             nr::GETRUSAGE => self.sys_getrusage(m, a[0], a[1]),
             nr::SYSINFO => self.sys_sysinfo(m, a[0]),
@@ -16156,8 +16168,34 @@ impl Kernel {
         getrandom(&self.vfs, m, buf, len)
     }
 
+    /// The caller, as [`crate::sched`]'s calls want it.
+    fn sched_cx(&self) -> crate::sched::Cx<'_> {
+        crate::sched::Cx { procs: &self.procs, pid: self.pid, tid: self.tid, creds: &self.creds, rlimits: self.rlimits.get() }
+    }
+
     fn sys_prlimit(&mut self, m: &mut GuestMem<'_>, resource: u64, new: u64, old: u64) -> SysResult {
         prlimit(&self.rlimits, &self.fds, self.creds.capable(CAP_SYS_RESOURCE), m, resource, new, old)
+    }
+}
+
+/// `getpriority`, `setpriority`, `sched_setscheduler`, `sched_setparam`,
+/// `sched_getscheduler`, `sched_getparam`, `ioprio_set` and `ioprio_get`,
+/// for the free path and the kernel's alike.
+fn sched_call(cx: &crate::sched::Cx<'_>, m: &mut GuestMem<'_>, n: u64, a: [u64; 6]) -> SysResult {
+    let (who, arg) = (a[0] as i32, a[1]);
+    match n {
+        nr::GETPRIORITY => cx.getpriority(a[0] as i32, a[1] as i32),
+        nr::SETPRIORITY => cx.setpriority(a[0] as i32, a[1] as i32, a[2] as i32),
+        nr::SCHED_SETSCHEDULER => cx.setscheduler(who, Some(a[1] as i32), a[2], || m.read_u32(a[2]).map_err(|_| Errno::EFAULT)),
+        nr::SCHED_SETPARAM => cx.setscheduler(who, None, arg, || m.read_u32(arg).map_err(|_| Errno::EFAULT)),
+        nr::SCHED_GETSCHEDULER => cx.getscheduler(who),
+        nr::IOPRIO_SET => cx.ioprio_set(a[0] as i32, a[1] as i32, a[2] as i32),
+        nr::IOPRIO_GET => cx.ioprio_get(a[0] as i32, a[1] as i32),
+        _ => {
+            let prio = cx.getparam(who, arg)?;
+            m.write_u32(arg, prio).map_err(|_| Errno::EFAULT)?;
+            Ok(0)
+        }
     }
 }
 
@@ -16469,6 +16507,8 @@ pub fn syscall_name(n: u64) -> &'static str {
         nr::SCHED_GETAFFINITY => "sched_getaffinity",
         nr::SCHED_YIELD => "sched_yield",
         nr::SCHED_SETPARAM => "sched_setparam",
+        nr::IOPRIO_SET => "ioprio_set",
+        nr::IOPRIO_GET => "ioprio_get",
         nr::SCHED_SETSCHEDULER => "sched_setscheduler",
         nr::SCHED_GETSCHEDULER => "sched_getscheduler",
         nr::SCHED_GETPARAM => "sched_getparam",
@@ -18088,13 +18128,8 @@ mod tests {
             (nr::RSEQ, [buf_at, 32, 0]),
             (nr::SCHED_GETAFFINITY, [0, 128, buf_at]),
             (nr::SCHED_GETAFFINITY, [0, 4, buf_at]),
-            (nr::SCHED_GETSCHEDULER, [0, 0, 0]),
-            (nr::SCHED_GETPARAM, [0, buf_at, 0]),
-            (nr::SCHED_SETPARAM, [0, buf_at, 0]),
-            (nr::SCHED_SETSCHEDULER, [0, 1, buf_at]),
-            (nr::SCHED_SETSCHEDULER, [0, 3, buf_at]),
-            (nr::SCHED_SETSCHEDULER, [0, 9, buf_at]),
             (nr::SCHED_GET_PRIORITY_MAX, [1, 0, 0]),
+            (nr::SCHED_GET_PRIORITY_MAX, [9, 0, 0]),
             (nr::SCHED_GET_PRIORITY_MIN, [0, 0, 0]),
             (nr::GETCPU, [buf_at, buf_at + 4, 0]),
             (nr::MEMBARRIER, [0, 0, 0]),
@@ -19184,13 +19219,27 @@ mod tests {
             set_args(&mut m, at, nr::SYSINFO, &[0x21400]);
             call(&mut m, &mut k);
             assert_eq!(m.read_u64(0x21400 + 32).unwrap(), 4 << 30);
-            // getpriority's nice 0 (20 - nice, as the raw call answers it).
+            // getpriority's 20 - nice, as the raw call answers it: nice 0
+            // at first, then what the free path's pass left; each pass
+            // raises it, kept and read back by the other path.
+            let (before, nice) = if lock_free { (20, 5) } else { (15, 9) };
             set_args(&mut m, at, nr::GETPRIORITY, &[0, 0]);
             call(&mut m, &mut k);
-            assert_eq!(ret(&m, at), 20);
-            set_args(&mut m, at, nr::SETPRIORITY, &[0, 0, 5]);
+            assert_eq!(ret(&m, at), before);
+            set_args(&mut m, at, nr::SETPRIORITY, &[0, 0, nice]);
             call(&mut m, &mut k);
             assert_eq!(ret(&m, at), 0);
+            set_args(&mut m, at, nr::GETPRIORITY, &[0, 0]);
+            call(&mut m, &mut k);
+            assert_eq!(ret(&m, at), 20 - nice as i64);
+            set_args(&mut m, at, nr::SETPRIORITY, &[0, 0, 0]);
+            call(&mut m, &mut k);
+            // lowered again only with CAP_SYS_NICE or room under
+            // RLIMIT_NICE, which starts at 0 (`can_nice`); the pass before
+            // this one went to uid 1000 and back, which gave the effective
+            // capabilities back
+            let want = if k.creds.capable(23) { 0 } else { -(Errno::EACCES.0 as i64) };
+            assert_eq!(ret(&m, at), want, "lowering the nice value, lock_free {lock_free}");
 
             // prlimit64: a soft NOFILE set one way is read back the other
             // and is the descriptor table's; raising a hard limit unprivileged

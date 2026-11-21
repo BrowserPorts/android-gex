@@ -500,6 +500,8 @@ extern "C" {
     fn k_proc_set_usage(pid: i32, cpu_ns: u64, rss: u64, vsize: u64, start_ns: u64);
     fn k_proc_add_task_cpu(tid: i32, ns: u64);
     fn k_proc_set_task_name(tid: i32, at: gex_kernel::PAddr, len: u32);
+    fn k_proc_sched_of(tid: i32) -> i64;
+    fn k_proc_set_sched(tid: i32, word: u64) -> i32;
     fn k_proc_cpu_total() -> u64;
     fn k_proc_loadavg(now_ns: u64) -> u64;
     fn k_proc_rss_total() -> u64;
@@ -1009,6 +1011,12 @@ extern "C" fn r_add_task_cpu(tid: i32, ns: u64) {
 extern "C" fn r_set_task_name(tid: i32, at: gex_kernel::PAddr, len: u32) {
     unsafe { k_proc_set_task_name(tid, at, len) }
 }
+extern "C" fn r_sched_of(tid: i32) -> i64 {
+    unsafe { k_proc_sched_of(tid) }
+}
+extern "C" fn r_set_sched(tid: i32, word: u64) -> i32 {
+    unsafe { k_proc_set_sched(tid, word) }
+}
 extern "C" fn r_cpu_total() -> u64 {
     unsafe { k_proc_cpu_total() }
 }
@@ -1085,6 +1093,8 @@ fn global_procs() -> Option<Arc<gex_kernel::proc::ProcTable>> {
             set_usage: r_set_usage,
             add_task_cpu: r_add_task_cpu,
             set_task_name: r_set_task_name,
+            sched_of: r_sched_of,
+            set_sched: r_set_sched,
             cpu_total: r_cpu_total,
             loadavg: r_loadavg,
             rss_total: r_rss_total,
