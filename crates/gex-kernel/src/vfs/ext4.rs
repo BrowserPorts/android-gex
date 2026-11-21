@@ -811,11 +811,12 @@ mod tests {
         }
     }
 
-    const APEX: &[u8] = include_bytes!("testdata/ext4/apex.img");
     const APEX_LISTING: &str = include_str!("testdata/ext4/apex.txt");
 
-    fn apex() -> Ext4Fs {
-        Ext4Fs::new(Arc::new(Image(APEX.to_vec()))).unwrap()
+    /// The image ext4-fixture.sh makes (apex.img): apex.txt is what Linux
+    /// showed in it.
+    fn apex() -> Option<Ext4Fs> {
+        Some(Ext4Fs::new(Arc::new(Image(crate::testfix::get("apex.img")?.to_vec()))).unwrap())
     }
 
     fn fnv(data: &[u8]) -> u64 {
@@ -858,7 +859,7 @@ mod tests {
     /// attributes; and a directory lists what Linux listed in it.
     #[test]
     fn an_image_is_what_linux_reads_it_as() {
-        let fs = apex();
+        let fs = or_skip!(apex());
         let mut seen = 0;
         let mut listed: HashMap<String, Vec<String>> = HashMap::new();
         for line in APEX_LISTING.lines() {
@@ -907,7 +908,7 @@ mod tests {
     /// and past the end.
     #[test]
     fn a_file_reads_from_anywhere() {
-        let fs = apex();
+        let fs = or_skip!(apex());
         let whole = read_all(&fs, "lib64/libfixture.so");
         assert_eq!(whole.len(), 36393);
         let f = fs.open("lib64/libfixture.so", 0, 0).unwrap();
@@ -936,7 +937,7 @@ mod tests {
     /// Nothing changes, and what is not there is said the usual ways.
     #[test]
     fn nothing_is_written_and_errors_are_linuxs() {
-        let fs = apex();
+        let fs = or_skip!(apex());
         let rw = crate::fs::oflags::O_RDWR;
         assert_eq!(fs.open("bin/tool", rw, 0).err(), Some(Errno::EROFS));
         assert_eq!(fs.open("bin/new", crate::fs::oflags::O_CREAT | 1, 0o644).err(), Some(Errno::EROFS));
@@ -963,19 +964,20 @@ mod tests {
     /// What is not an ext4, or one this cannot read, is refused.
     #[test]
     fn what_is_not_an_ext4_is_refused() {
+        let apex: &[u8] = fixture!("apex.img");
         let new = |image: Vec<u8>| Ext4Fs::new(Arc::new(Image(image))).err();
         assert_eq!(new(vec![0u8; 8192]), Some(Errno::EINVAL));
         assert_eq!(new(vec![0u8; 100]), Some(Errno::EINVAL));
         // A feature it does not read: inline data.
-        let mut image = APEX.to_vec();
+        let mut image = apex.to_vec();
         image[1024 + 0x61] |= 0x80;
         assert_eq!(new(image), Some(Errno::EINVAL));
         // A journal to replay.
-        let mut image = APEX.to_vec();
+        let mut image = apex.to_vec();
         image[1024 + 0x60] |= 0x04;
         assert_eq!(new(image), Some(Errno::EINVAL));
         // An inode table outside the image.
-        let mut image = APEX.to_vec();
+        let mut image = apex.to_vec();
         image[4096 + 8..4096 + 12].copy_from_slice(&0xffff_ff00u32.to_le_bytes());
         assert_eq!(new(image), Some(Errno::EINVAL));
     }

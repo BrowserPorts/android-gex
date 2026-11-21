@@ -42,7 +42,8 @@
 
 #define SELINUX_MAGIC 0xf97cff8c
 
-// The policy: crates/gex-kernel/src/selinux/testdata/test.33.
+// The policy: crates/gex-kernel/src/selinux/testdata/test.conf, as
+// tests/fixtures.sh compiles it (test.33).
 #ifndef TEST_POLICY
 #error "build with -DTEST_POLICY=\"<path to test.33>\""
 #endif

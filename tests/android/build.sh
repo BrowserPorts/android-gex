@@ -34,14 +34,19 @@ if [ -z "$ndk" ] || [ ! -d "$ndk/toolchains/llvm/prebuilt/$host/bin" ]; then
     exit 1
 fi
 CC=$ndk/toolchains/llvm/prebuilt/$host/bin/clang
-# The policies the SELinux programs carry, to load into the kernel they
-# run on: the kernel crate's test policy, and the same with tmpfs labelled.
-DATA=$HERE/../../crates/gex-kernel/src/selinux/testdata
-POLICIES="-DTEST_POLICY=\"$DATA/test.33\" -DLABELS_POLICY=\"$DATA/labels.33\""
-# And the ext4 image the mount test mounts: the kernel crate's fixture.
-POLICIES="$POLICIES -DEXT4_IMAGE=\"$HERE/../../crates/gex-kernel/src/vfs/testdata/ext4/apex.img\""
+# The programs that carry a test input made from sources in the tree
+# (tests/fixtures.sh): the SELinux ones the kernel crate's test policy and
+# the same with tmpfs labelled, to load into the kernel they run on, and the
+# mount test the ext4 image it mounts. They are built only when
+# GEX_TEST_FIXTURES names the directory tests/fixtures.sh made.
+FIXTURED="selinuxfs procattr filelabel ext4mount"
+FIX=${GEX_TEST_FIXTURES:-}
+if [ -z "$FIX" ]; then
+    echo "tests/android/build.sh: not building $FIXTURED (set GEX_TEST_FIXTURES; tests/fixtures.sh makes what they carry)" >&2
+fi
 
 for p in hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx binderhost selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock fwdecho fpops simdops drm smcall firststage svcrun; do
-    "$CC" --target="$TARGET" -O2 -Wall -Werror -static $POLICIES -Wl,--image-base=0x400000 -o "$OUT/$p" "$HERE/src/$p.c"
-    "$CC" --target="$TARGET" -O2 -Wall -Werror -static $POLICIES -o "$OUT/low/$p" "$HERE/src/$p.c"
+    case " $FIXTURED " in *" $p "*) [ -n "$FIX" ] || { rm -f "$OUT/$p" "$OUT/low/$p"; continue; } ;; esac
+    "$CC" --target="$TARGET" -O2 -Wall -Werror -static -DTEST_POLICY="\"$FIX/test.33\"" -DLABELS_POLICY="\"$FIX/labels.33\"" -DEXT4_IMAGE="\"$FIX/apex.img\"" -Wl,--image-base=0x400000 -o "$OUT/$p" "$HERE/src/$p.c"
+    "$CC" --target="$TARGET" -O2 -Wall -Werror -static -DTEST_POLICY="\"$FIX/test.33\"" -DLABELS_POLICY="\"$FIX/labels.33\"" -DEXT4_IMAGE="\"$FIX/apex.img\"" -o "$OUT/low/$p" "$HERE/src/$p.c"
 done

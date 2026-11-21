@@ -32,6 +32,9 @@ fn big_op_slow(what: &str, len: usize, at: &std::panic::Location<'_>) {
     }
 }
 
+#[cfg(test)]
+#[macro_use]
+mod testfix;
 pub mod cpus;
 pub mod entropy;
 pub mod errno;

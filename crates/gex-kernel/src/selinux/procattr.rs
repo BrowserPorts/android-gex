@@ -122,7 +122,6 @@ pub fn exec(ids: [u32; 6]) -> [u32; 6] {
 mod tests {
     use super::*;
 
-    const V33: &[u8] = include_bytes!("testdata/test.33");
     const INIT: &[u8] = b"system_u:system_r:init_t:s0";
     const FILE: &[u8] = b"system_u:object_r:file_t:s0";
     const KERNEL: &[u8] = b"system_u:system_r:kernel_t:s0";
@@ -132,8 +131,9 @@ mod tests {
     /// root and by an ordinary user alike).
     #[test]
     fn a_processs_files_take_and_read_as_a_kernels() {
+        let v33: &[u8] = fixture!("test.33");
         let mut s = Server::default();
-        s.load(V33).unwrap();
+        s.load(v33).unwrap();
         let mut ids = INITIAL;
         let show = |s: &Server, sid: u32| String::from_utf8(read(s, sid).unwrap()).unwrap();
         assert_eq!((show(&s, ids[CURRENT]), show(&s, ids[PREV]), show(&s, ids[EXEC])), ("system_u:system_r:kernel_t:s0\0".into(), "system_u:system_r:kernel_t:s0\0".into(), String::new()));
@@ -191,8 +191,9 @@ mod tests {
     /// else it is no context, and by the reference for anyone else.
     #[test]
     fn a_privileged_process_may_ask_for_a_context_the_policy_lacks() {
+        let v33: &[u8] = fixture!("test.33");
         let mut s = Server::default();
-        s.load(V33).unwrap();
+        s.load(v33).unwrap();
         let odd = b"nobody:system_r:init_t:s0";
         assert_eq!(written(&mut s, FSCREATE, odd, false), Err(Errno::EINVAL));
         assert_eq!(written(&mut s, EXEC, odd, true), Err(Errno::EINVAL));

@@ -29,6 +29,11 @@ fail=0
 # Android's processes run (an address space past what a lowered 32-bit
 # memory can give).
 check() {
+    # Not built: it carries a test input tests/fixtures.sh makes (build.sh).
+    if [ ! -x "$HERE/bin/$1" ]; then
+        echo "SKIP $1: not built (it needs GEX_TEST_FIXTURES at build time)"
+        return
+    fi
     if [ "$GEXC" = native ]; then
         out=$("$HERE/bin/$1" 2>"$ERR/$1.err")
     elif [ "${4:-}" = root ]; then

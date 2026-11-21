@@ -24,7 +24,9 @@
 set -eu
 OUT=$(CDPATH='' cd -- "$1" && pwd)
 WORK=$(mktemp -d)
-trap 'umount "$WORK/mnt" 2>/dev/null; rm -rf "$WORK"' EXIT
+# (The image is unmounted by then unless something failed, so the trap's
+# umount failing is no failure of the script's.)
+trap 'umount "$WORK/mnt" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 T=$WORK/tree
 mkdir -p "$T/bin" "$T/lib64" "$T/etc/long/nested/deeper" "$T/etc/empty" "$T/many" "$WORK/mnt"
 
@@ -66,7 +68,9 @@ setfattr -n user.comment -v 'a comment' "$T/bin/tool"
 setfattr -n user.big -v "$(seq 1 120 | tr '\n' ' ')" "$T/lib64/libfixture.so"
 setfattr -n security.capability -v 0sAQAAAgAgAAAAAAAAAAAAAAAAAAA= "$T/lib64/holes"
 
-mke2fs -q -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg,^resize_inode,uninit_bg -b 4096 -I 256 -m 0 -N 200 \
+# mke2fs stamps the root and lost+found with the time it runs; a fixed one
+# (the first image's) makes the same image every time.
+E2FSPROGS_FAKE_TIME=1794734585 SOURCE_DATE_EPOCH=1794734585 mke2fs -q -t ext4 -O ^has_journal,^metadata_csum,^64bit,^flex_bg,^resize_inode,uninit_bg -b 4096 -I 256 -m 0 -N 200 \
     -U 7d1522e1-9dfa-5edb-a43e-98e3a4d20250 -E hash_seed=7d1522e1-9dfa-5edb-a43e-98e3a4d20250,root_owner=0:0 -L fixture \
     -d "$T" "$OUT/apex.img" 96
 e2fsck -fn "$OUT/apex.img" >/dev/null

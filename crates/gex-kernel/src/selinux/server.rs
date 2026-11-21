@@ -502,7 +502,6 @@ fn percent_decoded(coded: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    const V33: &[u8] = include_bytes!("testdata/test.33");
 
     /// As Linux 6.8 was seen to be with SELinux on and nothing loaded: a
     /// process is "kernel", the named SIDs read their names.
@@ -522,9 +521,10 @@ mod tests {
     /// With test.33 loaded, as the kernel that loaded it answered.
     #[test]
     fn with_a_policy_sids_are_contexts() {
+        let v33: &[u8] = fixture!("test.33");
         let mut s = Server::default();
         assert_eq!(s.status(), [1, 0, 0, 0, 1], "the status page before a policy, as Linux 7.0's read");
-        s.load(V33).unwrap();
+        s.load(v33).unwrap();
         assert_eq!(s.seqno, 1);
         assert_eq!(s.status(), [1, 2, 0, 1, 1], "and after");
         // initial_contexts, as it read: kernel, security, unlabeled, file
@@ -586,8 +586,9 @@ mod tests {
     /// set by then.
     #[test]
     fn with_a_policy_its_files_read_as_a_kernels() {
+        let v33: &[u8] = fixture!("test.33");
         let mut s = Server::default();
-        s.load(V33).unwrap();
+        s.load(v33).unwrap();
         let mut read = 0;
         for line in include_str!("testdata/answers.txt").lines() {
             let Some((question, want)) = line.split_once(" => ") else { continue };
@@ -705,8 +706,9 @@ mod tests {
     /// loaded (testdata/answers.txt), and its answers.
     #[test]
     fn its_question_files_answer_as_a_kernels() {
+        let v33: &[u8] = fixture!("test.33");
         let mut s = Server::default();
-        s.load(V33).unwrap();
+        s.load(v33).unwrap();
         let asked = replay(&mut s, include_str!("testdata/answers.txt"));
         assert!(asked > 900, "{asked} questions");
         // Not a question, and not a file that takes one.
@@ -736,8 +738,9 @@ mod tests {
     /// context with anything around it is no context.
     #[test]
     fn odd_questions_answer_as_a_kernels() {
+        let v33: &[u8] = fixture!("test.33");
         let mut s = Server::default();
-        s.load(V33).unwrap();
+        s.load(v33).unwrap();
         let (k, f, e, i) = ("system_u:system_r:kernel_t:s0", "system_u:object_r:file_t:s0", "system_u:object_r:exec_t:s0", "system_u:system_r:init_t:s0");
         let mut ask = |file: &str, text: String| s.transact(file, &text).unwrap().map(|bytes| String::from_utf8(bytes).unwrap());
         for (class, want) in [("2", Ok("5 ffffffff 0 ffffffff 1 0")), ("2junk", Ok("5 ffffffff 0 ffffffff 1 0")), ("65538", Ok("5 ffffffff 0 ffffffff 1 0")), ("x2", Err(Error::Invalid)), ("0", Ok("0 ffffffff 0 ffffffff 1 0")), ("999", Ok("0 ffffffff 0 ffffffff 1 0"))] {
@@ -891,11 +894,12 @@ mod tests {
     /// the new policy's unlabeled context, and the count of loads was 2.
     #[test]
     fn another_policy_in_its_place_keeps_the_sids() {
+        let v33: &[u8] = fixture!("test.33");
         let mut s = Server::default();
-        s.load(V33).unwrap();
+        s.load(v33).unwrap();
         let init = s.context_to_sid("system_u:system_r:init_t:s0").unwrap();
         let app = s.context_to_sid("system_u:system_r:app_t:s0").unwrap();
-        s.load(include_bytes!("testdata/other.33")).unwrap();
+        s.load(fixture!("other.33")).unwrap();
         assert_eq!(s.seqno, 2);
         assert_eq!(s.status(), [1, 4, 0, 2, 1], "as its status page read");
         assert_eq!(s.sid_to_context(init, false).as_deref(), Ok("system_u:object_r:file_t:s0"), "no init_t now: unlabeled");
@@ -907,7 +911,7 @@ mod tests {
         assert_eq!(s.sid_to_context(SID_KERNEL, false).as_deref(), Ok("system_u:system_r:kernel_t:s0"));
         assert_eq!(s.sid_to_context(SID_UNLABELED, false).as_deref(), Ok("system_u:object_r:file_t:s0"));
         // The first policy again: the text has its names back.
-        s.load(V33).unwrap();
+        s.load(v33).unwrap();
         assert_eq!(s.sid_to_context(init, false).as_deref(), Ok("system_u:system_r:init_t:s0"));
         assert_eq!(s.context_to_sid("system_u:system_r:init_t:s0"), Ok(init));
     }

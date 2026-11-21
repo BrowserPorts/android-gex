@@ -636,7 +636,6 @@ impl File {
 mod tests {
     use super::*;
 
-    const V33: &[u8] = include_bytes!("../selinux/testdata/test.33");
 
     fn fs() -> (SelinuxFs, Arc<Mutex<Server>>) {
         let server = Arc::new(Mutex::new(Server::default()));
@@ -715,8 +714,9 @@ mod tests {
     /// that loaded it read (the security server's tests have the rest).
     #[test]
     fn with_a_policy_its_directories_are_filled() {
+        let v33: &[u8] = fixture!("test.33");
         let (fs, server) = fs();
-        server.lock().unwrap().load(V33).unwrap();
+        server.lock().unwrap().load(v33).unwrap();
         let classes = list(&fs, "class");
         assert!(classes.contains(&"file".to_string()) && classes.contains(&"binder".to_string()));
         assert_eq!(fs.metadata("class").unwrap().nlink, 2 + classes.len() as u32);
@@ -757,6 +757,7 @@ mod tests {
     /// file. The limits and refusals are the reference's.
     #[test]
     fn its_files_take_what_a_program_writes() {
+        let v33: &[u8] = fixture!("test.33");
         let (fs, server) = fs();
         let rw = crate::fs::oflags::O_RDWR;
         let open = |path: &str| fs.open(path, rw, 0).unwrap();
@@ -774,10 +775,10 @@ mod tests {
         // The policy: whole, from the start, and not nothing.
         let load = open("load");
         assert_eq!(load.write_at(0, b""), Err(Errno::EINVAL));
-        assert_eq!(load.write_at(1, V33), Err(Errno::EINVAL));
-        assert_eq!(load.write_at(0, &V33[..V33.len() / 2]), Err(Errno::EINVAL));
+        assert_eq!(load.write_at(1, v33), Err(Errno::EINVAL));
+        assert_eq!(load.write_at(0, &v33[..v33.len() / 2]), Err(Errno::EINVAL));
         assert_eq!(server.lock().unwrap().seqno, 0);
-        assert_eq!(load.write_at(0, V33), Ok(V33.len() as u64));
+        assert_eq!(load.write_at(0, v33), Ok(v33.len() as u64));
         let mut buf = [0u8; 8];
         assert_eq!(load.read_at(0, &mut buf), Err(Errno::EINVAL), "it has no way to be read");
         assert_eq!(read(&fs, "status").unwrap(), [1u32, 2, 0, 1, 1].iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());

@@ -1769,11 +1769,9 @@ impl Policy {
 mod tests {
     use super::*;
 
-    /// testdata/test.conf compiled by checkpolicy 3.5 (`checkpolicy -M -c
-    /// 30` and `-c 33`): one of everything a policy can hold. The two
-    /// versions differ in how file-name transitions are written.
-    const V30: &[u8] = include_bytes!("testdata/test.30");
-    const V33: &[u8] = include_bytes!("testdata/test.33");
+    // testdata/test.conf compiled by checkpolicy 3.5 (`checkpolicy -M -c
+    // 30` and `-c 33`): one of everything a policy can hold. The two
+    // versions differ in how file-name transitions are written.
 
     fn ty(p: &Policy, name: &str) -> u32 {
         p.types.iter().position(|t| t.name == name).unwrap_or_else(|| panic!("no type {name}")) as u32 + 1
@@ -1791,7 +1789,9 @@ mod tests {
     /// setools counts it in the same file (the numbers in the comments).
     #[test]
     fn a_compiled_policy_is_read_as_its_source_says() {
-        for (bytes, version) in [(V30, 30), (V33, 33)] {
+        let v30: &[u8] = fixture!("test.30");
+        let v33: &[u8] = fixture!("test.33");
+        for (bytes, version) in [(v30, 30), (v33, 33)] {
             let p = Policy::read(bytes).unwrap();
             assert_eq!((p.version, p.mls, p.allow_unknown, p.reject_unknown, p.trailing), (version, true, false, false, 0));
             // Classes 4, Permissions 15, Types 7, Attributes 2, Users 2,
@@ -1887,18 +1887,19 @@ mod tests {
     /// there.
     #[test]
     fn a_damaged_policy_is_refused() {
+        let v33: &[u8] = fixture!("test.33");
         assert_eq!(Policy::read(b"").err(), Some(Bad("truncated at byte 0".into())));
-        assert!(Policy::read(&V33[..V33.len() - 1]).is_err());
-        for cut in (0..V33.len()).step_by(7) {
-            assert!(Policy::read(&V33[..cut]).is_err(), "cut at {cut}");
+        assert!(Policy::read(&v33[..v33.len() - 1]).is_err());
+        for cut in (0..v33.len()).step_by(7) {
+            assert!(Policy::read(&v33[..cut]).is_err(), "cut at {cut}");
         }
         // Each word in turn made enormous.
-        for at in (0..V33.len() - 4).step_by(4) {
-            let mut bytes = V33.to_vec();
+        for at in (0..v33.len() - 4).step_by(4) {
+            let mut bytes = v33.to_vec();
             bytes[at..at + 4].copy_from_slice(&0x7fff_fff0u32.to_le_bytes());
             let _ = Policy::read(&bytes);
         }
-        let mut old = V33.to_vec();
+        let mut old = v33.to_vec();
         old[16..20].copy_from_slice(&23u32.to_le_bytes());
         assert!(Policy::read(&old).err().is_some_and(|e| e.0.contains("version 23")));
     }
@@ -1908,7 +1909,8 @@ mod tests {
     /// it does not allow together, is no context.
     #[test]
     fn a_context_is_read_from_text_and_written_back() {
-        let p = Policy::read(V33).unwrap();
+        let v33: &[u8] = fixture!("test.33");
+        let p = Policy::read(v33).unwrap();
         for text in [
             "system_u:system_r:kernel_t:s0",
             "system_u:object_r:file_t:s0-s1:c0.c2",
@@ -2038,7 +2040,8 @@ mod tests {
     /// same asked of this.
     #[test]
     fn its_answers_are_a_kernels() {
-        let asked = replay(&Policy::read(V33).unwrap(), include_str!("testdata/answers.txt"));
+        let v33: &[u8] = fixture!("test.33");
+        let asked = replay(&Policy::read(v33).unwrap(), include_str!("testdata/answers.txt"));
         assert!(asked > 400, "{asked} questions");
     }
 
@@ -2068,7 +2071,8 @@ mod tests {
     /// `its_labels_for_a_policy_given_are_a_kernels`.)
     #[test]
     fn a_filesystem_is_labelled_as_the_policy_says() {
-        let p = Policy::read(V33).unwrap();
+        let v33: &[u8] = fixture!("test.33");
+        let p = Policy::read(v33).unwrap();
         let text = |c: Option<&Context>| c.map(|c| p.context_string(c));
         let (file, dir) = (p.class_named("file").unwrap(), p.class_named("dir").unwrap());
         assert_eq!((p.fs_use("ext4").0, text(p.fs_use("ext4").1).as_deref()), (fs_use::XATTR, Some("system_u:object_r:file_t:s0")));

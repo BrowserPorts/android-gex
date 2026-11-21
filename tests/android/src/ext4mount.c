@@ -3,10 +3,10 @@
 // APEX stores its payload in a zip, uncompressed), a loop device is put
 // over that part of the file, and the device is mounted read-only.
 //
-// The image is the kernel crate's fixture
-// (crates/gex-kernel/src/vfs/testdata/ext4/apex.img), made as apexer
-// makes a payload; what is in it is what Linux's ext4 showed
-// (apex.txt beside it).
+// The image is the kernel crate's ext4 fixture, apex.img, which
+// tests/fixtures.sh makes (ext4-fixture.sh) as apexer makes a payload;
+// what is in it is what Linux's ext4 showed
+// (crates/gex-kernel/src/vfs/testdata/ext4/apex.txt).
 //
 // - mount -t ext4 of the device, read-only: its files read as they are,
 //   with their sizes, modes, owners, link counts and times, and the

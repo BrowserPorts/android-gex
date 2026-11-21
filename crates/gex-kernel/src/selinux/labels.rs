@@ -11,7 +11,7 @@
 //! As security/selinux/hooks.c at android17-6.18 (`inode_doinit_with_dentry`,
 //! `selinux_inode_getsecurity`, `selinux_inode_setxattr`,
 //! `selinux_inode_init_security`), and as Linux 7.0 was seen to label and
-//! relabel files with testdata/labels.33 loaded. This is the reckoning
+//! relabel files with testdata/labels.conf compiled and loaded. This is the reckoning
 //! alone: the system calls that use it are the kernel's, and
 //! tests/android/src/filelabel.c, which passes on Linux 7.0 and here,
 //! goes through them. Not here: what
@@ -242,18 +242,17 @@ mod tests {
     use super::super::procattr;
     use super::*;
 
-    /// testdata/labels.conf, which is test.conf with tmpfs labelled by
-    /// transition, compiled by checkpolicy at version 33.
-    const LABELS: &[u8] = include_bytes!("testdata/labels.33");
     const FILE_T: &str = "system_u:object_r:file_t:s0";
     const EXEC_T: &str = "system_u:object_r:exec_t:s0";
     const TMP_T: &str = "system_u:object_r:tmp_t:s0";
     const KERNEL_T: &str = "system_u:system_r:kernel_t:s0";
 
-    fn loaded() -> Server {
+    /// testdata/labels.conf, which is test.conf with tmpfs labelled by
+    /// transition, compiled by checkpolicy at version 33, loaded.
+    fn loaded() -> Option<Server> {
         let mut s = Server::default();
-        s.load(LABELS).unwrap();
-        s
+        s.load(crate::testfix::get("labels.33")?).unwrap();
+        Some(s)
     }
 
     fn read(s: &mut Server, f: &File<'_>, mac_admin: bool) -> String {
@@ -270,7 +269,7 @@ mod tests {
     /// unlabeled where no rule speaks.
     #[test]
     fn a_file_reads_the_label_its_filesystem_gives_it() {
-        let mut s = loaded();
+        let mut s = or_skip!(loaded());
         for (f, want) in [
             (of("proc", "/cpuinfo", "file", None), FILE_T),
             (of("proc", "/sys/kernel/hostname", "file", None), EXEC_T),
@@ -295,7 +294,7 @@ mod tests {
     /// and what the file read after.
     #[test]
     fn a_label_is_set_as_a_kernel_sets_it() {
-        let mut s = loaded();
+        let mut s = or_skip!(loaded());
         let mut stored: Vec<u8> = b"system_u:object_r:tmp_t:s0\0".to_vec();
         fn put(s: &mut Server, stored: &mut Vec<u8>, value: &[u8]) -> (Result<(), Errno>, String) {
             let f = File { fstype: "tmpfs", path: "/a", class: "file", stored: Some(stored) };
@@ -341,7 +340,7 @@ mod tests {
     /// class and the name.
     #[test]
     fn a_new_file_is_labelled_as_a_kernel_labels_it() {
-        let mut s = loaded();
+        let mut s = or_skip!(loaded());
         let sid = |s: &mut Server, c: &str| s.context_to_sid(c).unwrap();
         let (tmp, exec) = (sid(&mut s, TMP_T), sid(&mut s, EXEC_T));
         let app = sid(&mut s, "system_u:system_r:app_t:s0");
