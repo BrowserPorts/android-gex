@@ -67,12 +67,15 @@ Darwin)
     free_pct() { memory_pressure | tail -1 | grep -o '[0-9]*%' | tr -d %; }
     # The footprint macOS counts: resident and compressed.
     mem_mb() { footprint -p "$1" 2>/dev/null | awk '/phys_footprint:/{v=$2; u=$3; if (u ~ /GB/) v*=1024; else if (u ~ /KB/) v/=1024; print int(v); exit}'; }
+    # gexc's host descriptors: all of them, and the cached translations.
+    host_fds() { lsof -n -P -p "$1" -Fn 2>/dev/null | awk '/^n/{n++; if ($0 ~ /\.cwasm$/) c++} END{print n+0, c+0}'; }
     # macOS swaps to the disk that holds /.
     SWAP_DISK=/
     ;;
 Linux)
     free_pct() { awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{if (t) print int(a * 100 / t)}' /proc/meminfo; }
     mem_mb() { awk '/^VmRSS:|^VmSwap:/{s+=$2} END{print int(s / 1024)}' "/proc/$1/status" 2>/dev/null; }
+    host_fds() { n=0; c=0; for f in /proc/"$1"/fd/*; do n=$((n + 1)); case $(readlink "$f") in *.cwasm) c=$((c + 1)) ;; esac; done; echo "$n $c"; }
     SWAP_DISK=$OUT
     ;;
 *) fail "only macOS and Linux hosts" ;;
@@ -141,6 +144,13 @@ while kill -0 "$GROUP" 2>/dev/null; do
     [ "${swap:-100}" -lt "${disk:-100}" ] && disk=$swap
     f=$(free_pct)
     echo "${t}s gexc=${mem:-?}MB free=${f}% disk=${disk}GB" >>"$WATCH"
+    # Every five minutes, gexc's host descriptors: every guest process's
+    # host files and every translation mapped from the cache are its, and
+    # the host's limit on them is the guests' too.
+    if [ -n "$pid" ] && [ $((t / 15 % 20)) -eq 0 ]; then
+        hf=$(host_fds "$pid")
+        echo "${t}s host descriptors=${hf%% *} cached translations=${hf##* }" >>"$WATCH"
+    fi
     if [ "$t" -ge "$SECS" ]; then stop "time limit"; break; fi
     if [ "${f:-100}" -lt "$MIN_FREE" ]; then stop "memory ${f}% free"; break; fi
     if [ "${disk:-100}" -lt "$MIN_DISK_GB" ]; then stop "disk ${disk} GB free"; break; fi

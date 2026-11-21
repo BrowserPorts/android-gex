@@ -509,6 +509,18 @@ pub fn heap_stats_every() {
 /// (`gex_cache`'s `artifact`). Nothing when the host says no; the limit
 /// stays what it was.
 pub fn raise_open_files() {
+    #[cfg(target_os = "macos")]
+    fn macos_max_files() -> Option<u64> {
+        extern "C" {
+            fn sysctlbyname(name: *const u8, oldp: *mut std::ffi::c_void, oldlenp: *mut usize, newp: *const std::ffi::c_void, newlen: usize) -> i32;
+        }
+        let mut v: i32 = 0;
+        let mut len = std::mem::size_of::<i32>();
+        // SAFETY: the name is NUL-terminated, and the kernel writes at most
+        // `len` bytes into `v`, an i32 (the sysctl's type).
+        let r = unsafe { sysctlbyname(b"kern.maxfilesperproc\0".as_ptr(), &mut v as *mut i32 as *mut std::ffi::c_void, &mut len, std::ptr::null(), 0) };
+        (r == 0 && v > 0).then_some(v as u64)
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         #[repr(C)]
@@ -524,12 +536,16 @@ pub fn raise_open_files() {
         const RLIMIT_NOFILE: i32 = 7;
         #[cfg(target_os = "macos")]
         const RLIMIT_NOFILE: i32 = 8;
-        // macOS refuses a soft limit above OPEN_MAX whatever the hard one
-        // says (setrlimit(2)).
+        // macOS's own ceiling is kern.maxfilesperproc (92160 on a current
+        // Mac), and it takes a soft limit up to that: OPEN_MAX (10240),
+        // which setrlimit(2) names, is only where a program built for strict
+        // UNIX03 conformance is held. A whole Android boot (every guest
+        // process's host files and every mapped translation) went past
+        // 10240, and its guests' opens failed with the host's EMFILE.
         #[cfg(target_os = "linux")]
-        const MOST: u64 = u64::MAX;
+        let most: u64 = u64::MAX;
         #[cfg(target_os = "macos")]
-        const MOST: u64 = 10240;
+        let most: u64 = macos_max_files().unwrap_or(10240);
         let mut l = Rlimit { cur: 0, max: 0 };
         // SAFETY: both calls read or write the one struct given, which is
         // the layout of `struct rlimit` on these hosts (two 64-bit limits).
@@ -537,10 +553,15 @@ pub fn raise_open_files() {
             if getrlimit(RLIMIT_NOFILE, &mut l) != 0 {
                 return;
             }
-            let want = l.max.min(MOST);
+            let want = l.max.min(most);
             if want > l.cur {
+                let old = l.cur;
                 l.cur = want;
-                setrlimit(RLIMIT_NOFILE, &l);
+                if setrlimit(RLIMIT_NOFILE, &l) != 0 && want > 10240 && old < 10240 {
+                    // A host that does hold the soft limit to OPEN_MAX.
+                    l.cur = 10240;
+                    setrlimit(RLIMIT_NOFILE, &l);
+                }
             }
         }
     }

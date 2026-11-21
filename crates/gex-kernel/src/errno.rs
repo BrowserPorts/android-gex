@@ -115,6 +115,9 @@ impl Errno {
     /// straight through.
     #[cfg(not(target_os = "macos"))]
     pub fn from_host(code: i32) -> Errno {
+        if code == 24 {
+            host_out_of_descriptors();
+        }
         Errno(code)
     }
 
@@ -125,6 +128,9 @@ impl Errno {
     /// RPC, power, policy) are reported and reach the guest as `EIO`.
     #[cfg(target_os = "macos")]
     pub fn from_host(code: i32) -> Errno {
+        if code == 24 {
+            host_out_of_descriptors();
+        }
         match macos_to_linux(code) {
             Some(v) => Errno(v),
             None => {
@@ -133,6 +139,38 @@ impl Errno {
             }
         }
     }
+}
+
+/// The host refused gex a descriptor (`EMFILE`, the same number on both
+/// hosts): every guest process's host files and every translation mapped
+/// from the cache are this one process's descriptors, and the guest is
+/// told EMFILE for a table of its own that is nowhere near full. Said once,
+/// with how many the host process holds and, where the host names them
+/// (Linux's `/proc/self/fd`), how many are cached translations, when there
+/// is a descriptor left to look with; at the limit there is not.
+fn host_out_of_descriptors() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let dir = if cfg!(target_os = "linux") { "/proc/self/fd" } else { "/dev/fd" };
+    let (mut open, mut cached) = (0usize, 0usize);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            open += 1;
+            if std::fs::read_link(e.path()).is_ok_and(|t| t.extension().is_some_and(|x| x == "cwasm")) {
+                cached += 1;
+            }
+        }
+    }
+    let held = if open == 0 {
+        "every descriptor the host allows it".to_string()
+    } else if cfg!(target_os = "linux") {
+        format!("{open}, {cached} of them cached translations")
+    } else {
+        open.to_string()
+    };
+    eprintln!("[gex] the host is out of descriptors (EMFILE): gex holds {held}; the guest is told EMFILE");
 }
 
 #[cfg(target_os = "macos")]
