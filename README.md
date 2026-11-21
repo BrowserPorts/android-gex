@@ -1,201 +1,132 @@
-# gex
+# android-gex
 
-gex runs unmodified Linux and Windows programs in a web browser. It
-translates their machine code to WebAssembly and runs it against its own
-implementation of the Linux kernel ABI. That kernel is written in Rust and
-compiled to WebAssembly as well. A program needs no source changes and no
-rebuild, and nothing in it knows it is not on a Linux machine.
+android-gex is [stellite-gex](https://github.com/BrowserPorts/stellite-gex)
+with an Android personality: gex's Linux kernel and AArch64 translator,
+extended to run Android's userland. gex runs unmodified programs by
+translating their machine code to WebAssembly and running it against its own
+kernel, written in Rust.
 
-```console
-$ file hello
-hello: ELF 64-bit LSB executable, ARM aarch64, statically linked
+- Parent: [stellite-gex](https://github.com/BrowserPorts/stellite-gex),
+  Stellite's fork of [HeyPuter/gex](https://github.com/HeyPuter/gex)
+- Sibling: [unixnu-gex](https://github.com/BrowserPorts/unixnu-gex), the same
+  base with a Darwin personality
+- Submodule: [mesa-stellite](https://github.com/BrowserPorts/mesa-stellite),
+  at `third_party/mesa`
 
-$ gexc run hello
-hello from aarch64
-```
+The Android work is on the branch `android`. The rest of the tree is
+stellite-gex, whose README covers the engine, the page and Wine.
 
-The browser is the target. `gexc` also runs programs natively on wasmtime,
-for debugging and for building what a page loads ahead of time.
+## What it adds
 
-## What runs
+Kernel interfaces that Android needs and gex did not have:
 
-- **Linux programs for AArch64, x86-64 and i386.** Static and dynamically
-  linked ELF images, with musl or glibc. gex supports threads, `fork`,
-  `exec`, signals, pipes, sockets and a full filesystem (tmpfs, host
-  passthrough, `/proc`, `/dev`). Each guest process gets its own address
-  space. The kernel's shared state is one module that every process's
-  Workers share.
-- **wasm32 Linux programs.** `toolchain/gexcc` is a C/C++ compiler for gex's
-  wasm32 Linux target. It is used like `gcc`. The debdemo repository
-  builds Debian packages with it and assembles a Debian rootfs around them.
-- **Windows programs, through Wine.** `wine` builds Wine's own
-  Unix side as wasm32 for gex, plus a ready-to-run prefix. The Windows code
-  itself is translated like any other x86 code. The build is 64-bit Wine
-  with WoW64, which runs 64-bit and 32-bit Windows programs in one prefix.
-  The older 32-bit-only Wine build is still there, marked legacy, until it
-  is removed.
-- **Graphics.** `gex-wayland` is a Wayland compositor, and `gex-xwm` the X
-  window manager that a rootless Xwayland needs. Wayland and X11 programs
-  share one desktop. Xwayland can run as native WebAssembly in the page,
-  outside any guest. A guest's OpenGL calls go through gex's own libGL and
-  libEGL (`guest/gl`) to Mesa, which is compiled to WebAssembly and draws
-  with the browser's WebGPU (`third_party/mesa`, Gallium's `gex_wgpu`).
-  Desktop GL is supported up to 4.6.
-- **In the page, or ahead of time.** The same programs run in the browser
-  page (`page/`) and natively under `gexc`. An ejected project (below) runs
-  only what was built for it ahead of time, as a static site whose
-  JavaScript library a page of your own imports.
+- binder and binderfs
+- selinuxfs and a policy engine
+- signalfd, userfaultfd and seccomp
+- mount namespaces with propagation and bind mounts
+- loop devices, read-only ext4 and a subset of device-mapper
+- cgroup v1 and v2
+- eBPF: maps, program load, an interpreter and cgroup attach
+- netlink: uevent, route rules, xfrm and nfnetlink_log
+- legacy iptables
+- a 2D virtio-gpu DRM device, and vsock
 
-## How it works
+It also makes the arm64 translator answer as the hardware does: floating
+point, fault retry and per-page access checks.
 
-```
- guest ELF/PE ─▶ gex-ld ─▶ gex-xlate ─▶ gex-isa(-x86) ─▶ gex-lift(-x86) ─▶ gex-emit ─▶ wasm
-                  load      discover     decode            GIR               tier 1
-                                              │
-                                              ├─▶ gex-fjit   function JIT (GIR → wasm)
-                                              └─▶ gex-cgen   function tier (GIR → C → clang → wasm)
-
- page: hosts/browser (gex-kernel per process) + hosts/kernel (shared kernel) + Mesa + Xwayland
-```
-
-- **Guest virtual address equals linear-memory offset.** gex is the
-  kernel, so it allocates every guest address itself, inside the guest's
-  wasm memory. A guest load is a wasm load, with no translation arithmetic.
-- **Three tiers, one ABI.** Tier 1 translates each basic block into a wasm
-  function, at load time or when a branch first reaches it. Guest JITs and
-  late-loaded libraries need no special handling. The function JIT
-  (`gex-fjit`) turns a recovered guest function into one wasm function. The
-  function tier (`gex-cgen`) does the same through C and clang, ahead of
-  time. All three tiers call each other through one function table.
-- **Discovery is never load-bearing.** Code the translator did not find
-  lands on a stub, which translates it on demand. A wrong guess costs time,
-  never a wrong branch.
-- **Ahead-of-time builds.** `gexc run --record` records what a run loaded
-  and executed. `gexc eject` turns a recording into a project that builds
-  everything ahead of time, and runs only what that build made.
-  `site/eject-site.mjs` makes the web build of an
-  ejected project into a static site. The site is a JavaScript library that
-  your own page imports.
-
-## Layout
-
-| path | what it is |
-|------|------------|
-| `crates/gexc` | the command-line driver |
-| `crates/gex-isa`, `gex-isa-x86` | AArch64 and x86-64 decoders |
-| `crates/gex-ir` | GIR, the SSA IR translation goes through |
-| `crates/gex-lift`, `gex-lift-x86` | instruction semantics in GIR |
-| `crates/gex-f80` | exact x87 80-bit arithmetic |
-| `crates/gex-emit` | the wasm writer and tier-1 code generation |
-| `crates/gex-fjit` | the function JIT |
-| `crates/gex-cgen`, `gex-split` | the function tier, and splitting its units into hot and cold parts |
-| `crates/gex-units` | what a build ships of its function-tier units: whole, instrumented, or cut to a slot set |
-| `crates/gex-xlate` | code discovery and the translation driver |
-| `crates/gex-ld`, `gex-dylink` | ELF and PE loading; shared libraries for wasm32 programs |
-| `crates/gex-kernel` | the Linux personality: syscalls, VFS, signals, memory map, processes |
-| `crates/gex-abi`, `gex-mem`, `gex-atomic`, `gex-kmem` | the layout contract and guest-memory access |
-| `crates/gex-cache`, `gex-key` | the compiled-module cache and the content keys every host agrees on |
-| `crates/gex-wayland`, `gex-xwm`, `gex-gpu` | the compositor, the X window manager, WebGPU compositing |
-| `crates/gex-gl` | OpenGL ES passthrough for the native host |
-| `crates/gex-eject` | ejected projects, built and run ahead of time |
-| `hosts/browser` | the browser host: the kernel compiled to wasm, beside each guest |
-| `hosts/kernel` | the shared kernel module: process table, filesystem, pipes, sockets |
-| `hosts/hostwl` | the compositor for an X server that runs in the page |
-| `hosts/native` | the native host, on wasmtime |
-| `guest/` | libraries installed into the guest: GL and EGL, GLX setup, `libsteam_api` |
-| `page/` | the page: its source, runtime assets and build (`make page`) |
-| `ports/` | the Mesa, Xwayland and Tint builds the page ships |
-| `site/` | eject and demo sites built from the page, and recording a Windows program for eject |
-| `toolchain/` | gexcc, the wasm32 C/C++ compiler, its sysroots, busybox, and `pins`, the version of every fetched toolchain |
-| `wine/` | Wine for gex: dist, prefix, runner |
-| `scripts/` | generators for the GL transport and compatibility tables, source fetching, the script lint, profile and unit helpers |
-| `test/` | the runtime's tests and their runner, `test/run.mjs`, on two hosts: a headless browser page and Node |
-| `third_party/` | wasmtime (with local changes), Mesa, the Khronos GL registry and CTS |
+The work is checked by booting a prebuilt Android 17 arm64 emulator image.
+That image is a test oracle only. This repository holds no Android image and
+ships none.
 
 ## Building
 
-`make help` lists the targets. Every one of them builds from this tree and
-the pins in it, and prints what it made on its last line.
-
-### Run a Linux program
-
-```console
-$ make gexc
-...
-target/release/gexc target/x86/release/gexc
-
-$ target/release/gexc run hello
-hello from aarch64
+```sh
+make gexc
+make check
 ```
 
-`target/release/gexc` runs AArch64 guests, and `target/x86/release/gexc`
-runs x86-64 and i386 guests. Some other `gexc` commands:
+`make help` lists the other targets. Android's processes need a large guest
+memory, which the native host gives with the `big64` feature, a 64 GiB guest
+memory:
 
-```console
-$ gexc run --wayland SOCKET <elf>   # with the compositor, at SOCKET
-$ gexc build <elf> -o out.wasm      # translate only
-$ gexc disasm <elf>                 # disassemble
-$ gexc ir <elf> --at 0x400abc       # the GIR for one block
-$ gexc run --strace <elf>           # syscall trace
+```sh
+cargo build --release -p gexc --features big64
 ```
 
-### Build the page
+What the build needs:
 
-```console
-$ make page                         # the multi-process build, page/dist
-$ make serve                        # http://localhost:8088/
+- the Rust toolchain that `rust-toolchain.toml` names
+- the submodules `third_party/mesa`, `third_party/opengl-registry` and
+  `third_party/vk-gl-cts`
+- the Android NDK, for the test programs (r25 is the one used)
+- on macOS, the tools `scripts/host-env.sh` names
+
+No AOSP checkout is needed.
+
+## Running the tests
+
+The test programs in `tests/android/src` are small static C programs linked
+against bionic. They need neither Android's linker nor a system image.
+
+```sh
+sh tests/android/build.sh
+GEXC=target/release/gexc sh tests/android/run.sh
 ```
 
-`page/README.md` describes the two builds (`make page-sp` is the
-single-thread one), the runtime package (`make runtime`) and ejected
-programs' sites.
+`build.sh` finds the NDK through `ANDROID_NDK_HOME`. `run.sh` runs each
+program under gexc and checks what it prints and how it exits. With
+`GEXC=native` it runs them as they are, on an arm64 Linux host, which is the
+reference they are written against. You supply that host.
 
-### Run a Windows program
+Some kernel tests and four of the programs (`selinuxfs`, `procattr`,
+`filelabel` and `ext4mount`) take compiled inputs that are built from sources
+in this tree rather than kept in it. On a Linux host with `checkpolicy`,
+`e2fsprogs` and root through `sudo`:
 
-```console
-$ make wine
-...
-WINE64_DIST=...
-WINE64_PREFIX=...
+```sh
+sh tests/fixtures.sh OUT
+GEX_TEST_FIXTURES=OUT cargo test -p gex-kernel
+GEX_TEST_FIXTURES=OUT sh tests/android/build.sh
 ```
 
-`wine/README.md` covers running a program on it.
+Without `GEX_TEST_FIXTURES` the kernel tests that need them say they are
+skipped, and `build.sh` leaves those four programs out.
 
-### Build a program with gexcc
+`tests/android/oracle` boots Android's own userland under gexc from an image
+you supply, an Android 17 arm64 emulator system image. Its README lists what
+it needs and how to run it.
 
-```console
-$ make gexcc
-...
-out/gexcc/bin/gexcc
-$ out/gexcc/bin/gexcc -O2 -o hello hello.c && target/x86/release/gexc run hello
-```
+## Status
 
-### What the build needs
+Working:
 
-- the Rust toolchain from `rust-toolchain.toml` (it installs the
-  `wasm32-unknown-unknown` target);
-- clang and `wasm-ld` (LLVM 22), and Node.js 22;
-- for the page: Emscripten (`emsdk`) and `wasm-tools`
-  (`cargo install wasm-tools`);
-- for Wine: the host's MinGW-w64 GCC 12 (`x86_64-w64-mingw32-gcc`, and
-  `i686-w64-mingw32-gcc` for WoW64); it is a prerequisite, not a pin;
-- for AArch64 tests: `qemu-aarch64` as the reference. The musl cross
-  toolchains are fetched by `make toolchains` at the versions in
-  `toolchain/pins`.
+- 95 small bionic C programs, each run at two link addresses, pass on the
+  native host and match an arm64 Linux host
+- AOSP's `binderDriverInterfaceTest` passes, 20 of 20
+- the image's servicemanager answers
+- the image's init boots on the macOS native host: apexd activates the
+  image's 50 APEXes, then logd, netd, the HALs and the zygote start, and
+  system_server starts its core services
+- adb on the host connects to the guest and runs shell commands, through
+  `GEX_HOST_FORWARD`
 
-Fetched sources (musl, LLVM, Wine) are kept in bare mirrors under
-`~/.cache/gex` (`CACHE=`). A rerun fetches nothing it already has. The
-Makefile's header lists the settings.
+Not working:
 
-## Tests
-
-`make test` runs the runtime's tests (`node test/run.mjs`; `test/README.md`
-gives its options, passed as `ARGS="..."`). `make check` runs each crate's
-own tests (`cargo test`). Every other test lives in the gexdev repository.
+- Android does not reach `boot_completed`, and there is no display
+- boots are slow, and the guest's clock is slowed to suit
+- much of the Android kernel work is in the native host only, and the browser
+  host lacks it
+- there is no ashmem, and memory shared between processes is kept coherent by
+  copying, not truly shared
 
 ## Licence
 
-gex is free software under the GNU Affero General Public License, version 3
-only (`LICENSE`). Copyright (C) 2026 Puter Technologies Inc. The Android
-work in this fork is Copyright (C) 2026 Ryan Wilson, under the same licence.
-Third-party code keeps its own licence; `NOTICE` lists it.
+GNU Affero General Public License, version 3 only (`LICENSE`). gex is
+Copyright (C) 2026 Puter Technologies Inc. The Android work in this fork is
+Copyright (C) 2026 Ryan Wilson. Third-party code keeps its own licence, and
+`NOTICE` lists it.
+
+## Contributing
+
+This repository takes no pull requests and no issues. Both are turned off
+for the BrowserPorts organisation.
