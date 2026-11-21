@@ -204,9 +204,18 @@ impl Mmap<UnalignedLength> {
     /// returned.
     pub fn from_file(file: Arc<File>) -> Result<Self> {
         let sys = mmap::Mmap::from_file(&file)?;
+        // gex: the file is let go once it is mapped. A mapping stands on its
+        // own, and gex loads every translation from a file of the cache: a
+        // module that held its file held a host descriptor for as long as it
+        // lived, thousands for one program and past the host's limit for an
+        // Android boot (macOS's 92160), after which the guests' own opens
+        // failed with the host's EMFILE. Without the file, a memory image is
+        // made from the bytes (`MemoryImage::new`) and a clone copies
+        // (`MmapVec::to_owned`), as for a module that never had one.
+        drop(file);
         Ok(Mmap {
             sys,
-            data: UnalignedLength { file: Some(file) },
+            data: UnalignedLength { file: None },
         })
     }
 
