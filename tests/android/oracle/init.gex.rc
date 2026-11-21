@@ -38,6 +38,13 @@ on early-init
     # the image's build properties set neither): the emulator's 420 for a
     # 1080-wide phone, as GEX_VIRTIO_GPU=1080x1920 makes the display.
     setprop qemu.sf.lcd_density 420
+    # No compiling at first boot. /data is in memory here, so every boot is a
+    # first boot, and its dexopt of every package (116, by dex2oat64 run
+    # translated, on system_server's main thread in UpdatePackagesIfNeeded)
+    # outlasted boot b121's two hours. `skip` is ArtService's compiler filter
+    # for none (pm.dexopt.<reason>); the packages run from their dex, and are
+    # compiled later as a device configured so would compile them.
+    setprop pm.dexopt.first-boot skip
     # The composer finds its displays through DRM (the virtio-gpu's
     # connector) rather than asking the emulator's host, as a device with
     # guest rendering and no host renderer has it configured.
