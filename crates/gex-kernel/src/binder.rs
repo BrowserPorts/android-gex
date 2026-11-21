@@ -875,6 +875,11 @@ impl State {
 
     /// Give a range back, joined to the free ranges beside it.
     fn release(&mut self, proc: u64, at: u64) {
+        // The call's hold on its node (`binder_transaction_buffer_release`).
+        let held = self.procs.get_mut(&proc).and_then(|p| p.buffers.get_mut(&at)).and_then(|b| b.target_node.take());
+        if let Some(node) = held {
+            self.dec_node(node, true, false);
+        }
         let Some(p) = self.procs.get_mut(&proc) else { return };
         let Some(b) = p.buffers.get_mut(&at) else { return };
         if b.is_async {
@@ -1345,6 +1350,16 @@ impl State {
         if let Some(b) = self.procs.get_mut(&target_proc).and_then(|p| p.buffers.get_mut(&buffer)) {
             b.target_node = target_node;
             b.objects = objects;
+        }
+        // A call holds its node, strongly, until its buffer is given back
+        // (`binder_get_node_refs_for_txn`): the node's owner is not told
+        // it is let go, and the node is not freed, while a call to it waits
+        // (behind another one-way call, say) or is being served. Without
+        // it a call delivered after its node was freed named pointer 0,
+        // which libbinder takes for the context manager ("Calling transact
+        // on null Binder").
+        if let Some(node) = target_node {
+            let _ = self.inc_node(node, true, false, None);
         }
 
         let id = self.id();
