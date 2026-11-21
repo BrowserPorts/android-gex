@@ -198,6 +198,7 @@ run() {
     simdops) check "$1" "simdops ok" 0 ;;
     fdstress) check "$1" "fdstress ok" 0 ;;
     limits) check "$1" "limits ok" 0 ;;
+    cpufreq) check "$1" "cpufreq ok" 0 ;;
     psi) check "$1" "psi ok" 0 root ;;
     ctty) check "$1" "ctty ok" 0 ;;
     apexns) check "$1" "apexns ok" 0 root ;;
@@ -252,7 +253,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock fwdecho fpops simdops binderexit fdstress limits"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock fwdecho fpops simdops binderexit fdstress limits cpufreq"
     for p in $all; do
         run "$p"
     done

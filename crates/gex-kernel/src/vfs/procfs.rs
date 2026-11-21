@@ -1692,7 +1692,32 @@ mod tests {
 /// reads `online` first. Wine's `GetLogicalProcessorInformation` needs
 /// `online` and reads the topology (it is `STATUS_NOT_IMPLEMENTED` without
 /// them), and engines size their thread pools from that.
+///
+/// And `cpufreq`, as a virtual machine's kernel shows it (Linux's
+/// `virtual-cpufreq`, which Android's VMs run): a policy a processor
+/// (`cpufreq/policyN`, each `cpuN/cpufreq` a link to it) at one fixed
+/// frequency, [`CPU_KHZ`], under the `performance` governor, since gex's
+/// host says none. Android's CpuMonitorService reads it (`CpuInfoReader`),
+/// and without it reported a WTF before DropBox was up, and each failed
+/// DropBox lookup of the report was a WTF of its own, without end.
 pub struct SysCpuFs;
+
+/// The frequency each processor's policy reports, in kHz.
+pub const CPU_KHZ: u64 = 2_000_000;
+
+/// A policy's files, read-only here: a fixed frequency has nothing to set.
+const POLICY_FILES: [&str; 10] = [
+    "affected_cpus",
+    "related_cpus",
+    "cpuinfo_max_freq",
+    "cpuinfo_min_freq",
+    "scaling_cur_freq",
+    "scaling_max_freq",
+    "scaling_min_freq",
+    "scaling_driver",
+    "scaling_governor",
+    "scaling_available_governors",
+];
 
 impl SysCpuFs {
     fn list(n: u32) -> String {
@@ -1707,10 +1732,31 @@ impl SysCpuFs {
         (i < crate::cpus::count()).then_some((i, &rest[end..]))
     }
 
+    /// The processor a `cpufreq/policyN...` path names, and what follows.
+    fn policy(path: &str) -> Option<(u32, &str)> {
+        let rest = path.strip_prefix("cpufreq/policy")?;
+        let end = rest.find('/').unwrap_or(rest.len());
+        let i: u32 = rest[..end].parse().ok()?;
+        (i < crate::cpus::count()).then_some((i, &rest[end..]))
+    }
+
     fn generate(path: &str) -> Option<Vec<u8>> {
         let n = crate::cpus::count();
         if matches!(path, "online" | "possible" | "present") {
             return Some(Self::list(n).into_bytes());
+        }
+        if let Some((i, rest)) = Self::policy(path) {
+            let file = rest.strip_prefix('/')?;
+            return Some(
+                match file {
+                    "affected_cpus" | "related_cpus" => format!("{i}\n"),
+                    "cpuinfo_max_freq" | "cpuinfo_min_freq" | "scaling_cur_freq" | "scaling_max_freq" | "scaling_min_freq" => format!("{CPU_KHZ}\n"),
+                    "scaling_driver" => "virtual-cpufreq\n".to_string(),
+                    "scaling_governor" | "scaling_available_governors" => "performance\n".to_string(),
+                    _ => return None,
+                }
+                .into_bytes(),
+            );
         }
         let (i, rest) = Self::cpu(path)?;
         let all = crate::cpus::mask();
@@ -1736,10 +1782,17 @@ impl SysCpuFs {
             for i in 0..crate::cpus::count() {
                 v.push((format!("cpu{i}"), FileType::Directory));
             }
+            v.push(("cpufreq".into(), FileType::Directory));
             return Some(v);
         }
+        if path == "cpufreq" {
+            return Some((0..crate::cpus::count()).map(|i| (format!("policy{i}"), FileType::Directory)).collect());
+        }
+        if let Some((_, rest)) = Self::policy(path) {
+            return rest.is_empty().then(|| f(&POLICY_FILES));
+        }
         match Self::cpu(path)?.1 {
-            "" => Some(vec![("online".into(), FileType::Regular), ("topology".into(), FileType::Directory)]),
+            "" => Some(vec![("online".into(), FileType::Regular), ("topology".into(), FileType::Directory), ("cpufreq".into(), FileType::Symlink)]),
             "/topology" => Some(f(&[
                 "physical_package_id", "die_id", "core_id", "cluster_id", "thread_siblings",
                 "thread_siblings_list", "core_cpus", "core_cpus_list", "core_siblings",
@@ -1753,6 +1806,22 @@ impl SysCpuFs {
 impl FileSystem for SysCpuFs {
     fn fs_type(&self) -> &'static str {
         "sysfs"
+    }
+
+    /// `cpuN/cpufreq`, a link to its policy, as Linux's cpufreq makes it.
+    fn keeps_links(&self) -> bool {
+        true
+    }
+
+    fn read_link(&self, path: &str) -> Result<String, Errno> {
+        let path = path.trim_matches('/');
+        match Self::cpu(path) {
+            Some((i, "/cpufreq")) => Ok(format!("../cpufreq/policy{i}")),
+            _ => {
+                self.metadata(path)?;
+                Err(Errno::EINVAL)
+            }
+        }
     }
 
     /// A part of sysfs: sysfs's number.
@@ -1825,5 +1894,22 @@ mod syscpu_tests {
         assert_eq!(SysCpuFs.read_link("cpu3/topology"), Err(Errno::EINVAL));
         assert_eq!(SysCpuFs.read_link("cpu4"), Err(Errno::ENOENT));
         assert!(SysCpuFs.open("cpu9/topology/core_id", 0, 0).is_err());
+    }
+
+    /// cpufreq as a VM's kernel shows it: a policy a processor at one
+    /// frequency, and each processor's link to its policy.
+    #[test]
+    fn a_policy_a_processor_at_one_frequency() {
+        let _g = crate::cpus::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::cpus::set(4);
+        assert_eq!(read("cpufreq/policy2/related_cpus"), "2\n");
+        assert_eq!(read("cpufreq/policy2/affected_cpus"), "2\n");
+        assert_eq!(read("cpufreq/policy0/scaling_cur_freq"), format!("{CPU_KHZ}\n"));
+        assert_eq!(read("cpufreq/policy3/scaling_max_freq"), read("cpufreq/policy3/cpuinfo_max_freq"));
+        assert_eq!(read("cpufreq/policy1/scaling_governor"), "performance\n");
+        assert_eq!(SysCpuFs.metadata("cpufreq/policy4").unwrap_err(), Errno::ENOENT);
+        assert!(SysCpuFs.open("cpufreq/policy1/scaling_max_freq", 1, 0).is_err());
+        assert_eq!(SysCpuFs.read_link("cpu1/cpufreq"), Ok("../cpufreq/policy1".to_string()));
+        assert_eq!(SysCpuFs.metadata_nofollow("cpu1/cpufreq").unwrap().file_type, FileType::Symlink);
     }
 }
