@@ -2040,7 +2040,7 @@ export class Gex {
    *  (`wl-bridge.mjs` `sendEvent`). */
   /** The global kernel's memory and the address in it of `/dev/dsp`'s
    *  ring (hosts/kernel/src/audio.rs), or null: what the page plays
-   *  (page/runtime/src/host/audio.js). */
+   *  (runtime/src/host/audio.js). */
   audioRing() {
     const e = this.#shim?.exports;
     if (!this.#kernel || !e?.gex_audio_ring_addr || !this.#kernelSpec?.memory) return null;
@@ -2689,7 +2689,7 @@ export class Gex {
     if (missing.length) {
       throw new Error(
         `the gex runtime is out of date: it has no ${missing.join(', ')}. ` +
-          'Rebuild it with page/build-assets.sh and reload.',
+          'Rebuild it with runtime/files/build-assets.sh and reload.',
       );
     }
     // Whatever `useGl` was told before the shim existed.
@@ -2794,7 +2794,7 @@ export class Gex {
     const free = this.#shim.exports.gex_free;
     // Empty directories first, so a file arriving under one finds it.
     // `gex_add_file` makes directories on the way to each file, so an empty one
-    // would otherwise arrive not at all; `page/runtime/src/host/tar.js` collects them.
+    // would otherwise arrive not at all; `runtime/src/host/tar.js` collects them.
     for (const path of opts.dirs ?? []) {
       const p = enc.encode(path);
       const pp = this.#shim.exports.gex_alloc(p.length) >>> 0;
@@ -2876,7 +2876,7 @@ export class Gex {
       free?.(pp, p.length);
       free?.(up, u.length);
     }
-    // Hard links (`page/runtime/src/host/tar.js`), after their targets: one inode with two
+    // Hard links (`runtime/src/host/tar.js`), after their targets: one inode with two
     // names, as the host had it. A shim that cannot link gets a copy.
     for (const [path, target] of Object.entries(opts.hard ?? {})) {
       const p = enc.encode(path);
@@ -2897,7 +2897,7 @@ export class Gex {
       free?.(pp, p.length);
       free?.(tp, t.length);
     }
-    // Symbolic links (`page/runtime/src/host/tar.js`'s `links`), after files and hard links:
+    // Symbolic links (`runtime/src/host/tar.js`'s `links`), after files and hard links:
     // path -> target text. Only with the global kernel (a page or run-node):
     // a process that is the whole system has no filesystem yet to link in,
     // so a caller without one passes copies as files instead.
@@ -2925,7 +2925,7 @@ export class Gex {
       this.#shim.exports.gex_set_mtime(pp, p.length, BigInt(Math.trunc(secs)));
       free?.(pp, p.length);
     }
-    // The bundle's extended attributes (`page/runtime/src/host/tar.js`'s `xattrs`, path to
+    // The bundle's extended attributes (`runtime/src/host/tar.js`'s `xattrs`, path to
     // { name: bytes }): Wine's DOS attributes, hidden and system, on the
     // prefix's files and folders.
     for (const [path, attrs] of Object.entries(opts.xattrs ?? {})) {
@@ -5105,7 +5105,7 @@ export class Gex {
   }
 
   /**
-   * Give the guest a graphics device. `gl` is a `MesaGlDevice` from page/runtime/src/host/mesa-gl.js.
+   * Give the guest a graphics device. `gl` is a `MesaGlDevice` from runtime/src/host/mesa-gl.js.
    * Off by default, like the network. Best set before `load`, since the device
    * node is made while the filesystem is built; a later call still works.
    */

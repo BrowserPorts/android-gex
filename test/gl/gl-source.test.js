@@ -4,10 +4,10 @@
 // start Mesa, the glue and the module asked for once each (a page of its
 // own: a page runs one system). Says so and passes where the browser has no
 // WebGPU, or the build has no Mesa.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
-import { MesaGl } from '../../page/runtime/src/gl.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
+import { MesaGl } from '../../runtime/src/gl.js';
 import { SP_CODE, MP_CODE } from '../../hosts/browser/js/mode.mjs';
 
 // The single-thread build's Mesa is its own (gex/st/).

@@ -4,8 +4,8 @@
 // browser, after a reload (a page runs one system), on an OPFSFilesystem's
 // store (block lists): each case gives a count or an error, and the kernel
 // lives on (a "capacity overflow" panic there took every process down).
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem, OPFSFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem, OPFSFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox', 'native-progs'], timeout: 300 };
 

@@ -53,7 +53,7 @@ let zstdLoad = null;
  *  (zstd-late.mjs). */
 export function lazyReady() {
   if (lazyCacheOn() || !globalThis.GEX_REST_BUNDLE) return Promise.resolve();
-  zstdLoad ??= lateZstd(import('../../../page/vendor/zstddec/zstddec-stream.mjs'), new URL('../../../page/vendor/zstddec/zstddec.wasm', import.meta.url).href)
+  zstdLoad ??= lateZstd(import('../../../runtime/vendor/zstddec/zstddec-stream.mjs'), new URL('../../../runtime/vendor/zstddec/zstddec.wasm', import.meta.url).href)
     .then((d) => { zstd = d; })
     .catch((e) => { console.error(`[lazy] no zstd decoder: ${e?.message ?? e}`); });
   return zstdLoad;

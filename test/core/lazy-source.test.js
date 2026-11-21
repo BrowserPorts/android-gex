@@ -2,8 +2,8 @@
 // lazy files, by keys of its own; bytes it hands over ahead (ctx.put) are
 // read without asking it; a read it fails is EIO to the program; its port
 // reaches the page.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180, single: 'a lazy source needs the default build' };
 

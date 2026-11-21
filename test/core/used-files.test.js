@@ -1,8 +1,8 @@
 // fs.usedFiles: the files whose bytes the programs read, in the order of
 // their first reads (a stat alone is no read); hostTimeZone: the browser's
 // zone as a program's environment.
-import { System, hostTimeZone } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System, hostTimeZone } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, single: 'usedFiles needs the default build' };
 

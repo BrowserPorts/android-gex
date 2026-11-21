@@ -2,8 +2,8 @@
 // mem64): `mem64` and `units`' `jit: false`, `providers` and `stateful`
 // reach the runtime as gex's own switches do (GEX_NO_JIT, the provider
 // sources, the stateful list), and a malformed one is a TypeError before the page's one system is taken.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox'], timeout: 120 };
 

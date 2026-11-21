@@ -1,6 +1,6 @@
 // System's `exec` event: each process's exec, its pid and the file it runs.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, single: 'the default build\'s events' };
 

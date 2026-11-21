@@ -5,8 +5,8 @@
 // length and trapped out of bounds: FL Studio's FastMM on arm64, and this
 // program on x86-64 on the first round or two. Five runs of 30 rounds; any
 // failure is a failure.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 600 };
 

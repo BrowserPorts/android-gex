@@ -3,10 +3,10 @@
 // its window found by its title, its frames waited for and the page's pixel
 // in the window checked to be the probe's magenta, its window 200x150 by then. `more(out)` may look at
 // the probe's other lines once its frames are in.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { HostWindows } from '../../page/runtime/src/windows/host.js';
-import { MesaGl } from '../../page/runtime/src/gl.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { HostWindows } from '../../runtime/src/windows/host.js';
+import { MesaGl } from '../../runtime/src/gl.js';
 
 export async function glWindow(t, probe, more = () => {}) {
   const { check, eq, until, lines } = t;

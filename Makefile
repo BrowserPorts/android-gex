@@ -62,14 +62,14 @@ help:
 	@echo 'make gexc          gexc for AArch64, x86-64 and i386 guests (target/release, target/x86/release)'
 	@echo 'make wine          64-bit Wine with WoW64, and a prefix (prints WINE64_DIST=, WINE64_PREFIX=)'
 	@echo 'make gexcc         the wasm32 C/C++ compiler, from pins (out/gexcc; GEXCC_PREFIX= elsewhere)'
-	@echo 'make mesa          Mesa into page/public (FLAVOUR=--mp, --sp or --both)'
+	@echo 'make mesa          Mesa into runtime/files/out (FLAVOUR=--mp, --sp or --both)'
 	@echo 'make test          the runtime tests: node test/run.mjs on the package make runtime builds (ARGS="..." passes options)'
 	@echo 'make help-all      every target'
 
 help-all: help
 	@echo
-	@echo 'make assets        the hosts, guest libraries and rootfs alone (page/public)'
-	@echo 'make xwayland      Xwayland into page/public (FLAVOUR=--mp, --sp or --both)'
+	@echo 'make assets        the hosts, guest libraries and rootfs alone (runtime/files/out)'
+	@echo 'make xwayland      Xwayland into runtime/files/out (FLAVOUR=--mp, --sp or --both)'
 	@echo 'make toolchains    the pinned musl cross toolchains the page builds guest code with (CACHE/toolchains)'
 	@echo 'make runtime       the npm package @gexemu/runtime (PKG=DIR, default out/runtime)'
 	@echo 'make sysroot       the wasm32 sysroot (musl at MUSL_COMMIT); SNAPSHOT=1: the snapshot flavour'
@@ -96,11 +96,11 @@ gexc:
 	cargo build --release -p gexc --features x86 --target-dir target/x86
 	@echo $(GEXC_A64) $(GEXC_X86)
 
-# ---- the runtime's files (page/public) and its package ----
+# ---- the runtime's files (runtime/files/out) and its package ----
 # Mesa, and the Khronos registry guest/gl/build.sh generates the GL tables from
 MESA_CHECKOUT = git -C $(ROOT) submodule update --init third_party/mesa third_party/opengl-registry
-# vite and wisp-js, which page/runtime/build.sh builds the package with, at package-lock.json's versions
-NPM_CI = [ $(ROOT)/page/node_modules/.package-lock.json -nt $(ROOT)/page/package-lock.json ] || (cd $(ROOT)/page && npm ci --no-audit --no-fund)
+# vite and wisp-js, which runtime/build.sh builds the package with, at package-lock.json's versions
+NPM_CI = [ $(ROOT)/runtime/node_modules/.package-lock.json -nt $(ROOT)/runtime/package-lock.json ] || (cd $(ROOT)/runtime && npm ci --no-audit --no-fund)
 # The page's guest-side cross compilers (toolchain/pins), unpacked once in
 # CACHE/toolchains; GEX_TOOLCHAIN= / GEX_X86_TOOLCHAIN= name others.
 TC := $(CACHE)/toolchains
@@ -124,21 +124,21 @@ export GEX_MESA_PAGE_ONLY
 PAGE_ENV = PATH=$(EMSDK)/upstream/emscripten:$(EMSDK)/upstream/bin:$$PATH
 
 assets: toolchains
-	$(ROOT)/page/build-assets.sh
-	@echo $(ROOT)/page/public
+	$(ROOT)/runtime/files/build-assets.sh
+	@echo $(ROOT)/runtime/files/out
 # FLAVOUR: --mp (the multi-process build's), --sp or --both
 FLAVOUR ?= --mp
 mesa:
 	$(MESA_CHECKOUT)
 	@$(EMCC_CHECK)
-	$(PAGE_ENV) $(ROOT)/page/build.sh $(FLAVOUR) --gl-only
+	$(PAGE_ENV) $(ROOT)/runtime/files/build.sh $(FLAVOUR) --gl-only
 xwayland:
 	@$(EMCC_CHECK)
-	$(PAGE_ENV) $(ROOT)/page/build.sh $(FLAVOUR) --x-only
+	$(PAGE_ENV) $(ROOT)/runtime/files/build.sh $(FLAVOUR) --x-only
 PKG ?= $(OUT)/runtime
 runtime:
 	$(NPM_CI)
-	$(ROOT)/page/runtime/build.sh $(PKG)
+	$(ROOT)/runtime/build.sh $(PKG)
 	@echo $(PKG)
 
 # ---- pinned sources ----

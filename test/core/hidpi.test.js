@@ -2,9 +2,9 @@
 // canvas's content box at the real devicePixelRatio (1.5 is 1.5, not 2), and
 // follows a layout change and a change of scale (a zoom, another monitor) with
 // the frames drawn at it. `scale: 1` turns it off (hidpi-fixed.test.js).
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
 
 export const meta = {
   hosts: ['browser'], images: ['busybox'], timeout: 120,

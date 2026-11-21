@@ -7,9 +7,9 @@
 // its units (60x30 device pixels): each is listed where its client put it,
 // and a press over each, in CSS pixels on the page, reaches it at its own
 // surface coordinates.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
 
 export const meta = {
   hosts: ['browser'], images: ['busybox'], timeout: 180,

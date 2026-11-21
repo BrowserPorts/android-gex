@@ -1,8 +1,8 @@
 // CompositorWindows with a number for `scale`: the page's own sizing, left as it
 // is at any devicePixelRatio (here 1.5), and that scale for the frames.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
 
 export const meta = {
   hosts: ['browser'], images: ['busybox'], timeout: 120,

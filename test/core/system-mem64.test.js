@@ -1,8 +1,8 @@
 // System({ mem64: true }): every program starts in a 64-bit memory, the
 // first one included (page/mem64-pick's program says which it got; without
 // the option it starts 32-bit, core/mem64).
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], arches: ['x86'], images: ['busybox', 'mem64'], timeout: 120 };
 

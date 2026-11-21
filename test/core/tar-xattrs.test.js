@@ -1,8 +1,8 @@
 // addTar's `xattrs`: extended attributes a page sets on a layer's files (a
 // Wine prefix's user.DOSATTRIB), on the tar's files, on its lazy files and
 // on a layer laid after boot under `at`, beside the tar's own pax ones.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120 };
 

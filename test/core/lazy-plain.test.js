@@ -2,8 +2,8 @@
 // lazy file is a ranged request from its Worker, and a host that ignores
 // Range and sends no Content-Length (the test server's `?plain`) is read
 // from its whole answer, fetched once by that Worker rather than once a read.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180 };
 

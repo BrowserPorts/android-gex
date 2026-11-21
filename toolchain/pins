@@ -27,7 +27,7 @@ BUSYBOX_URL     := https://busybox.net/downloads/busybox-1.37.0.tar.bz2
 BUSYBOX_SHA256  := 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4
 
 # The guest-side cross compilers the page's assets are built with
-# (page/build-assets.sh: the gears, the guest GL driver, ld-musl for the
+# (runtime/files/build-assets.sh: the gears, the guest GL driver, ld-musl for the
 # aarch64 and x86-64 guests): musl.cc's builds, fetched by make toolchains.
 MUSL_CROSS_AARCH64_URL    := https://musl.cc/aarch64-linux-musl-cross.tgz
 MUSL_CROSS_AARCH64_SHA256 := c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38

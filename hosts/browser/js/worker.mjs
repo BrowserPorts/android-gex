@@ -889,7 +889,7 @@ async function handle(msg) {
   if (msg.unitCache) globalThis.GEX_UNIT_CACHE = 1;
   // The page's lazy source (fs.js setLazySource, lazy-cache.mjs).
   if (msg.lazyCache) setLazyCache(msg.lazyCache);
-  // The directories the page serves (page/runtime fs.mount, page-fs.mjs).
+  // The directories the page serves (runtime fs.mount, page-fs.mjs).
   if (msg.pageFs) setPageFs(msg.pageFs);
   // A rest bundle's files among the lazy ones (lazy-fetch.mjs `lazyReady`).
   // Its decoder now: a runtime the pool made ahead for an exec'd child
@@ -963,7 +963,7 @@ async function handle(msg) {
   // must run before `load` -- which mounts /dev/gex-gl only when the flag is on.
   if (msg.glChannel?.inRealm) {
     // The single-thread build: the compositor's Mesa is in this realm
-    // (page/runtime/src/host/compositor-worker.js `glInRealm`), and a submit is a promise
+    // (runtime/src/host/compositor-worker.js `glInRealm`), and a submit is a promise
     // the Suspending `gl_submit` waits on. A batch is run straight out of
     // this process's memory: no copy, and no batch in flight unwaited.
     // An unwaited batch is waited for all the same; its answer is what the
@@ -1167,7 +1167,7 @@ async function handle(msg) {
     gex.useNetwork(new NetProxy(msg.netChannel, msg.child?.pid ?? msg.pid ?? 1), { shared: true });
   } else if (msg.pageHosts && !msg.network) {
     // Only the page-served hosts, where the page cannot serve its sockets.
-    const { Sockets } = await import('../../../page/runtime/src/host/net.js');
+    const { Sockets } = await import('../../../runtime/src/host/net.js');
     const net = new Sockets(null, { pageHosts: msg.pageHosts, onEvent: (e) => port.post({ kind: 'net', event: e }) });
     gex.useNetwork(net);
   }

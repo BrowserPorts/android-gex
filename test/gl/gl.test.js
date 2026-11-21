@@ -1,10 +1,10 @@
 // MesaGl: the guest's GL device, and Mesa on WebGPU started on demand.
 // Says so and passes where the browser has no WebGPU, or the build has no
-// Mesa (page/public/gex/gex-wgpu-replay.*).
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
-import { MesaGl } from '../../page/runtime/src/gl.js';
+// Mesa (runtime/files/out/gex/gex-wgpu-replay.*).
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
+import { MesaGl } from '../../runtime/src/gl.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<canvas id="out" width="640" height="480"></canvas>` };
 

@@ -6,8 +6,8 @@
 //      aborts rejects boot with the signal's reason;
 //   2. a boot with `wait: true` goes on by itself once the other page closes;
 //      busy is then false (this page's own system never makes it busy).
-import { System } from '../../page/runtime/src/index.js';
-import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { OPFSFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180 };
 

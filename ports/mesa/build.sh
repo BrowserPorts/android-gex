@@ -9,7 +9,7 @@ MESA=$ROOT/third_party/mesa
 SANITIZE=${GEX_MESA_SANITIZE:-0}
 # GEX_MESA_THREADS=0: the single-thread build's Mesa,
 # without -pthread -- a plain memory, no glthread -- and Wink's `st` Tint.
-# Built in its own directory and published under page/public/gex/st/, beside
+# Built in its own directory and published under runtime/files/out/gex/st/, beside
 # the threaded one.
 # GEX_MESA_PAGE_ONLY=1: link only the page's gex-wgpu-replay (a page-only web build), not
 # the softpipe replay and smokes the Mesa tests use.
@@ -285,7 +285,7 @@ if [ "$SANITIZE" != 1 ] && [ -f "$TGT/gex-wgpu-replay.wasm.orig" ]; then
     [ -f "$TGT/split/gex-wgpu-replay.deferred.wasm" ] &&
         cp "$TGT/split/gex-wgpu-replay.deferred.wasm" "$TGT/gex-wgpu-replay.deferred.wasm"
 fi
-PUB="$ROOT/page/public/gex"
+PUB="$ROOT/runtime/files/out/gex"
 [ "$THREADS" = 0 ] && [ -d "$PUB" ] && PUB="$PUB/st" && mkdir -p "$PUB"
 # A link without -sSPLIT_MODULE=1 (the mesa-wink tree's) leaves no
 # .wasm.orig and so no split: its .wasm is the plain module, and that is what
@@ -302,7 +302,7 @@ if [ -d "$PUB" ] && [ -f "$FROM/gex-wgpu-replay.wasm" ]; then
         echo "  published $PUB/$f"
     done
     # The licences of what the replay is built from, beside it, for the npm
-    # package's THIRD-PARTY (page/runtime/build.sh): Mesa's, Dawn's (Tint is
+    # package's THIRD-PARTY (runtime/build.sh): Mesa's, Dawn's (Tint is
     # Dawn's) and emdawnwebgpu's.
     L=$PUB/licenses
     rm -rf "$L/mesa" "$L/dawn" "$L/emdawnwebgpu"

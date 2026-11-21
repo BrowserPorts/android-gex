@@ -2,8 +2,8 @@
 // index is named whole once the index is in, and the programs start before
 // its end: a file laid reads, a file still to come is there to a lookup and
 // waits for its bytes, and reads once they come.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 120, single: 'laid whole before the program starts (no early start: a read cannot wait in the one Worker)' };
 

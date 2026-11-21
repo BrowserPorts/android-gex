@@ -1,5 +1,5 @@
 // The way to a page's own lazy source (fs.js setLazySource,
-// page/runtime/src/lazy-source-worker.js). A lazy file's read happens in a
+// runtime/src/lazy-source-worker.js). A lazy file's read happens in a
 // Worker blocked in the kernel (lazy-fetch.mjs), which cannot wait on a
 // promise; the source is the page's module, asynchronous. So the read is
 // asked of the one Worker that runs it, through slots in a

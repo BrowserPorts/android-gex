@@ -6,8 +6,8 @@
 // thread's Worker while the crashed one's is still on its way to its end. Before, the kill's end claimed the process first and
 // the crash was never said. Then rt-killwait: SIGKILL ends a process whose
 // every thread is waiting.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['node', 'browser'], images: ['busybox'], timeout: 300 };
 

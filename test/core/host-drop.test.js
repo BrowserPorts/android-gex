@@ -2,9 +2,9 @@
 // guest (here an array of Files, as a FileList would be), with no window
 // under the point; their modes; `fallback` taking them when no window does;
 // the argument checks.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { HostDrop } from '../../page/runtime/src/drop.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { HostDrop } from '../../runtime/src/drop.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, single: 'the drop Worker needs the shared kernel' };
 

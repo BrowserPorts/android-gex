@@ -334,7 +334,7 @@ An eject writes data, never a page. A Wine page's build writes
 `build/web/`: the bundle (`rootfs.tar`), the units (`units/`) and the launch
 file (`wine32.json`: the program, its arguments, environment, working
 directory, size, the features kept and the units). A page runs it on the
-runtime package, `@gexemu/runtime` (page/runtime/README.md): a `System`, a
+runtime package, `@gexemu/runtime` (runtime/README.md): a `System`, a
 filesystem with the bundle (`addTar`), the units (`units`), and the program
 from the launch file (`spawn`). Loading policy (what to fetch when, how the
 files are packed and cached, a loading screen) is the page's.
@@ -348,7 +348,7 @@ user/eject.json `"start"` (`args`, `env`, `cwd`, `size`, `mtimes`, `strace`,
 `trapstack`, `filesystem`, `ready`) over the recording's. A `"start"` key for a
 build setting (`"compositor"`, say) fails the build and says where it goes.
 `"filesystem"` is required: `"memory"` or `{"kind": "opfs", "name": "..."}`
-(page/runtime README, "Persistence"). A new project's file says `"memory"`;
+(runtime README, "Persistence"). A new project's file says `"memory"`;
 a build whose file says neither fails.
 
 ### A Linux program's web build
@@ -407,7 +407,7 @@ why, rather than doing nothing.
 
 | Feature | What it is | Off |
 | --- | --- | --- |
-| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing | each window is its own canvas in the page, laid out by `page/runtime/src/host/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The compositor's code is not in the bundle |
+| `compositor` | the scene compositor: every window in one WebGPU canvas, drawn by a worker, with server-side decorations, its own cursor and hit testing | each window is its own canvas in the page, laid out by `runtime/src/host/bare-desktop.js` and composited by the browser; no decorations (Wine draws its own frames). The compositor's code is not in the bundle |
 | `gl` | the guest's OpenGL: Mesa on WebGPU | the page ships no Mesa |
 | `multiprocess` | more than one guest process | not yet: a Wine program is several processes |
 | `translation` | run-time translation (tier-1, the function JIT) behind the units | not yet: the translator is not a separate build |

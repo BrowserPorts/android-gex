@@ -4,8 +4,8 @@
 // links, a directory link), and a lazy file; the program, by a directory
 // link's name, a child of the kernel's pid 1; keys typed into it; its exit
 // status; and its last output before the system stops.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 import { tarOf } from '../lib/tar.mjs';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };

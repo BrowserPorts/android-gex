@@ -10,12 +10,12 @@
 # shim).
 #
 #   test/fixtures/gexcc/dl/spareidle.sh DIR   (gexcc on PATH; GEX_ROOT: a gex checkout
-#                                   with page/public/gex built for x86; DIR:
+#                                   with runtime/files/out/gex built for x86; DIR:
 #                                   where gex can see, not /dev/shm)
 set -u
 command -v gexcc > /dev/null || { echo "skip spareidle: gexcc not on PATH (toolchain/gexcc/install.sh)"; exit 0; }
 ROOT=${GEX_ROOT:?set GEX_ROOT to a gex checkout}
-SEED=$ROOT/page/public/gex/seed.x86.shared.wasm
+SEED=$ROOT/runtime/files/out/gex/seed.x86.shared.wasm
 [ -f "$SEED" ] || { echo "skip spareidle: no $SEED"; exit 0; }
 W=$(mktemp -d "${1:?DIR}/spareidle.XXXXXX")
 trap 'rm -rf "$W"' EXIT

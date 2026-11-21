@@ -1,8 +1,8 @@
 // CompositorWindows' `background`: the desktop's colour, and an image over
 // it once it is in, the image anchored at the edge that always shows.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
 
 export const meta = {
   hosts: ['browser'], images: ['busybox'], timeout: 120,

@@ -15,10 +15,10 @@ const js = gexUrl('hosts/browser/js/');
 register(`data:text/javascript,${encodeURIComponent(`export async function resolve(s, c, next) {
   return next(s.startsWith('@gex/') ? ${JSON.stringify(js)} + s.slice(5) : s, c);
 }`)}`);
-const mod = await import(gexUrl('page/runtime/src/host/page-globals.js'));
+const mod = await import(gexUrl('runtime/src/host/page-globals.js'));
 // Newer: the settings are page-config.js's `page`, not globals.
-const { page } = existsSync(gexJoin(GEX_ROOT, 'page/runtime/src/host/page-config.js'))
-  ? await import(gexUrl('page/runtime/src/host/page-config.js'))
+const { page } = existsSync(gexJoin(GEX_ROOT, 'runtime/src/host/page-config.js'))
+  ? await import(gexUrl('runtime/src/host/page-config.js'))
   : { page: null };
 const setGlobals = mod.setPageConfig ?? mod.setGlobals;
 

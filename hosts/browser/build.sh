@@ -72,8 +72,8 @@ if [ "${GEX_ARCH:-}" = "x86" ]; then
     GEXC=target/x86/release/gexc
 fi
 # What this is built from, taken now, before the build: written beside it as
-# page/public/gex/.inputs once it is installed (page/build-inputs.mjs).
-INPUTS_KEY=$(node page/build-inputs.mjs key gex_browser$INFIX)
+# runtime/files/out/gex/.inputs once it is installed (runtime/files/build-inputs.mjs).
+INPUTS_KEY=$(node runtime/files/build-inputs.mjs key gex_browser$INFIX)
 FEATURES=""
 [ -n "$ARCH_FEAT" ] && FEATURES="--features $ARCH_FEAT"
 # And the same list for the shared build below, which takes `shared-memory`
@@ -103,8 +103,8 @@ echo "hosts/browser: $(stat -c%s "$OUT") bytes${ARCH_FEAT:+ ($ARCH_FEAT)}${GEX_H
 # does.
 #
 # There used to be two copies: `run-node.mjs` read the one in `target/`, the
-# page fetched `/gex/gex_browser.wasm` out of `page/public`, and only
-# `page/build-assets.sh` copied one to the other. So the debugging harness and
+# page fetched `/gex/gex_browser.wasm` out of `runtime/files/out`, and only
+# `runtime/files/build-assets.sh` copied one to the other. So the debugging harness and
 # the demo could be built from different code, and were -- the page ran for
 # hours against a shim that a plain `cargo build` had produced without
 # `--export=__stack_pointer`, and every boot died with "Cannot set properties
@@ -113,7 +113,7 @@ echo "hosts/browser: $(stat -c%s "$OUT") bytes${ARCH_FEAT:+ ($ARCH_FEAT)}${GEX_H
 #
 # One artefact now, produced here, and the glue check is part of producing it
 # rather than of copying it.
-PUB=page/public/gex
+PUB=runtime/files/out/gex
 mkdir -p "$PUB"
 if ! node hosts/browser/js/check-glue.mjs "$OUT" hosts/browser/js/gex.mjs; then
     echo "hosts/browser: NOT installed -- the glue check failed" >&2
@@ -234,8 +234,8 @@ if [ -n "$ARCH_FEAT" ]; then
 else
     cargo build --release -p gexc 2>&1 | grep -E "^error" && exit 1
 fi
-$GEXC seed -o page/public/gex/seed$INFIX.wasm --no-shared-memory >/dev/null
-$GEXC seed -o page/public/gex/seed$INFIX.shared.wasm >/dev/null
+$GEXC seed -o runtime/files/out/gex/seed$INFIX.wasm --no-shared-memory >/dev/null
+$GEXC seed -o runtime/files/out/gex/seed$INFIX.shared.wasm >/dev/null
 echo "  seed: rebuilt from this emitter"
 
 # `GEX_MEM64=1`: also the wasm64 shim for a 64-bit guest memory, x86-64
@@ -259,8 +259,8 @@ if [ -n "${GEX_MEM64:-}" ] && [ -n "$ARCH_FEAT" ]; then
        && ! node hosts/browser/js/check-kernel.mjs "$M64OUT" "$PUB/gex_kernel$INFIX.m64.wasm"; then
         echo "hosts/browser: the wasm64 shim and gex_kernel$INFIX.m64.wasm disagree (GEX_MEM64=1 hosts/kernel/build.sh)"; exit 1
     fi
-    $GEXC seed --mem64 -o page/public/gex/seed$INFIX.m64.shared.wasm >/dev/null
+    $GEXC seed --mem64 -o runtime/files/out/gex/seed$INFIX.m64.shared.wasm >/dev/null
     echo "hosts/browser: $(stat -c%s "$M64OUT") bytes (wasm64, memory64), seed$INFIX.m64.shared.wasm"
 fi
 
-node page/build-inputs.mjs stamp page/public/gex "gex_browser$INFIX=$INPUTS_KEY"
+node runtime/files/build-inputs.mjs stamp runtime/files/out/gex "gex_browser$INFIX=$INPUTS_KEY"

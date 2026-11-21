@@ -7,8 +7,8 @@
 //   2. that file is there, the lazy file still reads as the server's; another file written,
 //      synced, without the first written again;
 //   3. both are there.
-import { System } from '../../page/runtime/src/index.js';
-import { OPFSFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { OPFSFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300 };
 

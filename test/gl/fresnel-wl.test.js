@@ -1,9 +1,9 @@
 // fresnel-gpui as a Wayland client of the page's
 // compositor (no X: DISPLAY unset), its tree from WORK/fresnel-tree.tar.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
-import { MesaGl } from '../../page/runtime/src/gl.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
+import { MesaGl } from '../../runtime/src/gl.js';
 
 export const meta = { hosts: ['browser'], arches: ['x86'], images: [], timeout: 600, html: `<style>html, body { margin: 0; background: #000; }</style>
 <canvas id="out" width="1280" height="760" style="width: 1280px; height: 760px; display: block;" tabindex="0"></canvas>` };

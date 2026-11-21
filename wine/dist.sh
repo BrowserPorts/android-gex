@@ -160,7 +160,7 @@ if [ "$MEDIA" != 0 ]; then WGST=-wgf; B64_MODS="$B64_MODS --enable-winegstreamer
 # the prefix keeps winebus's root device, but with "DemandStart"=1 on its
 # service: services.exe does not start it at boot, so a session with no
 # controller runs no winedevice for it and fetches no SDL. The page starts it
-# (`sc start winebus`, WineControllers in page/runtime/src/input.js) once a controller is
+# (`sc start winebus`, WineControllers in runtime/src/input.js) once a controller is
 # there. -sdl in the name. WINE64_PADS=off leaves all three out, as does
 # the memory64 flavour and the default for a Wine tree whose services.exe
 # has no DemandStart (it would start winebus at every boot).

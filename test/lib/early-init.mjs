@@ -6,10 +6,10 @@
 // (a fetch error, a decode error, an archive that ends short), what never
 // came is EIO to the program, never ENOENT; the system's phase is 'failed'
 // with the error, and the program goes on.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { bytesOf } from '../../page/runtime/src/internal.js';
-import { unzstd } from '../../page/runtime/src/host/zfetch.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { bytesOf } from '../../runtime/src/internal.js';
+import { unzstd } from '../../runtime/src/host/zfetch.js';
 import { tarOf } from './tar.mjs';
 
 const enc = new TextEncoder();

@@ -1,21 +1,21 @@
 // The runtime README's examples, run as written on the test page, and every
 // class and member its tables name, there. Each example is a ```js block of
-// page/runtime/README.md, in its order; a page has one System, so each phase
+// runtime/README.md, in its order; a page has one System, so each phase
 // (t.reload) runs the blocks that share one. What an example takes from the
 // page around it (a terminal widget, a desktop's frames, a button) is a stub
 // here; its `@gexemu/runtime` imports are the runtime's modules; its trees are the
 // slim Debian image (bash, uname). A block the README gains or loses fails
 // the block count, so a new example is never left unrun.
-import * as index from '../../page/runtime/src/index.js';
-import * as fsMod from '../../page/runtime/src/fs.js';
-import * as host from '../../page/runtime/src/windows/host.js';
-import * as single from '../../page/runtime/src/windows/single.js';
-import * as compositor from '../../page/runtime/src/windows/compositor.js';
-import * as wisp from '../../page/runtime/src/net/wisp.mjs';
-import * as audio from '../../page/runtime/src/audio.js';
-import * as gl from '../../page/runtime/src/gl.js';
-import * as input from '../../page/runtime/src/input.js';
-import * as drop from '../../page/runtime/src/drop.js';
+import * as index from '../../runtime/src/index.js';
+import * as fsMod from '../../runtime/src/fs.js';
+import * as host from '../../runtime/src/windows/host.js';
+import * as single from '../../runtime/src/windows/single.js';
+import * as compositor from '../../runtime/src/windows/compositor.js';
+import * as wisp from '../../runtime/src/net/wisp.mjs';
+import * as audio from '../../runtime/src/audio.js';
+import * as gl from '../../runtime/src/gl.js';
+import * as input from '../../runtime/src/input.js';
+import * as drop from '../../runtime/src/drop.js';
 import { SP_CODE, MP_CODE } from '../../hosts/browser/js/mode.mjs';
 
 export const meta = { hosts: ['browser'], images: ['slim'], timeout: 600 };
@@ -28,7 +28,7 @@ const M = {
 };
 // The single-thread build (system.js `SINGLE`).
 const SINGLE = !MP_CODE || (SP_CODE && typeof SharedArrayBuffer !== 'function');
-const readme = await (await fetch(new URL('../../page/runtime/README.md', import.meta.url))).text();
+const readme = await (await fetch(new URL('../../runtime/README.md', import.meta.url))).text();
 const BLOCKS = [...readme.matchAll(/```js\n([\s\S]*?)```/g)].map((m) => m[1]);
 
 /** Each phase: the blocks it runs (indices into BLOCKS), what it makes

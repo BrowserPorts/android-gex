@@ -3,8 +3,8 @@
 // programs, such as Wine's wineserver, to save before it goes away). A shell
 // that traps SIGUSR1 says so and goes on; a name nothing runs under signals
 // none; a non-string name throws.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 300 };
 

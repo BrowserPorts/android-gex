@@ -6,8 +6,8 @@ Called by: make lint.
 
 A script is a tracked file that is executable, ends in .sh, .py or .mjs, or is
 a Makefile or .mk, outside third_party, crates/*/src, the runtime's module sources
-(page/runtime/src, page/vendor, hosts/browser/js's modules), the runtime's examples
-(page/runtime/examples: modules a page imports, documentation, never run by path) and
+(runtime/src, runtime/vendor, hosts/browser/js's modules), the runtime's examples
+(runtime/examples: modules a page imports, documentation, never run by path) and
 test/ (run.mjs's own tree). It passes when one of these holds:
   - the Makefile names it;
   - a file that is reached names it (its path from the tree's root, its path
@@ -33,7 +33,7 @@ for line in files:
     m, _, _, path = line.split(None, 3)
     mode[path] = m
 
-SOURCE = re.compile(r'^(third_party/|crates/[^/]+/src/|page/runtime/src/|page/runtime/examples/|page/vendor/|test/)')
+SOURCE = re.compile(r'^(third_party/|crates/[^/]+/src/|runtime/src/|runtime/examples/|runtime/vendor/|test/)')
 def is_script(p):
     if SOURCE.match(p):
         return False

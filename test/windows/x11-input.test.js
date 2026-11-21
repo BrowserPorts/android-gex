@@ -5,10 +5,10 @@
 // page's main thread is busy is one key (no repeat timer in Xwayland runs
 // on past a release the page has not handed on yet), and the browser's own
 // repeats while a key is held are presses, the release after them.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { HostWindows } from '../../page/runtime/src/windows/host.js';
-import { Clipboard, PointerLock } from '../../page/runtime/src/input.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { HostWindows } from '../../runtime/src/windows/host.js';
+import { Clipboard, PointerLock } from '../../runtime/src/input.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<style>html, body { margin: 0; } #desk { position: relative; width: 800px; height: 600px; }</style>
 <div id="desk"></div>` };

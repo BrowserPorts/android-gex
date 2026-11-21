@@ -1,9 +1,9 @@
 // HostWindows at a scale that is not whole (1.5): the clients are told 180
 // 120ths (record word 18), and a window's size stays in CSS pixels, its
 // surface units, whatever its buffer is.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { HostWindows } from '../../page/runtime/src/windows/host.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { HostWindows } from '../../runtime/src/windows/host.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120, html: `<style>html, body { margin: 0; } #desk { position: relative; width: 800px; height: 600px; }</style>
 <div id="desk"></div>` };

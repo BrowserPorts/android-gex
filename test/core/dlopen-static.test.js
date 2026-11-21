@@ -4,9 +4,9 @@
 // dlopen reads it, found by its bare name beside the program (a static
 // program's run path is its own directory); calls into it from two threads, each calling back into
 // the program's libc; its constructor, its data and a second dlopen.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { bytesOf } from '../../page/runtime/src/internal.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { bytesOf } from '../../runtime/src/internal.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 

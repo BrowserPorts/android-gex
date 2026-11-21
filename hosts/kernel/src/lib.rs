@@ -3588,7 +3588,7 @@ pub extern "C" fn k_fs_read_dir(handle: i32, at: gex_kmem::PAddr, cap: u32) -> i
 /// written into; an open or a stat alone does not count), one path a line, at
 /// `at`; their length, or `-ERANGE` with nothing written when `cap` will not
 /// hold them (ask again with more). A recorded run's read set: gex-eject's
-/// bundle split (page/runtime/src/host/fs-opened.js asks).
+/// bundle split (runtime/src/host/fs-opened.js asks).
 #[no_mangle]
 pub extern "C" fn k_fs_opened(at: gex_kmem::PAddr, cap: u32) -> i32 {
     let mut b = rootfs().read_set().join("\n");

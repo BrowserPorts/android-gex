@@ -12,7 +12,7 @@
 //            while its inputs are unchanged, so a run without gexcc can reuse it.
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
-//   package  pkg/: the runtime package, page/runtime/build.sh (--single:
+//   package  pkg/: the runtime package, runtime/build.sh (--single:
 //            @gexemu/runtime-single).
 //   win-progs  win-progs.tar: the Windows test programs (fixtures/wine/src)
 //            built with MinGW for x64/ and x86/ (a source's `gex-nt-cc:`,
@@ -162,7 +162,7 @@ export const images = {
   // test/fixtures/programs/mem64-pick.c as an x86-64 program (static musl,
   // zig), for core/mem64: a system's memory64 process through the API.
   // And no-m64/: the runtime's files as gex's site lays them out (gex/...,
-  // links to page/public/gex), less the memory64 shim, for core/mem64-missing
+  // links to runtime/files/out/gex), less the memory64 shim, for core/mem64-missing
   // (and core/mem64-retry, which links it in later).
   async mem64(work) {
     const zig = process.env.ZIG || 'zig';
@@ -175,7 +175,7 @@ export const images = {
       if (r.status !== 0) throw new Error(`${name}.c: ${r.stderr}`);
       writeFileSync(keyFile, key);
     }
-    const pub = join(ROOT, 'page/public/gex'), site = join(work, 'no-m64');
+    const pub = join(ROOT, 'runtime/files/out/gex'), site = join(work, 'no-m64');
     rmSync(site, { recursive: true, force: true });
     mkdirSync(join(site, 'gex'), { recursive: true });
     for (const f of readdirSync(pub)) {
@@ -572,7 +572,7 @@ export const images = {
   // `single`: the runner's --single, whose pages have no SharedArrayBuffer:
   // @gexemu/runtime-single.
   async package(work, { single = false } = {}) {
-    execFileSync(join(ROOT, 'page/runtime/build.sh'), [...(single ? ['--single'] : []), join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
+    execFileSync(join(ROOT, 'runtime/build.sh'), [...(single ? ['--single'] : []), join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
     // A copy without the memory64 shim, for core/mem64-missing.
     const less = join(work, 'pkg-no-m64');
     rmSync(less, { recursive: true, force: true });

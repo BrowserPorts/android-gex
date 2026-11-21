@@ -3,8 +3,8 @@
 // says nothing, and boot fails naming the `arch` option, never guessing one;
 // the same tree with a Windows program (a 32-bit Wine tree's, i386 PE) boots
 // on x86's kernel.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 120 };
 

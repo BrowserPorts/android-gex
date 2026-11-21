@@ -16,11 +16,11 @@ import { Cdp, browserWsUrl } from '../test/lib/cdp.mjs';
 import { images, outputs } from './fixtures/images.mjs';
 import { PACKAGE_ENTRIES } from './lib/package.mjs';
 import { createServer } from 'node:http';
-import { refuseStale } from '../page/build-inputs.mjs';
+import { refuseStale } from '../runtime/files/build-inputs.mjs';
 
 const ROOT = join(import.meta.dirname, '..');
 const TESTS = import.meta.dirname;
-const WEB = join(ROOT, 'page');
+const WEB = join(ROOT, 'runtime', 'files');
 const ARCHES = { a64: 'aarch64', x86: 'x86' };
 const HOSTS = ['browser', 'node'];
 
@@ -46,15 +46,15 @@ const { values: o, positionals } = parseArgs({
   },
 });
 const log = (s) => process.stderr.write(`[test] ${s}\n`);
-// `--package DIR`: the runtime as page/runtime/build.sh built it into DIR, the
+// `--package DIR`: the runtime as runtime/build.sh built it into DIR, the
 // npm package, which the browser host runs (there is no other: no bundler, no
 // runtime from source in a page). The node host runs the sources. The tests' imports of the runtime's entry
 // modules go to the package's, which find their files themselves.
 const PACKAGE = o.package ? resolve(o.package) : null;
-if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--package: no ${PACKAGE}/index.mjs (page/runtime/build.sh DIR)`);
+if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--package: no ${PACKAGE}/index.mjs (runtime/build.sh DIR)`);
 // `--single`: the single-thread build. Its pages are served without
 // cross-origin isolation, so they have no SharedArrayBuffer, and its package
-// is `page/runtime/build.sh --single`'s (@gexemu/runtime-single). Browser only.
+// is `runtime/build.sh --single`'s (@gexemu/runtime-single). Browser only.
 // A test the single-thread build cannot run yet says why in its meta
 // (`single: 'why'`) and is skipped; one that needs longer there says so
 // (`singleTimeout`, seconds, in place of `timeout`).
@@ -135,12 +135,12 @@ for (const name of new Set(jobs.flatMap((j) => j.test.meta.images))) {
 if (o.prepare) process.exit(missing.size ? 1 : 0);
 
 // -- the build ---------------------------------------------------------------
-// Both hosts run page/public's kernel and shim (the page's JavaScript comes from
+// Both hosts run runtime/files/out's kernel and shim (the page's JavaScript comes from
 // source), which run the old code without a word when they are older than it.
 {
   const infix = (a) => (a === 'x86' ? '.x86' : '');
   const names = [...new Set(jobs.flatMap((j) => [`gex_kernel${infix(j.arch)}`, `gex_browser${infix(j.arch)}`]))];
-  if (names.length) refuseStale('test', join(resolve(WEB, process.env.GEX_PUBLIC_DIR || 'public'), 'gex'), names, 'hosts/browser/build.sh (GEX_ARCH=x86 for .x86)');
+  if (names.length) refuseStale('test', join(resolve(WEB, process.env.GEX_PUBLIC_DIR || 'out'), 'gex'), names, 'hosts/browser/build.sh (GEX_ARCH=x86 for .x86)');
 }
 
 // -- the browser -------------------------------------------------------------
@@ -148,7 +148,7 @@ let server = null;
 let chrome = null;
 let cdp = null;
 if (jobs.some((j) => j.host === 'browser')) {
-  if (!PACKAGE) throw new Error('the browser host runs the package: --package DIR (page/runtime/build.sh DIR, --single for --single)');
+  if (!PACKAGE) throw new Error('the browser host runs the package: --package DIR (runtime/build.sh DIR, --single for --single)');
   ({ server, chrome, cdp } = await startBrowser());
 }
 
@@ -262,8 +262,8 @@ async function runNode(test, arch, say, timeout) {
 // -- browser -------------------------------------------------------------------
 /** A static server (cross-origin isolated, unless --single) over the runtime package (/pkg/), the tree's
  *  files as they are (/tree/: the tests and what they import), the work directory and the test pages
- *  (/__t/), page/public's built files at the root, and one headless Chromium. No bundler: a test's import of one of the runtime's entry modules
- *  (page/runtime/src/index.js, ...) is redirected to the package's, and the page's import map gives
+ *  (/__t/), runtime/files/out's built files at the root, and one headless Chromium. No bundler: a test's import of one of the runtime's entry modules
+ *  (runtime/src/index.js, ...) is redirected to the package's, and the page's import map gives
  *  Node's built-in modules as stubs (a test's Node-only helpers load in a page, unused). */
 async function startBrowser() {
   const PORT = Number(o.port);
@@ -282,8 +282,8 @@ async function startBrowser() {
       + names.map((k) => `export const ${k} = no(${JSON.stringify(k)});`).join('\n') + '\nexport default {};\n';
   };
   const importMap = JSON.stringify({ imports: Object.fromEntries(builtinModules.filter((b) => !b.startsWith('_')).map((b) => [`node:${b}`, `/__t/node/${b}.mjs`])) });
-  const SRC = join(ROOT, 'page/runtime/src') + '/';
-  const PUBLIC = resolve(WEB, process.env.GEX_PUBLIC_DIR || 'public');
+  const SRC = join(ROOT, 'runtime/src') + '/';
+  const PUBLIC = resolve(WEB, process.env.GEX_PUBLIC_DIR || 'out');
   const server = createServer(async (req, res) => {
     const [path, query = ''] = req.url.split('?');
     const iso = () => {
@@ -315,7 +315,7 @@ async function startBrowser() {
       }
       return file(f, ROOT);
     }
-    // Anything else is the tree's built files (page/public), at the site root, where a test of the
+    // Anything else is the tree's built files (runtime/files/out), at the site root, where a test of the
     // runtime's internals, which it imports from the tree and not the package, finds them.
     if (!p.startsWith('/__t/')) return file(join(PUBLIC, p), PUBLIC);
     const sub = p.slice(4);

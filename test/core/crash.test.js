@@ -2,8 +2,8 @@
 // signal ends (SIGSEGV, SIGABRT), one that traps (rt-probe trap: wasm's
 // unreachable, SIGILL), and one that is not pid 1's child. An exit, and a
 // signal that is no crash (SIGTERM), are not.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
 
 export const meta = { hosts: ['browser', 'node'], images: ['busybox'], timeout: 180 };
 

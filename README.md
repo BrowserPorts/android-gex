@@ -42,7 +42,7 @@ for debugging and for building what a page loads ahead of time.
   with the browser's WebGPU (`third_party/mesa`, Gallium's `gex_wgpu`).
   Desktop GL is supported up to 4.6.
 - **In the page, or ahead of time.** The same programs run in the browser
-  page (`page/`) and natively under `gexc`. An ejected project (below) runs
+  page (`runtime/`) and natively under `gexc`. An ejected project (below) runs
   only what was built for it ahead of time, as a static site whose
   JavaScript library a page of your own imports.
 
@@ -102,7 +102,7 @@ for debugging and for building what a page loads ahead of time.
 | `hosts/hostwl` | the compositor for an X server that runs in the page |
 | `hosts/native` | the native host, on wasmtime |
 | `guest/` | libraries installed into the guest: GL and EGL, GLX setup, `libsteam_api` |
-| `page/` | the `@gexemu/runtime` package (`page/runtime`), its internal modules and the files it loads (`make assets`, `make mesa`, `make xwayland`) |
+| `runtime/` | the `@gexemu/runtime` package, its internal modules, and in `runtime/files` the build of the files it loads (`make assets`, `make mesa`, `make xwayland`) |
 | `ports/` | the Mesa, Xwayland and Tint builds the page ships |
 | `toolchain/` | gexcc, the wasm32 C/C++ compiler, its sysroots, busybox, and `pins`, the version of every fetched toolchain |
 | `wine/` | Wine for gex: dist, prefix, runner |
@@ -140,13 +140,13 @@ $ gexc run --strace <elf>           # syscall trace
 ### Build the runtime package
 
 ```console
-$ make assets mesa xwayland         # the files the runtime loads, page/public
+$ make assets mesa xwayland         # the files the runtime loads, runtime/files/out
 $ make runtime PKG=DIR              # the @gexemu/runtime package
 ```
 
-`page/README.md` describes the two builds (multi-process and
+`runtime/files/README.md` describes the two builds (multi-process and
 single-thread) and the runtime package. gex has no page of its own: a
-page imports the package (`page/runtime/README.md`).
+page imports the package (`runtime/README.md`).
 
 ### Run a Windows program
 

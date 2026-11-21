@@ -2,9 +2,9 @@
 // the output, started for the first X client, and that client's window shows
 // in the screen's own pixels, not as a window of the scene. rt-x11 maps a
 // 160x80 window at (0, 0), its background #3060c0.
-import { System } from '../../page/runtime/src/index.js';
-import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
-import { CompositorWindows } from '../../page/runtime/src/windows/compositor.js';
+import { System } from '../../runtime/src/index.js';
+import { MemoryFilesystem } from '../../runtime/src/fs.js';
+import { CompositorWindows } from '../../runtime/src/windows/compositor.js';
 
 export const meta = { hosts: ['browser'], images: ['busybox'], timeout: 180, html: `<style>html, body { margin: 0; }</style>
 <canvas id="out" width="640" height="480" style="width: 640px; height: 480px; display: block;"></canvas>` };
