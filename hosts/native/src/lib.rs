@@ -543,6 +543,10 @@ struct JitShared {
     remiss: std::collections::HashMap<u64, (u32, [u64; 4])>,
     /// How often each page has been retired, for that diagnostic.
     retired_pages: std::collections::HashMap<u64, u32>,
+    /// A hash of each page's bytes, for a page whose every live
+    /// translation was made from those bytes ([`page_hash`]): a flush of
+    /// its instruction cache that finds them unchanged retires nothing.
+    page_hash: std::collections::HashMap<u64, u64>,
     /// Blocks a publish did not count as translated because their page was
     /// retired after the translation's snapshot (their slots are abandoned).
     stale_blocks: usize,
@@ -599,6 +603,7 @@ impl JitShared {
             slot_owner: self.slot_owner.clone(),
             remiss: Default::default(),
             retired_pages: self.retired_pages.clone(),
+            page_hash: self.page_hash.clone(),
             stale_blocks: self.stale_blocks,
             provider: self.provider.clone(),
             ftab: self.ftab.fork_copy(),
@@ -1546,6 +1551,7 @@ fn run_program_with(
                 slot_owner: Default::default(),
                 remiss: Default::default(),
                 retired_pages: Default::default(),
+                page_hash: Default::default(),
                 stale_blocks: 0,
                 provider: Default::default(),
                 ftab: Default::default(),
@@ -6259,10 +6265,19 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     eprintln!("[guard] {addr:#x} changed (block {:#x})", pc as u64);
                 }
                 let page = addr / gex_abi::DISPATCH_PAGE;
-                retire_translations(
-                    &mut caller,
-                    &[(page * gex_abi::DISPATCH_PAGE, (page + 1) * gex_abi::DISPATCH_PAGE)],
-                )?;
+                // A flush of a page whose bytes are the ones all its
+                // translations were made from changes nothing (a JIT flushes
+                // what it wrote, and writes again what is there).
+                let unchanged = caller.data().jit.as_ref().is_some_and(|j| {
+                    let known = j.shared.lock().unwrap_or_else(|e| e.into_inner()).page_hash.get(&page).copied();
+                    known.is_some() && known == page_hash(&memory_of(&caller), page)
+                });
+                if !unchanged {
+                    retire_translations(
+                        &mut caller,
+                        &[(page * gex_abi::DISPATCH_PAGE, (page + 1) * gex_abi::DISPATCH_PAGE)],
+                    )?;
+                }
             }
             Ok(())
         })()) },
@@ -6577,6 +6592,15 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.page_table.clone()
     };
+    // The bytes of the page the translation starts on and the next, as they
+    // are before it reads them: a page found the same after is one it was
+    // made from whole (`page_hash`).
+    let hashes_before: Vec<(u64, Option<u32>, Option<u64>)> = if alt || gex_abi::X86 {
+        Vec::new()
+    } else {
+        let first = pc / gex_abi::DISPATCH_PAGE;
+        (first..first + 2).map(|p| (p, page_table.lookup(p), page_hash(&memory_of(caller), p))).collect()
+    };
     if pc % gex_abi::INST_ALIGN != 0 || pc >= gex_abi::dispatch_max_pages() * gex_abi::DISPATCH_PAGE {
         return Ok(false);
     }
@@ -6717,6 +6741,30 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // push -- which is exactly what filled one store with ten thousand
     // instances of the same modules.
     publish_unit(&shared, &translated_module, module, stats.blocks)?;
+    // A page this translation gave a base of its own, unchanged while it
+    // was made: every translation under that base is of these bytes, and
+    // the page's hash says so. A page that had a base already keeps a hash
+    // only if it was these bytes'; else it has none, and the next flush of
+    // it retires it.
+    if !hashes_before.is_empty() {
+        let mem = memory_of(caller);
+        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        for (p, base_before, before) in hashes_before {
+            let ours = translated_module.page_table.lookup(p);
+            if ours.is_none() {
+                continue;
+            }
+            let after = page_hash(&mem, p);
+            let kept = ours == sh.page_table.lookup(p);
+            let same = before.is_some() && before == after;
+            let fresh = base_before.is_none();
+            if kept && same && (fresh || sh.page_hash.get(&p).copied() == after) {
+                sh.page_hash.insert(p, after.unwrap());
+            } else {
+                sh.page_hash.remove(&p);
+            }
+        }
+    }
     replay_registry_taking(caller, Take::at(pc))?;
 
     // If the address that faulted did not end up with code, resuming would
@@ -8301,6 +8349,7 @@ fn retire_translations(
             (end - 1) / gex_abi::DISPATCH_PAGE,
         );
         for page in first..=last {
+            sh.page_hash.remove(&page);
             if sh.page_table.forget(page).is_some() {
                 pages += 1;
                 *sh.retired_pages.entry(page).or_default() += 1;
@@ -8579,6 +8628,23 @@ fn catch_up_and_resume(store: &mut Store<HostState>, ctx_addr: u64) -> Result<Op
         || dispatch_moved(store, &memory, pc);
     Ok((answered && pc != 0).then_some(pc))
 }
+
+/// A hash of guest page `page`'s bytes (`DISPATCH_PAGE` of them); `None`
+/// for a page past the guest memory.
+fn page_hash(memory: &Option<gex_mem::GuestMemory>, page: u64) -> Option<u64> {
+    use std::hash::Hasher;
+    let m = memory.as_ref()?;
+    let start = (page * gex_abi::DISPATCH_PAGE) as usize;
+    let bytes = m.bytes().get(start..start + gex_abi::DISPATCH_PAGE as usize)?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(bytes);
+    Some(h.finish())
+}
+
+fn memory_of(cx: &impl wasmtime::AsContext<Data = HostState>) -> Option<gex_mem::GuestMemory> {
+    cx.as_context().data().memory.clone()
+}
+
 /// Whether a dispatch to `pc` made now would find something, though the
 /// one that trapped did not: another thread retired the page in between
 /// (a JIT's code cache written again and its instruction cache flushed),
