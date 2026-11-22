@@ -7033,6 +7033,68 @@ fn setsockopt_kernel(io: &FdIo<'_>, fd: i32, level: u64, name: u64, value: &[u8]
         }
         return Ok(0);
     }
+    // Multicast memberships: IPv4's (`ip_mreq`, `ip_mreqn`, `group_req`)
+    // and IPv6's (`ipv6_mreq`, `group_req`), as `do_ip_setsockopt` and
+    // `do_ipv6_setsockopt` read them; the IPv6 forms on IPv6 sockets alone.
+    if let (0 | 41, 20 | 21 | 35 | 36 | 42 | 45, Ok(sock)) = (level, name, io.socket_of(fd)) {
+        let v6 = level == 41;
+        let is_v6 = sock.v6.load(std::sync::atomic::Ordering::Relaxed);
+        let tcp = sock.kind == crate::net::Kind::Tcp;
+        let ifidx = |b: &[u8]| u32::from_le_bytes(b[..4].try_into().unwrap());
+        // `struct group_req`: the interface, then a `sockaddr_storage`
+        // aligned to 8 (`compat_group_req` packs it at 4).
+        let (gr_len, gr_off) = if io.compat { (132, 4) } else { (136, 8) };
+        match (v6, name) {
+            (true, _) if !is_v6 => return Err(Errno::ENOPROTOOPT),
+            (true, 20 | 21) => {
+                if tcp {
+                    return Err(Errno::EPROTO);
+                }
+                if value.len() < 20 {
+                    return Err(Errno::EINVAL);
+                }
+                let group: [u8; 16] = value[..16].try_into().unwrap();
+                return sock.mcast(true, name == 20, group, ifidx(&value[16..20]), [0; 4]).map(|_| 0);
+            }
+            (true, 42 | 45) => {
+                if value.len() < gr_len {
+                    return Err(Errno::EINVAL);
+                }
+                let sa = &value[gr_off..];
+                if u16::from_le_bytes([sa[0], sa[1]]) != 10 {
+                    return Err(Errno::EADDRNOTAVAIL);
+                }
+                let group: [u8; 16] = sa[8..24].try_into().unwrap();
+                return sock.mcast(true, name == 42, group, ifidx(value), [0; 4]).map(|_| 0);
+            }
+            (false, 35 | 36) => {
+                if tcp {
+                    return Err(Errno::EPROTO);
+                }
+                if value.len() < 8 {
+                    return Err(Errno::EINVAL);
+                }
+                let mut group = [0u8; 16];
+                group[..4].copy_from_slice(&value[..4]);
+                let local: [u8; 4] = value[4..8].try_into().unwrap();
+                let index = if value.len() >= 12 { ifidx(&value[8..12]) } else { 0 };
+                return sock.mcast(false, name == 35, group, index, local).map(|_| 0);
+            }
+            (false, 42 | 45) => {
+                if value.len() < gr_len {
+                    return Err(Errno::EINVAL);
+                }
+                let sa = &value[gr_off..];
+                if u16::from_le_bytes([sa[0], sa[1]]) != 2 {
+                    return Err(Errno::EINVAL);
+                }
+                let mut group = [0u8; 16];
+                group[..4].copy_from_slice(&sa[4..8]);
+                return sock.mcast(false, name == 42, group, ifidx(value), [0; 4]).map(|_| 0);
+            }
+            _ => {}
+        }
+    }
     // IPV6_V6ONLY on an IPv6 socket, before it is bound or connected.
     if let (41, 26, Ok(sock)) = (level, name, io.socket_of(fd)) {
         if !sock.v6.load(std::sync::atomic::Ordering::Relaxed) {

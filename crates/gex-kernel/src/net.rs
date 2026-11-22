@@ -630,6 +630,10 @@ pub struct Socket {
     /// `::1` as their IPv4 kin.
     pub v6: AtomicBool,
     pub v6only: AtomicBool,
+    /// The multicast groups it has joined ([`Socket::mcast`]): IPv6 or not,
+    /// the group (an IPv4 one in the first four bytes), the interface's
+    /// index, and for IPv4 the local address it was asked by.
+    mcast: Mutex<Vec<(bool, [u8; 16], u32, [u8; 4])>>,
     net: Arc<dyn NetStack>,
     resolver: Arc<Resolver>,
     transport: Mutex<Option<Arc<dyn Transport>>>,
@@ -690,13 +694,89 @@ pub struct Socket {
     flow_names: Mutex<FlowNames>,
 }
 
+/// `net.ipv4.igmp_max_memberships`.
+const IGMP_MAX_MEMBERSHIPS: usize = 20;
+
 impl Socket {
+    /// A multicast group joined or left (`ip_mc_join_group`,
+    /// `ip_mc_leave_group`; `ipv6_sock_mc_join`, `ipv6_sock_mc_drop`): the
+    /// membership is kept and checked as Linux 6.18 keeps and checks it,
+    /// but no group's datagrams reach the guest (its network goes to the
+    /// host by connection). The interface is named by index; else, for
+    /// IPv4, by a local address; else it is the one a route to the group
+    /// takes, eth0. An interface has IPv4 state always, and IPv6 state
+    /// with an MTU of 1280 or more.
+    pub fn mcast(&self, v6: bool, join: bool, group: [u8; 16], ifindex: u32, local: [u8; 4]) -> Result<(), Errno> {
+        let multicast = if v6 { group[0] == 0xff } else { group[0] & 0xf0 == 0xe0 };
+        // The device a membership names; `None` with no device or none of
+        // the family's state there.
+        let device = || -> Option<crate::netdev::NetDev> {
+            let d = if ifindex != 0 {
+                crate::netdev::by_index(ifindex)
+            } else if !v6 && local != [0; 4] {
+                crate::netdev::all().into_iter().find(|d| d.inet.is_some_and(|(a, _)| a == local))
+            } else {
+                crate::netdev::by_name("eth0")
+            }?;
+            (!v6 || d.mtu >= 1280).then_some(d)
+        };
+        let mut list = self.mcast.lock().unwrap_or_else(|e| e.into_inner());
+        if v6 {
+            if !multicast {
+                return Err(Errno::EINVAL);
+            }
+            let found = list.iter().position(|m| m.0 && m.1 == group && (ifindex == 0 || m.2 == ifindex));
+            if !join {
+                let i = found.ok_or(Errno::EADDRNOTAVAIL)?;
+                list.remove(i);
+                return Ok(());
+            }
+            if found.is_some() {
+                return Err(Errno::EADDRINUSE);
+            }
+            if ifindex != 0 && crate::netdev::by_index(ifindex).is_none() {
+                return Err(Errno::ENODEV);
+            }
+            // `__ipv6_dev_mc_inc`: a device with no IPv6 state.
+            let d = device().ok_or(if ifindex != 0 { Errno::EINVAL } else { Errno::ENODEV })?;
+            list.push((true, group, d.index, [0; 4]));
+            return Ok(());
+        }
+        let dev = device();
+        if !join {
+            if ifindex == 0 && local == [0; 4] && dev.is_none() {
+                return Err(Errno::ENODEV);
+            }
+            let index = if ifindex != 0 { ifindex } else { dev.as_ref().map_or(0, |d| d.index) };
+            let i = list
+                .iter()
+                .position(|m| !m.0 && m.1[..4] == group[..4] && (if ifindex != 0 { m.2 == ifindex } else { local == [0; 4] || m.3 == local || m.2 == index }))
+                .ok_or(Errno::EADDRNOTAVAIL)?;
+            list.remove(i);
+            return Ok(());
+        }
+        if !multicast {
+            return Err(Errno::EINVAL);
+        }
+        let d = dev.ok_or(Errno::ENODEV)?;
+        let v4 = list.iter().filter(|m| !m.0);
+        if v4.clone().any(|m| m.1[..4] == group[..4] && m.2 == d.index) {
+            return Err(Errno::EADDRINUSE);
+        }
+        if v4.count() >= IGMP_MAX_MEMBERSHIPS {
+            return Err(Errno::ENOBUFS);
+        }
+        list.push((false, group, d.index, local));
+        Ok(())
+    }
+
     pub fn new(kind: Kind, net: Arc<dyn NetStack>, resolver: Arc<Resolver>, ports: Arc<Ports>, remote: Option<crate::unix::Remote>) -> Socket {
         Socket {
             kind,
             opts: Mutex::new(Default::default()),
             v6: AtomicBool::new(false),
             v6only: AtomicBool::new(false),
+            mcast: Mutex::new(Vec::new()),
             net,
             resolver,
             transport: Mutex::new(None),

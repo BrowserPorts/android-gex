@@ -78,6 +78,8 @@ impl Errno {
     pub const ENETUNREACH: Errno = Errno(101);
     pub const ENOTSOCK: Errno = Errno(88);
     pub const EMSGSIZE: Errno = Errno(90);
+    /// Protocol error (a membership asked of a stream socket).
+    pub const EPROTO: Errno = Errno(71);
     pub const EPROTOTYPE: Errno = Errno(91);
     pub const ENOPROTOOPT: Errno = Errno(92);
     pub const ECONNRESET: Errno = Errno(104);
