@@ -2359,15 +2359,29 @@ impl Namespace {
         }
     }
 
-    /// Where `mount` and `umount` of absolute `abs` act: the root
-    /// filesystem's links on it followed, up to another mount if it lies in
-    /// one. (A mount made under a name with a link in it would be found
-    /// under no name.)
+    /// Where `mount` and `umount` of absolute `abs` act: every link on it
+    /// followed, the last name's too, in the root filesystem and in the
+    /// mounts it leads into, as Linux walks a path a name at a time. (A
+    /// mount made under a name with a link in it would be found under no
+    /// name.) Where the walk fails, as far as it got: the call's own look
+    /// at the place says why.
     pub fn mount_target(&self, abs: &str) -> String {
-        match self.walk(abs, true) {
-            Ok(Some(w)) => w.path,
-            _ => abs.to_string(),
+        let mut current = abs.to_string();
+        for _ in 0..40 {
+            let dirs = match self.walk(&current, true) {
+                Ok(Some(w)) if !w.at_mount => return w.path,
+                Ok(Some(w)) => w.path,
+                Ok(None) => return current,
+                Err(_) => return current,
+            };
+            let Ok(dirs) = self.through_dir_links(dirs) else { return current };
+            let Ok((fs, rel)) = self.mount_of(dirs.clone()) else { return dirs };
+            match fs.read_link(&rel) {
+                Ok(target) => current = if target.starts_with('/') { normalize(&target, "/") } else { normalize(&target, &parent_of(&dirs)) },
+                Err(_) => return dirs,
+            }
         }
+        current
     }
 
     /// The root filesystem's [`FileSystem::walk`] of absolute `abs`, or

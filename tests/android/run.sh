@@ -155,7 +155,7 @@ run() {
     binderwork) check "$1" "binderwork ok" 0 ;;
     binderexit) check "$1" "binderexit ok" 0 ;;
     binderfreeze) check "$1" "binderfreeze ok" 0 ;;
-    binderfs) check "$1" "binderfs ok" 0 ;;
+    binderfs) check "$1" "binderfs ok" 0 root ;;
     bindersg) check "$1" "bindersg ok" 0 ;;
     binderctx) check "$1" "binderctx ok" 0 ;;
     selinuxfs) check "$1" "selinuxfs ok" 0 root ;;
@@ -204,6 +204,8 @@ run() {
     # The zygote's isolation of an app's data: a tmpfs over each data
     # directory in a namespace of its own, and user/0 made again in it.
     appdata) check "$1" "appdata ok" 0 root ;;
+    # umount2's and mount's checks, in Linux's order.
+    umount) check "$1" "umount ok" 0 root ;;
     # A guest's listener reached from the host: natively by connecting to
     # it, under gex through the host's forward of a port (GEX_HOST_FORWARD).
     fwdecho) hostfwd "$1" ;;
@@ -268,7 +270,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock fwdecho fpops simdops binderexit fdstress limits cpufreq bindernode sched hvc tun jitrace mcast pfkey appdata"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock fwdecho fpops simdops binderexit fdstress limits cpufreq bindernode sched hvc tun jitrace mcast pfkey appdata umount"
     for p in $all; do
         run "$p"
     done

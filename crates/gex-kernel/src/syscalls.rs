@@ -4945,12 +4945,52 @@ impl PathIo<'_> {
         }
         // A mount is at the directory its path leads to, links followed:
         // under any other name nothing would find it.
+        // `umount2` as `ksys_umount`, `can_umount` and `do_umount` take
+        // it: the flags, the path (its last link not followed for
+        // `UMOUNT_NOFOLLOW`), `CAP_SYS_ADMIN`, a mount there, then the
+        // flags together.
+        const CAP_SYS_ADMIN: u64 = 21;
         if n == nr::UMOUNT2 {
-            let target = self.ns.mount_target(&self.at_path(m, AT_FDCWD, a[0])?);
+            const MNT_FORCE: u64 = 1;
             const MNT_DETACH: u64 = 2;
-            return self.view.unmount_program(&target, a[1] & MNT_DETACH != 0).map(|()| 0);
+            const MNT_EXPIRE: u64 = 4;
+            const UMOUNT_NOFOLLOW: u64 = 8;
+            let flags = a[1] as u32 as u64;
+            if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let path = self.at_path(m, AT_FDCWD, a[0])?;
+            let follow = flags & UMOUNT_NOFOLLOW == 0;
+            let (meta, _) = self.ns.metadata_on(&path, follow)?;
+            if !self.creds.capable(CAP_SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            // A link itself is never mounted on.
+            if meta.file_type == FileType::Symlink {
+                return Err(Errno::EINVAL);
+            }
+            let target = self.ns.mount_target(&path);
+            if !self.view.get().is_mount_point(&target) {
+                return Err(Errno::EINVAL);
+            }
+            if flags & MNT_EXPIRE != 0 {
+                if flags & (MNT_FORCE | MNT_DETACH) != 0 {
+                    return Err(Errno::EINVAL);
+                }
+                // Marking a mount and taking it at the next call if
+                // nothing used it in between needs a mount's use counted,
+                // which nothing here does.
+                crate::bpf::say_once("umount2 with MNT_EXPIRE: a mount's use is not counted here");
+                return Err(Errno::EINVAL);
+            }
+            return self.view.unmount_program(&target, flags & MNT_DETACH != 0).map(|()| 0);
         }
         let target = self.ns.mount_target(&self.at_path(m, AT_FDCWD, a[1])?);
+        // `may_mount`: after the target is found.
+        if !self.creds.capable(CAP_SYS_ADMIN) {
+            self.ns.metadata(&target)?;
+            return Err(Errno::EPERM);
+        }
         let fstype = if a[2] == 0 {
             String::new()
         } else {
@@ -18861,6 +18901,17 @@ mod tests {
             }
             ret(m, at)
         };
+        // Without CAP_SYS_ADMIN (the kernel's ids are 1000's), EPERM, once
+        // the target is found.
+        let root = 0x31500u64;
+        m.write(root, b"/\0").unwrap();
+        for kernel in [false, true] {
+            assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, mnt, tmpfs, 0, 0]), -(Errno::ENOENT.0 as i64));
+            assert_eq!(call(&mut k, &mut m, kernel, nr::MOUNT, &[none, root, tmpfs, 0, 0]), -(Errno::EPERM.0 as i64));
+            assert_eq!(call(&mut k, &mut m, kernel, nr::UMOUNT2, &[root, 0]), -(Errno::EPERM.0 as i64));
+        }
+        k.creds = Creds::new(0, 0);
+        assert_eq!(call(&mut k, &mut m, true, nr::MKDIRAT, &[(-100i64) as u64, mnt, 0o755]), 0);
         for kernel in [false, true] {
             // proc only where something is mounted already; an unknown type
             // is ENODEV.
