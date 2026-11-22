@@ -52,7 +52,10 @@ mac$ python3 tests/android/oracle/owners-to-xattr.py ROOT owners.txt
 The image's own graphics are the emulator's host GPU, which gex does not
 have. `swiftshader.sh WORK ROOT` builds SwiftShader's Vulkan driver with the
 NDK and puts it in the tree, and the boot configuration (`bootconfig`) then
-chooses ANGLE over it.
+chooses ANGLE over it. Its `androidboot.logcat` is what the emulator gives
+when started without `-logcat` (`*:V`): the image's `goldfish-logcat`
+service needs it to start, and writes to `/dev/hvc1`, which gex has with
+`GEX_EMULATOR_HOST=1`.
 
 ## Booting
 
