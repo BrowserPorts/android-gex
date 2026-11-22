@@ -37,7 +37,12 @@ pub fn minor(dev: u64) -> u32 {
 }
 
 /// Open character device `dev` through the node `node` describes.
-pub fn open_char(dev: u64, node: NodeMeta) -> Result<Arc<dyn FileHandle>, Errno> {
+/// `flags` are the open's, which a device may refuse.
+pub fn open_char(dev: u64, node: NodeMeta, flags: u64) -> Result<Arc<dyn FileHandle>, Errno> {
+    // The hardware generator's, which opens for reading alone.
+    if major(dev) == 10 && minor(dev) == crate::hwrng::MISC_MINOR {
+        return crate::hwrng::open(flags, node);
+    }
     // An hvc minor its driver registered with no port behind it:
     // `hvc_install` finds no console for the index.
     if super::devfs::has_hvc() && major(dev) == super::devfs::HVC_MAJOR && minor(dev) < super::devfs::HVC_MINORS {

@@ -2065,7 +2065,7 @@ impl TmpFs {
                                 _ => at_open.clone(),
                             }
                         });
-                        return if block { super::devices::open_block(rdev, node) } else { super::devices::open_char(rdev, node) };
+                        return if block { super::devices::open_block(rdev, node) } else { super::devices::open_char(rdev, node, flags) };
                     }
                     // A directory opens for reading only.
                     let acc = flags & oflags::ACCMODE;

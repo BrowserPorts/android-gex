@@ -746,7 +746,7 @@ impl FileSystem for Ext4Fs {
             // filesystem is.
             S_IFCHR => {
                 let md = inode.metadata();
-                super::devices::open_char(md.rdev, Arc::new(move || md.clone()))
+                super::devices::open_char(md.rdev, Arc::new(move || md.clone()), flags)
             }
             S_IFBLK => {
                 let md = inode.metadata();

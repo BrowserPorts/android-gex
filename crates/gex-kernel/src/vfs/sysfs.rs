@@ -50,6 +50,12 @@ pub trait Attributes: Send + Sync + std::fmt::Debug {
     }
     /// A write, whole, to that file.
     fn write(&self, path: &str, data: &[u8]) -> Result<(), Errno>;
+    /// The mode of a file whose read fails now ([`Self::read_result`]'s
+    /// error): one with a write bit is still written to.
+    fn refused_mode(&self, path: &str) -> u32 {
+        let _ = path;
+        0o444
+    }
     /// Where the link at `path` leads, when there is one there.
     fn link(&self, path: &str) -> Option<String> {
         let _ = path;
@@ -180,6 +186,10 @@ impl NetAttrs {
 }
 
 impl Attributes for NetAttrs {
+    /// `carrier` is written to while it cannot be read.
+    fn refused_mode(&self, path: &str) -> u32 {
+        if path == "carrier" { 0o644 } else { 0o444 }
+    }
     fn vars(&self) -> Vec<(String, String)> {
         vec![("INTERFACE".to_string(), self.name.clone()), ("IFINDEX".to_string(), self.index.to_string())]
     }
@@ -262,7 +272,7 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
         // The character devices this kernel always has, with the modes
         // Linux's drivers give them (drivers/char/mem.c,
         // drivers/tty/tty_io.c, drivers/block/loop.c).
-        let chars: [(&str, &str, u32, u32, Option<u32>); 12] = [
+        let chars: [(&str, &str, u32, u32, Option<u32>); 13] = [
             ("mem", "null", 1, 3, Some(0o666)),
             ("mem", "zero", 1, 5, Some(0o666)),
             ("mem", "full", 1, 7, Some(0o666)),
@@ -275,10 +285,18 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
             ("misc", "loop-control", 10, 237, None),
             ("misc", "device-mapper", 10, 236, None),
             ("misc", "tun", 10, crate::tun::MISC_MINOR, None),
+            ("misc", "hw_random", 10, crate::hwrng::MISC_MINOR, None),
         ];
         // TUN's misc device names its node `net/tun` (`tun_miscdev`'s
         // `nodename`); Android's ueventd makes it as `/dev/tun` all the same.
-        let attrs_of = |n: &str| -> Option<Arc<dyn Attributes>> { (n == "tun").then(|| Arc::new(Nodename("net/tun")) as Arc<dyn Attributes>) };
+        // The hardware generator's is `hwrng`, with the core's attributes.
+        let attrs_of = |n: &str| -> Option<Arc<dyn Attributes>> {
+            match n {
+                "tun" => Some(Arc::new(Nodename("net/tun"))),
+                "hw_random" => Some(Arc::new(crate::hwrng::Attrs)),
+                _ => None,
+            }
+        };
         let mut all: Vec<Arc<Device>> = chars.iter().map(|(s, n, major, minor, mode)| Arc::new(Device { subsystem: s.to_string(), name: n.to_string(), major: *major, minor: *minor, mode: *mode, attrs: attrs_of(n) })).collect();
         // The emulator's consoles, when the kernel has them: every minor
         // of `hvc_console`'s driver, in `devices/virtual/tty` (no parent),
@@ -365,24 +383,36 @@ enum Node {
     /// A file of a device's driver, at its path in the device's
     /// directory: its mode and text.
     Attr(Arc<Device>, String, u32, String),
-    /// A file of a device's driver whose read fails now: its mode and the
-    /// error (a network device's `carrier` while it is down).
-    Refused(u32, Errno),
+    /// A file of a device's driver whose read fails now, at its path in
+    /// the device's directory: its mode and the error (a network device's
+    /// `carrier` while it is down).
+    Refused(Arc<Device>, String, u32, Errno),
 }
 
 /// An open attribute whose read fails ([`Node::Refused`]).
 #[derive(Debug)]
-struct RefusedFile(Errno);
+struct RefusedFile {
+    path: String,
+    err: Errno,
+    /// The driver's file, when it is one that is written to.
+    writes: Option<(Arc<Device>, String)>,
+}
 
 impl FileHandle for RefusedFile {
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
-        Err(self.0)
+        Err(self.err)
     }
-    fn write_at(&self, _offset: u64, _buf: &[u8]) -> SysResult {
-        Err(Errno::EACCES)
+    /// The driver's `store`, which a failing `show` does not stop.
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        let Some((d, path)) = &self.writes else { return Err(Errno::EACCES) };
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        d.attrs.as_ref().ok_or(Errno::EACCES)?.write(path, buf)?;
+        Ok(buf.len() as u64)
     }
     fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { file_type: FileType::Regular, size: 4096, mode: 0o444, ino: 1, mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: None })
+        SysFs.metadata(&self.path)
     }
 }
 
@@ -437,7 +467,10 @@ fn node(path: &str) -> Option<Node> {
             }
             match attrs.read_result(&rest) {
                 Some(Ok((mode, text))) => Node::Attr(d, rest, mode, text),
-                Some(Err(e)) => Node::Refused(if rest == "carrier" { 0o644 } else { 0o444 }, e),
+                Some(Err(e)) => {
+                    let mode = attrs.refused_mode(&rest);
+                    Node::Refused(d, rest, mode, e)
+                }
                 None => Node::Dir(attrs.list(&rest)?),
             }
         }
@@ -670,7 +703,12 @@ impl FileSystem for SysFs {
                 let text = d.vars().iter().map(|(k, v)| format!("{k}={v}\n")).collect();
                 Ok(Arc::new(File { path: path.to_string(), text, writes: Writes::Uevent(d) }))
             }
-            Node::Refused(_, e) => Ok(Arc::new(RefusedFile(e))),
+            Node::Refused(d, rest, mode, err) => {
+                if super::writes(flags) && mode & 0o200 == 0 {
+                    return Err(Errno::EACCES);
+                }
+                Ok(Arc::new(RefusedFile { path: path.to_string(), err, writes: (mode & 0o200 != 0).then_some((d, rest)) }))
+            }
             Node::Attr(d, rest, mode, text) => {
                 // One with no write bit is only read.
                 if super::writes(flags) && mode & 0o200 == 0 {
@@ -698,7 +736,7 @@ impl FileSystem for SysFs {
                 file_meta(path, FileType::Directory, if path.is_empty() { 0o555 } else { 0o755 }, 0, 2 + subdirs)
             }
             Node::Link(target) => file_meta(path, FileType::Symlink, 0o777, target.len() as u64, 1),
-            Node::Text(mode, _) | Node::Attr(_, _, mode, _) | Node::Refused(mode, _) => file_meta(path, FileType::Regular, mode, 4096, 1),
+            Node::Text(mode, _) | Node::Attr(_, _, mode, _) | Node::Refused(_, _, mode, _) => file_meta(path, FileType::Regular, mode, 4096, 1),
             Node::Uevent(_) => file_meta(path, FileType::Regular, 0o644, 4096, 1),
         })
     }

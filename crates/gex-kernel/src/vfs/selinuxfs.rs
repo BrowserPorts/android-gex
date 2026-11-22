@@ -323,7 +323,7 @@ impl FileSystem for SelinuxFs {
                 }
                 Ok(Arc::new(Dir { entries, metadata }))
             }
-            Kind::Null => super::devices::open_char(makedev(1, 3), Arc::new(move || metadata.clone())),
+            Kind::Null => super::devices::open_char(makedev(1, 3), Arc::new(move || metadata.clone()), flags),
             Kind::Missing => {
                 eprintln!("[gex] selinuxfs: {path} is not implemented");
                 Err(Errno::EOPNOTSUPP)

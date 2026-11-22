@@ -46,6 +46,7 @@ pub mod netlink;
 pub mod netdev;
 pub mod tun;
 pub mod pfkey;
+pub mod hwrng;
 pub mod block;
 pub mod loopdev;
 pub mod dm;
