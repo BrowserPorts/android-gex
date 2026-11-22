@@ -67,13 +67,10 @@ struct Entry {
 static START: OnceLock<Instant> = OnceLock::new();
 /// Milliseconds since `START` of the latest syscall entry by any thread.
 static LAST_ENTRY_MS: AtomicU64 = AtomicU64::new(0);
-static THREADS: Mutex<Option<HashMap<u32, Entry>>> = Mutex::new(None);
+static THREADS: Mutex<Option<HashMap<u64, Entry>>> = Mutex::new(None);
 
 thread_local! {
-    static HOST_TID: u32 = std::fs::read_link("/proc/thread-self")
-        .ok()
-        .and_then(|p| p.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()))
-        .unwrap_or(0);
+    static HOST_TID: u64 = gex_mem::hostthread::current();
 }
 
 fn start() -> Instant {
@@ -157,44 +154,15 @@ pub fn callout(target: u64, ret: u64, aborted: bool) {
     e.co_aborts += aborted as u64;
 }
 
-fn cpu_ms(host: u32) -> Option<u64> {
-    let s = std::fs::read_to_string(format!("/proc/self/task/{host}/stat")).ok()?;
-    let rest = &s[s.rfind(')')? + 2..];
-    let f: Vec<&str> = rest.split_whitespace().collect();
-    // utime, stime: fields 14 and 15 of the whole line, in clock ticks.
-    let (u, st): (u64, u64) = (f.get(11)?.parse().ok()?, f.get(12)?.parse().ok()?);
-    Some((u + st) * 10)
-}
-
-/// Every host thread's name and CPU, by host tid.
-fn all_threads_cpu() -> HashMap<u32, (String, u64)> {
-    let mut out = HashMap::new();
-    if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
-        for e in rd.flatten() {
-            if let Some(h) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) {
-                if let Some(c) = cpu_ms(h) {
-                    out.insert(h, (comm(h), c));
-                }
-            }
-        }
-    }
-    out
-}
-
-fn comm(host: u32) -> String {
-    std::fs::read_to_string(format!("/proc/self/task/{host}/comm")).map(|s| s.trim().to_string()).unwrap_or_default()
-}
-
 fn dump(why: &str) {
-    let snap: Vec<(u32, Entry)> = {
+    let snap: Vec<(u64, Entry)> = {
         let g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
         g.as_ref().map(|m| m.iter().map(|(k, v)| (*k, v.clone())).collect()).unwrap_or_default()
     };
-    // Threads that have exited have no /proc entry: left out.
-    let before: HashMap<u32, u64> = snap.iter().filter_map(|(h, _)| Some((*h, cpu_ms(*h)?))).collect();
-    let all_before = all_threads_cpu();
+    // Threads that have exited are not listed: left out.
+    let all_before = gex_mem::hostthread::threads();
     std::thread::sleep(Duration::from_millis(200));
-    let all_after = all_threads_cpu();
+    let all_after = gex_mem::hostthread::threads();
     // The host's other threads (compilers, the compositor, GPU) by name.
     let mut others: HashMap<String, u64> = HashMap::new();
     for (h, (name, a)) in &all_after {
@@ -209,7 +177,7 @@ fn dump(why: &str) {
     let t = start().elapsed().as_secs_f64();
     let mut lines = Vec::new();
     for (h, e) in &snap {
-        let (Some(b), Some(a)) = (before.get(h), cpu_ms(*h)) else { continue };
+        let (Some((_, b)), Some((name, a))) = (all_before.get(h), all_after.get(h)) else { continue };
         let state = match e.inside {
             Some(nr) => match e.call {
                 Some(c) => format!("in {} (raw {nr})", gex_kernel::syscalls::syscall_name(c)),
@@ -228,7 +196,7 @@ fn dump(why: &str) {
         };
         lines.push((e.pid, e.tid, format!(
             "  pid {} tid {} [{} {}] {} for {} ms, cpu {} ms/200{co}{bt}",
-            e.pid, e.tid, h, comm(*h), state, e.since.elapsed().as_millis(), a.saturating_sub(*b)
+            e.pid, e.tid, h, name, state, e.since.elapsed().as_millis(), a.saturating_sub(*b)
         )));
     }
     lines.sort();

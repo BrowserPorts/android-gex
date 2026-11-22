@@ -255,6 +255,7 @@ impl GuestMemory {
 }
 
 pub mod alloc_tag;
+pub mod hostthread;
 
 /// Which host pages of `[addr, addr + len)` the host has ever given this
 /// process (in memory, or swapped or compressed out of it), one byte each
