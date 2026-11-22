@@ -6881,7 +6881,11 @@ fn recover_dispatch_in_caller(caller: &mut Caller<'_, HostState>, ctx_addr: u64)
     if replay_registry_taking(caller, Take::at(pc))? || fill_empty_slot(caller, ctx_addr)? {
         return Ok(true);
     }
-    catch_up_in_caller(caller)
+    if catch_up_in_caller(caller)? {
+        return Ok(true);
+    }
+    let Some(memory) = caller.data().memory.clone() else { return Ok(false) };
+    Ok(dispatch_moved(caller, &memory, pc))
 }
 
 fn replay_registry(caller: &mut Caller<'_, HostState>) -> Result<bool> {
@@ -8571,8 +8575,40 @@ fn catch_up_and_resume(store: &mut Store<HostState>, ctx_addr: u64) -> Result<Op
     // taken again for ever.
     let answered = (behind && replay_into(&mut *store, Take::at(pc))?)
         || fill_empty_slot(&mut *store, ctx_addr)?
-        || (behind && replay_into(&mut *store, Take::All)?);
+        || (behind && replay_into(&mut *store, Take::All)?)
+        || dispatch_moved(store, &memory, pc);
     Ok((answered && pc != 0).then_some(pc))
+}
+/// Whether a dispatch to `pc` made now would find something, though the
+/// one that trapped did not: another thread retired the page in between
+/// (a JIT's code cache written again and its instruction cache flushed),
+/// and the directory entry the dispatch read, whose slot this thread had
+/// nothing in, has gone. The page's directory entry now names the miss
+/// span, or a slot that is filled: the dispatch is made again. The same
+/// target taken so 10,000 times running with nothing else between is a
+/// trap this cannot answer, and is reported.
+fn dispatch_moved(cx: &mut impl wasmtime::AsContextMut<Data = HostState>, memory: &gex_mem::GuestMemory, pc: u64) -> bool {
+    if gex_abi::X86 || pc == 0 {
+        return false;
+    }
+    thread_local! {
+        static AGAIN: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    let n = AGAIN.with(|c| {
+        let (at, n) = c.get();
+        let n = if at == pc { n + 1 } else { 1 };
+        c.set((pc, n));
+        n
+    });
+    if n >= 10_000 {
+        return false;
+    }
+    let Some(slot) = dispatch_slot_of(memory, pc, None) else { return false };
+    if slot.is_miss() {
+        return true;
+    }
+    let Some(t) = cx.as_context().data().jit.as_ref().and_then(|j| j.tables.get(slot.table).copied()) else { return false };
+    slot.index < t.size(cx.as_context_mut()) && !matches!(t.get(cx.as_context_mut(), slot.index), Some(Ref::Func(None)) | None)
 }
 
 /// A dispatch that reached a slot this thread's table has nothing in.
