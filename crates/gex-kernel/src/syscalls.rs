@@ -6432,6 +6432,15 @@ impl NetIo<'_> {
             let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
             return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
         }
+        // AF_KEY (crate::pfkey): made and closed (Android's network stack
+        // does so to wait out an RCU grace period).
+        if domain == crate::pfkey::AF_KEY {
+            let sock = crate::pfkey::create(io.creds.capable(12), ty & !(SOCK_NONBLOCK | SOCK_CLOEXEC), protocol)?;
+            let handle: Arc<dyn crate::vfs::FileHandle> = sock;
+            let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
+            let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+            return io.fds.insert(file, ty & SOCK_CLOEXEC != 0);
+        }
         // AF_NETLINK (crate::netlink): NETLINK_ROUTE, which answers its
         // interface and address dumps (musl's if_nameindex and getifaddrs,
         // Wine's nsi through them, glibc's getaddrinfo with AI_ADDRCONFIG),
