@@ -198,6 +198,14 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
             ("misc", "device-mapper", 10, 236, None),
         ];
         let mut all: Vec<Arc<Device>> = chars.iter().map(|(s, n, major, minor, mode)| Arc::new(Device { subsystem: s.to_string(), name: n.to_string(), major: *major, minor: *minor, mode: *mode, attrs: None })).collect();
+        // The emulator's consoles, when the kernel has them: every minor
+        // of `hvc_console`'s driver, in `devices/virtual/tty` (no parent),
+        // as `tty_register_driver` adds them without `TTY_DRIVER_DYNAMIC_DEV`.
+        if super::devfs::has_hvc() {
+            for n in 0..super::devfs::HVC_MINORS {
+                all.push(Arc::new(Device { subsystem: "tty".to_string(), name: format!("hvc{n}"), major: super::devfs::HVC_MAJOR, minor: n, mode: None, attrs: None }));
+            }
+        }
         // A virtio-gpu's minors, when there is one ([`crate::drm`]): the
         // render node first, as `drm_dev_register` adds them.
         for (name, minor) in crate::drm::minors() {

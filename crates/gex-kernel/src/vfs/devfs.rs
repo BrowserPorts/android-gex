@@ -20,6 +20,9 @@ enum Device {
     Full,
     Random,
     Tty,
+    /// One of the emulator's virtio consoles (`hvc_console`, with
+    /// `virtio_console` behind it), by its minor.
+    Hvc(u32),
 }
 
 /// The Linux device number (`makedev` encoding) each node reports as
@@ -33,6 +36,7 @@ fn rdev_of(device: Device) -> u64 {
         Device::Full => 0x107,
         Device::Random => 0x108,
         Device::Tty => 0x500,
+        Device::Hvc(n) => super::devices::makedev(HVC_MAJOR, n),
     }
 }
 
@@ -47,6 +51,23 @@ impl std::fmt::Debug for DevHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.device)
     }
+}
+
+/// `hvc_console`'s major (`HVC_MAJOR`): its driver registers a device for
+/// each of its `HVC_ALLOC_TTY_ADAPTERS` (8) minors when it loads.
+pub const HVC_MAJOR: u32 = 229;
+pub const HVC_MINORS: u32 = 8;
+/// The consoles the emulator gives an arm64 guest, with a port behind each
+/// (`SetupParameters.cpp`'s virtio consoles): hvc0, the kernel's console and
+/// `-shell`'s, and hvc1, where `goldfish-logcat` writes for `-logcat`.
+/// Without those options the emulator joins both to a `null` chardev:
+/// what is written goes nowhere and nothing is ever there to read.
+pub const HVC_PORTS: u32 = 2;
+
+/// Whether the kernel has the emulator's consoles: with the emulator's host
+/// side (`GEX_EMULATOR_HOST=1`), as [`crate::vsock`].
+pub fn has_hvc() -> bool {
+    crate::vsock::enabled()
 }
 
 /// The device a node numbered `dev` opens as, of those this module has:
@@ -65,6 +86,7 @@ pub(super) fn open_numbered(dev: u64, node: super::devices::NodeMeta) -> Option<
         (1, 7) => Device::Full,
         (1, 8 | 9) => Device::Random,
         (5, 0 | 1) => Device::Tty,
+        (HVC_MAJOR, n) if has_hvc() && n < HVC_PORTS => Device::Hvc(n),
         _ => return None,
     };
     Some(Arc::new(DevHandle { device, node: Some(node) }))
@@ -87,7 +109,7 @@ impl FileHandle for DevHandle {
             // typed: a reader waits, as it would at a terminal nobody types
             // at (it was end of file, and init's console shell, which init
             // starts again whenever it ends, ended at once, over and over).
-            Device::Tty => Err(Errno::EAGAIN),
+            Device::Tty | Device::Hvc(_) => Err(Errno::EAGAIN),
         }
     }
 
@@ -121,14 +143,14 @@ impl FileHandle for DevHandle {
     }
 
     fn is_tty(&self) -> bool {
-        self.device == Device::Tty
+        matches!(self.device, Device::Tty | Device::Hvc(_))
     }
 
     /// Nothing is ever there to read at a terminal here (`read_at`):
     /// readable said otherwise, a parked read found nothing and was tried
     /// again at once, for ever.
     fn poll_readable(&self) -> bool {
-        self.device != Device::Tty
+        !matches!(self.device, Device::Tty | Device::Hvc(_))
     }
 
     /// A terminal read waits here: a queue nothing notifies, since nothing
@@ -138,7 +160,7 @@ impl FileHandle for DevHandle {
     fn wait_queue(&self) -> u32 {
         static NOBODY_TYPES: std::sync::OnceLock<crate::wait::Queue> = std::sync::OnceLock::new();
         match self.device {
-            Device::Tty => NOBODY_TYPES.get_or_init(crate::wait::Queue::new).id(),
+            Device::Tty | Device::Hvc(_) => NOBODY_TYPES.get_or_init(crate::wait::Queue::new).id(),
             _ => 0,
         }
     }

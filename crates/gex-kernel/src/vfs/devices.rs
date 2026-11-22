@@ -38,6 +38,11 @@ pub fn minor(dev: u64) -> u32 {
 
 /// Open character device `dev` through the node `node` describes.
 pub fn open_char(dev: u64, node: NodeMeta) -> Result<Arc<dyn FileHandle>, Errno> {
+    // An hvc minor its driver registered with no port behind it:
+    // `hvc_install` finds no console for the index.
+    if super::devfs::has_hvc() && major(dev) == super::devfs::HVC_MAJOR && minor(dev) < super::devfs::HVC_MINORS {
+        return super::devfs::open_numbered(dev, node).ok_or(Errno::ENODEV);
+    }
     super::devfs::open_numbered(dev, node).ok_or(Errno::ENXIO)
 }
 
