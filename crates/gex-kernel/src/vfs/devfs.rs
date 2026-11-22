@@ -79,6 +79,8 @@ pub(super) fn open_numbered(dev: u64, node: super::devices::NodeMeta) -> Option<
         // The loop devices' control, and the device-mapper's.
         (10, 237) => return Some(crate::loopdev::Control::open(Some(node))),
         (10, 236) => return Some(crate::dm::Control::open(Some(node))),
+        // TUN and TAP devices' (`tun_miscdev`).
+        (10, crate::tun::MISC_MINOR) => return Some(crate::tun::TunFile::open(Some(node))),
         // A DRM device's nodes, when the kernel has one.
         (crate::drm::MAJOR, minor) => return crate::drm::open(minor, node),
         (1, 3) => Device::Null,

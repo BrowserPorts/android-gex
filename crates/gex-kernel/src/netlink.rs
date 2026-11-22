@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex};
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
@@ -58,18 +59,9 @@ const NLM_F_ACK: u16 = 4;
 const NLM_F_DUMP: u16 = 0x300;
 const AF_UNSPEC: u8 = 0;
 const AF_INET: u8 = 2;
-const ARPHRD_ETHER: u16 = 1;
-const ARPHRD_LOOPBACK: u16 = 772;
-const IFF_UP: u32 = 0x1;
 const IFF_BROADCAST: u32 = 0x2;
 const IFF_LOOPBACK: u32 = 0x8;
-const IFF_RUNNING: u32 = 0x40;
-const IFF_MULTICAST: u32 = 0x1000;
-const IFF_LOWER_UP: u32 = 0x10000;
-const IFLA_ADDRESS: u16 = 1;
-const IFLA_BROADCAST: u16 = 2;
 const IFLA_IFNAME: u16 = 3;
-const IFLA_MTU: u16 = 4;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
@@ -78,33 +70,14 @@ const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_HOST: u8 = 254;
 const IFA_F_PERMANENT: u8 = 0x80;
 
-/// One interface: its index, name, type, flags, MTU, hardware address, and
-/// its IPv4 address with prefix length.
-struct Iface {
-    index: u32,
-    name: &'static str,
-    kind: u16,
-    flags: u32,
-    mtu: u32,
-    mac: [u8; 6],
-    addr: [u8; 4],
-    prefix: u8,
-}
-
 /// The interfaces' names, in index order.
-pub fn interface_names() -> Vec<&'static str> {
-    IFACES.iter().map(|i| i.name).collect()
-}
-
-/// What sysfs says of each interface: index, name, `ARPHRD_*` type,
-/// `IFF_*` flags, MTU and hardware address.
-pub fn interfaces_info() -> Vec<(u32, &'static str, u16, u32, u32, [u8; 6])> {
-    IFACES.iter().map(|i| (i.index, i.name, i.kind, i.flags, i.mtu, i.mac)).collect()
+pub fn interface_names() -> Vec<String> {
+    crate::netdev::all().into_iter().map(|d| d.name).collect()
 }
 
 /// An interface's MTU, by name.
 pub fn interface_mtu(name: &str) -> Option<u32> {
-    IFACES.iter().find(|i| i.name == name).map(|i| i.mtu)
+    crate::netdev::by_name(name).map(|d| d.mtu)
 }
 
 /// eth0's address: where a connected socket says it is (`getsockname`).
@@ -124,31 +97,14 @@ pub fn local_for(peer: u32) -> u32 {
 /// Whether there is a network interface of index `index`
 /// (`dev_get_by_index`).
 pub fn iface_exists(index: u32) -> bool {
-    IFACES.iter().any(|i| i.index == index)
+    crate::netdev::by_index(index).is_some()
 }
 
-const IFACES: [Iface; 2] = [
-    Iface {
-        index: 1,
-        name: "lo",
-        kind: ARPHRD_LOOPBACK,
-        flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP,
-        mtu: 65536,
-        mac: [0; 6],
-        addr: [127, 0, 0, 1],
-        prefix: 8,
-    },
-    Iface {
-        index: 2,
-        name: "eth0",
-        kind: ARPHRD_ETHER,
-        flags: IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST | IFF_LOWER_UP,
-        mtu: 1500,
-        mac: [0x02, 0, 0, 0, 0, 0x01],
-        addr: ETH0_ADDR,
-        prefix: 24,
-    },
-];
+/// A message from the kernel to a group of `NETLINK_ROUTE`'s
+/// (`rtnl_notify`): a device's link coming, changing or going.
+pub(crate) fn route_notify(msg: Vec<u8>, group: u32) {
+    broadcast(NETLINK_ROUTE, None, &Datagram { data: msg, from: 0, group, cred: (0, 0, 0) }, 0, group);
+}
 
 /// Appends a `struct nlmsghdr` and `body`, padded to 4 bytes.
 fn message(out: &mut Vec<u8>, kind: u16, flags: u16, seq: u32, body: &[u8]) {
@@ -180,40 +136,52 @@ fn cstr(s: &str) -> Vec<u8> {
     v
 }
 
-/// `RTM_NEWLINK` for each interface: `struct ifinfomsg` and its attributes.
+/// `RTM_NEWLINK` for each interface (`rtnl_dump_ifinfo`: nothing said
+/// changed).
 fn links(out: &mut Vec<u8>, seq: u32) {
-    for i in &IFACES {
-        let mut b = vec![AF_UNSPEC, 0];
-        b.extend_from_slice(&i.kind.to_le_bytes());
-        b.extend_from_slice(&(i.index as i32).to_le_bytes());
-        b.extend_from_slice(&i.flags.to_le_bytes());
-        b.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // ifi_change
-        attr(&mut b, IFLA_IFNAME, &cstr(i.name));
-        attr(&mut b, IFLA_MTU, &i.mtu.to_le_bytes());
-        attr(&mut b, IFLA_ADDRESS, &i.mac);
-        let bcast = if i.kind == ARPHRD_ETHER { [0xff; 6] } else { [0; 6] };
-        attr(&mut b, IFLA_BROADCAST, &bcast);
-        message(out, RTM_NEWLINK, NLM_F_MULTI, seq, &b);
+    for d in crate::netdev::all() {
+        message(out, RTM_NEWLINK, NLM_F_MULTI, seq, &crate::netdev::fill(&d, 0));
     }
 }
 
-/// `RTM_NEWADDR` for each interface's address: `struct ifaddrmsg` and its
-/// attributes.
+/// `RTM_NEWADDR` for each interface's IPv4 address: `struct ifaddrmsg` and
+/// its attributes.
 fn addrs(out: &mut Vec<u8>, seq: u32) {
-    for i in &IFACES {
-        let scope = if i.flags & IFF_LOOPBACK != 0 { RT_SCOPE_HOST } else { RT_SCOPE_UNIVERSE };
-        let mut b = vec![AF_INET, i.prefix, IFA_F_PERMANENT, scope];
-        b.extend_from_slice(&i.index.to_le_bytes());
-        attr(&mut b, IFA_ADDRESS, &i.addr);
-        attr(&mut b, IFA_LOCAL, &i.addr);
-        if i.flags & IFF_BROADCAST != 0 {
-            let host = u32::MAX >> i.prefix;
-            let bcast = (u32::from_be_bytes(i.addr) | host).to_be_bytes();
+    for d in crate::netdev::all() {
+        let Some((addr, prefix)) = d.inet else { continue };
+        let scope = if d.flags & IFF_LOOPBACK != 0 { RT_SCOPE_HOST } else { RT_SCOPE_UNIVERSE };
+        let mut b = vec![AF_INET, prefix, IFA_F_PERMANENT, scope];
+        b.extend_from_slice(&d.index.to_le_bytes());
+        attr(&mut b, IFA_ADDRESS, &addr);
+        attr(&mut b, IFA_LOCAL, &addr);
+        if d.flags & IFF_BROADCAST != 0 {
+            let host = u32::MAX >> prefix;
+            let bcast = (u32::from_be_bytes(addr) | host).to_be_bytes();
             attr(&mut b, IFA_BROADCAST, &bcast);
         }
-        attr(&mut b, IFA_LABEL, &cstr(i.name));
+        attr(&mut b, IFA_LABEL, &cstr(&d.name));
         message(out, RTM_NEWADDR, NLM_F_MULTI, seq, &b);
     }
+}
+
+/// The device a link request names: `ifi_index`, else `IFLA_IFNAME`
+/// (`rtnl_dev_get`). `EINVAL` for a request too short to name one.
+fn link_of(req: &[u8]) -> Result<crate::netdev::NetDev, Errno> {
+    if req.len() < 32 {
+        return Err(Errno::EINVAL);
+    }
+    let index = i32::from_le_bytes(req[20..24].try_into().unwrap());
+    if index > 0 {
+        return crate::netdev::by_index(index as u32).ok_or(Errno::ENODEV);
+    }
+    for (kind, data) in crate::netdev::attrs_of(&req[32..]) {
+        if kind == IFLA_IFNAME {
+            let name = data.split(|&b| b == 0).next().unwrap_or(&[]);
+            let name = std::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
+            return crate::netdev::by_name(name).ok_or(Errno::ENODEV);
+        }
+    }
+    Err(Errno::EINVAL)
 }
 
 /// The reply to one request (`nlmsghdr` + body), if it is owed one.
@@ -229,7 +197,7 @@ fn route_answer(req: &[u8], net_admin: bool) -> Option<Vec<u8>> {
     // takes CAP_NET_ADMIN), acknowledged when asked; an error is always
     // said, with the request after it.
     let change = |r: Result<(), Errno>| change_reply(req, r);
-    let ifindex = |name: &str| IFACES.iter().find(|i| i.name == name).map(|i| i.index);
+    let ifindex = |name: &str| crate::netdev::by_name(name).map(|d| d.index);
     match kind {
         crate::fibrules::RTM_NEWRULE | crate::fibrules::RTM_DELRULE if !net_admin => return change(Err(Errno::EPERM)),
         crate::fibrules::RTM_NEWRULE => {
@@ -243,6 +211,46 @@ fn route_answer(req: &[u8], net_admin: bool) -> Option<Vec<u8>> {
             }
         }
         RTM_GETLINK if dump => links(&mut out, seq),
+        // One link, by index or by name (`rtnl_getlink`).
+        RTM_GETLINK => {
+            let dev = match link_of(req) {
+                Ok(d) => d,
+                Err(e) => return change(Err(e)),
+            };
+            message(&mut out, RTM_NEWLINK, 0, seq, &crate::netdev::fill(&dev, 0));
+            return Some(out);
+        }
+        // A change to a link that is there (`do_setlink`); making one this
+        // way is refused, as `tun` refuses it (`tun_validate`) and this
+        // kernel makes no other kind.
+        RTM_NEWLINK | RTM_DELLINK if !net_admin => return change(Err(Errno::EPERM)),
+        RTM_NEWLINK => {
+            let r = match link_of(req) {
+                Ok(dev) => {
+                    let f = u32::from_le_bytes(req[24..28].try_into().unwrap());
+                    let c = u32::from_le_bytes(req[28..32].try_into().unwrap());
+                    crate::netdev::setlink(dev.index, f, c, &req[32..])
+                }
+                Err(Errno::ENODEV) => {
+                    crate::bpf::say_once("RTM_NEWLINK making a link (no kind of link is made so here)");
+                    Err(Errno::EOPNOTSUPP)
+                }
+                Err(e) => Err(e),
+            };
+            return change(r);
+        }
+        // `rtnl_dellink`: a TUN or TAP device goes (its link operations
+        // delete as `unregister_netdevice` does); the others have none.
+        RTM_DELLINK => {
+            let r = link_of(req).and_then(|dev| {
+                if dev.tun.is_none() {
+                    return Err(Errno::EOPNOTSUPP);
+                }
+                crate::netdev::unregister(dev.index);
+                Ok(())
+            });
+            return change(r);
+        }
         // No IPv6 addresses: a dump for AF_INET6 is only its end.
         RTM_GETADDR if dump && (family == AF_UNSPEC || family == AF_INET) => addrs(&mut out, seq),
         RTM_GETADDR if dump => {}
@@ -1178,61 +1186,81 @@ impl FileHandle for Socket {
 pub mod ioctl {
     pub const SIOCGIFNAME: u64 = 0x8910;
     pub const SIOCGIFFLAGS: u64 = 0x8913;
+    pub const SIOCSIFFLAGS: u64 = 0x8914;
     pub const SIOCGIFADDR: u64 = 0x8915;
     pub const SIOCGIFBRDADDR: u64 = 0x8919;
     pub const SIOCGIFNETMASK: u64 = 0x891b;
     pub const SIOCGIFMTU: u64 = 0x8921;
+    pub const SIOCSIFMTU: u64 = 0x8922;
     pub const SIOCGIFHWADDR: u64 = 0x8927;
     pub const SIOCGIFINDEX: u64 = 0x8933;
+    pub const SIOCGIFTXQLEN: u64 = 0x8942;
 }
 
 /// Whether `req` is one of [`ioctl`]'s.
 pub fn is_iface_ioctl(req: u64) -> bool {
     use ioctl::*;
-    matches!(req, SIOCGIFNAME | SIOCGIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR | SIOCGIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX)
+    matches!(req, SIOCGIFNAME | SIOCGIFFLAGS | SIOCSIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR | SIOCGIFNETMASK | SIOCGIFMTU | SIOCSIFMTU | SIOCGIFHWADDR | SIOCGIFINDEX | SIOCGIFTXQLEN)
 }
 
 /// Answers one of [`ioctl`]'s in `ifr`, the first 32 bytes of a `struct
 /// ifreq` (the name, then the union's first 16 bytes: the same on 32- and
-/// 64-bit guests). `ENODEV` for an interface that is not here.
-pub fn iface_ioctl(req: u64, ifr: &mut [u8; 32]) -> Result<(), Errno> {
+/// 64-bit guests), as `dev_ioctl` does: the name is cut at a `:` (an
+/// alias's), `ENODEV` for an interface that is not here, and a change
+/// takes `CAP_NET_ADMIN` (`EPERM`).
+pub fn iface_ioctl(req: u64, ifr: &mut [u8; 32], net_admin: bool) -> Result<(), Errno> {
     use ioctl::*;
-    let iface = if req == SIOCGIFNAME {
+    let dev = if req == SIOCGIFNAME {
         let index = i32::from_le_bytes(ifr[16..20].try_into().unwrap());
-        IFACES.iter().find(|i| i.index as i32 == index)
+        crate::netdev::by_index(index as u32).filter(|_| index > 0)
     } else {
-        let name = ifr[..16].split(|&b| b == 0).next().unwrap_or(&[]);
-        IFACES.iter().find(|i| i.name.as_bytes() == name)
+        ifr[15] = 0;
+        let name = ifr[..16].split(|&b| b == 0 || b == b':').next().unwrap_or(&[]);
+        std::str::from_utf8(name).ok().and_then(crate::netdev::by_name)
     };
-    let i = iface.ok_or(Errno::ENODEV)?;
+    if matches!(req, SIOCSIFFLAGS | SIOCSIFMTU) && !net_admin {
+        return Err(Errno::EPERM);
+    }
+    let d = dev.ok_or(Errno::ENODEV)?;
     let inet = |ifr: &mut [u8; 32], a: [u8; 4]| {
         ifr[16..32].fill(0);
         ifr[16..18].copy_from_slice(&(AF_INET as u16).to_le_bytes());
         ifr[20..24].copy_from_slice(&a);
     };
-    let mask = (u32::MAX << (32 - i.prefix as u32)).to_be_bytes();
     match req {
         SIOCGIFNAME => {
             ifr[..16].fill(0);
-            ifr[..i.name.len()].copy_from_slice(i.name.as_bytes());
+            ifr[..d.name.len()].copy_from_slice(d.name.as_bytes());
         }
-        SIOCGIFINDEX => ifr[16..20].copy_from_slice(&(i.index as i32).to_le_bytes()),
+        SIOCGIFINDEX => ifr[16..20].copy_from_slice(&(d.index as i32).to_le_bytes()),
         // ifr_flags is a short: the low 16 bits (IFF_LOWER_UP is not among them).
-        SIOCGIFFLAGS => ifr[16..18].copy_from_slice(&(i.flags as u16).to_le_bytes()),
-        SIOCGIFMTU => ifr[16..20].copy_from_slice(&(i.mtu as i32).to_le_bytes()),
+        SIOCGIFFLAGS => ifr[16..18].copy_from_slice(&(d.get_flags() as u16).to_le_bytes()),
+        // Sign-extended from its short.
+        SIOCSIFFLAGS => crate::netdev::change_flags(d.index, i16::from_le_bytes([ifr[16], ifr[17]]) as i32 as u32)?,
+        SIOCGIFMTU => ifr[16..20].copy_from_slice(&(d.mtu as i32).to_le_bytes()),
+        SIOCSIFMTU => crate::netdev::set_mtu(d.index, i32::from_le_bytes(ifr[16..20].try_into().unwrap()))?,
+        SIOCGIFTXQLEN => ifr[16..20].copy_from_slice(&(d.txqlen as i32).to_le_bytes()),
         SIOCGIFHWADDR => {
             ifr[16..32].fill(0);
-            ifr[16..18].copy_from_slice(&i.kind.to_le_bytes());
-            ifr[18..24].copy_from_slice(&i.mac);
+            ifr[16..18].copy_from_slice(&d.kind.to_le_bytes());
+            let n = d.addr.len().min(14);
+            ifr[18..18 + n].copy_from_slice(&d.addr[..n]);
         }
-        SIOCGIFADDR => inet(ifr, i.addr),
-        SIOCGIFNETMASK => inet(ifr, mask),
-        SIOCGIFBRDADDR => {
-            if i.flags & IFF_BROADCAST == 0 {
-                return Err(Errno::EINVAL);
+        SIOCGIFADDR | SIOCGIFNETMASK | SIOCGIFBRDADDR => {
+            // `devinet_ioctl`: a device with no IPv4 address.
+            let (addr, prefix) = d.inet.ok_or(Errno::EADDRNOTAVAIL)?;
+            let mask = (u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0)).to_be_bytes();
+            match req {
+                SIOCGIFADDR => inet(ifr, addr),
+                SIOCGIFNETMASK => inet(ifr, mask),
+                _ => {
+                    if d.flags & IFF_BROADCAST == 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                    let b = u32::from_be_bytes(addr) | !u32::from_be_bytes(mask);
+                    inet(ifr, b.to_be_bytes());
+                }
             }
-            let b = u32::from_be_bytes(i.addr) | !u32::from_be_bytes(mask);
-            inet(ifr, b.to_be_bytes());
         }
         _ => return Err(Errno::ENOTTY),
     }
@@ -1363,30 +1391,30 @@ mod tests {
     #[test]
     fn interface_ioctls_answer_by_name_and_index() {
         let mut r = ifr("eth0");
-        iface_ioctl(ioctl::SIOCGIFINDEX, &mut r).unwrap();
+        iface_ioctl(ioctl::SIOCGIFINDEX, &mut r, false).unwrap();
         assert_eq!(i32::from_le_bytes(r[16..20].try_into().unwrap()), 2);
         let mut r = [0u8; 32];
         r[16..20].copy_from_slice(&1i32.to_le_bytes());
-        iface_ioctl(ioctl::SIOCGIFNAME, &mut r).unwrap();
+        iface_ioctl(ioctl::SIOCGIFNAME, &mut r, false).unwrap();
         assert_eq!(&r[..3], b"lo\0");
         let mut r = ifr("lo");
-        iface_ioctl(ioctl::SIOCGIFFLAGS, &mut r).unwrap();
+        iface_ioctl(ioctl::SIOCGIFFLAGS, &mut r, false).unwrap();
         assert_ne!(u16::from_le_bytes(r[16..18].try_into().unwrap()) as u32 & IFF_LOOPBACK, 0);
         let mut r = ifr("eth0");
-        iface_ioctl(ioctl::SIOCGIFADDR, &mut r).unwrap();
+        iface_ioctl(ioctl::SIOCGIFADDR, &mut r, false).unwrap();
         assert_eq!(&r[20..24], &[10, 0, 2, 15]);
-        iface_ioctl(ioctl::SIOCGIFNETMASK, &mut r).unwrap();
+        iface_ioctl(ioctl::SIOCGIFNETMASK, &mut r, false).unwrap();
         assert_eq!(&r[20..24], &[255, 255, 255, 0]);
-        iface_ioctl(ioctl::SIOCGIFBRDADDR, &mut r).unwrap();
+        iface_ioctl(ioctl::SIOCGIFBRDADDR, &mut r, false).unwrap();
         assert_eq!(&r[20..24], &[10, 0, 2, 255]);
         let mut r = ifr("eth0");
-        iface_ioctl(ioctl::SIOCGIFHWADDR, &mut r).unwrap();
-        assert_eq!(u16::from_le_bytes(r[16..18].try_into().unwrap()), ARPHRD_ETHER);
+        iface_ioctl(ioctl::SIOCGIFHWADDR, &mut r, false).unwrap();
+        assert_eq!(u16::from_le_bytes(r[16..18].try_into().unwrap()), crate::netdev::ARPHRD_ETHER);
         assert_eq!(&r[18..24], &[2, 0, 0, 0, 0, 1]);
         let mut r = ifr("lo");
-        iface_ioctl(ioctl::SIOCGIFMTU, &mut r).unwrap();
+        iface_ioctl(ioctl::SIOCGIFMTU, &mut r, false).unwrap();
         assert_eq!(i32::from_le_bytes(r[16..20].try_into().unwrap()), 65536);
-        assert_eq!(iface_ioctl(ioctl::SIOCGIFINDEX, &mut ifr("wlan0")).err(), Some(Errno::ENODEV));
+        assert_eq!(iface_ioctl(ioctl::SIOCGIFINDEX, &mut ifr("wlan0"), false).err(), Some(Errno::ENODEV));
     }
 
     #[test]

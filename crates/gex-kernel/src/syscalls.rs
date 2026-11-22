@@ -15234,6 +15234,14 @@ impl FdIo<'_> {
                 }
             }
         }
+        // A TUN descriptor's (`__tun_chr_ioctl`), which may make a network
+        // device (`CAP_NET_ADMIN`) or attach to one its owner and group
+        // allow.
+        if let Some(tun) = self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_tun()) {
+            let in_group = |g: u32| self.creds.in_group(g);
+            let cx = crate::tun::Caller { net_admin: self.creds.capable(12), euid: self.creds.uid(), in_group: &in_group };
+            return tun.ioctl(&cx, m, req, arg);
+        }
         // A block device's: the block layer's and its driver's, which may
         // name a descriptor of the caller's (a loop device's file).
         if let Some(disk) = self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_block()) {
@@ -15364,7 +15372,7 @@ impl FdIo<'_> {
                 // (crate::netlink), asked of any socket.
                 r if crate::netlink::is_iface_ioctl(r) => {
                     let mut ifr: [u8; 32] = m.read(arg, 32)?.try_into().unwrap();
-                    crate::netlink::iface_ioctl(r, &mut ifr)?;
+                    crate::netlink::iface_ioctl(r, &mut ifr, self.creds.capable(12))?;
                     m.write(arg, &ifr)?;
                     Ok(0)
                 }

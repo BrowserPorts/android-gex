@@ -24,6 +24,8 @@ impl Errno {
     pub const ENOTBLK: Errno = Errno(15);
     pub const E2BIG: Errno = Errno(7);
     pub const EBADF: Errno = Errno(9);
+    /// File descriptor in bad state (a TUN descriptor with no device).
+    pub const EBADFD: Errno = Errno(77);
     pub const ECHILD: Errno = Errno(10);
     pub const EAGAIN: Errno = Errno(11);
     pub const ENOEXEC: Errno = Errno(8);

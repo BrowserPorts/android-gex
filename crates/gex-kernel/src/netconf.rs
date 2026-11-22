@@ -21,7 +21,7 @@ use std::sync::Mutex;
 static SET: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// The interfaces there are, by name.
-fn interfaces() -> Vec<&'static str> {
+fn interfaces() -> Vec<String> {
     crate::netlink::interface_names()
 }
 
@@ -45,7 +45,7 @@ fn parse(path: &str) -> Option<(&str, &str, &str, Option<&str>)> {
 /// `default` for `neigh`, and every interface.
 fn entries(kind: &str) -> Vec<String> {
     let mut out: Vec<String> = if kind == "conf" { vec!["all".into(), "default".into()] } else { vec!["default".into()] };
-    out.extend(interfaces().into_iter().map(String::from));
+    out.extend(interfaces());
     out
 }
 

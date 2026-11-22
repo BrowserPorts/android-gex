@@ -43,6 +43,11 @@ pub trait Attributes: Send + Sync + std::fmt::Debug {
     fn list(&self, dir: &str) -> Option<Vec<(String, FileType)>>;
     /// The mode and text of the file at `path` in the device's directory.
     fn read(&self, path: &str) -> Option<(u32, String)>;
+    /// [`Self::read`], for a file that is there but whose read fails now
+    /// (the error its `show` gives).
+    fn read_result(&self, path: &str) -> Option<Result<(u32, String), Errno>> {
+        self.read(path).map(Ok)
+    }
     /// A write, whole, to that file.
     fn write(&self, path: &str, data: &[u8]) -> Result<(), Errno>;
     /// Where the link at `path` leads, when there is one there.
@@ -53,6 +58,29 @@ pub trait Attributes: Send + Sync + std::fmt::Debug {
     /// `DEVNAME`, where its node is not named as it is (`dri/card0`).
     fn devname(&self) -> Option<String> {
         None
+    }
+}
+
+/// A device whose node is named otherwise than it is (`DEVNAME`), with no
+/// files of its own.
+#[derive(Debug)]
+struct Nodename(&'static str);
+
+impl Attributes for Nodename {
+    fn vars(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn list(&self, dir: &str) -> Option<Vec<(String, FileType)>> {
+        dir.is_empty().then(Vec::new)
+    }
+    fn read(&self, _path: &str) -> Option<(u32, String)> {
+        None
+    }
+    fn write(&self, _path: &str, _data: &[u8]) -> Result<(), Errno> {
+        Err(Errno::EOPNOTSUPP)
+    }
+    fn devname(&self) -> Option<String> {
+        Some(self.0.to_string())
     }
 }
 
@@ -130,51 +158,101 @@ impl Device {
 #[derive(Debug)]
 struct NetAttrs {
     index: u32,
-    name: &'static str,
-    kind: u16,
-    flags: u32,
-    mtu: u32,
-    mac: [u8; 6],
+    name: String,
 }
 
 impl NetAttrs {
-    const FILES: [&'static str; 12] = ["addr_len", "address", "broadcast", "carrier", "dev_id", "flags", "ifindex", "iflink", "mtu", "operstate", "tx_queue_len", "type"];
+    /// `net_class_attrs` (`net/core/net-sysfs.c`) and a TUN device's group
+    /// (`tun_flags`, `owner`, `group`).
+    const FILES: [&'static str; 24] = [
+        "addr_assign_type", "addr_len", "address", "broadcast", "carrier", "carrier_changes", "carrier_down_count", "carrier_up_count", "dev_id", "dev_port", "dormant", "duplex", "flags", "ifalias", "ifindex", "iflink", "link_mode", "mtu", "name_assign_type", "netdev_group", "operstate", "proto_down", "testing", "tx_queue_len",
+    ];
+    const MORE: [&'static str; 2] = ["type", "speed"];
+    const TUN: [&'static str; 3] = ["tun_flags", "owner", "group"];
 
-    fn mac_text(m: &[u8; 6]) -> String {
-        m.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
+    fn dev(&self) -> Option<crate::netdev::NetDev> {
+        crate::netdev::by_index(self.index)
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":")
     }
 }
 
 impl Attributes for NetAttrs {
     fn vars(&self) -> Vec<(String, String)> {
-        vec![("INTERFACE".to_string(), self.name.to_string()), ("IFINDEX".to_string(), self.index.to_string())]
+        vec![("INTERFACE".to_string(), self.name.clone()), ("IFINDEX".to_string(), self.index.to_string())]
     }
     fn list(&self, dir: &str) -> Option<Vec<(String, FileType)>> {
-        (dir.is_empty()).then(|| Self::FILES.iter().map(|f| (f.to_string(), FileType::Regular)).collect())
+        if !dir.is_empty() {
+            return None;
+        }
+        let tun = self.dev().is_some_and(|d| d.tun.is_some());
+        let mut v: Vec<(String, FileType)> = Self::FILES.iter().chain(Self::MORE.iter()).map(|f| (f.to_string(), FileType::Regular)).collect();
+        if tun {
+            v.extend(Self::TUN.iter().map(|f| (f.to_string(), FileType::Regular)));
+        }
+        Some(v)
     }
     fn read(&self, path: &str) -> Option<(u32, String)> {
-        const ARPHRD_LOOPBACK: u16 = 772;
-        let loopback = self.kind == ARPHRD_LOOPBACK;
+        self.read_result(path).and_then(|r| r.ok())
+    }
+    /// The files `netdev_show` refuses (`EINVAL`) while the device is not
+    /// running (its carrier, speed, duplex, dormant and testing), and
+    /// `name_assign_type` for a name the kernel gave without saying how.
+    fn read_result(&self, path: &str) -> Option<Result<(u32, String), Errno>> {
+        let d = self.dev()?;
+        let running = d.running();
         let text = match path {
-            "addr_len" => "6".to_string(),
-            "address" => Self::mac_text(&self.mac),
-            "broadcast" => Self::mac_text(&if loopback { [0; 6] } else { [0xff; 6] }),
-            "carrier" => "1".to_string(),
+            "addr_assign_type" => d.addr_assign_type.to_string(),
+            "addr_len" => d.addr.len().to_string(),
+            "address" => Self::hex(&d.addr),
+            "broadcast" => Self::hex(&d.broadcast),
+            "carrier" | "speed" | "duplex" | "dormant" | "testing" if !running => return Some(Err(Errno::EINVAL)),
+            "carrier" => (d.carrier as u8).to_string(),
+            "speed" if d.tun.is_some() => "10000".to_string(),
+            "duplex" if d.tun.is_some() => "full".to_string(),
+            // No ethtool link settings for lo and eth0 here.
+            "speed" | "duplex" => return Some(Err(Errno::EINVAL)),
+            "dormant" | "testing" => "0".to_string(),
+            "carrier_changes" => (d.carrier_up + d.carrier_down).to_string(),
+            "carrier_up_count" => d.carrier_up.to_string(),
+            "carrier_down_count" => d.carrier_down.to_string(),
             "dev_id" => "0x0".to_string(),
-            "flags" => format!("{:#x}", self.flags & 0xffff),
-            "ifindex" | "iflink" => self.index.to_string(),
-            "mtu" => self.mtu.to_string(),
-            // Loopback's driver reports no operational state.
-            "operstate" => (if loopback { "unknown" } else { "up" }).to_string(),
-            "tx_queue_len" => (if loopback { "1000" } else { "1000" }).to_string(),
-            "type" => self.kind.to_string(),
+            "dev_port" | "link_mode" | "netdev_group" | "proto_down" => "0".to_string(),
+            "flags" => format!("{:#x}", d.flags),
+            "ifalias" => return Some(Ok((0o644, String::new()))),
+            "ifindex" | "iflink" => d.index.to_string(),
+            "mtu" => d.mtu.to_string(),
+            // NET_NAME_UNKNOWN: a name nobody said the origin of.
+            "name_assign_type" if d.tun.is_some() => return Some(Err(Errno::EINVAL)),
+            "name_assign_type" => "0".to_string(),
+            "operstate" => d.operstate_text().to_string(),
+            "tx_queue_len" => d.txqlen.to_string(),
+            "type" => d.kind.to_string(),
+            "tun_flags" | "owner" | "group" => {
+                let t = d.tun.as_ref()?;
+                match path {
+                    "tun_flags" => format!("{:#x}", t.flags & (crate::tun::TUN_FEATURES | crate::tun::IFF_PERSIST | crate::tun::IFF_TUN | crate::tun::IFF_TAP)),
+                    "owner" => t.owner.map_or("-1".to_string(), |o| o.to_string()),
+                    _ => t.group.map_or("-1".to_string(), |g| g.to_string()),
+                }
+            }
             _ => return None,
         };
-        Some((if path == "flags" || path == "mtu" || path == "tx_queue_len" { 0o644 } else { 0o444 }, format!("{text}\n")))
+        let rw = matches!(path, "flags" | "mtu" | "tx_queue_len" | "ifalias" | "netdev_group" | "proto_down" | "carrier" | "gro_flush_timeout");
+        Some(Ok((if rw { 0o644 } else { 0o444 }, format!("{text}\n"))))
     }
     fn write(&self, _path: &str, _data: &[u8]) -> Result<(), Errno> {
+        crate::bpf::say_once("a write to a network device's sysfs attribute (not here)");
         Err(Errno::EOPNOTSUPP)
     }
+}
+
+/// A network device comes (`netdev_register_kobject`): its directory, and
+/// its `add` uevent (`INTERFACE`, `IFINDEX`).
+pub fn add_net(name: &str, index: u32) {
+    add(Device { subsystem: "net".to_string(), name: name.to_string(), major: 0, minor: 0, mode: None, attrs: Some(Arc::new(NetAttrs { index, name: name.to_string() })) }, true);
 }
 
 /// The devices there are, in the order they came.
@@ -184,7 +262,7 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
         // The character devices this kernel always has, with the modes
         // Linux's drivers give them (drivers/char/mem.c,
         // drivers/tty/tty_io.c, drivers/block/loop.c).
-        let chars: [(&str, &str, u32, u32, Option<u32>); 11] = [
+        let chars: [(&str, &str, u32, u32, Option<u32>); 12] = [
             ("mem", "null", 1, 3, Some(0o666)),
             ("mem", "zero", 1, 5, Some(0o666)),
             ("mem", "full", 1, 7, Some(0o666)),
@@ -196,8 +274,12 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
             ("tty", "ptmx", 5, 2, Some(0o666)),
             ("misc", "loop-control", 10, 237, None),
             ("misc", "device-mapper", 10, 236, None),
+            ("misc", "tun", 10, crate::tun::MISC_MINOR, None),
         ];
-        let mut all: Vec<Arc<Device>> = chars.iter().map(|(s, n, major, minor, mode)| Arc::new(Device { subsystem: s.to_string(), name: n.to_string(), major: *major, minor: *minor, mode: *mode, attrs: None })).collect();
+        // TUN's misc device names its node `net/tun` (`tun_miscdev`'s
+        // `nodename`); Android's ueventd makes it as `/dev/tun` all the same.
+        let attrs_of = |n: &str| -> Option<Arc<dyn Attributes>> { (n == "tun").then(|| Arc::new(Nodename("net/tun")) as Arc<dyn Attributes>) };
+        let mut all: Vec<Arc<Device>> = chars.iter().map(|(s, n, major, minor, mode)| Arc::new(Device { subsystem: s.to_string(), name: n.to_string(), major: *major, minor: *minor, mode: *mode, attrs: attrs_of(n) })).collect();
         // The emulator's consoles, when the kernel has them: every minor
         // of `hvc_console`'s driver, in `devices/virtual/tty` (no parent),
         // as `tty_register_driver` adds them without `TTY_DRIVER_DYNAMIC_DEV`.
@@ -213,8 +295,8 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
         }
         // The network interfaces (`net/core/net-sysfs.c`): no device
         // number, and their own attributes.
-        for (index, name, kind, flags, mtu, mac) in crate::netlink::interfaces_info() {
-            all.push(Arc::new(Device { subsystem: "net".to_string(), name: name.to_string(), major: 0, minor: 0, mode: None, attrs: Some(Arc::new(NetAttrs { index, name, kind, flags, mtu, mac })) }));
+        for d in crate::netdev::all() {
+            all.push(Arc::new(Device { subsystem: "net".to_string(), name: d.name.clone(), major: 0, minor: 0, mode: None, attrs: Some(Arc::new(NetAttrs { index: d.index, name: d.name })) }));
         }
         Mutex::new(all)
     })
@@ -283,6 +365,25 @@ enum Node {
     /// A file of a device's driver, at its path in the device's
     /// directory: its mode and text.
     Attr(Arc<Device>, String, u32, String),
+    /// A file of a device's driver whose read fails now: its mode and the
+    /// error (a network device's `carrier` while it is down).
+    Refused(u32, Errno),
+}
+
+/// An open attribute whose read fails ([`Node::Refused`]).
+#[derive(Debug)]
+struct RefusedFile(Errno);
+
+impl FileHandle for RefusedFile {
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> SysResult {
+        Err(self.0)
+    }
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> SysResult {
+        Err(Errno::EACCES)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { file_type: FileType::Regular, size: 4096, mode: 0o444, ino: 1, mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: None })
+    }
 }
 
 fn dirs<S: AsRef<str>>(names: &[S]) -> Node {
@@ -334,8 +435,9 @@ fn node(path: &str) -> Option<Node> {
             if let Some(target) = attrs.link(&rest) {
                 return Some(Node::Link(target));
             }
-            match attrs.read(&rest) {
-                Some((mode, text)) => Node::Attr(d, rest, mode, text),
+            match attrs.read_result(&rest) {
+                Some(Ok((mode, text))) => Node::Attr(d, rest, mode, text),
+                Some(Err(e)) => Node::Refused(if rest == "carrier" { 0o644 } else { 0o444 }, e),
                 None => Node::Dir(attrs.list(&rest)?),
             }
         }
@@ -568,6 +670,7 @@ impl FileSystem for SysFs {
                 let text = d.vars().iter().map(|(k, v)| format!("{k}={v}\n")).collect();
                 Ok(Arc::new(File { path: path.to_string(), text, writes: Writes::Uevent(d) }))
             }
+            Node::Refused(_, e) => Ok(Arc::new(RefusedFile(e))),
             Node::Attr(d, rest, mode, text) => {
                 // One with no write bit is only read.
                 if super::writes(flags) && mode & 0o200 == 0 {
@@ -595,7 +698,7 @@ impl FileSystem for SysFs {
                 file_meta(path, FileType::Directory, if path.is_empty() { 0o555 } else { 0o755 }, 0, 2 + subdirs)
             }
             Node::Link(target) => file_meta(path, FileType::Symlink, 0o777, target.len() as u64, 1),
-            Node::Text(mode, _) | Node::Attr(_, _, mode, _) => file_meta(path, FileType::Regular, mode, 4096, 1),
+            Node::Text(mode, _) | Node::Attr(_, _, mode, _) | Node::Refused(mode, _) => file_meta(path, FileType::Regular, mode, 4096, 1),
             Node::Uevent(_) => file_meta(path, FileType::Regular, 0o644, 4096, 1),
         })
     }

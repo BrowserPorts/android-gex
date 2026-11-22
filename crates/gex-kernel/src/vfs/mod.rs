@@ -683,6 +683,10 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     }
     /// An open DRM node ([`crate::drm`]), whose `ioctl`s need the caller's
     /// descriptors.
+    fn as_tun(self: Arc<Self>) -> Option<Arc<crate::tun::TunFile>> {
+        None
+    }
+
     fn as_drm(self: Arc<Self>) -> Option<Arc<crate::drm::DrmFile>> {
         None
     }
