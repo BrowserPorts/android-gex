@@ -801,7 +801,7 @@ mod tests {
         // A network interface as Linux 7.0 shows `lo`: a class link to its
         // directory, its index and type, and an event of its name and
         // index alone; no device number.
-        assert_eq!(names("class/net"), ["eth0", "lo"]);
+        assert_eq!(names("class/net"), ["dummy0", "eth0", "lo"]);
         assert_eq!(SysFs.read_link("class/net/lo").unwrap(), "../../devices/virtual/net/lo");
         assert_eq!(read("class/net/lo/ifindex"), "1\n");
         assert_eq!(read("class/net/lo/type"), "772\n");

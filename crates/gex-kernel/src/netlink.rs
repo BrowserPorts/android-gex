@@ -220,37 +220,21 @@ fn route_answer(req: &[u8], net_admin: bool) -> Option<Vec<u8>> {
             message(&mut out, RTM_NEWLINK, 0, seq, &crate::netdev::fill(&dev, 0));
             return Some(out);
         }
-        // A change to a link that is there (`do_setlink`); making one this
-        // way is refused, as `tun` refuses it (`tun_validate`) and this
-        // kernel makes no other kind.
+        // A change to a link that is there, or a new one of a kind this
+        // kernel makes ([`crate::netdev::newlink`]).
         RTM_NEWLINK | RTM_DELLINK if !net_admin => return change(Err(Errno::EPERM)),
         RTM_NEWLINK => {
-            let r = match link_of(req) {
-                Ok(dev) => {
-                    let f = u32::from_le_bytes(req[24..28].try_into().unwrap());
-                    let c = u32::from_le_bytes(req[28..32].try_into().unwrap());
-                    crate::netdev::setlink(dev.index, f, c, &req[32..])
-                }
-                Err(Errno::ENODEV) => {
-                    crate::bpf::say_once("RTM_NEWLINK making a link (no kind of link is made so here)");
-                    Err(Errno::EOPNOTSUPP)
-                }
-                Err(e) => Err(e),
-            };
-            return change(r);
+            if req.len() < 32 {
+                return change(Err(Errno::EINVAL));
+            }
+            let index = i32::from_le_bytes(req[20..24].try_into().unwrap());
+            let f = u32::from_le_bytes(req[24..28].try_into().unwrap());
+            let c = u32::from_le_bytes(req[28..32].try_into().unwrap());
+            return change(crate::netdev::newlink(flags, index, f, c, &req[32..]));
         }
-        // `rtnl_dellink`: a TUN or TAP device goes (its link operations
-        // delete as `unregister_netdevice` does); the others have none.
-        RTM_DELLINK => {
-            let r = link_of(req).and_then(|dev| {
-                if dev.tun.is_none() {
-                    return Err(Errno::EOPNOTSUPP);
-                }
-                crate::netdev::unregister(dev.index);
-                Ok(())
-            });
-            return change(r);
-        }
+        // `rtnl_dellink`: a device whose kind has link operations (TUN and
+        // TAP, dummy, xfrm) goes; the others have none.
+        RTM_DELLINK => return change(link_of(req).and_then(|dev| crate::netdev::dellink(dev.index))),
         // No IPv6 addresses: a dump for AF_INET6 is only its end.
         RTM_GETADDR if dump && (family == AF_UNSPEC || family == AF_INET) => addrs(&mut out, seq),
         RTM_GETADDR if dump => {}
@@ -1325,18 +1309,19 @@ mod tests {
 
     /// What musl's `if_nameindex` does: a link dump, then an address dump;
     /// it wants every interface by index and name, and each dump's end.
+    /// The kernel's: `lo`, `eth0`, and GKI's `dummy0`.
     #[test]
-    fn a_link_dump_names_lo_and_eth0() {
+    fn a_link_dump_names_the_kernels_links() {
         let s = route();
         assert!(!s.poll_readable());
         let req = request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 7, AF_UNSPEC);
         assert_eq!(s.write_at(0, &req).unwrap(), req.len() as u64);
         assert!(s.poll_readable());
         let msgs = parse(&reply(&s));
-        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs.len(), 4);
         assert!(msgs.iter().all(|m| m.1 == 7));
-        assert_eq!(msgs[2].0, NLMSG_DONE);
-        let names: Vec<(i32, Vec<u8>)> = msgs[..2]
+        assert_eq!(msgs[3].0, NLMSG_DONE);
+        let names: Vec<(i32, Vec<u8>)> = msgs[..3]
             .iter()
             .map(|(k, _, b)| {
                 assert_eq!(*k, RTM_NEWLINK);
@@ -1345,7 +1330,7 @@ mod tests {
                 (index, name)
             })
             .collect();
-        assert_eq!(names, vec![(1, b"lo\0".to_vec()), (2, b"eth0\0".to_vec())]);
+        assert_eq!(names, vec![(1, b"lo\0".to_vec()), (2, b"eth0\0".to_vec()), (3, b"dummy0\0".to_vec())]);
         assert!(!s.poll_readable());
         assert_eq!(s.read_at(0, &mut [0u8; 64]).err(), Some(Errno::EAGAIN));
     }

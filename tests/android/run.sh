@@ -208,6 +208,8 @@ run() {
     umount) check "$1" "umount ok" 0 root ;;
     # The hardware random number generator's device and attributes.
     hwrng) check "$1" "hwrng ok" 0 root ;;
+    # Links made and deleted over NETLINK_ROUTE: dummy and xfrm.
+    newlink) check "$1" "newlink ok" 0 root ;;
     # A guest's listener reached from the host: natively by connecting to
     # it, under gex through the host's forward of a port (GEX_HOST_FORWARD).
     fwdecho) hostfwd "$1" ;;
@@ -272,7 +274,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock fwdecho fpops simdops binderexit fdstress limits cpufreq bindernode sched hvc tun jitrace mcast pfkey appdata umount hwrng"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock fwdecho fpops simdops binderexit fdstress limits cpufreq bindernode sched hvc tun jitrace mcast pfkey appdata umount hwrng newlink"
     for p in $all; do
         run "$p"
     done

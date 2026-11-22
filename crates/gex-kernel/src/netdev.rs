@@ -78,6 +78,100 @@ pub struct TunInfo {
     pub queues: u32,
 }
 
+/// A kind of link `RTM_NEWLINK` makes (`rtnl_link_ops`), of those GKI
+/// builds in: `dummy` (drivers/net/dummy.c) and `xfrm`
+/// (net/xfrm/xfrm_interface_core.c). No packet passes either here.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkKind {
+    Dummy,
+    /// `struct xfrm_if_parms`.
+    Xfrm { link: u32, if_id: u32, collect_md: bool },
+}
+
+impl LinkKind {
+    /// `rtnl_link_ops.kind`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            LinkKind::Dummy => "dummy",
+            LinkKind::Xfrm { .. } => "xfrm",
+        }
+    }
+}
+
+/// `eth_random_addr`: random, unicast, locally administered.
+fn random_ether() -> Vec<u8> {
+    let mut a = [0u8; 6];
+    crate::vfs::devfs::fill_random(&mut a);
+    a[0] = (a[0] & 0xfe) | 0x02;
+    a.to_vec()
+}
+
+/// `dummy_setup` after `ether_setup`: an Ethernet device without ARP or
+/// multicast, no queue, no MTU limits, a random address.
+fn dummy_dev(name: &str) -> NetDev {
+    NetDev {
+        index: 0,
+        name: name.to_string(),
+        kind: ARPHRD_ETHER,
+        flags: IFF_BROADCAST | IFF_NOARP,
+        gflags: 0,
+        mtu: 1500,
+        min_mtu: 0,
+        max_mtu: 0,
+        txqlen: 1000,
+        addr: random_ether(),
+        broadcast: vec![0xff; 6],
+        addr_assign_type: 1,
+        inet: None,
+        carrier: true,
+        carrier_up: 0,
+        carrier_down: 0,
+        operstate: IF_OPER_UNKNOWN,
+        qdisc: "noop",
+        up_qdisc: "noqueue",
+        netns_immutable: false,
+        addr_gen_mode: 0,
+        tun: None,
+        link_kind: Some(LinkKind::Dummy),
+        stats: [0; 8],
+    }
+}
+
+/// `xfrmi_dev_setup` and `xfrmi_dev_init`: no hardware address, no ARP,
+/// an Ethernet MTU up to IP's largest; the address kind of the device it
+/// is linked to when that is here (`eth_hw_addr_inherit`), else random.
+/// Its setup gives no queue length, so `alloc_netdev_mqs` gives it no
+/// queue (`IFF_NO_QUEUE`) and the default length.
+fn xfrm_dev(name: &str, link: u32, if_id: u32, collect_md: bool) -> NetDev {
+    let assign = by_index(link).map_or(1, |p| p.addr_assign_type);
+    NetDev {
+        index: 0,
+        name: name.to_string(),
+        kind: ARPHRD_NONE,
+        flags: IFF_NOARP,
+        gflags: 0,
+        mtu: 1500,
+        min_mtu: 68,
+        max_mtu: 65535,
+        txqlen: 1000,
+        addr: Vec::new(),
+        broadcast: Vec::new(),
+        addr_assign_type: assign,
+        inet: None,
+        carrier: true,
+        carrier_up: 0,
+        carrier_down: 0,
+        operstate: IF_OPER_UNKNOWN,
+        qdisc: "noop",
+        up_qdisc: "noqueue",
+        netns_immutable: false,
+        addr_gen_mode: 0,
+        tun: None,
+        link_kind: Some(LinkKind::Xfrm { link, if_id, collect_md }),
+        stats: [0; 8],
+    }
+}
+
 /// One device.
 #[derive(Clone, Debug)]
 pub struct NetDev {
@@ -115,6 +209,9 @@ pub struct NetDev {
     /// `IFLA_INET6_ADDR_GEN_MODE` (`IN6_ADDR_GEN_MODE_EUI64`, 0, until set).
     pub addr_gen_mode: u8,
     pub tun: Option<TunInfo>,
+    /// Its kind's link operations, for a kind made over `RTM_NEWLINK`
+    /// ([`LinkKind`]).
+    pub link_kind: Option<LinkKind>,
     /// Packets and bytes in and out, and the drops (`rtnl_link_stats64`'s
     /// first eight).
     pub stats: [u64; 8],
@@ -195,6 +292,7 @@ fn boot_devices() -> Vec<NetDev> {
             netns_immutable: true,
             addr_gen_mode: 0,
             tun: None,
+            link_kind: None,
             stats: [0; 8],
         },
         // The network's own interface (crate::netlink): an Ethernet
@@ -222,14 +320,20 @@ fn boot_devices() -> Vec<NetDev> {
             netns_immutable: false,
             addr_gen_mode: 0,
             tun: None,
+            link_kind: None,
             stats: [0; 8],
         },
     ]
+    .into_iter()
+    // GKI's dummy driver, built in, with its one device (`numdummies`):
+    // down until someone brings it up.
+    .chain(std::iter::once(NetDev { index: 3, ..dummy_dev("dummy0") }))
+    .collect()
 }
 
 fn with<R>(f: impl FnOnce(&mut Table) -> R) -> R {
     let mut t = TABLE.lock().unwrap_or_else(|e| e.into_inner());
-    let t = t.get_or_insert_with(|| Table { devs: boot_devices(), last_index: 2 });
+    let t = t.get_or_insert_with(|| Table { devs: boot_devices(), last_index: 3 });
     f(t)
 }
 
@@ -285,7 +389,15 @@ fn prep_name(t: &Table, name: &str) -> Result<String, Errno> {
 /// then `RTM_NEWLINK` (all changed) to the link group. Its index, or what
 /// was wrong with its name (`EINVAL`, `EEXIST`, `ENFILE`) or a fixed index
 /// (`EBUSY`).
-pub fn register(mut dev: NetDev, fixed_index: Option<u32>) -> Result<NetDev, Errno> {
+pub fn register(dev: NetDev, fixed_index: Option<u32>) -> Result<NetDev, Errno> {
+    let dev = register_quiet(dev, fixed_index)?;
+    notify(RTM_NEWLINK, &dev, !0);
+    Ok(dev)
+}
+
+/// [`register`] for a link `RTM_NEWLINK` makes (`rtnl_link_initializing`):
+/// no `RTM_NEWLINK` yet, which the request's end sends.
+fn register_quiet(mut dev: NetDev, fixed_index: Option<u32>) -> Result<NetDev, Errno> {
     let dev = with(|t| {
         dev.name = prep_name(t, &dev.name)?;
         dev.index = match fixed_index {
@@ -310,7 +422,6 @@ pub fn register(mut dev: NetDev, fixed_index: Option<u32>) -> Result<NetDev, Err
     })?;
     crate::vfs::sysfs::add_net(&dev.name, dev.index);
     with(|t| t.devs.push(dev.clone()));
-    notify(RTM_NEWLINK, &dev, !0);
     Ok(dev)
 }
 
@@ -347,6 +458,15 @@ pub fn update(index: u32, f: impl FnOnce(&mut NetDev)) -> Option<NetDev> {
 /// promiscuous and all-multicast modes as asked; one `RTM_NEWLINK` with
 /// what changed, if anything did.
 pub fn change_flags(index: u32, new: u32) -> Result<(), Errno> {
+    let (dev, changes) = change_flags_quiet(index, new)?;
+    if changes != 0 {
+        notify(RTM_NEWLINK, &dev, changes);
+    }
+    Ok(())
+}
+
+/// [`change_flags`] without its notice: the device, and what changed.
+fn change_flags_quiet(index: u32, new: u32) -> Result<(NetDev, u32), Errno> {
     const USER: u32 = IFF_DEBUG | IFF_NOTRAILERS | IFF_NOARP | IFF_DYNAMIC | IFF_MULTICAST | IFF_PORTSEL | IFF_AUTOMEDIA;
     let (dev, changes) = with(|t| {
         let d = t.devs.iter_mut().find(|d| d.index == index).ok_or(Errno::ENODEV)?;
@@ -365,10 +485,7 @@ pub fn change_flags(index: u32, new: u32) -> Result<(), Errno> {
         d.gflags = (d.gflags & !(IFF_PROMISC | IFF_ALLMULTI)) | (new & (IFF_PROMISC | IFF_ALLMULTI));
         Ok::<_, Errno>((d.clone(), (old ^ d.flags) | (old_g ^ d.gflags)))
     })?;
-    if changes != 0 {
-        notify(RTM_NEWLINK, &dev, changes);
-    }
-    Ok(())
+    Ok((dev, changes))
 }
 
 /// `netif_set_mtu_ext`: the same MTU is nothing; outside the device's
@@ -545,10 +662,294 @@ pub fn fill(dev: &NetDev, change: u32) -> Vec<u8> {
             });
         });
     }
+    if let Some(kind) = &dev.link_kind {
+        // `rtnl_link_info_fill`: the kind, and the kind's own data.
+        const IFLA_XFRM_LINK: u16 = 1;
+        const IFLA_XFRM_IF_ID: u16 = 2;
+        const IFLA_XFRM_COLLECT_METADATA: u16 = 3;
+        nest(&mut b, IFLA_LINKINFO, |l| {
+            let mut k = kind.name().as_bytes().to_vec();
+            k.push(0);
+            attr(l, IFLA_INFO_KIND, &k);
+            if let LinkKind::Xfrm { link, if_id, collect_md } = kind {
+                nest(l, IFLA_INFO_DATA, |d| {
+                    attr(d, IFLA_XFRM_LINK, &link.to_le_bytes());
+                    attr(d, IFLA_XFRM_IF_ID, &if_id.to_le_bytes());
+                    if *collect_md {
+                        attr(d, IFLA_XFRM_COLLECT_METADATA, &[]);
+                    }
+                });
+            }
+        });
+    }
+    // `nla_put_iflink`: the device it is linked to, if not itself.
+    const IFLA_LINK: u16 = 5;
+    if let Some(LinkKind::Xfrm { link, .. }) = &dev.link_kind {
+        if *link != dev.index {
+            attr(&mut b, IFLA_LINK, &link.to_le_bytes());
+        }
+    }
     let mut q = dev.qdisc.as_bytes().to_vec();
     q.push(0);
     attr(&mut b, IFLA_QDISC, &q);
     b
+}
+
+/// `rtnl_newlink`: the request's `nlmsg_flags`, its `ifinfomsg` (index,
+/// flags, change mask) and its attributes. A kind's checks first (`dummy`'s
+/// address), then the device the request names: one that is there is
+/// changed (`rtnl_changelink`, `NLM_F_EXCL` `EEXIST`), one that is not is
+/// made with `NLM_F_CREATE` (`rtnl_newlink_create`, `rtnl_create_link`),
+/// else `ENODEV`. A device made is listed with no notice until its flags
+/// are set (`rtnl_configure_link`), then one `RTM_NEWLINK`, all changed.
+/// Of the kinds GKI builds in, `dummy` and `xfrm` are here; another kind
+/// is refused and said once (`tun` refuses, as `tun_validate` does).
+pub fn newlink(nl_flags: u16, ifi_index: i32, ifi_flags: u32, ifi_change: u32, attrs: &[u8]) -> Result<(), Errno> {
+    const NLM_F_REPLACE: u16 = 0x100;
+    const NLM_F_EXCL: u16 = 0x200;
+    const NLM_F_CREATE: u16 = 0x400;
+    const IFLA_ADDRESS: u16 = 1;
+    const IFLA_BROADCAST: u16 = 2;
+    const IFLA_IFNAME: u16 = 3;
+    const IFLA_MTU: u16 = 4;
+    const IFLA_MASTER: u16 = 10;
+    const IFLA_PROTINFO: u16 = 12;
+    const IFLA_TXQLEN: u16 = 13;
+    const IFLA_MAP: u16 = 14;
+    const IFLA_OPERSTATE: u16 = 16;
+    const IFLA_LINKMODE: u16 = 17;
+    const IFLA_LINKINFO: u16 = 18;
+    const IFLA_GROUP: u16 = 27;
+    const IFLA_NUM_TX_QUEUES: u16 = 31;
+    const IFLA_NUM_RX_QUEUES: u16 = 32;
+    const IFLA_INFO_KIND: u16 = 1;
+    const IFLA_INFO_DATA: u16 = 2;
+    const IFLA_XFRM_LINK: u16 = 1;
+    const IFLA_XFRM_IF_ID: u16 = 2;
+    const IFLA_XFRM_COLLECT_METADATA: u16 = 3;
+    let tb: Vec<(u16, &[u8])> = attrs_of(attrs);
+    let get = |k: u16| tb.iter().rev().find(|(t, _)| *t == k).map(|(_, d)| *d);
+    let u32_of = |d: &[u8]| -> Result<u32, Errno> { d.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or(Errno::EINVAL) };
+    let linkinfo: Vec<(u16, &[u8])> = get(IFLA_LINKINFO).map(attrs_of).unwrap_or_default();
+    let info = |k: u16| linkinfo.iter().rev().find(|(t, _)| *t == k).map(|(_, d)| *d);
+    // The kind (`rtnl_link_ops_get`), and its checks.
+    #[derive(PartialEq)]
+    enum Ops {
+        Dummy,
+        Xfrm,
+    }
+    let ops = match info(IFLA_INFO_KIND) {
+        None => None,
+        Some(k) => {
+            let k = k.split(|&b| b == 0).next().unwrap_or(&[]);
+            match k {
+                b"dummy" => Some(Ops::Dummy),
+                b"xfrm" => Some(Ops::Xfrm),
+                // `tun_validate`.
+                b"tun" => return Err(Errno::EOPNOTSUPP),
+                // A kind GKI builds in or as a module that this kernel
+                // lacks is said; any other is no kind, as on Linux.
+                other => {
+                    const GKI: [&[u8]; 15] = [b"veth", b"bridge", b"vti", b"vti6", b"ipip", b"gre", b"gretap", b"erspan", b"ip6gre", b"ip6gretap", b"ip6erspan", b"wireguard", b"ifb", b"vlan", b"vcan"];
+                    if GKI.contains(&other) {
+                        crate::bpf::say_once(&format!("RTM_NEWLINK of kind {} (of the kinds GKI has, only dummy and xfrm here)", String::from_utf8_lossy(other)));
+                    }
+                    None
+                }
+            }
+        }
+    };
+    let data: Vec<(u16, &[u8])> = if ops.is_some() { info(IFLA_INFO_DATA).map(attrs_of).unwrap_or_default() } else { Vec::new() };
+    let datum = |k: u16| data.iter().rev().find(|(t, _)| *t == k).map(|(_, d)| *d);
+    if ops == Some(Ops::Dummy) {
+        // `dummy_validate`.
+        if let Some(a) = get(IFLA_ADDRESS) {
+            if a.len() != 6 {
+                return Err(Errno::EINVAL);
+            }
+            if a[0] & 1 != 0 || a.iter().all(|&b| b == 0) {
+                return Err(Errno::EADDRNOTAVAIL);
+            }
+        }
+    }
+    // `xfrmi_netlink_parms`.
+    let xfrm = || -> Result<(u32, u32, bool), Errno> {
+        let link = datum(IFLA_XFRM_LINK).map(u32_of).transpose()?.unwrap_or(0);
+        let if_id = datum(IFLA_XFRM_IF_ID).map(u32_of).transpose()?.unwrap_or(0);
+        Ok((link, if_id, datum(IFLA_XFRM_COLLECT_METADATA).is_some()))
+    };
+    // The device named, by index or by name.
+    if ifi_index < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let name = get(IFLA_IFNAME).map(|n| String::from_utf8_lossy(n.split(|&b| b == 0).next().unwrap_or(&[])).into_owned());
+    let (specified, found) = if ifi_index > 0 {
+        (true, by_index(ifi_index as u32))
+    } else if let Some(n) = &name {
+        (true, by_name(n))
+    } else {
+        (false, None)
+    };
+    // The rest of the attributes, for `do_setlink`.
+    let rest = || -> Vec<u8> {
+        let mut out = Vec::new();
+        for (k, d) in attrs_of(attrs) {
+            if k != IFLA_LINKINFO {
+                attr(&mut out, k, d);
+            }
+        }
+        out
+    };
+    if let Some(dev) = found {
+        // `rtnl_changelink`.
+        if nl_flags & NLM_F_EXCL != 0 {
+            return Err(Errno::EEXIST);
+        }
+        if nl_flags & NLM_F_REPLACE != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if info(IFLA_INFO_DATA).is_some() {
+            match (&ops, &dev.link_kind) {
+                (Some(Ops::Xfrm), Some(LinkKind::Xfrm { link, collect_md, .. })) => {
+                    // `xfrmi_changelink`, then `xfrmi_update`.
+                    let (new_link, if_id, md) = xfrm()?;
+                    if if_id == 0 || md || *collect_md {
+                        return Err(Errno::EINVAL);
+                    }
+                    if all().iter().any(|d| d.index != dev.index && matches!(d.link_kind, Some(LinkKind::Xfrm { if_id: i, .. }) if i == if_id)) {
+                        return Err(Errno::EEXIST);
+                    }
+                    // `xfrmi_change`: the link cannot change.
+                    let same_link = new_link == *link;
+                    if same_link {
+                        update(dev.index, |d| {
+                            if let Some(LinkKind::Xfrm { if_id: i, .. }) = &mut d.link_kind {
+                                *i = if_id;
+                            }
+                        });
+                    }
+                    state_change(dev.index);
+                    if !same_link {
+                        return Err(Errno::EINVAL);
+                    }
+                }
+                _ => return Err(Errno::EOPNOTSUPP),
+            }
+        }
+        return setlink(dev.index, ifi_flags, ifi_change, &rest());
+    }
+    if nl_flags & NLM_F_CREATE == 0 {
+        if specified || get(IFLA_GROUP).is_none() {
+            return Err(Errno::ENODEV);
+        }
+        crate::bpf::say_once("RTM_NEWLINK changing a group of links (not here)");
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if get(IFLA_MAP).is_some() || get(IFLA_PROTINFO).is_some() {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let Some(ops) = ops else { return Err(Errno::EOPNOTSUPP) };
+    // `rtnl_create_link`.
+    let template = |k: &str| format!("{k}%d");
+    let name = name.unwrap_or_else(|| template(if ops == Ops::Dummy { "dummy" } else { "xfrm" }));
+    for q in [IFLA_NUM_TX_QUEUES, IFLA_NUM_RX_QUEUES] {
+        if let Some(d) = get(q) {
+            if !(1..=4096).contains(&u32_of(d)?) {
+                return Err(Errno::EINVAL);
+            }
+            if u32_of(d)? != 1 {
+                crate::bpf::say_once("RTM_NEWLINK with more than one queue (not here)");
+                return Err(Errno::EOPNOTSUPP);
+            }
+        }
+    }
+    let mut dev = match ops {
+        Ops::Dummy => dummy_dev(&name),
+        Ops::Xfrm => {
+            let (link, if_id, md) = xfrm()?;
+            xfrm_dev(&name, link, if_id, md)
+        }
+    };
+    // `validate_linkmsg`.
+    let addr_len = dev.addr.len();
+    if get(IFLA_ADDRESS).is_some_and(|a| a.len() < addr_len) || get(IFLA_BROADCAST).is_some_and(|a| a.len() < addr_len) {
+        return Err(Errno::EINVAL);
+    }
+    if let Some(d) = get(IFLA_MTU) {
+        let mtu = u32_of(d)?;
+        if mtu < dev.min_mtu || (dev.max_mtu > 0 && mtu > dev.max_mtu) {
+            return Err(Errno::EINVAL);
+        }
+        dev.mtu = mtu;
+    }
+    if let Some(a) = get(IFLA_ADDRESS) {
+        dev.addr = a[..addr_len].to_vec();
+        dev.addr_assign_type = 3;
+    }
+    if let Some(a) = get(IFLA_BROADCAST) {
+        dev.broadcast = a[..addr_len].to_vec();
+    }
+    if let Some(d) = get(IFLA_TXQLEN) {
+        dev.txqlen = u32_of(d)?;
+    }
+    for (k, what) in [(IFLA_OPERSTATE, "an operational state"), (IFLA_LINKMODE, "a link mode"), (IFLA_GROUP, "a group"), (IFLA_MASTER, "a master")] {
+        if get(k).is_some() {
+            crate::bpf::say_once(&format!("RTM_NEWLINK making a link with {what} (not here)"));
+            return Err(Errno::EOPNOTSUPP);
+        }
+    }
+    // The kind's `newlink`: `xfrmi_newlink`'s checks.
+    if let Some(LinkKind::Xfrm { link, if_id, collect_md }) = &dev.link_kind {
+        let xfrms: Vec<(u32, bool)> = all().iter().filter_map(|d| match d.link_kind {
+            Some(LinkKind::Xfrm { if_id, collect_md, .. }) => Some((if_id, collect_md)),
+            _ => None,
+        }).collect();
+        if *collect_md {
+            if *link != 0 || *if_id != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if xfrms.iter().any(|(_, md)| *md) {
+                return Err(Errno::EEXIST);
+            }
+        } else {
+            if *if_id == 0 {
+                return Err(Errno::EINVAL);
+            }
+            if xfrms.iter().any(|(i, md)| !md && i == if_id) {
+                return Err(Errno::EEXIST);
+            }
+        }
+    }
+    let fixed = (ifi_index > 0).then_some(ifi_index as u32);
+    let dev = register_quiet(dev, fixed)?;
+    // `rtnl_configure_link`.
+    let mut dev = dev;
+    if ifi_flags != 0 || ifi_change != 0 {
+        let mut f = ifi_flags;
+        if ifi_change != 0 {
+            f = (f & ifi_change) | (dev.get_flags() & !ifi_change);
+        }
+        match change_flags_quiet(dev.index, f) {
+            Ok((d, _)) => dev = d,
+            Err(e) => {
+                unregister(dev.index);
+                return Err(e);
+            }
+        }
+    }
+    notify(RTM_NEWLINK, &dev, !0);
+    Ok(())
+}
+
+/// `rtnl_dellink`'s `rtnl_delete_link`: a device whose kind has link
+/// operations goes (`unregister_netdevice`); the others are `EOPNOTSUPP`.
+pub fn dellink(index: u32) -> Result<(), Errno> {
+    let dev = by_index(index).ok_or(Errno::ENODEV)?;
+    if dev.tun.is_none() && dev.link_kind.is_none() {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    unregister(index);
+    Ok(())
 }
 
 /// `do_setlink` for an `RTM_NEWLINK` request naming a device that is
@@ -661,7 +1062,7 @@ mod tests {
         for bad in ["", ".", "..", "a/b", "a:b", "a b", "0123456789abcdef"] {
             assert!(!valid_name(bad), "{bad:?}");
         }
-        let t = Table { devs: boot_devices(), last_index: 2 };
+        let t = Table { devs: boot_devices(), last_index: 3 };
         assert_eq!(prep_name(&t, "tun%d"), Ok("tun0".into()));
         assert_eq!(prep_name(&t, "eth%d"), Ok("eth1".into()));
         assert_eq!(prep_name(&t, "lo"), Err(Errno::EEXIST));

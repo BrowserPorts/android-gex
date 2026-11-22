@@ -465,6 +465,7 @@ impl TunFile {
                 netns_immutable: false,
                 addr_gen_mode: 0,
                 tun: Some(tun),
+                link_kind: None,
                 stats: [0; 8],
             }
         } else {
@@ -491,6 +492,7 @@ impl TunFile {
                 netns_immutable: false,
                 addr_gen_mode: 0,
                 tun: Some(tun),
+                link_kind: None,
                 stats: [0; 8],
             }
         };
