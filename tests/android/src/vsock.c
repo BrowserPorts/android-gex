@@ -21,12 +21,16 @@
 //   it are EINVAL or ENOTCONN.
 // Then, where the host is the emulator (port 5000 accepts): the sensors
 // service, as the image's sensors HAL asks it, says it has no sensors;
-// after a shutdown, reads are 0 and writes EPIPE.
+// after a shutdown, reads are 0 and writes EPIPE. The boot-properties
+// service, as qemu-props asks it, lists none (the end-of-list NUL alone:
+// this emulator is given no properties); the misc pipe answers a heartbeat
+// OK, random bytes as many as asked, and anything else KO.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -193,6 +197,27 @@ int main(void) {
         if (shutdown(fd, SHUT_WR)) die("shutdown", 0, errno);
         if (read(fd, buf, sizeof buf) != 0) die("read after shutdown", 0, errno);
         if (write(fd, "x", 1) != -1 || errno != EPIPE) die("write after shutdown", 0, errno);
+        close(fd);
+
+        fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+        static const char props[] = "pipe:qemud:boot-properties";
+        if (connect_to(fd, VMADDR_CID_HOST, 5000) || write(fd, props, sizeof props) != sizeof props || write(fd, "0004list", 8) != 8) die("boot-properties", 0, errno);
+        if (read_fully(fd, buf, 5) || memcmp(buf, "0001", 5)) die("the end of the properties", buf[4], 0);
+        close(fd);
+
+        fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+        static const char misc[] = "pipe:QemuMiscPipe";
+        if (connect_to(fd, VMADDR_CID_HOST, 5000) || write(fd, misc, sizeof misc) != sizeof misc) die("the misc pipe", 0, errno);
+        static const char *const asks[] = {"heartbeat", "get_random=12", "what"};
+        static const int answers[] = {3, 12, 3};
+        for (int i = 0; i < 3; i++) {
+            int32_t n = strlen(asks[i]) + 1, got;
+            if (write(fd, &n, 4) != 4 || write(fd, asks[i], n) != n) die("a misc message", i, errno);
+            if (read_fully(fd, (char *)&got, 4) || got != answers[i] || read_fully(fd, buf, got)) die("a misc answer", i, got);
+            if (i == 0 && memcmp(buf, "OK", 3)) die("a heartbeat's answer", buf[0], 0);
+            if (i == 2 && memcmp(buf, "KO", 3)) die("an unknown message's answer", buf[0], 0);
+        }
+        printf("vsock: no boot properties, and the misc pipe answers\n");
     }
     close(fd);
     printf("vsock ok\n");

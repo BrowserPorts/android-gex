@@ -29,9 +29,21 @@
 //!   sensors (0), `wake` answers `wake`; `set-delay:`, `time:` and `set:`
 //!   (of a sensor not there) are taken without an answer, as is anything
 //!   else. With no sensor enabled nothing is ever reported.
+//!   **`boot-properties`** (`android/boot-properties.c`): `list` answers
+//!   each property the emulator was given as a message, then a message of
+//!   one NUL that ends the list; this host gives none, so the list is the
+//!   NUL alone (`qemu-props` reads it and sets nothing). Anything else is
+//!   taken without an answer.
+//! - **`QemuMiscPipe`** (`android/emulation/QemuMiscPipe.cpp`), a message
+//!   pipe rather than a qemud service: each message both ways is a 32-bit
+//!   length in the guest's byte order and that many bytes (`qemu-props`'s
+//!   `sendMessage`). `heartbeat` and `bootcomplete` answer `OK` and a NUL,
+//!   `get_random=<n>` that many random bytes (the kernel's), anything else
+//!   `KO` and a NUL. The emulator's work on boot completion (its adb
+//!   scripts, the display's cutout) is not done here.
 //!
-//! The emulator's other services (`boot-properties`, `gps`, the camera,
-//! `QemuMiscPipe` and the rest) are not here.
+//! The emulator's other services (`gps`, the camera and the rest) are not
+//! here.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -43,12 +55,14 @@ const CONNECT_MAX: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Service {
     Sensors,
+    BootProperties,
 }
 
 impl Service {
     fn find(name: &[u8]) -> Option<Service> {
         match name {
             b"sensors" => Some(Service::Sensors),
+            b"boot-properties" => Some(Service::BootProperties),
             _ => None,
         }
     }
@@ -62,8 +76,39 @@ impl Service {
                 b"wake" => Some(b"wake".to_vec()),
                 _ => None,
             },
+            // `boot_property_client_recv`: no properties, then the NUL.
+            Service::BootProperties => (msg == b"list").then(|| vec![0]),
         }
     }
+}
+
+/// `qemuMiscPipeDecodeAndExecute`: the answer to one message.
+fn misc_message(msg: &[u8]) -> Vec<u8> {
+    if msg.starts_with(b"heartbeat") || msg.starts_with(b"bootcomplete") {
+        return b"OK\0".to_vec();
+    }
+    if let Some(rest) = msg.strip_prefix(b"get_random=") {
+        // `sscanf("%d")`: an optional sign, then digits.
+        let text: Vec<u8> = rest.iter().copied().take_while(|b| *b != 0).collect();
+        let text = String::from_utf8_lossy(&text);
+        let text = text.trim_start();
+        let digits: String = text.chars().enumerate().take_while(|(i, c)| c.is_ascii_digit() || (*i == 0 && (*c == '-' || *c == '+'))).map(|(_, c)| c).collect();
+        if let Ok(n) = digits.parse::<i64>() {
+            if n > 0 {
+                let mut out = vec![0u8; n.min(i32::MAX as i64) as usize];
+                crate::vfs::devfs::fill_random(&mut out);
+                return out;
+            }
+        }
+    }
+    b"KO\0".to_vec()
+}
+
+/// What a connection string names.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Target {
+    Qemud(Service),
+    Misc,
 }
 
 #[derive(Debug)]
@@ -77,6 +122,8 @@ enum State {
         /// Guest bytes not yet a whole frame.
         partial: Vec<u8>,
     },
+    /// `QemuMiscPipe`, with the guest's bytes not yet a whole message.
+    Misc(Vec<u8>),
 }
 
 /// The host's end of one stream to the emulator's pipe services.
@@ -117,8 +164,12 @@ impl Connection {
                     Some(nul) => {
                         name.extend_from_slice(&buf[..nul]);
                         match connect(name) {
-                            Some(service) => {
+                            Some(Target::Qemud(service)) => {
                                 self.state = State::Qemud { service, partial: Vec::new() };
+                                &buf[nul + 1..]
+                            }
+                            Some(Target::Misc) => {
+                                self.state = State::Misc(Vec::new());
                                 &buf[nul + 1..]
                             }
                             None => {
@@ -130,7 +181,7 @@ impl Connection {
                     }
                 }
             }
-            State::Qemud { .. } => buf,
+            State::Qemud { .. } | State::Misc(_) => buf,
         };
         if let State::Qemud { service, partial } = &mut self.state {
             partial.extend_from_slice(rest);
@@ -138,6 +189,21 @@ impl Connection {
                 if let Some(answer) = service.message(&msg) {
                     self.out.extend(frame(&answer));
                 }
+            }
+        }
+        if let State::Misc(partial) = &mut self.state {
+            partial.extend_from_slice(rest);
+            // A length, then the message (`AndroidMessagePipe`).
+            while partial.len() >= 4 {
+                let len = i32::from_le_bytes([partial[0], partial[1], partial[2], partial[3]]);
+                let len = len.max(0) as usize;
+                if partial.len() - 4 < len {
+                    break;
+                }
+                let msg: Vec<u8> = partial.drain(..4 + len).skip(4).collect();
+                let answer = misc_message(&msg);
+                self.out.extend((answer.len() as i32).to_le_bytes());
+                self.out.extend(answer);
             }
         }
         self.out.len() > before
@@ -212,14 +278,22 @@ fn frames(partial: &mut Vec<u8>) -> Vec<Vec<u8>> {
     msgs
 }
 
-/// The service a connection string names: `pipe:qemud:<service>[:<args>]`.
-/// `None` for anything else (`ConnectorPipe::onGuestSend`; no service but
-/// qemud's is here, and no `qemud:<name>` service of its own).
-fn connect(name: &[u8]) -> Option<Service> {
+/// The service a connection string names: `pipe:qemud:<service>[:<args>]`,
+/// or `pipe:QemuMiscPipe`. `None` for anything else
+/// (`ConnectorPipe::onGuestSend`; no other service is here, and no
+/// `qemud:<name>` service of its own).
+fn connect(name: &[u8]) -> Option<Target> {
     let rest = name.strip_prefix(b"pipe:")?;
-    let args = rest.strip_prefix(b"qemud:")?;
-    let service = args.split(|&b| b == b':').next()?;
-    Service::find(service)
+    // The pipe's name, up to its arguments.
+    let mut parts = rest.splitn(2, |&b| b == b':');
+    match parts.next()? {
+        b"QemuMiscPipe" => Some(Target::Misc),
+        b"qemud" => {
+            let service = parts.next()?.split(|&b| b == b':').next()?;
+            Service::find(service).map(Target::Qemud)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -269,7 +343,7 @@ mod tests {
         assert!(c.send(&[&b"mud:sensors:extra\0"[..], &frame(b"list-sensors")].concat()));
         assert_eq!(read_all(&mut c), b"00010");
 
-        for name in [&b"pipe:qemud:gps\0"[..], b"pipe:opengles\0", b"pipe:qemud\0", b"pipe:sensors\0", b"qemud:sensors\0", b"pipe:QemuMiscPipe\0"] {
+        for name in [&b"pipe:qemud:gps\0"[..], b"pipe:opengles\0", b"pipe:qemud\0", b"pipe:sensors\0", b"qemud:sensors\0", b"pipe:QemuMiscPipes\0"] {
             let mut c = Connection::new();
             c.send(name);
             assert!(!c.send(&frame(b"list-sensors")), "{}", String::from_utf8_lossy(name));
@@ -280,6 +354,32 @@ mod tests {
         c.send(&[b'x'; 100]);
         c.send(&[b'x'; 28]);
         assert!(!c.send(&[b"\0".as_slice(), &frame(b"list-sensors")].concat()));
+    }
+
+    /// What `qemu-props` does: the boot properties (none here), then a
+    /// heartbeat on the misc pipe, written in two parts as it writes them.
+    #[test]
+    fn boot_properties_are_none_and_the_misc_pipe_answers() {
+        let mut c = Connection::new();
+        assert!(c.send(b"pipe:qemud:boot-properties\0000\x34list"));
+        assert_eq!(read_all(&mut c), b"0001\0");
+        assert!(!c.send(&frame(b"other")));
+
+        let mut m = Connection::new();
+        assert!(!m.send(b"pipe:QemuMiscPipe:args\0"));
+        let msg = b"heartbeat\0";
+        assert!(!m.send(&(msg.len() as i32).to_le_bytes()));
+        assert!(m.send(msg));
+        assert_eq!(read_all(&mut m), [&3i32.to_le_bytes()[..], b"OK\0"].concat());
+        let both = [&5i32.to_le_bytes()[..], b"what\0", &14i32.to_le_bytes()[..], b"get_random=16\0"].concat();
+        assert!(m.send(&both));
+        let got = read_all(&mut m);
+        assert_eq!(&got[..7], [&3i32.to_le_bytes()[..], b"KO\0"].concat().as_slice());
+        assert_eq!(&got[7..11], &16i32.to_le_bytes());
+        assert_eq!(got.len(), 11 + 16);
+        assert_eq!(misc_message(b"get_random=0\0"), b"KO\0");
+        assert_eq!(misc_message(b"get_random=-3\0"), b"KO\0");
+        assert_eq!(misc_message(b"bootcomplete\0"), b"OK\0");
     }
 
     #[test]
