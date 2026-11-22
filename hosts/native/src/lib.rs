@@ -424,6 +424,11 @@ pub(crate) mod jit_stats {
     pub static COMPILE_US: AtomicU64 = AtomicU64::new(0);
     /// Blocks that failed their page check and were translated again.
     pub static STALE: AtomicU64 = AtomicU64::new(0);
+    /// Blocks that failed their page check while a newer translation
+    /// provided their address (reached by a direct jump), and the pages
+    /// retired for such a block reached again and again.
+    pub static STALE_PASSED: AtomicU64 = AtomicU64::new(0);
+    pub static STALE_SIBLING: AtomicU64 = AtomicU64::new(0);
     /// The last few translated pcs, and since the last line the lowest and
     /// highest, so a translation storm shows where it is without a print per
     /// miss (which changes the timing enough to hide it).
@@ -1020,7 +1025,7 @@ fn jit_stats_every() {
         use jit_stats::*;
         use std::sync::atomic::Ordering::Relaxed;
         eprintln!(
-            "gex: jit at {}s: {} published ({} blocks, {} MiB of wasm), {} installs, {} cache hits, {} misses, {} filled, {} stale, {} retired; tmpfs {} MiB",
+            "gex: jit at {}s: {} published ({} blocks, {} MiB of wasm), {} installs, {} cache hits, {} misses, {} filled, {} stale ({} passed, {} pages retired for them), {} retired; tmpfs {} MiB",
             start.elapsed().as_secs(),
             PUBLISHED.load(Relaxed),
             BLOCKS.load(Relaxed),
@@ -1030,6 +1035,8 @@ fn jit_stats_every() {
             CACHE_MISSES.load(Relaxed),
             FILLED.load(Relaxed),
             STALE.load(Relaxed),
+            STALE_PASSED.load(Relaxed),
+            STALE_SIBLING.load(Relaxed),
             RETIRED.load(Relaxed),
             gex_kernel::vfs::tmpfs::TMPFS_BYTES.load(Relaxed) >> 20,
         );
@@ -6158,9 +6165,25 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     }
                     None => false,
                 };
+                if !again {
+                    jit_stats::STALE_PASSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 if again {
                     jit_stats::STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     translate_and_install(&mut caller, start)?;
+                } else if n == STALE_SIBLING_LIMIT {
+                    // A newer translation provides the address, yet this
+                    // block is reached again and again: by a direct jump
+                    // from a sibling in its own module whose pages have not
+                    // changed, so nothing would translate the sibling again,
+                    // and a loop through the two costs a trip here every
+                    // pass (ART's JIT, whose code cache is written a page
+                    // past code that already runs). The block's page is
+                    // retired: the siblings on it fail their own checks and
+                    // are translated again, without the jump.
+                    jit_stats::STALE_SIBLING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let page = start / gex_abi::DISPATCH_PAGE * gex_abi::DISPATCH_PAGE;
+                    retire_translations(&mut caller, &[(page, page + gex_abi::DISPATCH_PAGE)])?;
                 } else {
                     // The newer translation is in the shared registry, but
                     // not necessarily in this thread's table yet: without
@@ -6726,6 +6749,10 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
 /// neighbour's slot conflict, a page retired and translated anew), never
 /// hundreds: translating it again each time ate 100 MB/s until MemoryMax.
 const REMISS_LIMIT: u32 = 64;
+
+/// How many times running a block that a newer translation has replaced may
+/// fail its page check before its page is retired (`PAGE_STALE`).
+const STALE_SIBLING_LIMIT: u64 = 64;
 
 /// Count a miss at `pc` when it is already translated, and past
 /// [`REMISS_LIMIT`] stop with what dispatch sees there.
