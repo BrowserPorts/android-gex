@@ -1413,6 +1413,39 @@ struct Mounted {
     group: Option<u64>,
     /// The peer group it takes from without giving to, if it is a slave.
     master: Option<u64>,
+    /// Whether a program made it (`mount(2)`), rather than the host in
+    /// setting the namespace up.
+    guest: bool,
+    /// What it covers, by where each is: the mount made at the same place
+    /// before it and every mount under that place, each of them a
+    /// program's (Linux hides them under the new mount until it is
+    /// unmounted). The host's own mounts are never covered: they stand
+    /// for what a system's early boot would have mounted, and a program
+    /// that mounts over `/dev` still finds the host's `/dev/binderfs`.
+    covered: Vec<(String, Mounted)>,
+}
+
+/// Put `m` at `at` in `table`. A program's mount covers what a program
+/// mounted there or under it, which comes back when it is unmounted
+/// ([`uncover`]); the host's replaces what was at `at`, as it always has.
+fn cover_with(table: &mut BTreeMap<String, Mounted>, at: String, mut m: Mounted) {
+    if m.guest {
+        let under: Vec<String> = table.iter().filter(|(k, v)| v.guest && (at == "/" || within(k, &at))).map(|(k, _)| k.clone()).collect();
+        for k in under {
+            let v = table.remove(&k).expect("a key of the table");
+            m.covered.push((k, v));
+        }
+    }
+    table.insert(at, m);
+}
+
+/// Take the mount at `at` from `table`, and put back what it covered.
+fn uncover(table: &mut BTreeMap<String, Mounted>, at: &str) -> Option<Mounted> {
+    let mut gone = table.remove(at)?;
+    for (k, v) in std::mem::take(&mut gone.covered) {
+        table.insert(k, v);
+    }
+    Some(gone)
 }
 
 /// Every mount namespace there is, for a mount that spreads.
@@ -1510,7 +1543,10 @@ impl MountNs {
     /// is (a bind mount's peers are elsewhere than it), and in their slaves
     /// as a slave. What is made under a shared mount is shared, in a group
     /// of its own with its copies (`attach_recursive_mnt`).
-    fn mount(self: &Arc<Self>, at: String, fs: Arc<dyn FileSystem>, origin: Arc<dyn FileSystem>, root: String, join: Option<u64>, unless_there: bool) -> bool {
+    ///
+    /// A program's mount (`guest`) covers what programs mounted at `at`
+    /// and under it, in each namespace it is made in ([`cover_with`]).
+    fn mount(self: &Arc<Self>, at: String, fs: Arc<dyn FileSystem>, origin: Arc<dyn FileSystem>, root: String, join: Option<u64>, unless_there: bool, guest: bool) -> bool {
         let spread = {
             let mut table = self.lock();
             if unless_there && table.contains_key(&at) {
@@ -1519,7 +1555,7 @@ impl MountNs {
             match Self::covering(&table, &at).map(|(_, m, loc)| (m.group, Arc::clone(&m.origin), loc)) {
                 Some((Some(group), cover, loc)) => (group, cover, loc),
                 _ => {
-                    table.insert(at, Mounted { fs, origin, root, group: join, master: None });
+                    cover_with(&mut table, at, Mounted { fs, origin, root, group: join, master: None, guest, covered: Vec::new() });
                     self.count();
                     return true;
                 }
@@ -1534,8 +1570,10 @@ impl MountNs {
                 root: root.clone(),
                 group: if slave { None } else { Some(new) },
                 master: if slave { Some(new) } else { None },
+                guest,
+                covered: Vec::new(),
             };
-            ns.lock().insert(path, m);
+            cover_with(&mut ns.lock(), path, m);
             ns.count();
         }
         true
@@ -1548,11 +1586,14 @@ impl MountNs {
         let (group, cover, loc, gone) = {
             let mut table = self.lock();
             let Some(gone) = table.get(at).cloned() else { return false };
-            let parent = Self::parent(&table, at).map(|(k, m)| (m.group, Arc::clone(&m.origin), place(&m.root, &at[if k == "/" { 0 } else { k.len() }..])));
+            // What it is mounted on: the mount it covers at the same place,
+            // else the one it is in.
+            let on = gone.covered.iter().find(|(k, _)| k == at).map(|(_, m)| (m.group, Arc::clone(&m.origin), m.root.clone()));
+            let parent = on.or_else(|| Self::parent(&table, at).map(|(k, m)| (m.group, Arc::clone(&m.origin), place(&m.root, &at[if k == "/" { 0 } else { k.len() }..]))));
             match parent {
                 Some((Some(group), cover, loc)) => (group, cover, loc, gone),
                 _ => {
-                    table.remove(at);
+                    uncover(&mut table, at);
                     self.count();
                     return true;
                 }
@@ -1563,17 +1604,25 @@ impl MountNs {
             let mut table = ns.lock();
             // The same mount there: the filesystem that spread with it.
             if table.get(&path).is_some_and(|m| Arc::ptr_eq(&m.fs, &gone.fs)) {
-                table.remove(&path);
+                uncover(&mut table, &path);
                 done |= Arc::ptr_eq(&ns, self) && path == at;
                 drop(table);
                 ns.count();
             }
         }
         if !done {
-            self.lock().remove(at);
+            uncover(&mut self.lock(), at);
             self.count();
         }
         true
+    }
+
+    /// The programs' mounts under `at` (not at it), deepest first.
+    fn guest_children(&self, at: &str) -> Vec<String> {
+        let table = self.lock();
+        let mut out: Vec<String> = table.iter().filter(|(k, m)| m.guest && k.as_str() != at && (at == "/" || within(k, at))).map(|(k, _)| k.clone()).collect();
+        out.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        out
     }
 
     /// Change how the mount at exactly `at` spreads, and with `recursive`
@@ -1584,9 +1633,19 @@ impl MountNs {
             return false;
         }
         let which: Vec<String> = table.keys().filter(|k| k.as_str() == at || (recursive && (at == "/" || within(k, at)))).cloned().collect();
+        // Each mount, and with `recursive` what each covers (Linux's
+        // change goes through the whole tree under the mount).
+        fn each(m: &mut Mounted, recursive: bool, f: &mut dyn FnMut(&mut Mounted)) {
+            f(m);
+            if recursive {
+                for (_, c) in m.covered.iter_mut() {
+                    each(c, recursive, f);
+                }
+            }
+        }
         for k in which {
-            let m = table.get_mut(&k).expect("a key of the table");
-            match kind {
+            let top = table.get_mut(&k).expect("a key of the table");
+            each(top, recursive, &mut |m: &mut Mounted| match kind {
                 // A group of its own, which a copy of the namespace then
                 // has too.
                 Propagation::Shared => {
@@ -1601,7 +1660,7 @@ impl MountNs {
                         m.master = Some(group);
                     }
                 }
-            }
+            });
         }
         true
     }
@@ -1813,8 +1872,43 @@ impl VfsView {
     /// for every process in it, and wherever it spreads to.
     pub fn mount(&self, at: &str, fs: Arc<dyn FileSystem>) {
         let at = self.outer(at);
-        self.mount_ns().mount(at, Arc::clone(&fs), fs, String::new(), None, false);
+        self.mount_ns().mount(at, Arc::clone(&fs), fs, String::new(), None, false, false);
         self.sync();
+    }
+
+    /// A program's mount (`mount(2)`): as [`VfsView::mount`], but over
+    /// what programs mounted at `at` and under it, which it hides until it
+    /// is unmounted, as Linux's does.
+    pub fn mount_program(&self, at: &str, fs: Arc<dyn FileSystem>) {
+        let at = self.outer(at);
+        self.mount_ns().mount(at, Arc::clone(&fs), fs, String::new(), None, false, true);
+        self.sync();
+    }
+
+    /// A program's unmount (`umount2`) of the mount at exactly `path`:
+    /// `EINVAL` where there is none, `EBUSY` while programs' mounts are
+    /// under it, unless `detach` (`MNT_DETACH`), which takes them too. What
+    /// it covered shows again.
+    pub fn unmount_program(&self, path: &str, detach: bool) -> Result<(), Errno> {
+        if normalize(path, "/") == "/" {
+            return Err(Errno::EINVAL);
+        }
+        let at = self.outer(path);
+        if !self.own().contains_key(&at) {
+            let ns = self.mount_ns();
+            if !ns.lock().contains_key(&at) {
+                return Err(Errno::EINVAL);
+            }
+            let children = ns.guest_children(&at);
+            if !children.is_empty() && !detach {
+                return Err(Errno::EBUSY);
+            }
+            for child in children {
+                ns.unmount(&child);
+            }
+        }
+        self.sync();
+        if self.unmount(path) { Ok(()) } else { Err(Errno::EINVAL) }
     }
 
     /// Remove the mount at exactly `path` (absolute). The root mount
@@ -1888,9 +1982,9 @@ impl VfsView {
             Vec::new()
         };
         let target = self.outer(&target);
-        ns.mount(target.clone(), root, origin, place_of, join, false);
+        ns.mount(target.clone(), root, origin, place_of, join, false, true);
         for (rest, m) in under {
-            ns.mount(format!("{}{rest}", target.trim_end_matches('/')), m.fs, m.origin, m.root, m.group, false);
+            ns.mount(format!("{}{rest}", target.trim_end_matches('/')), m.fs, m.origin, m.root, m.group, false, true);
         }
         self.sync();
         Ok(())
@@ -1904,7 +1998,7 @@ impl VfsView {
             return false;
         }
         let fs = fs();
-        let mounted = self.mount_ns().mount(at, Arc::clone(&fs), fs, String::new(), None, true);
+        let mounted = self.mount_ns().mount(at, Arc::clone(&fs), fs, String::new(), None, true, true);
         self.sync();
         mounted
     }
@@ -3125,6 +3219,53 @@ mod tests {
         jailed.join_mounts(apart.view().mount_ns());
         assert!(jailed.is_mount_point("/d") && jailed.is_mount_point("/jail/in") && !jailed.is_mount_point("/a"));
         assert_eq!((jailed.root(), jailed.cwd.as_str()), ("/", "/"));
+    }
+
+    /// A program's mount covers what programs mounted at its place and
+    /// under it, until it is unmounted; an unmount with mounts under it is
+    /// `EBUSY` but for `MNT_DETACH`. The host's own mounts stay.
+    #[test]
+    fn a_programs_mount_covers_what_is_under_it() {
+        let root = Arc::new(TmpFs::new());
+        for dir in ["data", "data/user", "data/user/0", "dev", "dev/binderfs"] {
+            root.add_dir(dir);
+        }
+        let mut v = Vfs::new();
+        v.mount("/", root);
+        let host = Arc::new(TmpFs::new());
+        host.add_file("binder", Vec::new());
+        v.mount("/dev/binderfs", host);
+        let lower = Arc::new(TmpFs::new());
+        lower.add_dir("0");
+        lower.add_file("0/app", Vec::new());
+        let view = Arc::clone(v.view());
+        view.mount_program("/data/user", lower);
+        let bound = Arc::new(TmpFs::new());
+        bound.add_file("bound", Vec::new());
+        view.mount_program("/data/user/0", bound);
+        v.refresh();
+        assert!(v.open("/data/user/0/bound", 0, 0).is_ok());
+        // An app's tmpfs over /data/user: nothing of either below shows.
+        view.mount_program("/data/user", Arc::new(TmpFs::new()));
+        view.mount_program("/dev", Arc::new(TmpFs::new()));
+        v.refresh();
+        assert!(v.metadata("/data/user/0").is_err());
+        assert!(!v.is_mount_point("/data/user/0"));
+        assert!(v.open("/dev/binderfs/binder", 0, 0).is_ok());
+        // Gone again, the two below are back as they were.
+        assert_eq!(view.unmount_program("/data/user", false), Ok(()));
+        v.refresh();
+        assert!(v.open("/data/user/0/bound", 0, 0).is_ok());
+        assert_eq!(view.unmount_program("/data/user/0", false), Ok(()));
+        v.refresh();
+        assert!(v.open("/data/user/0/app", 0, 0).is_ok());
+        // Busy with a mount under it, unless detached.
+        view.mount_program("/data/user/0", Arc::new(TmpFs::new()));
+        assert_eq!(view.unmount_program("/data/user", false), Err(Errno::EBUSY));
+        assert_eq!(view.unmount_program("/data/user", true), Ok(()));
+        v.refresh();
+        assert!(!v.is_mount_point("/data/user/0") && !v.is_mount_point("/data/user"));
+        assert_eq!(view.unmount_program("/data/user", true), Err(Errno::EINVAL));
     }
 
     /// A bind mount shows what is at one place at another: the same

@@ -4947,7 +4947,8 @@ impl PathIo<'_> {
         // under any other name nothing would find it.
         if n == nr::UMOUNT2 {
             let target = self.ns.mount_target(&self.at_path(m, AT_FDCWD, a[0])?);
-            return if self.view.unmount(&target) { Ok(0) } else { Err(Errno::EINVAL) };
+            const MNT_DETACH: u64 = 2;
+            return self.view.unmount_program(&target, a[1] & MNT_DETACH != 0).map(|()| 0);
         }
         let target = self.ns.mount_target(&self.at_path(m, AT_FDCWD, a[1])?);
         let fstype = if a[2] == 0 {
@@ -5010,11 +5011,11 @@ impl PathIo<'_> {
         match fstype.as_str() {
             "tmpfs" | "ramfs" => {
                 let options = if a[4] == 0 { Vec::new() } else { m.read_cstr(a[4], 4096)? };
-                self.view.mount(&target, mounted(Arc::new(crate::vfs::TmpFs::mounted(&String::from_utf8_lossy(&options))?)));
+                self.view.mount_program(&target, mounted(Arc::new(crate::vfs::TmpFs::mounted(&String::from_utf8_lossy(&options))?)));
                 Ok(0)
             }
             "devtmpfs" | "devfs" => {
-                self.view.mount(&target, mounted(Arc::new(crate::vfs::DevFs::new())));
+                self.view.mount_program(&target, mounted(Arc::new(crate::vfs::DevFs::new())));
                 Ok(0)
             }
             // A filesystem on a block device: ext4, which is ext2's and
@@ -5043,7 +5044,7 @@ impl PathIo<'_> {
                     }
                     return Err(if read_only { Errno::EACCES } else { Errno::EROFS });
                 }
-                self.view.mount(&target, mounted(Arc::new(crate::vfs::ext4::Ext4Fs::new(dev)?)));
+                self.view.mount_program(&target, mounted(Arc::new(crate::vfs::ext4::Ext4Fs::new(dev)?)));
                 Ok(0)
             }
             // selinuxfs: every mount is the one filesystem, over the
@@ -5052,7 +5053,7 @@ impl PathIo<'_> {
                 if a[4] != 0 && !m.read_cstr(a[4], 4096)?.is_empty() {
                     return Err(Errno::EINVAL);
                 }
-                self.view.mount(&target, mounted(Arc::new(crate::vfs::SelinuxFs::of_kernel())));
+                self.view.mount_program(&target, mounted(Arc::new(crate::vfs::SelinuxFs::of_kernel())));
                 Ok(0)
             }
             // bpffs: each mount is one of its own, empty.
@@ -5061,14 +5062,14 @@ impl PathIo<'_> {
                     crate::bpf::say_once("bpffs mount options");
                     return Err(Errno::EINVAL);
                 }
-                self.view.mount(&target, mounted(Arc::new(crate::vfs::BpfFs::new())));
+                self.view.mount_program(&target, mounted(Arc::new(crate::vfs::BpfFs::new())));
                 Ok(0)
             }
             // binderfs: every mount has binder devices of its own.
             "binder" => {
                 let data = if a[4] == 0 { Vec::new() } else { m.read_cstr(a[4], 4096)? };
                 let max = crate::vfs::BinderFs::options(&String::from_utf8_lossy(&data))?;
-                self.view.mount(&target, mounted(Arc::new(crate::vfs::BinderFs::new(max)?)));
+                self.view.mount_program(&target, mounted(Arc::new(crate::vfs::BinderFs::new(max)?)));
                 Ok(0)
             }
             // `/proc` needs a source of process state that only the host can
@@ -5100,7 +5101,7 @@ impl PathIo<'_> {
             "cgroup" => {
                 let options = if a[4] == 0 { Vec::new() } else { m.read_cstr(a[4], 4096)? };
                 let hier = crate::cgroup1::mount(&String::from_utf8_lossy(&options))?;
-                self.view.mount(&target, mounted(crate::vfs::cgroup1fs::instance(hier)));
+                self.view.mount_program(&target, mounted(crate::vfs::cgroup1fs::instance(hier)));
                 Ok(0)
             }
             "debugfs" => {
