@@ -2580,6 +2580,12 @@ fn run_thread_loop(
                 if let Some(signo) = other {
                     let detail = e.downcast_ref::<wasmtime::Trap>().map(|t| t.to_string()).unwrap_or_default();
                     let at = store.data().memory.clone().map(|m| read_u64(m.bytes(), (ctx_addr + ctx::PC as u64) as usize)).unwrap_or(0);
+                    if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
+                        // A trap's signal goes to the handler at the PC last
+                        // written back (a block's start), with no address:
+                        // say which trap, and where in the wasm.
+                        eprintln!("gex: trap in guest code ({detail}), signal {signo} at the context's pc {at:#x}, thread {}: {e:?}", store.data().thread.tid);
+                    }
                     // A wasm32 program's handler runs from a frame its own code
                     // finds at a syscall's return (libgex `__gex_signal_frames`),
                     // and the frames that trapped are gone: it dies of the
@@ -5003,6 +5009,26 @@ fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64
 /// instruction runs again, its handler runs, or the process ends.
 fn access_fault(caller: &mut Caller<'_, HostState>, addr: u64, pc: u64, size: u32, write: bool) -> Result<()> {
     let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
+        // What the translation of `pc` was made against and what is there
+        // now: a fault in code changed since (a JIT's reused cache) shows
+        // as an instruction that cannot make it, or a page whose directory
+        // entry no longer names the base the block checks.
+        let alt = thread_alt(&*caller);
+        let page = gex_abi::page_key(pc, alt);
+        let key = gex_abi::addr_key(pc, alt);
+        let (provider, translated, base, retired) = caller.data().jit.as_ref().map_or((None, false, None, 0), |j| {
+            let sh = j.shared.lock().unwrap_or_else(|e| e.into_inner());
+            (sh.provider.get(&key).copied(), sh.translated.contains(&key), sh.page_table.lookup(page), sh.retired_pages.get(&page).copied().unwrap_or(0))
+        });
+        let alt_dir = if alt { other_dir(&*caller) } else { 0 };
+        let gm = GuestMem::new(memory.bytes());
+        let dir = gex_abi::dir_entry_addr(page, alt_dir).and_then(|a| gm.read_u32(a).ok());
+        let inst = gm.read_u32(pc).ok();
+        eprintln!(
+            "gex: access fault at {addr:#x} ({size} bytes, write {write}) at pc {pc:#x}: instruction there now {inst:08x?}; provider {provider:x?}, translated {translated}; page {page:#x} has base {base:?}, directory entry {dir:?}, retired {retired} times"
+        );
+    }
     let state = caller.data_mut();
     let mut gm = GuestMem::new(memory.bytes());
     let what = if write { "a store" } else { "a load" };
@@ -7793,6 +7819,31 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
             for fr in bt.frames().iter().take(24) {
                 eprintln!("gex-wine32:   {}", fr.func_name().unwrap_or("?"));
             }
+        }
+    }
+    if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
+        // Where the branch came from: the block of the last indirect branch,
+        // what is there now, and whether its translation still matches its
+        // page (a JIT's code cache reused under an old translation).
+        if let Some(memory) = caller.data().memory.clone() {
+            let gm = GuestMem::new(memory.bytes());
+            let base = caller.data().thread.ctx_addr;
+            let last = gm.read_u64(base + ctx::LAST_TARGET as u64).unwrap_or(0);
+            let src = gm.read_u64(base + ctx::LAST_SOURCE as u64).unwrap_or(0);
+            let lr = gm.read_u64(base + ctx::x(30) as u64).unwrap_or(0);
+            let code: Vec<String> = (0..8).map(|i| format!("{:08x}", gm.read_u32(src + 4 * i).unwrap_or(0))).collect();
+            let alt = thread_alt(&*caller);
+            let page = gex_abi::page_key(src, alt);
+            let (provider, base_now, retired) = caller.data().jit.as_ref().map_or((None, None, 0), |j| {
+                let sh = j.shared.lock().unwrap_or_else(|e| e.into_inner());
+                (sh.provider.get(&gex_abi::addr_key(src, alt)).copied(), sh.page_table.lookup(page), sh.retired_pages.get(&page).copied().unwrap_or(0))
+            });
+            let alt_dir = if alt { other_dir(&*caller) } else { 0 };
+            let dir = gex_abi::dir_entry_addr(page, alt_dir).and_then(|a| gm.read_u32(a).ok());
+            eprintln!(
+                "gex: branch to {pc:#x}, which cannot be run: x30 {lr:#x}; last indirect target {last:#x} from block {src:#x} [{}]; provider {provider:x?}; page {page:#x} has base {base_now:?}, directory entry {dir:?}, retired {retired} times",
+                code.join(" ")
+            );
         }
     }
     if deliver_guest_fault_kind(caller, fault_code::ACCESS_VIOLATION, pc, pc, 8)? {
