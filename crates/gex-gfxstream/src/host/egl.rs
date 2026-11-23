@@ -128,6 +128,43 @@ pub fn texture_image(display: EGLDisplay, context: EGLContext, texture: u32) -> 
     create_image(display, context, EGL_GL_TEXTURE_2D_KHR, texture as usize as *mut c_void)
 }
 
+pub type EGLSync = *mut c_void;
+pub const EGL_SYNC_FENCE_KHR: EGLenum = 0x30F9;
+pub const EGL_SYNC_STATUS_KHR: EGLint = 0x30F1;
+pub const EGL_SIGNALED_KHR: EGLint = 0x30F2;
+pub const EGL_CONDITION_SATISFIED_KHR: EGLint = 0x30F6;
+pub const EGL_SYNC_FLUSH_COMMANDS_BIT_KHR: EGLint = 0x0001;
+pub const EGL_FOREVER_KHR: u64 = u64::MAX;
+
+/// `EGL_KHR_fence_sync` and `EGL_KHR_wait_sync`, found once.
+pub struct SyncFns {
+    pub create: unsafe extern "C" fn(EGLDisplay, EGLenum, *const EGLint) -> EGLSync,
+    pub destroy: unsafe extern "C" fn(EGLDisplay, EGLSync) -> EGLBoolean,
+    pub client_wait: unsafe extern "C" fn(EGLDisplay, EGLSync, EGLint, u64) -> EGLint,
+    pub wait: unsafe extern "C" fn(EGLDisplay, EGLSync, EGLint) -> EGLint,
+    pub get_attrib: unsafe extern "C" fn(EGLDisplay, EGLSync, EGLint, *mut EGLint) -> EGLBoolean,
+}
+
+pub fn sync_fns() -> Option<&'static SyncFns> {
+    static F: std::sync::OnceLock<Option<SyncFns>> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        let p = |n: &str| {
+            let a = proc_address(n);
+            (!a.is_null()).then_some(a)
+        };
+        unsafe {
+            Some(SyncFns {
+                create: std::mem::transmute(p("eglCreateSyncKHR")?),
+                destroy: std::mem::transmute(p("eglDestroySyncKHR")?),
+                client_wait: std::mem::transmute(p("eglClientWaitSyncKHR")?),
+                wait: std::mem::transmute(p("eglWaitSyncKHR")?),
+                get_attrib: std::mem::transmute(p("eglGetSyncAttribKHR")?),
+            })
+        }
+    })
+    .as_ref()
+}
+
 /// `eglCreateImageKHR` with no attributes.
 pub fn create_image(display: EGLDisplay, context: EGLContext, target: EGLenum, buffer: *mut c_void) -> EGLImage {
     let p = proc_address("eglCreateImageKHR");

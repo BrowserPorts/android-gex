@@ -99,7 +99,22 @@ pub struct Renderer {
     syncs: std::collections::HashMap<u64, usize>,
     next_sync: u64,
     dma: Option<Box<dyn Dma>>,
+    /// Fence syncs (`EmulatedEglFenceSync`) by handle, from 1.
+    fences: std::collections::HashMap<u64, Fence>,
+    next_fence: u64,
 }
+
+/// A fence sync and its references: one, and one more to be let go when it
+/// signals (`destroyWhenSignaled`).
+struct Fence {
+    egl: EGLSync,
+    refs: u32,
+    destroy_when_signaled: bool,
+}
+
+/// `SyncThread::get()`'s address, which the guest passes back to the sync
+/// device: any number but 0.
+pub const SYNC_THREAD: u64 = 1;
 
 // The EGL handles are the driver's; the renderer's lock is what orders
 // their use.
@@ -165,7 +180,7 @@ impl Renderer {
         unsafe { eglMakeCurrent(display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
         let max_version = if features.gles_dynamic_version { max_version_of(&host_version) } else { MaxVersion::Es2 };
         let configs = config::Configs::new(display, max_version > MaxVersion::Es2);
-        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None, syncs: Default::default(), next_sync: 0, dma: None })
+        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None, syncs: Default::default(), next_sync: 0, dma: None, fences: Default::default(), next_fence: 0 })
     }
 
     /// `rcGetGLString`'s answer for `name`: the host's string on the
@@ -486,6 +501,48 @@ impl Thread {
                 reply(&[], r.create_image(v(0) as u32, v(1) as u32, v(2) as u32, owner) as u64)
             }
             "rcDestroyClientImage" => reply(&[], r.destroy_image(v(0) as u32) as u64),
+            "rcCreateSyncKHR" => {
+                // Some context must be current: a trivial one if not
+                // (`createTrivialContext`, `bindContext`).
+                if self.context == 0 {
+                    let owner = self.owner();
+                    let ctx = r.create_context(0, 0, objects::GLES_API_2, owner);
+                    let win = r.create_window(0, 1, 1, owner);
+                    self.make_current(&mut r, ctx, win, win);
+                }
+                let h = r.create_fence(v(3) != 0);
+                let thread = if h == 0 { 0 } else { SYNC_THREAD };
+                reply(&[&h.to_le_bytes(), &thread.to_le_bytes()], 0)
+            }
+            "rcClientWaitSyncKHR" => {
+                let Some(egl) = r.fences.get(&v(0)).map(|f| f.egl) else { return reply(&[], EGL_CONDITION_SATISFIED_KHR as u64) };
+                let display = r.display;
+                drop(r);
+                let res = sync_fns().map(|s| unsafe { (s.client_wait)(display, egl, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, v(2)) }).unwrap_or(EGL_CONDITION_SATISFIED_KHR);
+                reply(&[], res as u32 as u64)
+            }
+            "rcWaitSyncKHR" => {
+                if let (Some(f), Some(s)) = (r.fences.get(&v(0)), sync_fns()) {
+                    unsafe { (s.wait)(r.display, f.egl, 0) };
+                }
+                None
+            }
+            "rcDestroySyncKHR" | "rcDestroySyncKHRAsync" => {
+                r.fence_unref(v(0));
+                entry.answers().then(|| crate::answer(entry, call, &[], 0))
+            }
+            "rcIsSyncSignaled" => {
+                let signaled = match (r.fences.get(&v(0)), sync_fns()) {
+                    (Some(f), Some(s)) => {
+                        let mut st = 0;
+                        unsafe { (s.get_attrib)(r.display, f.egl, EGL_SYNC_STATUS_KHR, &mut st) };
+                        st == EGL_SIGNALED_KHR
+                    }
+                    // A sync not here was destroyed: signalled.
+                    _ => true,
+                };
+                reply(&[], signaled as u64)
+            }
             "rcFBPost" => {
                 r.post(v(0) as u32);
                 None
@@ -576,6 +633,61 @@ impl Drop for Thread {
 }
 
 impl Renderer {
+    /// `EmulatedEglFenceSync::create`: a fence on the current context, the
+    /// context flushed; 0 if the host makes none.
+    fn create_fence(&mut self, destroy_when_signaled: bool) -> u64 {
+        let Some(f) = sync_fns() else {
+            not_yet("eglCreateSyncKHR");
+            return 0;
+        };
+        let egl = unsafe { (f.create)(self.display, EGL_SYNC_FENCE_KHR, std::ptr::null()) };
+        if egl.is_null() {
+            eprintln!("[gex] gfxstream: no EGL fence sync: {:#x}", unsafe { eglGetError() });
+            return 0;
+        }
+        if let Ok(g) = gl::fns() {
+            unsafe { (g.glFlush)() };
+        }
+        self.next_fence += 1;
+        self.fences.insert(self.next_fence, Fence { egl, refs: 1 + destroy_when_signaled as u32, destroy_when_signaled });
+        self.next_fence
+    }
+
+    fn fence_unref(&mut self, handle: u64) {
+        let gone = match self.fences.get_mut(&handle) {
+            Some(f) => {
+                f.refs -= 1;
+                f.refs == 0
+            }
+            None => false,
+        };
+        if gone {
+            let f = self.fences.remove(&handle).unwrap();
+            if let Some(s) = sync_fns() {
+                unsafe { (s.destroy)(self.display, f.egl) };
+            }
+        }
+    }
+
+    /// The sync device's wait (`SyncThread`'s trigger-wait): until the fence
+    /// signals, then the reference it kept for that let go.
+    pub fn wait_fence(renderer: &Mutex<Renderer>, handle: u64) {
+        let (display, egl) = {
+            let r = renderer.lock().unwrap_or_else(|e| e.into_inner());
+            match r.fences.get(&handle) {
+                Some(f) => (r.display, f.egl),
+                None => return,
+            }
+        };
+        if let Some(s) = sync_fns() {
+            unsafe { (s.client_wait)(display, egl, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER_KHR) };
+        }
+        let mut r = renderer.lock().unwrap_or_else(|e| e.into_inner());
+        if r.fences.get(&handle).is_some_and(|f| f.destroy_when_signaled) {
+            r.fence_unref(handle);
+        }
+    }
+
     /// Where DMA pointers' memory is.
     pub fn set_dma(&mut self, dma: Box<dyn Dma>) {
         self.dma = Some(dma);
@@ -865,6 +977,34 @@ mod tests {
         let at = |x: usize, y: usize| &px[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4];
         assert_eq!(at(0, 8), [0, 255, 0, 255]);
         assert_eq!(at(15, 8), [0, 0, 255, 255]);
+        assert!(t.broken.is_none());
+    }
+
+    /// The composer's frame fence: a sync made with no context current (a
+    /// trivial one is bound), waited for as the sync device's host does,
+    /// then signalled, waited on, destroyed; unknown handles signalled.
+    #[test]
+    #[ignore = "needs the host's Mesa EGL"]
+    fn fence_syncs_signal_and_go() {
+        let r = Renderer::new(Features::default(), DisplaySize { width: 8, height: 8, dpi_x: 160, dpi_y: 160 }).unwrap();
+        let renderer = Arc::new(Mutex::new(r));
+        let mut t = Thread::new(renderer.clone());
+        let attrs: Vec<u8> = [0x3144i32, -1, egl::EGL_NONE].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut w = 0u32.to_le_bytes().to_vec();
+        w.extend(encode("rcCreateSyncKHR", &[P::V(0x3144), P::In(&attrs), P::V(attrs.len() as u64), P::V(1), P::Out(8), P::Out(8)]));
+        let a = t.feed(&w);
+        let h = u64::from_le_bytes(a[0..8].try_into().unwrap());
+        assert_ne!(h, 0);
+        assert_eq!(u64::from_le_bytes(a[8..16].try_into().unwrap()), SYNC_THREAD);
+        assert_ne!(t.context, 0, "a trivial context bound");
+        Renderer::wait_fence(&renderer, h);
+        let a = t.feed(&encode("rcIsSyncSignaled", &[P::V(h)]));
+        assert_eq!(i32_at(&a, 0), 1);
+        let a = t.feed(&encode("rcClientWaitSyncKHR", &[P::V(h), P::V(1), P::V(u64::MAX)]));
+        assert_eq!(i32_at(&a, 0), EGL_CONDITION_SATISFIED_KHR);
+        assert_eq!(i32_at(&t.feed(&encode("rcDestroySyncKHR", &[P::V(h)])), 0), 0);
+        assert!(renderer.lock().unwrap().fences.is_empty());
+        assert_eq!(i32_at(&t.feed(&encode("rcIsSyncSignaled", &[P::V(h)])), 0), 1);
         assert!(t.broken.is_none());
     }
 
