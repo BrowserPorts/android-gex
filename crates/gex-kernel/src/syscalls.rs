@@ -3721,7 +3721,8 @@ impl PathIo<'_> {
             nr::FSTAT => self.fstat(m, a[0] as i32, a[1]),
             nr::NEWFSTATAT => self.fstatat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::STATX => self.statx(m, a[0] as i32, a[1], a[2], a[4]),
-            nr::FACCESSAT | nr::FACCESSAT2 => self.faccessat(m, a[0] as i32, a[1], a[2] as u32),
+            nr::FACCESSAT => self.faccessat(m, a[0] as i32, a[1], a[2] as u32, 0),
+            nr::FACCESSAT2 => self.faccessat(m, a[0] as i32, a[1], a[2] as u32, a[3] as u32),
             nr::READLINKAT => self.readlinkat(m, a[0] as i32, a[1], a[2], a[3]),
             nr::GETCWD => self.getcwd(m, a[0], a[1]),
             nr::BPF => {
@@ -4277,16 +4278,75 @@ impl PathIo<'_> {
         Ok(0)
     }
 
-    pub fn faccessat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32) -> SysResult {
+    /// `faccessat` and `faccessat2` as `do_faccessat` asks: the real ids
+    /// (the effective ones with `AT_EACCESS`), and with them root's
+    /// permitted capabilities or, for anyone else, none; a write to a
+    /// read-only filesystem `EROFS`; then `generic_permission` on the
+    /// file's owner, group and mode, and `CAP_DAC_OVERRIDE` and
+    /// `CAP_DAC_READ_SEARCH` as it lets them override. Not yet: search
+    /// permission on the directories along the path, ACLs, SELinux.
+    pub fn faccessat(&self, m: &GuestMem<'_>, dirfd: i32, path: u64, mode: u32, flags: u32) -> SysResult {
+        const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+        const AT_EACCESS: u32 = 0x200;
+        const AT_EMPTY_PATH: u32 = 0x1000;
+        const CAP_DAC_OVERRIDE: u64 = 1 << 1;
+        const CAP_DAC_READ_SEARCH: u64 = 1 << 2;
+        const W: u32 = 2;
+        const X: u32 = 1;
+        if mode & !7 != 0 || flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH) != 0 {
+            return Err(Errno::EINVAL);
+        }
         let p = self.at_path(m, dirfd, path)?;
-        // A root guest (`--uid 0`) may read and write anything; execute
-        // still needs an execute bit, which the host checks. Anything but
-        // what is in a read-only mount, which nobody writes.
-        if self.creds.ruid() == 0 && mode & 2 != 0 && self.ns.access(&p, 2) == Err(Errno::EROFS) {
+        let md = if flags & AT_SYMLINK_NOFOLLOW != 0 { self.ns.metadata_nofollow(&p)? } else { self.ns.metadata(&p)? };
+        if mode == 0 {
+            return Ok(0);
+        }
+        // `access_override_creds`.
+        let caps = self.creds.caps();
+        let (uid, gid, caps) = if flags & AT_EACCESS != 0 {
+            (self.creds.uid(), self.creds.gid(), caps[0])
+        } else {
+            let ruid = self.creds.ruid();
+            (ruid, self.creds.rgid(), if ruid == 0 { caps[1] } else { 0 })
+        };
+        // `sb_permission`: nothing is written on a read-only filesystem.
+        if mode & W != 0 && matches!(md.file_type, FileType::Regular | FileType::Directory | FileType::Symlink) && self.ns.access(&p, W) == Err(Errno::EROFS) {
             return Err(Errno::EROFS);
         }
-        let mode = if self.creds.ruid() == 0 { mode & 1 } else { mode & 7 };
-        self.ns.access(&p, mode).map(|_| 0)
+        // A file whose filesystem keeps no owner: the filesystem's own
+        // answer (the host's, for a host tree without owners: a guest
+        // that `stat` says owns everything would otherwise be told it may
+        // write root's directories). Execute alone for root, as before.
+        let Some((owner, group)) = md.owner else {
+            let ask = if uid == 0 { mode & X } else { mode };
+            return self.ns.access(&p, ask).map(|_| 0);
+        };
+        // `acl_permission_check`.
+        let perm = md.mode & 0o7777;
+        let bits = if uid == owner {
+            perm >> 6
+        } else if gid == group || self.creds.groups().contains(&group) {
+            perm >> 3
+        } else {
+            perm
+        } & 7;
+        if mode & !bits == 0 {
+            return Ok(0);
+        }
+        let has = |c: u64| caps & c != 0;
+        if md.file_type == FileType::Directory {
+            if mode & W == 0 && has(CAP_DAC_READ_SEARCH) {
+                return Ok(0);
+            }
+            return if has(CAP_DAC_OVERRIDE) { Ok(0) } else { Err(Errno::EACCES) };
+        }
+        if mode == 4 && has(CAP_DAC_READ_SEARCH) {
+            return Ok(0);
+        }
+        if (mode & X == 0 || perm & 0o111 != 0) && has(CAP_DAC_OVERRIDE) {
+            return Ok(0);
+        }
+        Err(Errno::EACCES)
     }
 
     pub fn readlinkat(
