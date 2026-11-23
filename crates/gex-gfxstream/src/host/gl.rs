@@ -7,6 +7,7 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 
 pub const GL_TEXTURE_2D: u32 = 0x0DE1;
+pub const GL_VERSION: u32 = 0x1F02;
 pub const GL_TEXTURE_BINDING_2D: u32 = 0x8069;
 pub const GL_FRAMEBUFFER: u32 = 0x8D40;
 pub const GL_FRAMEBUFFER_BINDING: u32 = 0x8CA6;

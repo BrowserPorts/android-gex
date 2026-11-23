@@ -407,13 +407,17 @@ impl Thread {
                 let (ret, b) = string_answer(&s, size.min(value(&a[2]) as i32));
                 reply(&[&b], ret as u32 as u64)
             }
-            "rcGetGLString" => {
-                let s = r.gl_string(value(&a[0]) as u32, None);
-                let size = match a[1] {
+            "rcGetGLString" | "rcGetHostExtensionsString" => {
+                // The host's string on the thread's current context, if it
+                // has one (`rcGetHostExtensionsString` is GL_EXTENSIONS's).
+                let (name, out, size) = if call.name == "rcGetGLString" { (v(0) as u32, 1, 2) } else { (GL_EXTENSIONS, 1, 0) };
+                let current = (self.context != 0).then(|| gl_string(name));
+                let s = r.gl_string(name, current);
+                let room = match a[out] {
                     Arg::Out(n) => n as i32,
                     _ => 0,
                 };
-                let (ret, b) = string_answer(&s, size.min(value(&a[2]) as i32));
+                let (ret, b) = string_answer(&s, room.min(v(size) as i32));
                 reply(&[&b], ret as u32 as u64)
             }
             "rcGetNumConfigs" => reply(&[&(config::ATTRIBUTES.len() as u32).to_le_bytes()], r.configs.list.len() as u64),
@@ -543,6 +547,64 @@ impl Thread {
                 };
                 reply(&[], signaled as u64)
             }
+            // One display, 0, whose only config is 0 (`mDisplayConfigs`).
+            "rcGetFBDisplayConfigsCount" => reply(&[], 1),
+            "rcGetFBDisplayActiveConfig" => reply(&[], 0),
+            "rcGetFBDisplayConfigsParam" => {
+                let p = if v(0) as i32 != 0 {
+                    -1
+                } else {
+                    match v(1) {
+                        1 => r.size.width,
+                        2 => r.size.height,
+                        3 => r.size.dpi_x,
+                        4 => r.size.dpi_y,
+                        5 => 60,
+                        _ => -1,
+                    }
+                };
+                reply(&[], p as u32 as u64)
+            }
+            "rcGetDisplayPose" => {
+                if v(0) != 0 {
+                    return reply(&[], u32::MAX as u64);
+                }
+                let (w, h) = (r.size.width as u32, r.size.height as u32);
+                reply(&[&0i32.to_le_bytes(), &0i32.to_le_bytes(), &w.to_le_bytes(), &h.to_le_bytes()], 0)
+            }
+            "rcSetDisplayPose" | "rcSetDisplayPoseDpi" | "rcSetDisplayColorBuffer" => reply(&[], if v(0) == 0 { 0 } else { u32::MAX as u64 }),
+            "rcGetDisplayColorBuffer" => {
+                if v(0) != 0 {
+                    return reply(&[], u32::MAX as u64);
+                }
+                reply(&[&r.shown.to_le_bytes()], 0)
+            }
+            "rcGetColorBufferDisplay" => {
+                let shown = v(0) as u32 == r.shown && r.shown != 0;
+                reply(&[&0u32.to_le_bytes()], if shown { 0 } else { u32::MAX as u64 })
+            }
+            "rcCreateDisplay" | "rcCreateDisplayById" | "rcDestroyDisplay" => {
+                eprintln!("[gex] gfxstream: {}: there is one display here, 0", call.name);
+                if entry.answers() {
+                    reply(&[], u32::MAX as u64)
+                } else {
+                    None
+                }
+            }
+            // The identity until set (`rcGetDisplayColorTransform`).
+            "rcGetDisplayColorTransform" => {
+                let mut m = [0f32; 16];
+                for i in 0..4 {
+                    m[i * 5] = 1.0;
+                }
+                let b: Vec<u8> = m.iter().flat_map(|x| x.to_le_bytes()).collect();
+                reply(&[&b], if v(0) == 0 { 0 } else { u32::MAX as u64 })
+            }
+            "rcSetDisplayColorTransform" => reply(&[], if v(0) == 0 { 0 } else { u32::MAX as u64 }),
+            "rcColorBufferCacheFlush" => reply(&[], 0),
+            // Taken and not used here: the swap interval of a window, the
+            // process's name, host-side tracing.
+            "rcFBSetSwapInterval" | "rcSetProcessMetadata" | "rcSetTracingForPuid" => None,
             "rcFBPost" => {
                 r.post(v(0) as u32);
                 None
@@ -1120,6 +1182,15 @@ mod tests {
         assert_eq!(renderer.lock().unwrap().objects.windows[&(win as u32)].width, 32);
         let a = t.feed(&encode("rcMakeCurrent", &[P::V(ctx as u64), P::V(win as u64), P::V(win as u64)]));
         assert_eq!(i32_at(&a, 0), 1);
+        // With a context current, the GL strings are the host's own, the
+        // version the one offered.
+        let a = t.feed(&encode("rcGetGLString", &[P::V(gl::GL_VERSION as u64), P::Out(256), P::V(256)]));
+        let v = String::from_utf8_lossy(&a[..i32_at(&a, 256) as usize - 1]).into_owned();
+        assert!(v.starts_with("OpenGL ES 3.1") || v.starts_with("OpenGL ES 3.0") || v.starts_with("OpenGL ES 2.0"), "{v}");
+        assert!(v.len() > "OpenGL ES 3.1".len(), "{v}");
+        let a = t.feed(&encode("rcGetHostExtensionsString", &[P::V(8192), P::Out(8192)]));
+        let e = String::from_utf8_lossy(&a[..i32_at(&a, 8192) as usize - 1]).into_owned();
+        assert!(e.contains("GL_OES_EGL_image ") && e.contains("ANDROID_EMU_host_composition_v2"), "{e}");
         // The renderer's textures are not the guest context's.
         let cb_tex = renderer.lock().unwrap().objects.color_buffers[&(cb as u32)].tex;
         type IsTexture = unsafe extern "C" fn(u32) -> u8;
