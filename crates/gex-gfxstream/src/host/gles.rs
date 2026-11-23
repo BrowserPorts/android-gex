@@ -184,7 +184,8 @@ impl Thread {
         let mut outs: Vec<usize> = Vec::new();
         for (p, a) in entry.params.iter().zip(&call.args) {
             match a {
-                Arg::Value(x) => v.push(*x),
+                // No OpenGL ES call has one; the address alone.
+                Arg::Value(x) | Arg::Dma(x) => v.push(*x),
                 Arg::In(d) if d.is_empty() && p.null_allowed => v.push(0),
                 Arg::Out(0) if p.null_allowed => {
                     v.push(0);

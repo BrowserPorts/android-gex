@@ -46,6 +46,17 @@ impl Default for Features {
     }
 }
 
+/// The memory DMA pointers name (the goldfish address space's), by guest
+/// physical address: what the emulator's `g_emugl_dma_get_host_addr` gives
+/// its decoders.
+pub trait Dma: Send {
+    /// `buf.len()` bytes at `addr` into `buf`; false if they are not all
+    /// there.
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool;
+    /// `buf` to `addr`; false if the memory is not all there.
+    fn write(&self, addr: u64, buf: &[u8]) -> bool;
+}
+
 /// The OpenGL ES version the host's contexts reach (`GLESDispatchMaxVersion`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MaxVersion {
@@ -87,6 +98,7 @@ pub struct Renderer {
     /// The guest's syncs (`glFenceSyncAEMU`) by handle, from 1.
     syncs: std::collections::HashMap<u64, usize>,
     next_sync: u64,
+    dma: Option<Box<dyn Dma>>,
 }
 
 // The EGL handles are the driver's; the renderer's lock is what orders
@@ -153,7 +165,7 @@ impl Renderer {
         unsafe { eglMakeCurrent(display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
         let max_version = if features.gles_dynamic_version { max_version_of(&host_version) } else { MaxVersion::Es2 };
         let configs = config::Configs::new(display, max_version > MaxVersion::Es2);
-        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None, syncs: Default::default(), next_sync: 0 })
+        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None, syncs: Default::default(), next_sync: 0, dma: None })
     }
 
     /// `rcGetGLString`'s answer for `name`: the host's string on the
@@ -498,7 +510,29 @@ impl Thread {
                 r.bind_color_buffer(v(0) as u32, true);
                 None
             }
-            "rcUpdateColorBuffer" | "rcUpdateColorBufferDMA" => {
+            "rcUpdateColorBufferDMA" | "rcReadColorBufferDMA" => {
+                let (Arg::Dma(addr), size) = (&a[7], v(8) as usize) else { return reply(&[], 0) };
+                let (cb, x, y, w, h, fmt, ty) = (v(0) as u32, v(1) as i32, v(2) as i32, v(3) as i32, v(4) as i32, v(5) as u32, v(6) as u32);
+                if *addr == 0 || r.dma.is_none() {
+                    eprintln!("[gex] gfxstream: {} with no DMA memory at {addr:#x}", call.name);
+                    return reply(&[], 0);
+                }
+                if call.name == "rcUpdateColorBufferDMA" {
+                    let mut px = vec![0u8; size];
+                    if !r.dma.as_ref().unwrap().read(*addr, &mut px) {
+                        eprintln!("[gex] gfxstream: rcUpdateColorBufferDMA: {size} bytes at {addr:#x} are not all DMA memory");
+                        return reply(&[], 0);
+                    }
+                    r.update_color_buffer(cb, x, y, w, h, fmt, ty, &px);
+                } else {
+                    let px = r.read_color_buffer(cb, x, y, w, h, fmt, ty, size);
+                    if !r.dma.as_ref().unwrap().write(*addr, &px) {
+                        eprintln!("[gex] gfxstream: rcReadColorBufferDMA: {size} bytes at {addr:#x} are not all DMA memory");
+                    }
+                }
+                reply(&[], 0)
+            }
+            "rcUpdateColorBuffer" => {
                 let pixels = match &a[7] {
                     Arg::In(d) => *d,
                     _ => &[],
@@ -506,7 +540,7 @@ impl Thread {
                 r.update_color_buffer(v(0) as u32, v(1) as i32, v(2) as i32, v(3) as i32, v(4) as i32, v(5) as u32, v(6) as u32, pixels);
                 reply(&[], 0)
             }
-            "rcReadColorBuffer" | "rcReadColorBufferDMA" => {
+            "rcReadColorBuffer" => {
                 let len = match a[7] {
                     Arg::Out(n) => n as usize,
                     _ => 0,
@@ -542,6 +576,11 @@ impl Drop for Thread {
 }
 
 impl Renderer {
+    /// Where DMA pointers' memory is.
+    pub fn set_dma(&mut self, dma: Box<dyn Dma>) {
+        self.dma = Some(dma);
+    }
+
     fn add_sync(&mut self, sync: *mut std::ffi::c_void) -> u64 {
         self.next_sync += 1;
         self.syncs.insert(self.next_sync, sync as usize);
@@ -584,6 +623,7 @@ mod tests {
         V(u64),
         In(&'a [u8]),
         Out(u32),
+        Dma(u64),
     }
 
     fn encode(name: &str, params: &[P<'_>]) -> Vec<u8> {
@@ -597,6 +637,7 @@ mod tests {
                     body.extend_from_slice(d);
                 }
                 (P::Out(n), _) => body.extend_from_slice(&n.to_le_bytes()),
+                (P::Dma(a), crate::Kind::Dma) => body.extend_from_slice(&a.to_le_bytes()),
                 _ => panic!("{name}: a parameter of the wrong kind"),
             }
         }
@@ -733,6 +774,58 @@ mod tests {
         assert!(r.objects.color_buffers.contains_key(&(target as u32)));
         r.post(src as u32);
         assert!(!r.objects.color_buffers.contains_key(&(target as u32)));
+    }
+
+    /// DMA memory for the tests: one region at 0x1000_0000.
+    struct Region(Arc<Mutex<Vec<u8>>>);
+
+    impl Dma for Region {
+        fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+            let m = self.0.lock().unwrap();
+            let Some(at) = addr.checked_sub(0x1000_0000).map(|a| a as usize) else { return false };
+            match m.get(at..at + buf.len()) {
+                Some(s) => {
+                    buf.copy_from_slice(s);
+                    true
+                }
+                None => false,
+            }
+        }
+        fn write(&self, addr: u64, buf: &[u8]) -> bool {
+            let mut m = self.0.lock().unwrap();
+            let Some(at) = addr.checked_sub(0x1000_0000).map(|a| a as usize) else { return false };
+            match m.get_mut(at..at + buf.len()) {
+                Some(s) => {
+                    s.copy_from_slice(buf);
+                    true
+                }
+                None => false,
+            }
+        }
+    }
+
+    /// The mapper's path (`rcUpdateColorBufferDMA`, `rcReadColorBufferDMA`):
+    /// pixels at a guest physical address into a color buffer and back out
+    /// to another; the address alone on the wire.
+    #[test]
+    #[ignore = "needs the host's Mesa EGL"]
+    fn pixels_move_through_dma_memory() {
+        let mut r = Renderer::new(Features::default(), DisplaySize { width: 8, height: 8, dpi_x: 160, dpi_y: 160 }).unwrap();
+        let mem = Arc::new(Mutex::new(vec![0u8; 4096]));
+        r.set_dma(Box::new(Region(mem.clone())));
+        let mut t = Thread::new(Arc::new(Mutex::new(r)));
+        let mut w = 0u32.to_le_bytes().to_vec();
+        w.extend(encode("rcCreateColorBufferDMA", &[P::V(4), P::V(4), P::V(gl::GL_RGBA as u64), P::V(0)]));
+        let cb = i32_at(&t.feed(&w), 0) as u64;
+        let px: Vec<u8> = (0..64).collect();
+        mem.lock().unwrap()[..64].copy_from_slice(&px);
+        let up = encode("rcUpdateColorBufferDMA", &[P::V(cb), P::V(0), P::V(0), P::V(4), P::V(4), P::V(gl::GL_RGBA as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::Dma(0x1000_0000), P::V(64)]);
+        assert_eq!(up.len(), 8 + 7 * 4 + 8 + 4);
+        assert_eq!(i32_at(&t.feed(&up), 0), 0);
+        let a = t.feed(&encode("rcReadColorBufferDMA", &[P::V(cb), P::V(0), P::V(0), P::V(4), P::V(4), P::V(gl::GL_RGBA as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::Dma(0x1000_0100), P::V(64)]));
+        assert_eq!(a, [0, 0, 0, 0]);
+        assert_eq!(mem.lock().unwrap()[0x100..0x140], px[..]);
+        assert!(t.broken.is_none());
     }
 
     /// A guest's OpenGL ES 2 drawing through the stream as its encoder sends

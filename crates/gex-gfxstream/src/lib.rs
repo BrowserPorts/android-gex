@@ -14,7 +14,10 @@
 //! - its opcode and its length in bytes, header included, as `u32`s;
 //! - each parameter in order: a scalar as its type's size, little-endian; a
 //!   pointer as a `u32` length, then that many bytes for an `in` or `inout`
-//!   pointer (an `out` pointer's bytes are the answer's);
+//!   pointer (an `out` pointer's bytes are the answer's); a pointer to DMA
+//!   memory (`var_flag DMA`) as the memory's 64-bit guest physical address
+//!   alone (`lockAndWriteDma`), its length another parameter, its bytes
+//!   never in the answer;
 //! - then, if checksums were agreed, a checksum. Never here: the host
 //!   offers none (`ANDROID_EMU_CHECKSUM_HELPER` is not in its extensions).
 //!
@@ -70,6 +73,8 @@ pub enum Kind {
     Out,
     /// Both.
     InOut,
+    /// Memory the guest and host share, by its guest physical address.
+    Dma,
 }
 
 impl Entry {
@@ -100,6 +105,8 @@ pub enum Arg<'a> {
     Out(u32),
     /// An `inout` pointer's bytes, which the answer gives back changed.
     InOut(&'a [u8]),
+    /// A DMA pointer's guest physical address.
+    Dma(u64),
 }
 
 /// One call read off the stream.
@@ -153,6 +160,7 @@ pub fn next_call(buf: &[u8]) -> Result<Option<(Call<'_>, usize)>, Malformed> {
                 v[..b.len()].copy_from_slice(b);
                 Arg::Value(u64::from_le_bytes(v))
             }
+            Kind::Dma => Arg::Dma(u64::from_le_bytes(take(8)?.try_into().unwrap())),
             Kind::In | Kind::InOut | Kind::Out => {
                 let n = u32::from_le_bytes(take(4)?.try_into().unwrap());
                 match p.kind {

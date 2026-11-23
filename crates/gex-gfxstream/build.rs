@@ -85,6 +85,8 @@ struct Attrib {
     dir: HashMap<String, String>,
     /// Parameters a null pointer may be passed for (`var_flag ... nullAllowed`).
     nullable: Vec<String>,
+    /// Pointers sent as a guest physical address (`var_flag ... DMA`).
+    dma: Vec<String>,
     flags: Vec<String>,
 }
 
@@ -108,7 +110,15 @@ fn attribs(text: &str) -> (u32, HashMap<String, Attrib>) {
                 out.entry(current.clone()).or_default().dir.insert(f[1].to_string(), f[2].to_string());
             }
             (_, "flag") => out.entry(current.clone()).or_default().flags.extend(f[1..].iter().map(|s| s.to_string())),
-            (_, "var_flag") if f[2..].contains(&"nullAllowed") => out.entry(current.clone()).or_default().nullable.push(f[1].to_string()),
+            (_, "var_flag") => {
+                let a = out.entry(current.clone()).or_default();
+                if f[2..].contains(&"nullAllowed") {
+                    a.nullable.push(f[1].to_string());
+                }
+                if f[2..].contains(&"DMA") {
+                    a.dma.push(f[1].to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -173,7 +183,9 @@ fn main() {
             let mut params = String::new();
             for (t, n) in &e.params {
                 let info = ty.get(t.as_str()).unwrap_or_else(|| panic!("{api}: {}: no type {t}", e.name));
-                let kind = if info.pointer {
+                let kind = if info.pointer && a.is_some_and(|a| a.dma.contains(n)) {
+                    "Kind::Dma".to_string()
+                } else if info.pointer {
                     match a.and_then(|a| a.dir.get(n)).map(String::as_str).unwrap_or("in") {
                         "in" => "Kind::In".to_string(),
                         "out" => "Kind::Out".to_string(),
