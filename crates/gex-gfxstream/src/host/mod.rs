@@ -469,6 +469,11 @@ impl Thread {
                 self.make_current(&mut r, v(0) as u32, v(1) as u32, v(2) as u32);
                 None
             }
+            "rcCreateClientImage" => {
+                let owner = self.owner();
+                reply(&[], r.create_image(v(0) as u32, v(1) as u32, v(2) as u32, owner) as u64)
+            }
+            "rcDestroyClientImage" => reply(&[], r.destroy_image(v(0) as u32) as u64),
             "rcFBPost" => {
                 r.post(v(0) as u32);
                 None
@@ -792,6 +797,24 @@ mod tests {
             assert_eq!(at(16, y), [0, 0, 255, 255]);
             assert_eq!(at(31, y), [0, 0, 255, 255]);
         }
+        // A client image of one of the guest's textures, bound to another.
+        let a = t.feed(&encode("glGenTextures", &[P::V(2), P::Out(8)]));
+        let (t1, t2) = (i32_at(&a, 0) as u64, i32_at(&a, 4) as u64);
+        let mut w = encode("glBindTexture", &[P::V(gl::GL_TEXTURE_2D as u64), P::V(t1)]);
+        w.extend(encode("glTexImage2D", &[P::V(gl::GL_TEXTURE_2D as u64), P::V(0), P::V(gl::GL_RGBA as u64), P::V(4), P::V(4), P::V(0), P::V(gl::GL_RGBA as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::In(&[])]));
+        t.feed(&w);
+        let image = i32_at(&t.feed(&encode("rcCreateClientImage", &[P::V(ctx), P::V(egl::EGL_GL_TEXTURE_2D_KHR as u64), P::V(t1)])), 0) as u64;
+        assert_ne!(image, 0);
+        let mut w = encode("glBindTexture", &[P::V(gl::GL_TEXTURE_2D as u64), P::V(t2)]);
+        w.extend(encode("glEGLImageTargetTexture2DOES", &[P::V(gl::GL_TEXTURE_2D as u64), P::V(image)]));
+        w.extend(encode("glGetError", &[]));
+        assert_eq!(t.feed(&w), [0, 0, 0, 0]);
+        // One never given is refused by the host's GL.
+        let mut w = encode("glEGLImageTargetTexture2DOES", &[P::V(gl::GL_TEXTURE_2D as u64), P::V(image + 100)]);
+        w.extend(encode("glGetError", &[]));
+        assert_ne!(t.feed(&w), [0, 0, 0, 0]);
+        assert_eq!(i32_at(&t.feed(&encode("rcDestroyClientImage", &[P::V(image)])), 0), 1);
+        assert_eq!(i32_at(&t.feed(&encode("rcDestroyClientImage", &[P::V(image)])), 0), 0);
         assert!(t.broken.is_none());
     }
 

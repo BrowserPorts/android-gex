@@ -475,10 +475,14 @@ impl Thread {
                 not_yet(n);
                 None
             }
-            // An EGL image's handle names a host image only through
-            // renderControl's client images, not done yet.
+            // An EGL image by the handle `rcCreateClientImage` gave; one it
+            // never gave is null, which the host's GL refuses.
             "glEGLImageTargetTexture2DOES" | "glEGLImageTargetRenderbufferStorageOES" => {
-                not_yet(call.name);
+                type Target = unsafe extern "C" fn(u32, *mut c_void);
+                let image = self.renderer().image(v(1) as u32);
+                if let Some(g) = f::<Target>(entry.name) {
+                    unsafe { g(v(0) as u32, image) };
+                }
                 None
             }
             _ => return None,

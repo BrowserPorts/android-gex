@@ -125,21 +125,26 @@ type DestroyImage = unsafe extern "C" fn(EGLDisplay, EGLImage) -> EGLBoolean;
 
 /// An image of a texture of `context`'s (`EGL_KHR_gl_texture_2D_image`).
 pub fn texture_image(display: EGLDisplay, context: EGLContext, texture: u32) -> EGLImage {
+    create_image(display, context, EGL_GL_TEXTURE_2D_KHR, texture as usize as *mut c_void)
+}
+
+/// `eglCreateImageKHR` with no attributes.
+pub fn create_image(display: EGLDisplay, context: EGLContext, target: EGLenum, buffer: *mut c_void) -> EGLImage {
     let p = proc_address("eglCreateImageKHR");
     if p.is_null() {
         return std::ptr::null_mut();
     }
     let f: CreateImage = unsafe { std::mem::transmute(p) };
-    unsafe { f(display, context, EGL_GL_TEXTURE_2D_KHR, texture as usize as *mut c_void, std::ptr::null()) }
+    unsafe { f(display, context, target, buffer, std::ptr::null()) }
 }
 
-pub fn destroy_image(display: EGLDisplay, image: EGLImage) {
+pub fn destroy_image(display: EGLDisplay, image: EGLImage) -> bool {
     let p = proc_address("eglDestroyImageKHR");
     if p.is_null() || image.is_null() {
-        return;
+        return false;
     }
     let f: DestroyImage = unsafe { std::mem::transmute(p) };
-    unsafe { f(display, image) };
+    unsafe { f(display, image) == EGL_TRUE }
 }
 
 /// An entry point by name, or null.

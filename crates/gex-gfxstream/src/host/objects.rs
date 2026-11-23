@@ -83,12 +83,21 @@ impl ColorBuffer {
     }
 }
 
+/// An image of a guest context's object (`EmulatedEglImage`).
+pub struct Image {
+    pub egl: EGLImage,
+    pub owner: Owner,
+}
+
 #[derive(Default)]
 pub struct Objects {
     next: u32,
     pub contexts: HashMap<u32, Context>,
     pub windows: HashMap<u32, Window>,
     pub color_buffers: HashMap<u32, ColorBuffer>,
+    /// Numbered apart, from 1 (gfxstream gives the host image's address).
+    pub images: HashMap<u32, Image>,
+    next_image: u32,
 }
 
 // The handles are the driver's; the renderer's lock orders their use.
@@ -493,9 +502,60 @@ impl Renderer {
         }
     }
 
+    /// `rcCreateClientImage`: an image of an object of a guest context's
+    /// (`EGL_GL_TEXTURE_2D_KHR`: a texture by name), or of none; 0 if the
+    /// host's EGL makes none.
+    pub fn create_image(&mut self, context: u32, target: u32, buffer: u32, owner: Owner) -> u32 {
+        let ctx = if context != 0 {
+            match self.objects.contexts.get(&context) {
+                Some(c) => c.egl,
+                None => {
+                    eprintln!("[gex] gfxstream: rcCreateClientImage: no context {context}");
+                    return 0;
+                }
+            }
+        } else {
+            std::ptr::null_mut()
+        };
+        let egl = create_image(self.display, ctx, target, buffer as usize as *mut _);
+        if egl.is_null() {
+            eprintln!("[gex] gfxstream: rcCreateClientImage: the host made no image: {:#x}", unsafe { eglGetError() });
+            return 0;
+        }
+        let o = &mut self.objects;
+        loop {
+            o.next_image = o.next_image.wrapping_add(1);
+            if o.next_image != 0 && !o.images.contains_key(&o.next_image) {
+                break;
+            }
+        }
+        o.images.insert(o.next_image, Image { egl, owner });
+        o.next_image
+    }
+
+    /// `rcDestroyClientImage`: whether there was one to destroy.
+    pub fn destroy_image(&mut self, handle: u32) -> bool {
+        match self.objects.images.remove(&handle) {
+            Some(i) => destroy_image(self.display, i.egl),
+            None => {
+                eprintln!("[gex] gfxstream: rcDestroyClientImage: no image {handle}");
+                false
+            }
+        }
+    }
+
+    /// The host image of a handle, or null.
+    pub fn image(&self, handle: u32) -> EGLImage {
+        self.objects.images.get(&handle).map(|i| i.egl).unwrap_or(std::ptr::null_mut())
+    }
+
     /// What a render thread or a guest process made, let go when it ends
     /// (`cleanupProcGLObjects`, a render thread's context and window sets).
     pub fn ended(&mut self, owner: Owner) {
+        let images: Vec<u32> = self.objects.images.iter().filter(|(_, i)| i.owner == owner).map(|(h, _)| *h).collect();
+        for h in images {
+            self.destroy_image(h);
+        }
         let contexts: Vec<u32> = self.objects.contexts.iter().filter(|(_, c)| c.owner == owner).map(|(h, _)| *h).collect();
         let windows: Vec<u32> = self.objects.windows.iter().filter(|(_, w)| w.owner == owner).map(|(h, _)| *h).collect();
         for h in windows {
