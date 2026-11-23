@@ -247,7 +247,8 @@ impl Thread {
             "glGetCompressedTextureFormats" => {
                 let count = v(0) as i32;
                 let mut formats = vec![0i32; count.max(0) as usize + SLACK];
-                if integer(GL_NUM_COMPRESSED_TEXTURE_FORMATS) > count {
+                // GLES 1's decoder asks no count.
+                if gles2 && integer(GL_NUM_COMPRESSED_TEXTURE_FORMATS) > count {
                     eprintln!("[gex] gfxstream: glGetCompressedTextureFormats: the guest asked for fewer formats than the host has");
                 } else if let Some(g) = f::<GetIntegerv>("glGetIntegerv") {
                     unsafe { g(GL_COMPRESSED_TEXTURE_FORMATS, formats.as_mut_ptr()) };
@@ -471,9 +472,45 @@ impl Thread {
                 let vb: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
                 reply(&[&lb, &vb], 0)
             }
-            // GLES 1's client arrays and draws from them.
-            n if call.api == "gles1" && entry.custom_decoder && (n.ends_with("PointerData") || n.ends_with("PointerOffset") || n.starts_with("glDrawElements")) => {
-                not_yet(n);
+            // GLES 1's client arrays (`GLESv1Decoder`): each kept by its
+            // array's place with the context, passed with stride 0.
+            n if !gles2 && n.ends_with("PointerData") => {
+                let (base, loc, vals): (&'static str, u32, Vec<u64>) = match n {
+                    "glVertexPointerData" => ("glVertexPointer", 0, vec![v(0), v(1), 0]),
+                    "glNormalPointerData" => ("glNormalPointer", 1, vec![v(0), 0]),
+                    "glColorPointerData" => ("glColorPointer", 2, vec![v(0), v(1), 0]),
+                    "glPointSizePointerData" => ("glPointSizePointerOES", 3, vec![v(0), 0]),
+                    "glTexCoordPointerData" => ("glTexCoordPointer", 4 + v(0) as u32, vec![v(1), v(2), 0]),
+                    "glMatrixIndexPointerData" => ("glMatrixIndexPointerOES", 12, vec![v(0), v(1), 0]),
+                    "glWeightPointerData" => ("glWeightPointerOES", 13, vec![v(0), v(1), 0]),
+                    _ => return None,
+                };
+                let data_at = entry.params.iter().position(|p| p.name == "data")?;
+                let addr = self.keep_array(loc, bytes(&a[data_at]));
+                let mut vals = vals;
+                vals.push(addr);
+                forward(call, base, &vals);
+                None
+            }
+            n if !gles2 && n.ends_with("PointerOffset") => {
+                let base = match n {
+                    "glPointSizePointerOffset" => "glPointSizePointerOES",
+                    "glWeightPointerOffset" => "glWeightPointerOES",
+                    "glMatrixIndexPointerOffset" => "glMatrixIndexPointerOES",
+                    "glVertexPointerOffset" => "glVertexPointer",
+                    "glColorPointerOffset" => "glColorPointer",
+                    "glNormalPointerOffset" => "glNormalPointer",
+                    "glTexCoordPointerOffset" => "glTexCoordPointer",
+                    _ => return None,
+                };
+                let vals: Vec<u64> = a.iter().map(value).collect();
+                forward(call, base, &vals);
+                None
+            }
+            "glDrawElementsData" => {
+                let mut b = Buf::from(bytes(&a[3]));
+                let p = b.addr();
+                forward(call, "glDrawElements", &[v(0), v(1), v(2), p]);
                 None
             }
             // An EGL image by the handle `rcCreateClientImage` gave; one it

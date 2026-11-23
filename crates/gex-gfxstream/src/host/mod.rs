@@ -828,6 +828,46 @@ mod tests {
         assert!(t.broken.is_none());
     }
 
+    /// GLES 1 as its encoder sends it: a client array of vertices sent as
+    /// data, a flat colour, a clear and a draw; the left half drawn.
+    #[test]
+    #[ignore = "needs the host's Mesa EGL"]
+    fn a_guest_draws_with_opengl_es_1() {
+        let r = Renderer::new(Features::default(), DisplaySize { width: 16, height: 16, dpi_x: 160, dpi_y: 160 }).unwrap();
+        let mut t = Thread::new(Arc::new(Mutex::new(r)));
+        const EGL_OPENGL_ES_BIT: i32 = 1;
+        let attrs: Vec<u8> = [egl::EGL_RED_SIZE, 8, egl::EGL_GREEN_SIZE, 8, egl::EGL_BLUE_SIZE, 8, egl::EGL_RENDERABLE_TYPE, EGL_OPENGL_ES_BIT, egl::EGL_NONE].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut w = 0u32.to_le_bytes().to_vec();
+        w.extend(encode("rcChooseConfig", &[P::In(&attrs), P::V(attrs.len() as u64), P::Out(4), P::V(1)]));
+        let a = t.feed(&w);
+        assert!(i32_at(&a, 4) >= 1, "no OpenGL ES 1 config");
+        let config = i32_at(&a, 0) as u64;
+        let ctx = i32_at(&t.feed(&encode("rcCreateContext", &[P::V(config), P::V(0), P::V(objects::GLES_API_CM as u64)])), 0) as u64;
+        assert_ne!(ctx, 0, "no OpenGL ES 1 context");
+        let win = i32_at(&t.feed(&encode("rcCreateWindowSurface", &[P::V(config), P::V(16), P::V(16)])), 0) as u64;
+        let cb = i32_at(&t.feed(&encode("rcCreateColorBuffer", &[P::V(16), P::V(16), P::V(gl::GL_RGBA as u64)])), 0) as u64;
+        t.feed(&encode("rcSetWindowColorBuffer", &[P::V(win), P::V(cb)]));
+        assert_eq!(i32_at(&t.feed(&encode("rcMakeCurrent", &[P::V(ctx), P::V(win), P::V(win)])), 0), 1);
+        const GL_VERTEX_ARRAY: u64 = 0x8074;
+        let fl = |x: f32| P::V(x.to_bits() as u64);
+        let quad: Vec<u8> = [-1.0f32, -1.0, 0.0, -1.0, 0.0, 1.0, -1.0, -1.0, 0.0, 1.0, -1.0, 1.0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let mut w = encode("glViewport", &[P::V(0), P::V(0), P::V(16), P::V(16)]);
+        w.extend(encode("glClearColor", &[fl(0.0), fl(0.0), fl(1.0), fl(1.0)]));
+        w.extend(encode("glClear", &[P::V(gl::GL_COLOR_BUFFER_BIT as u64)]));
+        w.extend(encode("glEnableClientState", &[P::V(GL_VERTEX_ARRAY)]));
+        w.extend(encode("glVertexPointerData", &[P::V(2), P::V(gl::GL_FLOAT as u64), P::V(8), P::In(&quad), P::V(quad.len() as u64)]));
+        w.extend(encode("glColor4f", &[fl(0.0), fl(1.0), fl(0.0), fl(1.0)]));
+        w.extend(encode("glDrawArrays", &[P::V(gl::GL_TRIANGLES as u64), P::V(0), P::V(6)]));
+        w.extend(encode("glGetError", &[]));
+        assert_eq!(t.feed(&w), [0, 0, 0, 0], "a GL error");
+        t.feed(&encode("rcFlushWindowColorBuffer", &[P::V(win)]));
+        let px = t.feed(&encode("rcReadColorBuffer", &[P::V(cb), P::V(0), P::V(0), P::V(16), P::V(16), P::V(gl::GL_RGBA as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::Out(16 * 16 * 4)]));
+        let at = |x: usize, y: usize| &px[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4];
+        assert_eq!(at(0, 8), [0, 255, 0, 255]);
+        assert_eq!(at(15, 8), [0, 0, 255, 255]);
+        assert!(t.broken.is_none());
+    }
+
     /// A guest's OpenGL ES 2 drawing through the stream as its encoder sends
     /// it: shaders as strings, a program, a uniform of floats, a client
     /// array sent as data, a clear and a draw; then flushed and read back,
