@@ -1,0 +1,9 @@
+[package]
+name = "gex-gfxstream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors = ["Ryan Wilson"]
+description = "gfxstream's wire protocol, as Android's emulator image speaks it: the calls, decoded"
+
+[dependencies]

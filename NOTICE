@@ -11,6 +11,12 @@ by the Free Software Foundation (see LICENSE).
 gex includes third-party code under its own licences, listed below. Each
 keeps its original notices in its files.
 
+crates/gex-gfxstream/spec/{renderControl,gles1,gles2}.{in,attrib,types}
+    gfxstream's API descriptions (platform/hardware/google/gfxstream,
+    codegen/, at android-17.0.0_r1), unchanged. Copyright The Android Open
+    Source Project. Apache-2.0 (its text is the first part of
+    third_party/wasmtime-49.0.2/LICENSE).
+
 third_party/wasmtime-49.0.2/
     Wasmtime, by the Bytecode Alliance and its contributors, with local
     changes. Apache-2.0 WITH LLVM-exception (third_party/wasmtime-49.0.2/LICENSE).

@@ -723,6 +723,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gex-gfxstream"
+version = "0.0.1"
+
+[[package]]
 name = "gex-gl"
 version = "0.0.1"
 dependencies = [

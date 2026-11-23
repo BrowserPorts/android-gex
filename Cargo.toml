@@ -29,6 +29,7 @@ members = [
     "crates/gex-xwm",
     "crates/gex-gpu",
     "crates/gex-gl",
+    "crates/gex-gfxstream",
     "crates/gex-eject",
     "crates/gexc",
     "hosts/browser",

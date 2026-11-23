@@ -1,0 +1,2 @@
+# name bits format isPointer: types the API files use but do not declare.
+mat4x4_ptr 32 %p true
