@@ -18,6 +18,7 @@ wasmparser = "0.219"
 gex-wayland.workspace = true
 gex-gpu.workspace = true
 gex-gl = { workspace = true, features = ["host"] }
+gex-gfxstream = { workspace = true, features = ["host"] }
 gex-ld.workspace = true
 gex-xlate = { workspace = true, features = ["parallel", "cgen", "fjit"] }
 gex-cgen.workspace = true

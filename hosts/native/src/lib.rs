@@ -18,6 +18,7 @@ pub mod aot_only;
 pub mod libprov;
 pub(crate) mod elfprov;
 pub mod aot_share;
+pub mod gfxstream;
 pub mod gl;
 pub mod profile;
 pub mod pe_units;
@@ -4074,6 +4075,9 @@ fn mount_filesystems(
         kernel.vfs.mount(guest, Arc::new(HostFs::new(host)));
     }
     let mut devfs = DevFs::new();
+    // The emulator's graphics pipes behind the goldfish pipe, when the
+    // kernel stands in for the emulator.
+    crate::gfxstream::install();
     if opts.gl {
         // Named for what it is rather than as `/dev/dri/renderD128`: this is
         // not a DRM device and a program that probed it as one would be
