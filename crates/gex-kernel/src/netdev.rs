@@ -438,9 +438,12 @@ pub fn unregister(index: u32) {
             }
         });
         notify(RTM_NEWLINK, &dev, IFF_UP | IFF_RUNNING);
+        crate::routes::device_changed(index);
     }
     with(|t| t.devs.retain(|d| d.index != index));
     notify(RTM_DELLINK, &dev, !0);
+    // Its routes go with it.
+    crate::routes::device_changed(index);
     crate::vfs::sysfs::remove("net", &dev.name);
 }
 
@@ -461,6 +464,10 @@ pub fn change_flags(index: u32, new: u32) -> Result<(), Errno> {
     let (dev, changes) = change_flags_quiet(index, new)?;
     if changes != 0 {
         notify(RTM_NEWLINK, &dev, changes);
+    }
+    // Up or down, its routes follow (`fib_netdev_event`, `addrconf_notify`).
+    if changes & IFF_UP != 0 {
+        crate::routes::device_changed(index);
     }
     Ok(())
 }
@@ -938,6 +945,9 @@ pub fn newlink(nl_flags: u16, ifi_index: i32, ifi_flags: u32, ifi_change: u32, a
         }
     }
     notify(RTM_NEWLINK, &dev, !0);
+    if dev.running() {
+        crate::routes::device_changed(dev.index);
+    }
     Ok(())
 }
 

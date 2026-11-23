@@ -48,6 +48,7 @@ pub mod tun;
 pub mod pfkey;
 pub mod hwrng;
 pub mod dmaheap;
+pub mod routes;
 pub mod block;
 pub mod loopdev;
 pub mod dm;

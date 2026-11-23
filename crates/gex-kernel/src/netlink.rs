@@ -185,7 +185,7 @@ fn link_of(req: &[u8]) -> Result<crate::netdev::NetDev, Errno> {
 }
 
 /// The reply to one request (`nlmsghdr` + body), if it is owed one.
-fn route_answer(req: &[u8], net_admin: bool) -> Option<Vec<u8>> {
+fn route_answer(req: &[u8], net_admin: bool, portid: u32) -> Option<Vec<u8>> {
     let kind = u16::from_le_bytes(req[4..6].try_into().unwrap());
     let flags = u16::from_le_bytes(req[6..8].try_into().unwrap());
     let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
@@ -209,6 +209,15 @@ fn route_answer(req: &[u8], net_admin: bool) -> Option<Vec<u8>> {
             for b in crate::fibrules::dump(family, &ifindex) {
                 message(&mut out, crate::fibrules::RTM_NEWRULE, NLM_F_MULTI, seq, &b);
             }
+        }
+        // Routes ([`crate::routes`]): a change needs CAP_NET_ADMIN, after
+        // a body of at least the family's byte.
+        crate::routes::RTM_NEWROUTE | crate::routes::RTM_DELROUTE if req.len() > 16 && !net_admin => return change(Err(Errno::EPERM)),
+        crate::routes::RTM_NEWROUTE | crate::routes::RTM_DELROUTE => return change(crate::routes::change(kind, req, portid)),
+        crate::routes::RTM_GETROUTE if dump => out.extend_from_slice(&crate::routes::dump(req, seq)),
+        crate::routes::RTM_GETROUTE => {
+            crate::bpf::say_once("RTM_GETROUTE of one route (a lookup)");
+            return change(Err(Errno::EOPNOTSUPP));
         }
         RTM_GETLINK if dump => links(&mut out, seq),
         // One link, by index or by name (`rtnl_getlink`).
@@ -923,7 +932,7 @@ impl Socket {
                         let r = match self.protocol {
                             NETLINK_XFRM => xfrm_answer(&data[at..at + len], who.net_admin),
                             NETLINK_NETFILTER => nfnl_answer(&data[at..at + len], who.net_admin, portid),
-                            _ => route_answer(&data[at..at + len], who.net_admin),
+                            _ => route_answer(&data[at..at + len], who.net_admin, portid),
                         };
                         if let Some(r) = r {
                             out.extend_from_slice(&r);
@@ -935,14 +944,24 @@ impl Socket {
                     // Each answer names the socket it answers
                     // (`nlmsg_pid`, as `netlink_ack` and the dumps fill
                     // it): iproute2 skips a message that names another.
+                    // A long answer comes as Linux's dumps come, in
+                    // datagrams of at most a page's worth of messages
+                    // (`NLMSG_GOODSIZE`), whole messages each.
+                    const GOODSIZE: usize = 4096 - 320;
                     let portid = self.state().portid;
                     let mut at = 0;
+                    let mut start = 0;
                     while at + 16 <= out.len() {
                         let len = u32::from_le_bytes(out[at..at + 4].try_into().unwrap()) as usize;
                         out[at + 12..at + 16].copy_from_slice(&portid.to_le_bytes());
-                        at += (len.max(16) + 3) & !3;
+                        let next = (at + ((len.max(16) + 3) & !3)).min(out.len());
+                        if next - start > GOODSIZE && at > start {
+                            self.from_kernel(out[start..at].to_vec());
+                            start = at;
+                        }
+                        at = next;
                     }
-                    self.from_kernel(out);
+                    self.from_kernel(out[start..].to_vec());
                 }
             }
             _ => {
@@ -1358,12 +1377,13 @@ mod tests {
     #[test]
     fn anything_else_is_refused_when_it_wants_an_answer() {
         let s = route();
-        s.write_at(0, &request(24, NLM_F_REQUEST | NLM_F_ACK, 9, AF_INET)).unwrap();
+        // RTM_NEWNEIGH: no neighbour table is kept.
+        s.write_at(0, &request(28, NLM_F_REQUEST | NLM_F_ACK, 9, AF_INET)).unwrap();
         let msgs = parse(&reply(&s));
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].0, NLMSG_ERROR);
         assert_eq!(i32::from_le_bytes(msgs[0].2[..4].try_into().unwrap()), -(Errno::EOPNOTSUPP.0 as i32));
-        s.write_at(0, &request(24, NLM_F_REQUEST, 10, AF_INET)).unwrap();
+        s.write_at(0, &request(28, NLM_F_REQUEST, 10, AF_INET)).unwrap();
         assert!(!s.poll_readable());
     }
 

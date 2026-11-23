@@ -75,7 +75,11 @@ impl Errno {
     pub const ECANCELED: Errno = Errno(125);
     pub const ESTALE: Errno = Errno(116);
     pub const EADDRNOTAVAIL: Errno = Errno(99);
+    /// Network is down (a route through a device that is not up).
+    pub const ENETDOWN: Errno = Errno(100);
     pub const ENETUNREACH: Errno = Errno(101);
+    /// No route to host (an IPv6 gateway nothing reaches).
+    pub const EHOSTUNREACH: Errno = Errno(113);
     pub const ENOTSOCK: Errno = Errno(88);
     pub const EMSGSIZE: Errno = Errno(90);
     /// Protocol error (a membership asked of a stream socket).
