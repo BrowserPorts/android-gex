@@ -6044,6 +6044,22 @@ impl MapIo<'_> {
         let _ = self.flush_shared(m, 0, u64::MAX);
     }
 
+    /// This process's shared mappings of `handle`, given what it holds now:
+    /// after a hand-over has written them all back, so that two mappings of
+    /// one buffer agree when the call returns.
+    pub fn refresh_shared_of(&self, m: &mut GuestMem<'_>, handle: &Arc<dyn crate::vfs::FileHandle>) {
+        let maps: Vec<SharedMap> = {
+            let mm = self.mem.lock();
+            mm.log.shared_maps.iter().filter(|map| Arc::ptr_eq(&map.file.handle, handle)).cloned().collect()
+        };
+        // The kernel's own writes, whatever the mappings allow the program.
+        let user = m.take_user();
+        for map in maps {
+            let _ = refresh(m, &map, true, None, false);
+        }
+        m.set_user(user);
+    }
+
     /// `msync(MS_INVALIDATE)`: the shared mappings over `[addr, addr + len)`
     /// given what their files hold now where another process wrote back.
     pub fn refresh_shared(&self, m: &mut GuestMem<'_>, addr: u64, len: u64) -> Result<(), Errno> {
@@ -10164,8 +10180,14 @@ fn free_call_untagged(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: F
             None => {
                 if f.io.hands_over_buffers(a[0] as i32, a[1]) {
                     f.map.flush_all_shared(m);
+                    let r = f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2]);
+                    if let Ok(file) = f.io.fds.get(a[0] as i32) {
+                        f.map.refresh_shared_of(m, &file.handle);
+                    }
+                    r
+                } else {
+                    f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2])
                 }
-                f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2])
             }
         };
         // A terminal's request may have signalled this process's own group
@@ -15355,6 +15377,10 @@ impl FdIo<'_> {
                 }
             }
         }
+        // A DMA-BUF heap's, whose allocation makes a descriptor.
+        if let Some(heap) = self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_dma_heap()) {
+            return heap.ioctl(self.fds, m, req, arg);
+        }
         // A TUN descriptor's (`__tun_chr_ioctl`), which may make a network
         // device (`CAP_NET_ADMIN`) or attach to one its owner and group
         // allow.
@@ -15880,6 +15906,11 @@ impl Kernel {
         }
         if self.fd_io().hands_over_buffers(fd, req) {
             self.map_io().flush_all_shared(m);
+            let r = self.fd_io().ioctl(m, &self.procs, &self.tty, fd, req, arg);
+            if let Ok(file) = self.fds.get(fd) {
+                self.map_io().refresh_shared_of(m, &file.handle);
+            }
+            return r;
         }
         self.fd_io().ioctl(m, &self.procs, &self.tty, fd, req, arg)
     }

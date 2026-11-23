@@ -480,7 +480,6 @@ pub struct Gpu {
     res: AtomicU32,
     next_bo: AtomicU64,
     next_file: AtomicU64,
-    dmabuf_ino: AtomicU64,
     /// Changes to any object's bytes, from 1.
     changes: AtomicU64,
     frame: Option<std::path::PathBuf>,
@@ -513,7 +512,6 @@ pub fn gpu() -> Option<&'static Gpu> {
             res: AtomicU32::new(0),
             next_bo: AtomicU64::new(1),
             next_file: AtomicU64::new(1),
-            dmabuf_ino: AtomicU64::new(0),
             changes: AtomicU64::new(1),
             frame: std::env::var_os("GEX_VIRTIO_GPU_FRAME").map(Into::into),
         })
@@ -1180,8 +1178,8 @@ impl DrmFile {
             match &*d {
                 Some(f) => Arc::clone(f),
                 None => {
-                    let g = gpu().ok_or(Errno::ENODEV)?;
-                    let ino = g.dmabuf_ino.fetch_add(1, Relaxed) + 1;
+                    gpu().ok_or(Errno::ENODEV)?;
+                    let ino = DMABUF_INO.fetch_add(1, Relaxed) + 1;
                     let buf = Arc::new(DmaBuf { bo: Arc::clone(&bo), ino, name: Mutex::new(String::new()) });
                     let rw = flags & RDWR != 0;
                     let f = OpenFile::new(buf, "/dmabuf:".into(), if rw { crate::fs::oflags::O_RDWR } else { crate::fs::oflags::O_RDONLY }, true, rw);
@@ -2072,6 +2070,30 @@ impl FileHandle for DrmFile {
     fn changes(&self) -> u64 {
         gpu().map_or(0, |g| g.changes.load(Relaxed))
     }
+}
+
+/// The dmabuf filesystem's inode numbers, for every exporter's.
+static DMABUF_INO: AtomicU64 = AtomicU64::new(0);
+
+/// A dma-buf of `size` bytes, zeroed, that no device of this kernel
+/// exported (a DMA-BUF heap's: [`crate::dmaheap`]), open for writing too
+/// with `rw`.
+pub fn exported_buffer(size: u64, rw: bool) -> Arc<OpenFile> {
+    // Numbered apart from any GPU's objects, and in no GPU's mapping space.
+    static NEXT: AtomicU64 = AtomicU64::new(1 << 62);
+    let bo = Arc::new(Bo {
+        id: NEXT.fetch_add(1, Relaxed),
+        res: 0,
+        size,
+        start: u64::MAX,
+        data: Mutex::new(vec![0; size as usize]),
+        changes: AtomicU64::new(1),
+        handles: AtomicU32::new(0),
+        dmabuf: Mutex::new(None),
+    });
+    let ino = DMABUF_INO.fetch_add(1, Relaxed) + 1;
+    let buf = Arc::new(DmaBuf { bo, ino, name: Mutex::new(String::new()) });
+    OpenFile::new(buf, "/dmabuf:".into(), if rw { crate::fs::oflags::O_RDWR } else { crate::fs::oflags::O_RDONLY }, true, rw)
 }
 
 /// A dma-buf: an exported object.

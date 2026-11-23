@@ -687,6 +687,12 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// A DMA-BUF heap ([`crate::dmaheap`]), whose allocation makes a
+    /// descriptor.
+    fn as_dma_heap(self: Arc<Self>) -> Option<Arc<crate::dmaheap::Heap>> {
+        None
+    }
+
     fn as_drm(self: Arc<Self>) -> Option<Arc<crate::drm::DrmFile>> {
         None
     }

@@ -113,6 +113,29 @@ impl Attributes for DrmMinor {
     }
 }
 
+/// A DMA-BUF heap's (`dma_heap_devnode`): its node under `dma_heap/`, no
+/// mode of its own.
+#[derive(Debug)]
+struct DmaHeapNode(&'static str);
+
+impl Attributes for DmaHeapNode {
+    fn vars(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn list(&self, dir: &str) -> Option<Vec<(String, FileType)>> {
+        dir.is_empty().then(Vec::new)
+    }
+    fn read(&self, _path: &str) -> Option<(u32, String)> {
+        None
+    }
+    fn write(&self, _path: &str, _data: &[u8]) -> Result<(), Errno> {
+        Err(Errno::EACCES)
+    }
+    fn devname(&self) -> Option<String> {
+        Some(format!("dma_heap/{}", self.0))
+    }
+}
+
 /// A device as the device model has it.
 #[derive(Clone, Debug)]
 pub struct Device {
@@ -310,6 +333,10 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
         // render node first, as `drm_dev_register` adds them.
         for (name, minor) in crate::drm::minors() {
             all.push(Arc::new(Device { subsystem: "drm".to_string(), name: name.to_string(), major: crate::drm::MAJOR, minor: *minor, mode: None, attrs: Some(Arc::new(DrmMinor(name))) }));
+        }
+        // The DMA-BUF heaps, when the kernel has them ([`crate::dmaheap`]).
+        for (minor, name) in crate::dmaheap::heaps().iter().enumerate() {
+            all.push(Arc::new(Device { subsystem: "dma_heap".to_string(), name: name.to_string(), major: crate::dmaheap::MAJOR, minor: minor as u32, mode: None, attrs: Some(Arc::new(DmaHeapNode(name))) }));
         }
         // The network interfaces (`net/core/net-sysfs.c`): no device
         // number, and their own attributes.

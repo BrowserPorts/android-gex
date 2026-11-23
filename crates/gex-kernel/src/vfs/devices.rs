@@ -43,6 +43,10 @@ pub fn open_char(dev: u64, node: NodeMeta, flags: u64) -> Result<Arc<dyn FileHan
     if major(dev) == 10 && minor(dev) == crate::hwrng::MISC_MINOR {
         return crate::hwrng::open(flags, node);
     }
+    // A DMA-BUF heap's.
+    if major(dev) == crate::dmaheap::MAJOR {
+        return crate::dmaheap::open(minor(dev), node);
+    }
     // An hvc minor its driver registered with no port behind it:
     // `hvc_install` finds no console for the index.
     if super::devfs::has_hvc() && major(dev) == super::devfs::HVC_MAJOR && minor(dev) < super::devfs::HVC_MINORS {
