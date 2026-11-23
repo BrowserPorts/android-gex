@@ -6,4 +6,9 @@ license.workspace = true
 authors = ["Ryan Wilson"]
 description = "gfxstream's wire protocol, as Android's emulator image speaks it: the calls, decoded"
 
+[features]
+# The host's side (`host`), which links the host's EGL and OpenGL ES (Mesa).
+# Off for users that only read the protocol.
+host = []
+
 [dependencies]

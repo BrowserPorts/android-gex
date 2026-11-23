@@ -24,6 +24,9 @@
 
 include!(concat!(env!("OUT_DIR"), "/apis.rs"));
 
+#[cfg(feature = "host")]
+pub mod host;
+
 /// One API's calls.
 pub struct Api {
     pub name: &'static str,

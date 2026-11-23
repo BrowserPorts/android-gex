@@ -112,7 +112,22 @@ fn attribs(text: &str) -> (u32, HashMap<String, Attrib>) {
     (base, out)
 }
 
+/// The host's EGL for the `host` feature: on macOS Homebrew's Mesa, or
+/// `GEX_MESA_PREFIX` (as `gex-gl` finds it).
+fn link_mesa() {
+    println!("cargo:rerun-if-env-changed=GEX_MESA_PREFIX");
+    if std::env::var_os("CARGO_FEATURE_HOST").is_none() || std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    let prefix = std::env::var_os("GEX_MESA_PREFIX").map(std::path::PathBuf::from).or_else(|| {
+        ["/opt/homebrew/opt/mesa", "/usr/local/opt/mesa"].into_iter().map(std::path::PathBuf::from).find(|p| p.join("lib").exists())
+    });
+    let prefix = prefix.expect("gex-gfxstream: no Mesa on macOS; `brew install mesa` or set GEX_MESA_PREFIX");
+    println!("cargo:rustc-link-search=native={}", prefix.join("lib").display());
+}
+
 fn main() {
+    link_mesa();
     let spec = Path::new("spec");
     println!("cargo:rerun-if-changed=spec");
     let mut known = HashMap::new();
