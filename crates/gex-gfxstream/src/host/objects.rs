@@ -40,6 +40,9 @@ pub struct Context {
     pub egl: EGLContext,
     pub version: u32,
     pub owner: Owner,
+    /// Client-array data by attribute, kept until replaced
+    /// (`GLESv2Decoder`'s context data).
+    pub(super) arrays: HashMap<u32, super::gles::Buf>,
 }
 
 pub struct Window {
@@ -179,7 +182,7 @@ impl Renderer {
             eprintln!("[gex] gfxstream: rcCreateContext: the host made no OpenGL ES {major}.{minor} context: {:#x}", unsafe { eglGetError() });
             return 0;
         }
-        self.objects.contexts.insert(handle, Context { egl, version, owner });
+        self.objects.contexts.insert(handle, Context { egl, version, owner, arrays: HashMap::new() });
         handle
     }
 

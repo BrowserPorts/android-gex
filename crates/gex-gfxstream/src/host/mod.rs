@@ -15,6 +15,7 @@ pub mod compose;
 pub mod config;
 pub mod egl;
 pub mod gl;
+mod gles;
 pub mod objects;
 
 use crate::{Arg, Call};
@@ -83,6 +84,9 @@ pub struct Renderer {
     shown: u32,
     posts: u64,
     sink: Option<compose::Sink>,
+    /// The guest's syncs (`glFenceSyncAEMU`) by handle, from 1.
+    syncs: std::collections::HashMap<u64, usize>,
+    next_sync: u64,
 }
 
 // The EGL handles are the driver's; the renderer's lock is what orders
@@ -149,7 +153,7 @@ impl Renderer {
         unsafe { eglMakeCurrent(display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
         let max_version = if features.gles_dynamic_version { max_version_of(&host_version) } else { MaxVersion::Es2 };
         let configs = config::Configs::new(display, max_version > MaxVersion::Es2);
-        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None })
+        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None, syncs: Default::default(), next_sync: 0 })
     }
 
     /// `rcGetGLString`'s answer for `name`: the host's string on the
@@ -352,6 +356,9 @@ impl Thread {
     /// One call: its answer, if it has one.
     fn run(&mut self, call: &Call<'_>) -> Option<Vec<u8>> {
         let (_, entry) = crate::entry(call.opcode)?;
+        if call.api != "renderControl" {
+            return self.gles(call, entry);
+        }
         let renderer = self.renderer.clone();
         let mut r = renderer.lock().unwrap_or_else(|e| e.into_inner());
         let a = &call.args;
@@ -530,6 +537,22 @@ impl Drop for Thread {
 }
 
 impl Renderer {
+    fn add_sync(&mut self, sync: *mut std::ffi::c_void) -> u64 {
+        self.next_sync += 1;
+        self.syncs.insert(self.next_sync, sync as usize);
+        self.next_sync
+    }
+
+    /// A handle's sync, or null (which the host's GL refuses as it would a
+    /// sync it never made).
+    fn sync(&self, handle: u64) -> *mut std::ffi::c_void {
+        self.syncs.get(&handle).copied().unwrap_or(0) as *mut _
+    }
+
+    fn remove_sync(&mut self, handle: u64) -> *mut std::ffi::c_void {
+        self.syncs.remove(&handle).unwrap_or(0) as *mut _
+    }
+
     /// A guest process's `GLProcessPipe` closed: what it made goes.
     pub fn process_ended(&mut self, puid: u64) {
         self.ended(Owner::Process(puid));
@@ -705,6 +728,71 @@ mod tests {
         assert!(r.objects.color_buffers.contains_key(&(target as u32)));
         r.post(src as u32);
         assert!(!r.objects.color_buffers.contains_key(&(target as u32)));
+    }
+
+    /// A guest's OpenGL ES 2 drawing through the stream as its encoder sends
+    /// it: shaders as strings, a program, a uniform of floats, a client
+    /// array sent as data, a clear and a draw; then flushed and read back,
+    /// the left half the uniform's colour and the right the clear colour.
+    #[test]
+    #[ignore = "needs the host's Mesa EGL"]
+    fn a_guest_draws_with_opengl_es() {
+        let r = Renderer::new(Features::default(), DisplaySize { width: 32, height: 32, dpi_x: 160, dpi_y: 160 }).unwrap();
+        let renderer = Arc::new(Mutex::new(r));
+        let mut t = Thread::new(renderer.clone());
+        let attrs: Vec<u8> = [egl::EGL_RED_SIZE, 8, egl::EGL_GREEN_SIZE, 8, egl::EGL_BLUE_SIZE, 8, egl::EGL_ALPHA_SIZE, 8, egl::EGL_RENDERABLE_TYPE, egl::EGL_OPENGL_ES2_BIT, egl::EGL_NONE].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut w = 0u32.to_le_bytes().to_vec();
+        w.extend(encode("rcChooseConfig", &[P::In(&attrs), P::V(attrs.len() as u64), P::Out(4), P::V(1)]));
+        let config = i32_at(&t.feed(&w), 0) as u64;
+        let ctx = i32_at(&t.feed(&encode("rcCreateContext", &[P::V(config), P::V(0), P::V(objects::GLES_API_2 as u64)])), 0) as u64;
+        let win = i32_at(&t.feed(&encode("rcCreateWindowSurface", &[P::V(config), P::V(32), P::V(32)])), 0) as u64;
+        let cb = i32_at(&t.feed(&encode("rcCreateColorBuffer", &[P::V(32), P::V(32), P::V(gl::GL_RGBA as u64)])), 0) as u64;
+        t.feed(&encode("rcSetWindowColorBuffer", &[P::V(win), P::V(cb)]));
+        assert_eq!(i32_at(&t.feed(&encode("rcMakeCurrent", &[P::V(ctx), P::V(win), P::V(win)])), 0), 1);
+        let shader = |t: &mut Thread, kind: u32, src: &str| {
+            let s = i32_at(&t.feed(&encode("glCreateShader", &[P::V(kind as u64)])), 0) as u64;
+            let mut text = src.as_bytes().to_vec();
+            text.push(0);
+            assert!(t.feed(&encode("glShaderString", &[P::V(s), P::In(&text), P::V(text.len() as u64)])).is_empty());
+            t.feed(&encode("glCompileShader", &[P::V(s)]));
+            let a = t.feed(&encode("glGetShaderiv", &[P::V(s), P::V(gl::GL_COMPILE_STATUS as u64), P::Out(4)]));
+            assert_eq!(i32_at(&a, 0), 1, "{src}");
+            s
+        };
+        let vs = shader(&mut t, gl::GL_VERTEX_SHADER, "attribute vec2 pos; void main() { gl_Position = vec4(pos, 0.0, 1.0); }");
+        let fs = shader(&mut t, gl::GL_FRAGMENT_SHADER, "precision mediump float; uniform vec4 color; void main() { gl_FragColor = color; }");
+        let prog = i32_at(&t.feed(&encode("glCreateProgram", &[])), 0) as u64;
+        let mut w = encode("glAttachShader", &[P::V(prog), P::V(vs)]);
+        w.extend(encode("glAttachShader", &[P::V(prog), P::V(fs)]));
+        w.extend(encode("glBindAttribLocation", &[P::V(prog), P::V(3), P::In(b"pos\0")]));
+        w.extend(encode("glLinkProgram", &[P::V(prog)]));
+        w.extend(encode("glGetProgramiv", &[P::V(prog), P::V(gl::GL_LINK_STATUS as u64), P::Out(4)]));
+        assert_eq!(i32_at(&t.feed(&w), 0), 1);
+        t.feed(&encode("glUseProgram", &[P::V(prog)]));
+        let loc = i32_at(&t.feed(&encode("glGetUniformLocation", &[P::V(prog), P::In(b"color\0")])), 0);
+        assert!(loc >= 0);
+        let fl = |x: f32| P::V(x.to_bits() as u64);
+        let mut w = encode("glUniform4f", &[P::V(loc as u32 as u64), fl(1.0), fl(0.5), fl(0.0), fl(1.0)]);
+        let quad: Vec<u8> = [-1.0f32, -1.0, 0.0, -1.0, 0.0, 1.0, -1.0, -1.0, 0.0, 1.0, -1.0, 1.0].iter().flat_map(|x| x.to_le_bytes()).collect();
+        w.extend(encode("glEnableVertexAttribArray", &[P::V(3)]));
+        w.extend(encode("glVertexAttribPointerData", &[P::V(3), P::V(2), P::V(gl::GL_FLOAT as u64), P::V(0), P::V(8), P::In(&quad), P::V(quad.len() as u64)]));
+        w.extend(encode("glViewport", &[P::V(0), P::V(0), P::V(32), P::V(32)]));
+        w.extend(encode("glClearColor", &[fl(0.0), fl(0.0), fl(1.0), fl(1.0)]));
+        w.extend(encode("glClear", &[P::V(gl::GL_COLOR_BUFFER_BIT as u64)]));
+        w.extend(encode("glDrawArrays", &[P::V(gl::GL_TRIANGLES as u64), P::V(0), P::V(6)]));
+        w.extend(encode("glGetError", &[]));
+        let a = t.feed(&w);
+        assert_eq!(a, [0, 0, 0, 0], "a GL error");
+        assert_eq!(i32_at(&t.feed(&encode("rcFlushWindowColorBuffer", &[P::V(win)])), 0), 0);
+        let px = t.feed(&encode("rcReadColorBuffer", &[P::V(cb), P::V(0), P::V(0), P::V(32), P::V(32), P::V(gl::GL_RGBA as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::Out(32 * 32 * 4)]));
+        let at = |x: usize, y: usize| &px[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
+        for y in [0, 15, 31] {
+            assert_eq!(at(0, y), [255, 128, 0, 255], "row {y}");
+            assert_eq!(at(15, y), [255, 128, 0, 255]);
+            assert_eq!(at(16, y), [0, 0, 255, 255]);
+            assert_eq!(at(31, y), [0, 0, 255, 255]);
+        }
+        assert!(t.broken.is_none());
     }
 
     /// A guest's frame (`egl_window_surface_t`'s path): a context, a window

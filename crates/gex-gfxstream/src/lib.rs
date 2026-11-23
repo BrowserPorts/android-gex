@@ -39,6 +39,8 @@ pub struct Entry {
     pub name: &'static str,
     /// The return value's size in bytes, 0 for none.
     pub ret: u32,
+    /// Its C type.
+    pub ret_ty: &'static str,
     pub params: &'static [Param],
     /// gfxstream's host decodes it by hand (`flag custom_decoder`): its
     /// meaning is not the GL call of its name.
@@ -51,7 +53,11 @@ pub struct Entry {
 
 pub struct Param {
     pub name: &'static str,
+    /// Its C type, as the spec writes it with spaces taken out.
+    pub ty: &'static str,
     pub kind: Kind,
+    /// A pointer sent with no bytes is passed as null.
+    pub null_allowed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
