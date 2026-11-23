@@ -13,6 +13,7 @@ pub type EGLSurface = *mut c_void;
 pub type EGLint = i32;
 pub type EGLenum = u32;
 pub type EGLBoolean = u32;
+pub type EGLImage = *mut c_void;
 
 pub const EGL_NONE: EGLint = 0x3038;
 pub const EGL_TRUE: EGLBoolean = 1;
@@ -69,6 +70,9 @@ pub const EGL_VENDOR: EGLenum = 0x3053;
 pub const EGL_VERSION: EGLenum = 0x3054;
 pub const EGL_EXTENSIONS: EGLenum = 0x3055;
 pub const EGL_PLATFORM_SURFACELESS_MESA: EGLenum = 0x31DD;
+pub const EGL_DRAW: EGLint = 0x3059;
+pub const EGL_READ: EGLint = 0x305A;
+pub const EGL_GL_TEXTURE_2D_KHR: EGLenum = 0x30B1;
 
 #[link(name = "EGL")]
 extern "C" {
@@ -85,6 +89,57 @@ extern "C" {
     pub fn eglMakeCurrent(dpy: EGLDisplay, draw: EGLSurface, read: EGLSurface, ctx: EGLContext) -> EGLBoolean;
     pub fn eglQueryString(dpy: EGLDisplay, name: EGLint) -> *const c_char;
     pub fn eglGetError() -> EGLint;
+    pub fn eglGetCurrentContext() -> EGLContext;
+    pub fn eglGetCurrentSurface(which: EGLint) -> EGLSurface;
+}
+
+/// What is current on the calling thread, to be put back.
+pub struct Binding {
+    display: EGLDisplay,
+    context: EGLContext,
+    draw: EGLSurface,
+    read: EGLSurface,
+}
+
+impl Binding {
+    pub fn current(display: EGLDisplay) -> Binding {
+        unsafe { Binding { display, context: eglGetCurrentContext(), draw: eglGetCurrentSurface(EGL_DRAW), read: eglGetCurrentSurface(EGL_READ) } }
+    }
+
+    pub fn is(&self, context: EGLContext, draw: EGLSurface, read: EGLSurface) -> bool {
+        self.context == context && self.draw == draw && self.read == read
+    }
+
+    pub fn context(&self) -> EGLContext {
+        self.context
+    }
+
+    /// Makes it current again.
+    pub fn restore(&self) -> bool {
+        unsafe { eglMakeCurrent(self.display, self.draw, self.read, self.context) == EGL_TRUE }
+    }
+}
+
+type CreateImage = unsafe extern "C" fn(EGLDisplay, EGLContext, EGLenum, *mut c_void, *const EGLint) -> EGLImage;
+type DestroyImage = unsafe extern "C" fn(EGLDisplay, EGLImage) -> EGLBoolean;
+
+/// An image of a texture of `context`'s (`EGL_KHR_gl_texture_2D_image`).
+pub fn texture_image(display: EGLDisplay, context: EGLContext, texture: u32) -> EGLImage {
+    let p = proc_address("eglCreateImageKHR");
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
+    let f: CreateImage = unsafe { std::mem::transmute(p) };
+    unsafe { f(display, context, EGL_GL_TEXTURE_2D_KHR, texture as usize as *mut c_void, std::ptr::null()) }
+}
+
+pub fn destroy_image(display: EGLDisplay, image: EGLImage) {
+    let p = proc_address("eglDestroyImageKHR");
+    if p.is_null() || image.is_null() {
+        return;
+    }
+    let f: DestroyImage = unsafe { std::mem::transmute(p) };
+    unsafe { f(display, image) };
 }
 
 /// An entry point by name, or null.

@@ -14,10 +14,13 @@
 
 pub mod config;
 pub mod egl;
+pub mod gl;
+pub mod objects;
 
 use crate::{Arg, Call};
 use egl::*;
 use std::ffi::c_char;
+use objects::Owner;
 use std::sync::{Arc, Mutex};
 
 /// gfxstream's renderer version (`rendererVersion`).
@@ -69,11 +72,12 @@ pub struct Renderer {
     host_extensions: String,
     /// The context every guest context shares with, and its surface: where
     /// color buffers are made and drawn to (`FrameBuffer`'s own context).
-    #[allow(dead_code)]
     root: EGLContext,
-    #[allow(dead_code)]
     root_surface: EGLSurface,
     size: DisplaySize,
+    objects: objects::Objects,
+    /// Render threads are numbered from 1.
+    threads: u64,
 }
 
 // The EGL handles are the driver's; the renderer's lock is what orders
@@ -140,7 +144,7 @@ impl Renderer {
         unsafe { eglMakeCurrent(display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
         let max_version = if features.gles_dynamic_version { max_version_of(&host_version) } else { MaxVersion::Es2 };
         let configs = config::Configs::new(display, max_version > MaxVersion::Es2);
-        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size })
+        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0 })
     }
 
     /// `rcGetGLString`'s answer for `name`: the host's string on the
@@ -192,6 +196,12 @@ impl Renderer {
 /// One guest render thread: a `pipe:opengles` stream.
 pub struct Thread {
     renderer: Arc<Mutex<Renderer>>,
+    id: u64,
+    /// What `rcMakeCurrent` made current (`RenderThreadInfoGl`'s
+    /// `currContext`, `currDrawSurf`, `currReadSurf`).
+    context: u32,
+    draw: u32,
+    read: u32,
     /// The stream's first word (`clientFlags`), not yet all read.
     flags_left: usize,
     /// Bytes of a call not yet whole.
@@ -227,7 +237,77 @@ fn words(b: &[u8]) -> Vec<i32> {
 
 impl Thread {
     pub fn new(renderer: Arc<Mutex<Renderer>>) -> Thread {
-        Thread { renderer, flags_left: 4, pending: Vec::new(), puid: 0, broken: None }
+        let id = {
+            let mut r = renderer.lock().unwrap_or_else(|e| e.into_inner());
+            r.threads += 1;
+            r.threads
+        };
+        Thread { renderer, id, context: 0, draw: 0, read: 0, flags_left: 4, pending: Vec::new(), puid: 0, broken: None }
+    }
+
+    /// Whose what this thread makes is.
+    fn owner(&self) -> Owner {
+        if self.puid != 0 {
+            Owner::Process(self.puid)
+        } else {
+            Owner::Thread(self.id)
+        }
+    }
+
+    /// The host thread feeding this stream has the stream's context current,
+    /// or none: a host thread may serve more than one stream.
+    fn rebind(&self) {
+        let r = self.renderer.lock().unwrap_or_else(|e| e.into_inner());
+        let want = r.objects.contexts.get(&self.context).map(|c| c.egl).unwrap_or(std::ptr::null_mut());
+        let surf = |h: u32| r.objects.windows.get(&h).map(|w| w.surface).unwrap_or(std::ptr::null_mut());
+        let (draw, read) = (surf(self.draw), surf(self.read));
+        if !Binding::current(r.display).is(want, draw, read) && unsafe { eglMakeCurrent(r.display, draw, read, want) } != EGL_TRUE {
+            eprintln!("[gex] gfxstream: render thread {}: its context could not be made current here: {:#x}", self.id, unsafe { eglGetError() });
+        }
+    }
+
+    /// `FrameBuffer::bindContext`.
+    fn make_current(&mut self, r: &mut Renderer, context: u32, draw: u32, read: u32) -> bool {
+        let none = std::ptr::null_mut();
+        let (mut egl, mut d, mut rd) = (none, none, none);
+        if context != 0 || draw != 0 || read != 0 {
+            let Some(c) = r.objects.contexts.get(&context) else { return false };
+            let Some(dw) = r.objects.windows.get(&draw) else { return false };
+            egl = c.egl;
+            d = dw.surface;
+            rd = if read != draw {
+                match r.objects.windows.get(&read) {
+                    Some(w) => w.surface,
+                    None => return false,
+                }
+            } else {
+                d
+            };
+        }
+        if unsafe { eglMakeCurrent(r.display, d, rd, egl) } != EGL_TRUE {
+            eprintln!("[gex] gfxstream: eglMakeCurrent failed: {:#x}", unsafe { eglGetError() });
+            return false;
+        }
+        // The surfaces bound are told their contexts; unbinding tells the
+        // ones bound before that they have none.
+        let (bind_draw, bind_read) = if draw == 0 && read == 0 { (self.draw, self.read) } else { (draw, read) };
+        if bind_draw != 0 && bind_read != 0 {
+            if let Some(w) = r.objects.windows.get_mut(&bind_draw) {
+                w.draw_context = context;
+                if bind_draw == bind_read {
+                    w.read_context = context;
+                }
+            }
+            if bind_draw != bind_read {
+                if let Some(w) = r.objects.windows.get_mut(&bind_read) {
+                    w.read_context = context;
+                }
+            }
+        }
+        self.context = context;
+        self.draw = draw;
+        self.read = read;
+        true
     }
 
     /// Bytes from the guest; what the host answers, in order.
@@ -236,6 +316,7 @@ impl Thread {
         if self.broken.is_some() {
             return out;
         }
+        self.rebind();
         if self.flags_left > 0 {
             let n = self.flags_left.min(data.len());
             self.flags_left -= n;
@@ -266,8 +347,10 @@ impl Thread {
     /// One call: its answer, if it has one.
     fn run(&mut self, call: &Call<'_>) -> Option<Vec<u8>> {
         let (_, entry) = crate::entry(call.opcode)?;
-        let r = self.renderer.lock().unwrap_or_else(|e| e.into_inner());
+        let renderer = self.renderer.clone();
+        let mut r = renderer.lock().unwrap_or_else(|e| e.into_inner());
         let a = &call.args;
+        let v = |i: usize| value(&a[i]);
         let reply = |outs: &[&[u8]], ret: u64| Some(crate::answer(entry, call, outs, ret));
         match call.name {
             "rcGetRendererVersion" => reply(&[], RENDERER_VERSION as u64),
@@ -325,9 +408,78 @@ impl Thread {
                 reply(&[], v as u32 as u64)
             }
             "rcSetPuid" => {
-                drop(r);
-                self.puid = value(&a[0]);
+                self.puid = v(0);
                 None
+            }
+            "rcCreateContext" => {
+                let owner = self.owner();
+                reply(&[], r.create_context(v(0) as u32, v(1) as u32, v(2) as u32, owner) as u64)
+            }
+            "rcDestroyContext" => {
+                r.destroy_context(v(0) as u32);
+                None
+            }
+            "rcCreateWindowSurface" => {
+                let owner = self.owner();
+                reply(&[], r.create_window(v(0) as u32, v(1) as u32, v(2) as u32, owner) as u64)
+            }
+            "rcDestroyWindowSurface" => {
+                r.destroy_window(v(0) as u32);
+                None
+            }
+            "rcCreateColorBuffer" => reply(&[], r.create_color_buffer(v(0) as u32, v(1) as u32, v(2) as u32) as u64),
+            "rcCreateColorBufferDMA" => {
+                // A framework format other than 0 (`FRAMEWORK_FORMAT_GL_COMPATIBLE`)
+                // is a YUV layout converted on upload (`YUVConverter`).
+                if v(3) as i32 != 0 {
+                    eprintln!("[gex] gfxstream: a color buffer of framework format {} (YUV) is not done here yet", v(3) as i32);
+                    return reply(&[], 0);
+                }
+                reply(&[], r.create_color_buffer(v(0) as u32, v(1) as u32, v(2) as u32) as u64)
+            }
+            // With the refcount pipe, opening and closing count nothing.
+            "rcOpenColorBuffer" | "rcCloseColorBuffer" => None,
+            "rcOpenColorBuffer2" => reply(&[], 0),
+            "rcSetWindowColorBuffer" => {
+                r.set_window_color_buffer(v(0) as u32, v(1) as u32);
+                None
+            }
+            "rcFlushWindowColorBuffer" => reply(&[], r.flush_window(v(0) as u32) as u32 as u64),
+            "rcFlushWindowColorBufferAsync" | "rcFlushWindowColorBufferAsyncWithFrameNumber" => {
+                r.flush_window(v(0) as u32);
+                None
+            }
+            "rcMakeCurrent" => {
+                let ok = self.make_current(&mut r, v(0) as u32, v(1) as u32, v(2) as u32);
+                reply(&[], ok as u64)
+            }
+            "rcMakeCurrentAsync" => {
+                self.make_current(&mut r, v(0) as u32, v(1) as u32, v(2) as u32);
+                None
+            }
+            "rcBindTexture" => {
+                r.bind_color_buffer(v(0) as u32, false);
+                None
+            }
+            "rcBindRenderbuffer" => {
+                r.bind_color_buffer(v(0) as u32, true);
+                None
+            }
+            "rcUpdateColorBuffer" | "rcUpdateColorBufferDMA" => {
+                let pixels = match &a[7] {
+                    Arg::In(d) => *d,
+                    _ => &[],
+                };
+                r.update_color_buffer(v(0) as u32, v(1) as i32, v(2) as i32, v(3) as i32, v(4) as i32, v(5) as u32, v(6) as u32, pixels);
+                reply(&[], 0)
+            }
+            "rcReadColorBuffer" | "rcReadColorBufferDMA" => {
+                let len = match a[7] {
+                    Arg::Out(n) => n as usize,
+                    _ => 0,
+                };
+                let b = r.read_color_buffer(v(0) as u32, v(1) as i32, v(2) as i32, v(3) as i32, v(4) as i32, v(5) as u32, v(6) as u32, len);
+                reply(&[&b], 0)
             }
             // `rcSelectChecksumHelper`: none was offered, so none is chosen.
             "rcSelectChecksumHelper" => None,
@@ -341,6 +493,25 @@ impl Thread {
                 }
             }
         }
+    }
+}
+
+impl Drop for Thread {
+    /// A render thread's end: what it made with no process said goes, and
+    /// nothing stays current.
+    fn drop(&mut self) {
+        let mut r = self.renderer.lock().unwrap_or_else(|e| e.into_inner());
+        if self.context != 0 && Binding::current(r.display).context() == r.objects.contexts.get(&self.context).map(|c| c.egl).unwrap_or(std::ptr::null_mut()) {
+            unsafe { eglMakeCurrent(r.display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+        }
+        r.ended(Owner::Thread(self.id));
+    }
+}
+
+impl Renderer {
+    /// A guest process's `GLProcessPipe` closed: what it made goes.
+    pub fn process_ended(&mut self, puid: u64) {
+        self.ended(Owner::Process(puid));
     }
 }
 
@@ -434,5 +605,75 @@ mod tests {
         assert!(s.contains("ANDROID_EMU_host_composition_v2") && s.contains("ANDROID_EMU_gles_max_version_"), "{s}");
         assert!(!s.contains("CHECKSUM"));
         assert!(t.broken.is_none());
+    }
+
+    fn clear(r: f32, g: f32, b: f32, a: f32) {
+        type ClearColor = unsafe extern "C" fn(f32, f32, f32, f32);
+        type Clear = unsafe extern "C" fn(u32);
+        unsafe {
+            let cc: ClearColor = std::mem::transmute(egl::proc_address("glClearColor"));
+            let c: Clear = std::mem::transmute(egl::proc_address("glClear"));
+            cc(r, g, b, a);
+            c(gl::GL_COLOR_BUFFER_BIT);
+        }
+    }
+
+    /// A guest's frame (`egl_window_surface_t`'s path): a context, a window
+    /// surface on a color buffer, made current, drawn (here by the host's
+    /// GL directly, there being no GLES decoder yet), flushed into the
+    /// color buffer and read back; a rectangle written into the color
+    /// buffer and read back; handles from 1 and never reused while in use.
+    #[test]
+    #[ignore = "needs the host's Mesa EGL"]
+    fn a_frame_reaches_its_color_buffer() {
+        let r = Renderer::new(Features::default(), DisplaySize { width: 64, height: 64, dpi_x: 160, dpi_y: 160 }).unwrap();
+        let renderer = Arc::new(Mutex::new(r));
+        let mut t = Thread::new(renderer.clone());
+        let mut w = 0u32.to_le_bytes().to_vec();
+        let attrs: Vec<u8> = [egl::EGL_RED_SIZE, 8, egl::EGL_GREEN_SIZE, 8, egl::EGL_BLUE_SIZE, 8, egl::EGL_ALPHA_SIZE, 8, egl::EGL_RENDERABLE_TYPE, egl::EGL_OPENGL_ES2_BIT, egl::EGL_NONE].iter().flat_map(|v| v.to_le_bytes()).collect();
+        w.extend(encode("rcChooseConfig", &[P::In(&attrs), P::V(attrs.len() as u64), P::Out(4), P::V(1)]));
+        let a = t.feed(&w);
+        assert!(i32_at(&a, 4) >= 1);
+        let config = i32_at(&a, 0) as u64;
+        let a = t.feed(&encode("rcCreateContext", &[P::V(config), P::V(0), P::V(objects::GLES_API_2 as u64)]));
+        let ctx = i32_at(&a, 0);
+        let a = t.feed(&encode("rcCreateWindowSurface", &[P::V(config), P::V(16), P::V(16)]));
+        let win = i32_at(&a, 0);
+        let a = t.feed(&encode("rcCreateColorBufferDMA", &[P::V(32), P::V(32), P::V(gl::GL_RGBA as u64), P::V(0)]));
+        let cb = i32_at(&a, 0);
+        assert_eq!((ctx, win, cb), (1, 2, 3));
+        // Attaching gives the window the color buffer's size.
+        assert!(t.feed(&encode("rcSetWindowColorBuffer", &[P::V(win as u64), P::V(cb as u64)])).is_empty());
+        assert_eq!(renderer.lock().unwrap().objects.windows[&(win as u32)].width, 32);
+        let a = t.feed(&encode("rcMakeCurrent", &[P::V(ctx as u64), P::V(win as u64), P::V(win as u64)]));
+        assert_eq!(i32_at(&a, 0), 1);
+        clear(1.0, 0.0, 1.0, 1.0);
+        let a = t.feed(&encode("rcFlushWindowColorBuffer", &[P::V(win as u64)]));
+        assert_eq!(i32_at(&a, 0), 0);
+        let n = 32 * 32 * 4;
+        let a = t.feed(&encode("rcReadColorBuffer", &[P::V(cb as u64), P::V(0), P::V(0), P::V(32), P::V(32), P::V(gl::GL_RGBA as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::Out(n)]));
+        assert_eq!(a.len(), n as usize);
+        assert!(a.chunks_exact(4).all(|p| p == [255, 0, 255, 255]), "{:?}", &a[..8]);
+        // The guest's context is still current, and still draws.
+        clear(0.0, 1.0, 0.0, 1.0);
+        t.feed(&encode("rcFlushWindowColorBuffer", &[P::V(win as u64)]));
+        // A 2x2 rectangle written at (4, 4), read back with a row around it.
+        let px: Vec<u8> = (0..16).map(|i| i as u8 * 10).collect();
+        let a = t.feed(&encode("rcUpdateColorBuffer", &[P::V(cb as u64), P::V(4), P::V(4), P::V(2), P::V(2), P::V(gl::GL_RGBA as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::In(&px)]));
+        assert_eq!(i32_at(&a, 0), 0);
+        let a = t.feed(&encode("rcReadColorBuffer", &[P::V(cb as u64), P::V(3), P::V(4), P::V(4), P::V(2), P::V(gl::GL_RGB as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::Out(24)]));
+        assert_eq!(&a[..3], [0, 255, 0]);
+        assert_eq!(&a[3..9], [0, 10, 20, 40, 50, 60]);
+        assert_eq!(&a[9..12], [0, 255, 0]);
+        // Unbound, then gone with the thread; the color buffer with its pipe.
+        let a = t.feed(&encode("rcMakeCurrent", &[P::V(0), P::V(0), P::V(0)]));
+        assert_eq!(i32_at(&a, 0), 1);
+        assert!(t.broken.is_none());
+        drop(t);
+        let mut r = renderer.lock().unwrap();
+        assert!(r.objects.contexts.is_empty() && r.objects.windows.is_empty());
+        assert_eq!(r.objects.color_buffers.len(), 1);
+        r.release_color_buffer(cb as u32);
+        assert!(r.objects.color_buffers.is_empty());
     }
 }
