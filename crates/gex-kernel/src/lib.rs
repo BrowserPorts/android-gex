@@ -46,6 +46,7 @@ pub mod netlink;
 pub mod netdev;
 pub mod tun;
 pub mod pfkey;
+pub mod goldfishpipe;
 pub mod hwrng;
 pub mod dmaheap;
 pub mod routes;

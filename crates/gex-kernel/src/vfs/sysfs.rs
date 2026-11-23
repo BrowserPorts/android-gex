@@ -321,6 +321,11 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
             }
         };
         let mut all: Vec<Arc<Device>> = chars.iter().map(|(s, n, major, minor, mode)| Arc::new(Device { subsystem: s.to_string(), name: n.to_string(), major: *major, minor: *minor, mode: *mode, attrs: attrs_of(n) })).collect();
+        // The emulator's goldfish pipe, a misc device with no parent
+        // (`init_miscdevice` sets none).
+        if crate::goldfishpipe::present() {
+            all.push(Arc::new(Device { subsystem: "misc".to_string(), name: crate::goldfishpipe::NAME.to_string(), major: 10, minor: crate::goldfishpipe::MISC_MINOR, mode: None, attrs: None }));
+        }
         // The emulator's consoles, when the kernel has them: every minor
         // of `hvc_console`'s driver, in `devices/virtual/tty` (no parent),
         // as `tty_register_driver` adds them without `TTY_DRIVER_DYNAMIC_DEV`.

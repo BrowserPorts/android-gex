@@ -231,6 +231,17 @@ impl Connection {
     pub fn pending(&self) -> usize {
         self.out.len()
     }
+
+    /// Whether the connector refused the stream (no such service, or no
+    /// NUL in its first 128 bytes).
+    pub fn refused(&self) -> bool {
+        matches!(self.state, State::Refused)
+    }
+
+    /// Whether the stream is still taking its connection string.
+    pub fn connecting(&self) -> bool {
+        matches!(self.state, State::Connecting(_))
+    }
 }
 
 fn say_once(name: &str) {

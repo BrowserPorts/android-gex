@@ -43,6 +43,10 @@ pub fn open_char(dev: u64, node: NodeMeta, flags: u64) -> Result<Arc<dyn FileHan
     if major(dev) == 10 && minor(dev) == crate::hwrng::MISC_MINOR {
         return crate::hwrng::open(flags, node);
     }
+    // The emulator's goldfish pipe, a new pipe each open.
+    if major(dev) == 10 && minor(dev) == crate::goldfishpipe::MISC_MINOR && crate::goldfishpipe::present() {
+        return crate::goldfishpipe::open(node);
+    }
     // A DMA-BUF heap's.
     if major(dev) == crate::dmaheap::MAJOR {
         return crate::dmaheap::open(minor(dev), node);
