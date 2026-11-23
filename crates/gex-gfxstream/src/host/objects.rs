@@ -2,8 +2,13 @@
 //! them: contexts (`EmulatedEglContext`), window surfaces
 //! (`EmulatedEglWindowSurface`: a host pbuffer the guest's window is drawn
 //! into, copied into its color buffer at a flush) and color buffers
-//! (`ColorBufferGl`: a texture of the root context's, which every guest
-//! context shares, with an EGL image of it to bind elsewhere).
+//! (`ColorBufferGl`: a texture of the root context's, with an EGL image of
+//! it through which guest contexts reach it).
+//!
+//! A guest context shares objects only with the context it names, as EGL
+//! has it: gfxstream shares every context with its own and keeps each
+//! guest share group's names apart in its translator; here the host's EGL
+//! keeps them apart, and the renderer's own objects are no guest's.
 //!
 //! Color buffers are counted as with the `RefCountPipe` feature, which the
 //! image's allocator and EGL always use: one reference when made, none taken
@@ -145,7 +150,7 @@ impl Renderer {
     }
 
     /// `rcCreateContext`: a host context of the guest's config, sharing with
-    /// `share` or else the root, at the version asked; 0 if it cannot be.
+    /// `share` if one is named, at the version asked; 0 if it cannot be.
     pub fn create_context(&mut self, config: u32, share: u32, version: u32, owner: Owner) -> u32 {
         let shared = if share != 0 {
             match self.objects.contexts.get(&share) {
@@ -156,7 +161,7 @@ impl Renderer {
                 }
             }
         } else {
-            self.root
+            std::ptr::null_mut()
         };
         let handle = self.objects.handle();
         let Some(cfg) = self.configs.list.get(config as usize).map(|c| c.host) else {
@@ -500,12 +505,20 @@ impl Renderer {
 }
 
 /// `ColorBufferGl::blitFromCurrentReadBuffer`: the current read buffer into
-/// the color buffer's texture, with the context current that drew it (it
-/// shares the texture), its bindings left as they were. A multisampled
-/// buffer is resolved by a blit (OpenGL ES 3).
+/// the color buffer, with the context current that drew it, through a
+/// texture of that context's made from the color buffer's EGL image, the
+/// context's bindings left as they were. A multisampled buffer is resolved
+/// by a blit (OpenGL ES 3).
 fn blit_from_read_buffer(f: &Fns, cb: &ColorBuffer, es3: bool) {
+    if cb.image.is_null() {
+        return;
+    }
     unsafe {
         let tex = int(f, gl::GL_TEXTURE_BINDING_2D);
+        let mut tmp = 0;
+        (f.glGenTextures)(1, &mut tmp);
+        (f.glBindTexture)(gl::GL_TEXTURE_2D, tmp);
+        (f.glEGLImageTargetTexture2DOES)(gl::GL_TEXTURE_2D, cb.image);
         let read_binding = if es3 { gl::GL_READ_FRAMEBUFFER_BINDING } else { gl::GL_FRAMEBUFFER_BINDING };
         let read_target = if es3 { gl::GL_READ_FRAMEBUFFER } else { gl::GL_FRAMEBUFFER };
         let read = int(f, read_binding);
@@ -519,17 +532,17 @@ fn blit_from_read_buffer(f: &Fns, cb: &ColorBuffer, es3: bool) {
             (f.glGenFramebuffers)(1, &mut fbo);
             let draw = int(f, gl::GL_DRAW_FRAMEBUFFER_BINDING);
             (f.glBindFramebuffer)(gl::GL_DRAW_FRAMEBUFFER, fbo);
-            (f.glFramebufferTexture2D)(gl::GL_DRAW_FRAMEBUFFER, gl::GL_COLOR_ATTACHMENT0, gl::GL_TEXTURE_2D, cb.tex, 0);
+            (f.glFramebufferTexture2D)(gl::GL_DRAW_FRAMEBUFFER, gl::GL_COLOR_ATTACHMENT0, gl::GL_TEXTURE_2D, tmp, 0);
             (f.glBlitFramebuffer)(0, 0, w, h, 0, 0, w, h, gl::GL_COLOR_BUFFER_BIT, gl::GL_NEAREST);
             (f.glBindFramebuffer)(gl::GL_DRAW_FRAMEBUFFER, draw as u32);
             (f.glDeleteFramebuffers)(1, &fbo);
         } else {
-            (f.glBindTexture)(gl::GL_TEXTURE_2D, cb.tex);
             (f.glCopyTexSubImage2D)(gl::GL_TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
         }
         if read != 0 {
             (f.glBindFramebuffer)(read_target, read as u32);
         }
+        (f.glDeleteTextures)(1, &tmp);
         (f.glBindTexture)(gl::GL_TEXTURE_2D, tex as u32);
         // Other contexts read the texture next.
         (f.glFlush)();

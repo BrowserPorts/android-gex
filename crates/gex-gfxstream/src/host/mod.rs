@@ -3,9 +3,8 @@
 //! (`host/RenderControl.cpp`, `FrameBuffer.cpp`, `host/gl/`).
 //!
 //! One [`Renderer`] for the machine holds what every guest process shares:
-//! the host's display, a root context every guest context shares with (so a
-//! color buffer, a texture of the root's, is every context's), the configs,
-//! and the objects by handle. A [`Thread`] is one `pipe:opengles` stream, a
+//! the host's display, a root context of its own (where color buffers are
+//! kept, composed and read), the configs, and the objects by handle. A [`Thread`] is one `pipe:opengles` stream, a
 //! guest render thread: its current context and surfaces, its process.
 //!
 //! What the host offers the guest is said in `GL_EXTENSIONS`
@@ -71,8 +70,8 @@ pub struct Renderer {
     max_version: MaxVersion,
     /// The host's extensions, read on the root context.
     host_extensions: String,
-    /// The context every guest context shares with, and its surface: where
-    /// color buffers are made and drawn to (`FrameBuffer`'s own context).
+    /// The renderer's own context and its surface: where color buffers are
+    /// made, composed and read (`FrameBuffer`'s own context).
     root: EGLContext,
     root_surface: EGLSurface,
     size: DisplaySize,
@@ -737,6 +736,11 @@ mod tests {
         assert_eq!(renderer.lock().unwrap().objects.windows[&(win as u32)].width, 32);
         let a = t.feed(&encode("rcMakeCurrent", &[P::V(ctx as u64), P::V(win as u64), P::V(win as u64)]));
         assert_eq!(i32_at(&a, 0), 1);
+        // The renderer's textures are not the guest context's.
+        let cb_tex = renderer.lock().unwrap().objects.color_buffers[&(cb as u32)].tex;
+        type IsTexture = unsafe extern "C" fn(u32) -> u8;
+        let is_texture: IsTexture = unsafe { std::mem::transmute(egl::proc_address("glIsTexture")) };
+        assert_eq!(unsafe { is_texture(cb_tex) }, 0);
         clear(1.0, 0.0, 1.0, 1.0);
         let a = t.feed(&encode("rcFlushWindowColorBuffer", &[P::V(win as u64)]));
         assert_eq!(i32_at(&a, 0), 0);
