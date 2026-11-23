@@ -60,8 +60,19 @@ pub struct ColorBuffer {
     fbo: u32,
     /// The guest's references (`ColorBufferRef::refcount`).
     pub refs: u32,
-    /// The windows it is attached to.
-    windows: u32,
+    /// The windows it is attached to, and the display while it shows it.
+    holds: u32,
+}
+
+impl ColorBuffer {
+    /// A window or the display takes or lets go of it.
+    pub fn hold(&mut self, on: bool) {
+        if on {
+            self.holds += 1;
+        } else {
+            self.holds -= 1;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -241,7 +252,7 @@ impl Renderer {
             return;
         }
         if let Some(c) = self.objects.color_buffers.get_mut(&cb) {
-            c.windows -= 1;
+            c.hold(false);
         }
         self.free_if_unused(cb);
     }
@@ -257,7 +268,7 @@ impl Renderer {
             eprintln!("[gex] gfxstream: rcSetWindowColorBuffer: no color buffer {cb}");
             return;
         };
-        c.windows += 1;
+        c.hold(true);
         let (width, height) = (c.width, c.height);
         let w = self.objects.windows.get_mut(&window).unwrap();
         let old = std::mem::replace(&mut w.color_buffer, cb);
@@ -330,7 +341,7 @@ impl Renderer {
         if image.is_null() {
             eprintln!("[gex] gfxstream: no EGL image of a color buffer's texture: {:#x}", unsafe { eglGetError() });
         }
-        self.objects.color_buffers.insert(handle, ColorBuffer { tex, image, width, height, format, format_checked: false, fbo: 0, refs: 1, windows: 0 });
+        self.objects.color_buffers.insert(handle, ColorBuffer { tex, image, width, height, format, format_checked: false, fbo: 0, refs: 1, holds: 0 });
         handle
     }
 
@@ -342,9 +353,9 @@ impl Renderer {
         self.free_if_unused(handle);
     }
 
-    fn free_if_unused(&mut self, handle: u32) {
+    pub(super) fn free_if_unused(&mut self, handle: u32) {
         match self.objects.color_buffers.get(&handle) {
-            Some(c) if c.refs == 0 && c.windows == 0 => {}
+            Some(c) if c.refs == 0 && c.holds == 0 => {}
             _ => return,
         }
         let c = self.objects.color_buffers.remove(&handle).unwrap();

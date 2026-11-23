@@ -27,6 +27,20 @@ pub const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 pub const GL_SAMPLE_BUFFERS: u32 = 0x80A8;
 pub const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
 pub const GL_NEAREST: u32 = 0x2600;
+pub const GL_VIEWPORT: u32 = 0x0BA2;
+pub const GL_DEPTH_BUFFER_BIT: u32 = 0x0100;
+pub const GL_BLEND: u32 = 0x0BE2;
+pub const GL_ONE: u32 = 1;
+pub const GL_ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
+pub const GL_TEXTURE0: u32 = 0x84C0;
+pub const GL_ARRAY_BUFFER: u32 = 0x8892;
+pub const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
+pub const GL_STATIC_DRAW: u32 = 0x88E4;
+pub const GL_TRIANGLES: u32 = 0x0004;
+pub const GL_VERTEX_SHADER: u32 = 0x8B31;
+pub const GL_FRAGMENT_SHADER: u32 = 0x8B30;
+pub const GL_COMPILE_STATUS: u32 = 0x8B81;
+pub const GL_LINK_STATUS: u32 = 0x8B82;
 
 pub const GL_RGBA: u32 = 0x1908;
 pub const GL_RGB: u32 = 0x1907;
@@ -92,6 +106,34 @@ pub struct Fns {
     pub glEGLImageTargetRenderbufferStorageOES: unsafe extern "C" fn(u32, *mut c_void),
     pub glBlitFramebuffer: unsafe extern "C" fn(i32, i32, i32, i32, i32, i32, i32, i32, u32, u32),
     pub glGetError: unsafe extern "C" fn() -> u32,
+    pub glCreateShader: unsafe extern "C" fn(u32) -> u32,
+    pub glShaderSource: unsafe extern "C" fn(u32, i32, *const *const u8, *const i32),
+    pub glCompileShader: unsafe extern "C" fn(u32),
+    pub glGetShaderiv: unsafe extern "C" fn(u32, u32, *mut i32),
+    pub glGetShaderInfoLog: unsafe extern "C" fn(u32, i32, *mut i32, *mut u8),
+    pub glCreateProgram: unsafe extern "C" fn() -> u32,
+    pub glAttachShader: unsafe extern "C" fn(u32, u32),
+    pub glLinkProgram: unsafe extern "C" fn(u32),
+    pub glGetProgramiv: unsafe extern "C" fn(u32, u32, *mut i32),
+    pub glUseProgram: unsafe extern "C" fn(u32),
+    pub glGetAttribLocation: unsafe extern "C" fn(u32, *const u8) -> i32,
+    pub glGetUniformLocation: unsafe extern "C" fn(u32, *const u8) -> i32,
+    pub glUniform1i: unsafe extern "C" fn(i32, i32),
+    pub glUniform1f: unsafe extern "C" fn(i32, f32),
+    pub glUniform2f: unsafe extern "C" fn(i32, f32, f32),
+    pub glUniform4f: unsafe extern "C" fn(i32, f32, f32, f32, f32),
+    pub glGenBuffers: unsafe extern "C" fn(i32, *mut u32),
+    pub glBindBuffer: unsafe extern "C" fn(u32, u32),
+    pub glBufferData: unsafe extern "C" fn(u32, isize, *const c_void, u32),
+    pub glEnableVertexAttribArray: unsafe extern "C" fn(u32),
+    pub glVertexAttribPointer: unsafe extern "C" fn(u32, i32, u32, u8, i32, *const c_void),
+    pub glDrawElements: unsafe extern "C" fn(u32, i32, u32, *const c_void),
+    pub glViewport: unsafe extern "C" fn(i32, i32, i32, i32),
+    pub glClear: unsafe extern "C" fn(u32),
+    pub glEnable: unsafe extern "C" fn(u32),
+    pub glDisable: unsafe extern "C" fn(u32),
+    pub glBlendFunc: unsafe extern "C" fn(u32, u32),
+    pub glActiveTexture: unsafe extern "C" fn(u32),
 }
 
 /// The entry points, or the first one the host lacks.
@@ -130,6 +172,34 @@ pub fn fns() -> Result<&'static Fns, String> {
             glEGLImageTargetRenderbufferStorageOES,
             glBlitFramebuffer,
             glGetError,
+            glCreateShader,
+            glShaderSource,
+            glCompileShader,
+            glGetShaderiv,
+            glGetShaderInfoLog,
+            glCreateProgram,
+            glAttachShader,
+            glLinkProgram,
+            glGetProgramiv,
+            glUseProgram,
+            glGetAttribLocation,
+            glGetUniformLocation,
+            glUniform1i,
+            glUniform1f,
+            glUniform2f,
+            glUniform4f,
+            glGenBuffers,
+            glBindBuffer,
+            glBufferData,
+            glEnableVertexAttribArray,
+            glVertexAttribPointer,
+            glDrawElements,
+            glViewport,
+            glClear,
+            glEnable,
+            glDisable,
+            glBlendFunc,
+            glActiveTexture,
         ))
     })
     .as_ref()

@@ -12,6 +12,7 @@
 //! (`rcGetGLString`), and the guest takes its paths by it:
 //! [`Features`] says which.
 
+pub mod compose;
 pub mod config;
 pub mod egl;
 pub mod gl;
@@ -78,6 +79,11 @@ pub struct Renderer {
     objects: objects::Objects,
     /// Render threads are numbered from 1.
     threads: u64,
+    drawer: Option<compose::Drawer>,
+    /// The color buffer the display shows, and how many posts there were.
+    shown: u32,
+    posts: u64,
+    sink: Option<compose::Sink>,
 }
 
 // The EGL handles are the driver's; the renderer's lock is what orders
@@ -144,7 +150,7 @@ impl Renderer {
         unsafe { eglMakeCurrent(display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
         let max_version = if features.gles_dynamic_version { max_version_of(&host_version) } else { MaxVersion::Es2 };
         let configs = config::Configs::new(display, max_version > MaxVersion::Es2);
-        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0 })
+        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None })
     }
 
     /// `rcGetGLString`'s answer for `name`: the host's string on the
@@ -457,6 +463,22 @@ impl Thread {
                 self.make_current(&mut r, v(0) as u32, v(1) as u32, v(2) as u32);
                 None
             }
+            "rcFBPost" => {
+                r.post(v(0) as u32);
+                None
+            }
+            "rcCompose" | "rcComposeWithoutPost" | "rcComposeAsync" | "rcComposeAsyncWithoutPost" => {
+                let buf = match &a[1] {
+                    Arg::In(d) => *d,
+                    _ => &[],
+                };
+                let done = r.compose(buf, !call.name.ends_with("WithoutPost"));
+                if entry.answers() {
+                    reply(&[], done as u64)
+                } else {
+                    None
+                }
+            }
             "rcBindTexture" => {
                 r.bind_color_buffer(v(0) as u32, false);
                 None
@@ -616,6 +638,74 @@ mod tests {
             cc(r, g, b, a);
             c(gl::GL_COLOR_BUFFER_BIT);
         }
+    }
+
+    fn layer(cb: u32, mode: u32, frame: [i32; 4], crop: [f32; 4], color: [u8; 4]) -> Vec<u8> {
+        let mut l = Vec::new();
+        for w in [cb, mode] {
+            l.extend_from_slice(&w.to_le_bytes());
+        }
+        for w in frame {
+            l.extend_from_slice(&w.to_le_bytes());
+        }
+        for f in crop {
+            l.extend_from_slice(&f.to_le_bytes());
+        }
+        l.extend_from_slice(&1i32.to_le_bytes()); // HWC2_BLEND_MODE_NONE
+        l.extend_from_slice(&1.0f32.to_le_bytes());
+        l.extend_from_slice(&color);
+        l.extend_from_slice(&0u32.to_le_bytes());
+        l
+    }
+
+    /// The guest's composer (host composition v2): a solid colour over the
+    /// whole target, then a 4x4 color buffer into the rectangle (2, 2) to
+    /// (6, 6); posted, the display's frame has the source's first row at
+    /// the rectangle's top, as gfxstream's compositor and display put it.
+    #[test]
+    #[ignore = "needs the host's Mesa EGL"]
+    fn layers_are_composed_and_posted() {
+        let r = Renderer::new(Features::default(), DisplaySize { width: 8, height: 8, dpi_x: 160, dpi_y: 160 }).unwrap();
+        let renderer = Arc::new(Mutex::new(r));
+        let frames: Arc<Mutex<Vec<(u32, u32, Vec<u8>, u64)>>> = Arc::default();
+        let got = frames.clone();
+        renderer.lock().unwrap().set_sink(Box::new(move |f| got.lock().unwrap().push((f.width, f.height, f.rgba.clone(), f.number))));
+        let mut t = Thread::new(renderer.clone());
+        let mut w = 0u32.to_le_bytes().to_vec();
+        w.extend(encode("rcCreateColorBufferDMA", &[P::V(4), P::V(4), P::V(gl::GL_RGBA as u64), P::V(0)]));
+        w.extend(encode("rcCreateColorBufferDMA", &[P::V(8), P::V(8), P::V(gl::GL_RGBA as u64), P::V(0)]));
+        let a = t.feed(&w);
+        let (src, target) = (i32_at(&a, 0) as u64, i32_at(&a, 4) as u64);
+        let px: Vec<u8> = (0..16u8).flat_map(|i| [(i / 4) * 40, (i % 4) * 40, 0, 255]).collect();
+        t.feed(&encode("rcUpdateColorBuffer", &[P::V(src), P::V(0), P::V(0), P::V(4), P::V(4), P::V(gl::GL_RGBA as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::In(&px)]));
+        let mut req = Vec::new();
+        for x in [2u32, 0, target as u32, 2] {
+            req.extend_from_slice(&x.to_le_bytes());
+        }
+        req.extend(layer(0, 3, [0, 0, 8, 8], [0.0, 0.0, 1.0, 1.0], [0, 0, 255, 255]));
+        req.extend(layer(src as u32, 2, [2, 2, 6, 6], [0.0, 0.0, 4.0, 4.0], [0; 4]));
+        let a = t.feed(&encode("rcCompose", &[P::V(req.len() as u64), P::In(&req)]));
+        assert_eq!(i32_at(&a, 0), 1);
+        let f = frames.lock().unwrap();
+        assert_eq!(f.len(), 1);
+        let (fw, fh, rgba, n) = &f[0];
+        assert_eq!((*fw, *fh, *n), (8, 8, 1));
+        let at = |x: usize, y: usize| &rgba[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4];
+        assert_eq!(at(0, 0), [0, 0, 255, 255]);
+        assert_eq!(at(7, 7), [0, 0, 255, 255]);
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(at(x + 2, y + 2), [y as u8 * 40, x as u8 * 40, 0, 255], "({x}, {y})");
+            }
+        }
+        drop(f);
+        // The target is held while shown: released by its pipe, it stays
+        // until another frame is posted.
+        let mut r = renderer.lock().unwrap();
+        r.release_color_buffer(target as u32);
+        assert!(r.objects.color_buffers.contains_key(&(target as u32)));
+        r.post(src as u32);
+        assert!(!r.objects.color_buffers.contains_key(&(target as u32)));
     }
 
     /// A guest's frame (`egl_window_surface_t`'s path): a context, a window
