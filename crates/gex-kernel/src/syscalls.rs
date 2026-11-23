@@ -5692,6 +5692,15 @@ impl MapIo<'_> {
             let len_aligned = crate::mem::page_align_up(len);
             let file = self.fds.get(fd)?;
             let name = file.path.clone();
+            // `do_mmap`: a shared mapping that may be written needs the
+            // file open for writing, and any mapping needs it open for
+            // reading.
+            if flags & crate::mem::flags::SHARED != 0 && prot_bits & crate::mem::prot::WRITE != 0 && !file.writable {
+                return Err(Errno::EACCES);
+            }
+            if !file.readable {
+                return Err(Errno::EACCES);
+            }
             file.handle.may_map(offset, len_aligned, prot_bits, flags & crate::mem::flags::SHARED != 0)?;
             let hold = MapHold(file.handle.map_hold(prot_bits, flags & crate::mem::flags::SHARED != 0)?.into_iter().collect());
             if file.handle.maps_own_memory() {
