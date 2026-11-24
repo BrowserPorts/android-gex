@@ -38,6 +38,10 @@ pub mod cmd {
     pub const PROG_QUERY: u64 = 16;
     pub const PROG_TEST_RUN: u64 = 10;
     pub const MAP_FREEZE: u64 = 22;
+    pub const MAP_LOOKUP_BATCH: u64 = 24;
+    pub const MAP_LOOKUP_AND_DELETE_BATCH: u64 = 25;
+    pub const MAP_UPDATE_BATCH: u64 = 26;
+    pub const MAP_DELETE_BATCH: u64 = 27;
 }
 
 /// Map types (`enum bpf_map_type`).
@@ -94,6 +98,116 @@ pub enum Object {
     Prog(Arc<crate::bpfprog::Prog>),
 }
 
+/// `__jhash_mix`.
+fn jhash_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *a = a.wrapping_sub(*c);
+    *a ^= c.rotate_left(4);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= a.rotate_left(6);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= b.rotate_left(8);
+    *b = b.wrapping_add(*a);
+    *a = a.wrapping_sub(*c);
+    *a ^= c.rotate_left(16);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= a.rotate_left(19);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= b.rotate_left(4);
+    *b = b.wrapping_add(*a);
+}
+
+/// `__jhash_final`.
+fn jhash_final(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(14));
+    *a ^= *c;
+    *a = a.wrapping_sub(c.rotate_left(11));
+    *b ^= *a;
+    *b = b.wrapping_sub(a.rotate_left(25));
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(16));
+    *a ^= *c;
+    *a = a.wrapping_sub(c.rotate_left(4));
+    *b ^= *a;
+    *b = b.wrapping_sub(a.rotate_left(14));
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(24));
+}
+
+const JHASH_INITVAL: u32 = 0xdead_beef;
+
+/// `jhash`: bytes.
+fn jhash(k: &[u8], initval: u32) -> u32 {
+    let mut len = k.len();
+    let init = JHASH_INITVAL.wrapping_add(len as u32).wrapping_add(initval);
+    let (mut a, mut b, mut c) = (init, init, init);
+    let word = |at: usize| u32::from_le_bytes(k[at..at + 4].try_into().unwrap());
+    let mut at = 0;
+    while len > 12 {
+        a = a.wrapping_add(word(at));
+        b = b.wrapping_add(word(at + 4));
+        c = c.wrapping_add(word(at + 8));
+        jhash_mix(&mut a, &mut b, &mut c);
+        len -= 12;
+        at += 12;
+    }
+    if len == 0 {
+        return c;
+    }
+    // The last block, a byte at a time into a, b and c.
+    for i in (0..len).rev() {
+        let v = (k[at + i] as u32) << ((i % 4) * 8);
+        match i / 4 {
+            0 => a = a.wrapping_add(v),
+            1 => b = b.wrapping_add(v),
+            _ => c = c.wrapping_add(v),
+        }
+    }
+    jhash_final(&mut a, &mut b, &mut c);
+    c
+}
+
+/// `jhash2`: 32-bit words.
+fn jhash2(k: &[u32], initval: u32) -> u32 {
+    let init = JHASH_INITVAL.wrapping_add((k.len() as u32) << 2).wrapping_add(initval);
+    let (mut a, mut b, mut c) = (init, init, init);
+    let mut rest = k;
+    while rest.len() > 3 {
+        a = a.wrapping_add(rest[0]);
+        b = b.wrapping_add(rest[1]);
+        c = c.wrapping_add(rest[2]);
+        jhash_mix(&mut a, &mut b, &mut c);
+        rest = &rest[3..];
+    }
+    if rest.is_empty() {
+        return c;
+    }
+    if rest.len() == 3 {
+        c = c.wrapping_add(rest[2]);
+    }
+    if rest.len() >= 2 {
+        b = b.wrapping_add(rest[1]);
+    }
+    a = a.wrapping_add(rest[0]);
+    jhash_final(&mut a, &mut b, &mut c);
+    c
+}
+
+/// `htab_map_hash`: a key of whole words by words (`jhash_1word` and
+/// `jhash_2words` come to the same), any other by bytes.
+fn htab_hash(key: &[u8], hashrnd: u32) -> u32 {
+    if key.len() % 4 == 0 {
+        let words: Vec<u32> = key.chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+        jhash2(&words, hashrnd)
+    } else {
+        jhash(key, hashrnd)
+    }
+}
+
 /// A map.
 #[derive(Debug)]
 pub struct Map {
@@ -116,6 +230,9 @@ pub struct Map {
     /// each held by a [`WriteHold`] for as long as it lasts: while any
     /// does, it cannot be frozen.
     writers: Mutex<u64>,
+    /// A hash's seed for the bucket of a key (`hashrnd`): 0 with
+    /// `BPF_F_ZERO_SEED`, else drawn at creation.
+    hashrnd: u32,
 }
 
 /// A writable mapping of a map, for as long as the mapping lasts (and in
@@ -282,7 +399,7 @@ impl Map {
                 return Err(Errno::EINVAL);
             }
             let ring = Ring { consumer: vec![0; PAGE as usize], producer: vec![0; PAGE as usize], data: vec![0; max_entries as usize], changes: 1 };
-            return Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(Data::Ringbuf(ring)), changes: std::sync::atomic::AtomicU64::new(1), frozen: Default::default(), writers: Mutex::new(0) });
+            return Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(Data::Ringbuf(ring)), changes: std::sync::atomic::AtomicU64::new(1), frozen: Default::default(), writers: Mutex::new(0), hashrnd: 0 });
         }
         // (Socket storage has no number of entries: one a socket.)
         if value_size == 0 || (max_entries == 0) != (ty == map_type::SK_STORAGE) || key_size > MAX_KEY {
@@ -377,7 +494,14 @@ impl Map {
         // A devmap's lookup gives programs the ifindex itself, so they may
         // not write it (`dev_map_init_map`).
         let flags = if ty == map_type::DEVMAP_HASH { flags | RDONLY_PROG } else { flags };
-        Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(data), changes: std::sync::atomic::AtomicU64::new(1), frozen: Default::default(), writers: Mutex::new(0) })
+        let hashrnd = if flags & ZERO_SEED != 0 {
+            0
+        } else {
+            let mut b = [0u8; 4];
+            crate::vfs::devfs::fill_random(&mut b);
+            u32::from_le_bytes(b)
+        };
+        Ok(Map { id: next_map_id(), ty, key_size, value_size, max_entries, flags, name, btf: None, data: Mutex::new(data), changes: std::sync::atomic::AtomicU64::new(1), frozen: Default::default(), writers: Mutex::new(0), hashrnd })
     }
 
     pub fn id(&self) -> u32 {
@@ -728,6 +852,28 @@ impl Map {
                 h.order.remove(&o);
                 Ok(())
             }
+        }
+    }
+
+    /// Whether the map has a hash's batch walk (`BATCH_OPS(htab)`): a
+    /// hash and an LRU hash; a device hash has no batch commands.
+    fn hash_batches(&self) -> bool {
+        matches!(self.ty, map_type::HASH | map_type::LRU_HASH)
+    }
+
+    /// The hash's buckets (`n_buckets`: `max_entries` rounded up to a power
+    /// of two).
+    fn buckets(&self) -> u32 {
+        self.max_entries.next_power_of_two()
+    }
+
+    /// The elements of bucket `b` of a hash, as its list holds them: the
+    /// latest put there first (`hlist_nulls_add_head_rcu`).
+    fn bucket(&self, b: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let n = self.buckets();
+        match &*self.lock() {
+            Data::Hash(h) => h.order.values().rev().filter(|(k, _)| htab_hash(k, self.hashrnd) & (n - 1) == b).cloned().collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -1284,6 +1430,168 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
             }
             Ok(0)
         }
+        // The batch commands (`bpf_map_do_batch`): `struct { in_batch,
+        // out_batch, keys, values; u32 count, map_fd; u64 elem_flags, flags }`.
+        // A hash walks its buckets (`__htab_map_lookup_and_delete_batch`),
+        // the others go a key at a time (`generic_map_*_batch`); a map with
+        // no such command is `ENOTSUPP`.
+        cmd::MAP_LOOKUP_BATCH | cmd::MAP_LOOKUP_AND_DELETE_BATCH | cmd::MAP_UPDATE_BATCH | cmd::MAP_DELETE_BATCH => {
+            if size < 56 {
+                return Err(Errno::EINVAL);
+            }
+            zero_from(56)?;
+            let (map, r, w) = map_of(c, u32_at(36) as i32)?;
+            let reads = matches!(cmd, cmd::MAP_LOOKUP_BATCH | cmd::MAP_LOOKUP_AND_DELETE_BATCH);
+            let writes = cmd != cmd::MAP_LOOKUP_BATCH;
+            if (reads && !r) || (writes && !w) {
+                return Err(Errno::EPERM);
+            }
+            let generic = matches!(map.ty, map_type::ARRAY | map_type::PERCPU_ARRAY | map_type::LPM_TRIE);
+            let has = match cmd {
+                cmd::MAP_LOOKUP_BATCH | cmd::MAP_UPDATE_BATCH => map.hash_batches() || generic,
+                cmd::MAP_LOOKUP_AND_DELETE_BATCH => map.hash_batches(),
+                _ => map.hash_batches() || map.ty == map_type::LPM_TRIE,
+            };
+            if !has {
+                return Err(crate::btf::ENOTSUPP);
+            }
+            // No map here has a spin lock for `BPF_F_LOCK` to take.
+            if u64_at(40) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let (in_batch, out_batch, keys, values) = (u64_at(0), u64_at(8), u64_at(16), u64_at(24));
+            let max = u32_at(32);
+            let ks = map.key_size as u64;
+            let count_at = attr + 32;
+            let hash_walk = map.hash_batches() && matches!(cmd, cmd::MAP_LOOKUP_BATCH | cmd::MAP_LOOKUP_AND_DELETE_BATCH);
+            if hash_walk && u64_at(48) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if max == 0 {
+                return Ok(0);
+            }
+            m.write(count_at, &0u32.to_le_bytes())?;
+            if hash_walk {
+                // Whole buckets, from the one `in_batch` names; `ENOSPC` if
+                // the first will not fit, `ENOENT` past the last, and the
+                // bucket to go on from in `out_batch`.
+                let delete = cmd == cmd::MAP_LOOKUP_AND_DELETE_BATCH;
+                let vs = map.value_size as u64;
+                let n = map.buckets();
+                let mut batch = if in_batch != 0 { m.read_u32(in_batch)? } else { 0 };
+                if batch >= n {
+                    return Err(Errno::ENOENT);
+                }
+                let mut total = 0u32;
+                let mut ret = Ok(0);
+                loop {
+                    let elems = map.bucket(batch);
+                    let cnt = elems.len() as u32;
+                    if cnt > max - total {
+                        if total == 0 {
+                            ret = Err(Errno::ENOSPC);
+                        }
+                        break;
+                    }
+                    if delete {
+                        for (k, _) in &elems {
+                            let _ = map.delete(k);
+                        }
+                    }
+                    for (i, (k, v)) in elems.iter().enumerate() {
+                        let at = (total + i as u32) as u64;
+                        m.write(keys + at * ks, k)?;
+                        m.write(values + at * vs, v)?;
+                    }
+                    total += cnt;
+                    batch += 1;
+                    if batch >= n {
+                        ret = Err(Errno::ENOENT);
+                        break;
+                    }
+                }
+                m.write(out_batch, &batch.to_le_bytes())?;
+                m.write(count_at, &total.to_le_bytes())?;
+                return ret;
+            }
+            let vs = map.user_value_size() as u64;
+            let mut cp = 0u32;
+            let mut err: Result<(), Errno> = Ok(());
+            match cmd {
+                cmd::MAP_LOOKUP_BATCH => {
+                    // Key after key from the one `in_batch` holds; the last
+                    // key gone over back in `out_batch`.
+                    let mut prev = if in_batch != 0 { Some(m.read(in_batch, ks as usize)?.to_vec()) } else { None };
+                    while cp < max {
+                        let key = match map.next_key(prev.as_deref()) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                err = Err(e);
+                                break;
+                            }
+                        };
+                        match map.lookup(&key) {
+                            Ok(v) => {
+                                m.write(keys + cp as u64 * ks, &key)?;
+                                m.write(values + cp as u64 * vs, &v)?;
+                                cp += 1;
+                            }
+                            Err(Errno::ENOENT) => {}
+                            Err(e) => return Err(e),
+                        }
+                        prev = Some(key);
+                    }
+                    m.write(count_at, &cp.to_le_bytes())?;
+                    if cp > 0 {
+                        if let Some(p) = &prev {
+                            m.write(out_batch, p)?;
+                        }
+                    }
+                }
+                cmd::MAP_UPDATE_BATCH => {
+                    while cp < max {
+                        let key = match m.read(keys + cp as u64 * ks, ks as usize) {
+                            Ok(k) => k.to_vec(),
+                            Err(_) => {
+                                err = Err(Errno::EFAULT);
+                                break;
+                            }
+                        };
+                        let value = match m.read(values + cp as u64 * vs, vs as usize) {
+                            Ok(v) => v.to_vec(),
+                            Err(_) => {
+                                err = Err(Errno::EFAULT);
+                                break;
+                            }
+                        };
+                        if let Err(e) = map.update(&key, &value, 0) {
+                            err = Err(e);
+                            break;
+                        }
+                        cp += 1;
+                    }
+                    m.write(count_at, &cp.to_le_bytes())?;
+                }
+                _ => {
+                    while cp < max {
+                        let key = match m.read(keys + cp as u64 * ks, ks as usize) {
+                            Ok(k) => k.to_vec(),
+                            Err(_) => {
+                                err = Err(Errno::EFAULT);
+                                break;
+                            }
+                        };
+                        if let Err(e) = map.delete(&key) {
+                            err = Err(e);
+                            break;
+                        }
+                        cp += 1;
+                    }
+                    m.write(count_at, &cp.to_le_bytes())?;
+                }
+            }
+            err.map(|_| 0)
+        }
         // `map_freeze`: the descriptor must be able to write it, and no
         // writable mapping of it be left; frozen, the system call and new
         // mappings no longer write it (programs still may).
@@ -1788,5 +2096,25 @@ fn lpm_order(a: &&(u32, Vec<u8>, Vec<u8>), b: &&(u32, Vec<u8>, Vec<u8>)) -> std:
         Some(i) => bit_of(da, i).cmp(&bit_of(db, i)),
         // One is a prefix of the other: the longer (under it) first.
         None => pb.cmp(pa),
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// `jhash` over bytes and `jhash2` over the same words agree, as the
+    /// kernel's do (both start from the length in bytes); a key's bucket is
+    /// a function of its bytes and the seed alone.
+    #[test]
+    fn the_two_jhashes_agree_on_words() {
+        for words in [vec![0u32], vec![7, 9], vec![1, 2, 3], vec![0xdead_beef, 4, 5, 6], vec![1; 7]] {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            for seed in [0, 1, 0x1234_5678] {
+                assert_eq!(jhash(&bytes, seed), jhash2(&words, seed));
+            }
+        }
+        assert_ne!(htab_hash(&[1, 0, 0, 0], 0), htab_hash(&[2, 0, 0, 0], 0));
+        assert_eq!(jhash(&[], 5), JHASH_INITVAL.wrapping_add(5));
     }
 }
