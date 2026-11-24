@@ -692,6 +692,53 @@ pub struct Socket {
     from_here: AtomicBool,
     /// In the global kernel: a moved socket's flows (`op::FLOW`).
     flow_names: Mutex<FlowNames>,
+    /// Who owns it (`sk_uid`): its maker's filesystem uid, or the
+    /// accepter's for an accepted connection (`sock_graft`).
+    pub uid: std::sync::atomic::AtomicU32,
+    /// The cgroup (v2) its maker was in (`cgroup_sk_alloc`).
+    pub cgroup: std::sync::atomic::AtomicU64,
+    /// Its inode number, its own (`socket:[N]`, sock_diag's `idiag_inode`).
+    ino: u64,
+    /// A UDP socket `connect`ed (a `sendto` only remembers where its reply
+    /// comes from, in `peer`).
+    udp_connected: AtomicBool,
+}
+
+/// The sockets of this kernel, while they last: what sock_diag reports.
+static LIVE: Mutex<Vec<std::sync::Weak<Socket>>> = Mutex::new(Vec::new());
+
+/// The live sockets.
+pub fn live() -> Vec<Arc<Socket>> {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|w| w.upgrade()).collect()
+}
+
+/// A socket's inode number: one a socket, never reused (sockfs's
+/// `get_next_ino`), from where pipes and the rest do not reach.
+fn next_ino() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 20);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// What sock_diag says of a socket (`inet_diag_msg`'s fields as the guest
+/// sees them).
+#[derive(Clone, Debug)]
+pub struct DiagView {
+    pub tcp: bool,
+    pub v6: bool,
+    pub v6only: bool,
+    /// The TCP state number (UDP: 1 connected, 7 not).
+    pub state: u8,
+    /// Listening (TCP's listener table).
+    pub listening: bool,
+    /// In the table of connections (TCP's established hash; for UDP,
+    /// bound: hashed by its port).
+    pub hashed: bool,
+    pub local: (u32, u16),
+    pub peer: (u32, u16),
+    pub ino: u64,
+    pub uid: u32,
+    pub cgroup: u64,
+    pub opts: crate::bpfsock::SockOpts,
 }
 
 /// `net.ipv4.igmp_max_memberships`.
@@ -799,12 +846,63 @@ impl Socket {
             flow_turn: std::sync::atomic::AtomicUsize::new(0),
             from_here: AtomicBool::new(false),
             flow_names: Mutex::new(FlowNames::default()),
+            uid: std::sync::atomic::AtomicU32::new(0),
+            cgroup: std::sync::atomic::AtomicU64::new(0),
+            ino: next_ino(),
+            udp_connected: AtomicBool::new(false),
+        }
+    }
+
+    /// Its inode number.
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    /// How sock_diag sees it now. A TCP connection the host has closed
+    /// is taken to be in CLOSE_WAIT (the host stack's own states are not
+    /// seen here), one refused is closed and in no table; a TCP socket
+    /// bound and never connected or listening is "bound inactive" (state 7
+    /// in no table but its own).
+    pub fn diag_view(&self) -> DiagView {
+        let local = self.local();
+        let peer = self.peer().unwrap_or((0, 0));
+        let listening = self.kind == Kind::Tcp && self.is_listening();
+        let has_transport = self.moved().is_some() || self.transport.lock().unwrap().is_some();
+        let (state, hashed) = match self.kind {
+            Kind::Tcp if listening => (10, true),
+            Kind::Tcp if has_transport => match self.status() {
+                Status::Connecting => (2, true),
+                Status::Open => (1, true),
+                Status::Closed => (8, true),
+                Status::Refused => (7, false),
+            },
+            Kind::Tcp => (7, false),
+            Kind::Udp => (if self.udp_connected.load(Ordering::Relaxed) { 1 } else { 7 }, local.1 != 0),
+        };
+        DiagView {
+            tcp: self.kind == Kind::Tcp,
+            v6: self.v6.load(Ordering::Relaxed),
+            v6only: self.v6only.load(Ordering::Relaxed),
+            state,
+            listening,
+            hashed,
+            local,
+            peer: if self.kind == Kind::Udp && state != 1 { (0, 0) } else { peer },
+            ino: self.ino,
+            uid: self.uid.load(Ordering::Relaxed),
+            cgroup: self.cgroup.load(Ordering::Relaxed),
+            opts: *self.opts.lock().unwrap_or_else(|e| e.into_inner()),
         }
     }
 
     /// Remember the `Arc` this socket lives in (made right after `new`).
     pub fn set_self(self: &Arc<Self>) {
         *self.me.lock().unwrap() = Arc::downgrade(self);
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if live.len() >= 64 && live.len().is_power_of_two() {
+            live.retain(|w| w.strong_count() > 0);
+        }
+        live.push(Arc::downgrade(self));
     }
 
     /// One receiver at a time, from its read to its `last_from`: a guard
@@ -1147,6 +1245,7 @@ impl Socket {
         }
         *self.peer.lock().unwrap() = Some((addr, port));
         if self.kind == Kind::Udp {
+            self.udp_connected.store(true, Ordering::Relaxed);
             // A connected UDP socket only fixes the default destination, and
             // the only destination that means anything here is the resolver.
             return Ok(());
@@ -2122,7 +2221,7 @@ impl FileHandle for Socket {
             file_type: FileType::Socket,
             size: 0,
             mode: 0o600,
-            ino: 3,
+            ino: self.ino,
             mtime: 0,
             nlink: 1,
             rdev: 0,

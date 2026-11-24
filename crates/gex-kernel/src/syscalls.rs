@@ -6583,7 +6583,7 @@ impl NetIo<'_> {
                 return Err(Errno::ESOCKTNOSUPPORT);
             }
             let protocol = protocol as u32;
-            if protocol != crate::netlink::NETLINK_ROUTE && protocol != crate::netlink::NETLINK_KOBJECT_UEVENT && protocol != crate::netlink::NETLINK_XFRM && protocol != crate::netlink::NETLINK_NETFILTER && protocol != crate::netlink::NETLINK_GENERIC {
+            if protocol != crate::netlink::NETLINK_ROUTE && protocol != crate::netlink::NETLINK_KOBJECT_UEVENT && protocol != crate::netlink::NETLINK_XFRM && protocol != crate::netlink::NETLINK_NETFILTER && protocol != crate::netlink::NETLINK_GENERIC && protocol != crate::sockdiag::NETLINK_SOCK_DIAG {
                 return Err(Errno::EPROTONOSUPPORT);
             }
             let handle: Arc<dyn crate::vfs::FileHandle> = crate::netlink::Socket::new(protocol, kind as u32, io.netlink_sender());
@@ -6623,6 +6623,8 @@ impl NetIo<'_> {
         };
         let sock = Arc::new(net::Socket::new(kind, net, Arc::clone(self.resolver), Arc::clone(self.ports), self.unix_remote));
         sock.v6.store(domain == AF_INET6, std::sync::atomic::Ordering::Relaxed);
+        sock.uid.store(io.creds.uid(), std::sync::atomic::Ordering::Relaxed);
+        sock.cgroup.store(crate::cgroup::tree().group_of(io.pid), std::sync::atomic::Ordering::Relaxed);
         sock.set_self();
         sock.set_nonblocking(ty & SOCK_NONBLOCK != 0);
         let flags = if ty & SOCK_NONBLOCK != 0 { oflags::O_NONBLOCK } else { 0 };
@@ -6634,7 +6636,7 @@ impl NetIo<'_> {
             net::Kind::Udp => (SOCK_DGRAM as u32, 17),
         };
         crate::bpfsock::created(&handle, &sock.opts, io.pid, io.creds.ruid(), io.creds.rgid(), domain as u32, sock_ty, proto)?;
-        let file = OpenFile::new(handle, "socket".to_string(), flags, true, true);
+        let file = OpenFile::new(handle, format!("socket:[{}]", sock.ino()), flags, true, true);
         io.fds.insert(file, ty & SOCK_CLOEXEC != 0)
     }
 
@@ -6868,12 +6870,16 @@ fn accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64,
 fn inet_accept(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, addr: u64, len_out: u64, flags: u64) -> SysResult {
     let listener = io.socket_of(fd)?;
     let sock = listener.accept()?;
+    // The accepted socket is the accepter's (`sock_graft`).
+    sock.uid.store(io.creds.uid(), std::sync::atomic::Ordering::Relaxed);
+    // Its cgroup is the listener's (`cgroup_sk_clone`).
+    sock.cgroup.store(listener.cgroup.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
     let (ip, port) = sock.peer().unwrap_or((0, 0));
     let nonblock = flags & SOCK_NONBLOCK != 0;
     sock.set_nonblocking(nonblock);
     let oflag = if nonblock { oflags::O_NONBLOCK } else { 0 };
     let handle: Arc<dyn crate::vfs::FileHandle> = sock.clone();
-    let file = OpenFile::new(handle, "socket".to_string(), oflag, true, true);
+    let file = OpenFile::new(handle, format!("socket:[{}]", sock.ino()), oflag, true, true);
     let new_fd = io.fds.insert(file, flags & SOCK_CLOEXEC != 0)?;
     io.write_sockaddr(m, listener.v6.load(std::sync::atomic::Ordering::Relaxed), ip, port, addr, len_out)?;
     Ok(new_fd)

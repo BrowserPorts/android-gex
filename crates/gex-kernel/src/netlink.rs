@@ -915,6 +915,9 @@ impl Socket {
             }
         }
         self.insert(tgid, nl_pid)?;
+        // Groups past the protocol's are dropped (`netlink_bind`):
+        // sock_diag has four.
+        let groups = if self.protocol == crate::sockdiag::NETLINK_SOCK_DIAG { groups & 0xf } else { groups };
         self.state().groups = groups;
         Ok(())
     }
@@ -1075,6 +1078,23 @@ impl Socket {
     /// address.
     fn to_kernel(&self, who: Sender, named: bool, data: &[u8]) {
         match self.protocol {
+            // sock_diag: each request answered in its own datagrams, a
+            // dump's end apart from its messages (`sockdiag::answer`).
+            crate::sockdiag::NETLINK_SOCK_DIAG => {
+                let portid = self.state().portid;
+                let asker = crate::sockdiag::Asker { net_admin: who.net_admin && self.opener.net_admin };
+                let mut at = 0;
+                while at + 16 <= data.len() {
+                    let len = u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+                    if len < 16 || at + len > data.len() {
+                        break;
+                    }
+                    for d in crate::sockdiag::answer(&data[at..at + len], asker, portid) {
+                        self.from_kernel(d);
+                    }
+                    at += (len + 3) & !3;
+                }
+            }
             NETLINK_ROUTE | NETLINK_XFRM | NETLINK_NETFILTER | NETLINK_GENERIC => {
                 // A request is answered; the answers to one datagram are
                 // one datagram.
