@@ -44,6 +44,7 @@ pub mod inotify;
 pub mod locks;
 pub mod netlink;
 pub mod sockdiag;
+pub mod tc;
 pub mod netdev;
 pub mod tun;
 pub mod pfkey;

@@ -442,6 +442,8 @@ pub fn unregister(index: u32) {
     }
     with(|t| t.devs.retain(|d| d.index != index));
     notify(RTM_DELLINK, &dev, !0);
+    // Its queueing disciplines and classifiers, unannounced.
+    crate::tc::forget(index);
     // Its routes go with it.
     crate::routes::device_changed(index);
     crate::vfs::sysfs::remove("net", &dev.name);

@@ -2509,6 +2509,9 @@ impl FdIo<'_> {
                     data.extend_from_slice(m.read(base, len.min(1 << 22))?);
                 }
             }
+            // The programs a classifier request names, as this process's
+            // descriptors are ([`crate::tc::progs_named`]).
+            let _progs = crate::tc::Progs::enter(crate::tc::progs_named(&data, &|fd| self.fds.get(fd)));
             return sock.send(self.netlink_sender(), to, &data);
         }
         if name != 0 {
@@ -6989,6 +6992,7 @@ fn sendto(io: &FdIo<'_>, m: &GuestMem<'_>, fd: i32, buf: u64, len: u64, dest: u6
     if let Ok(sock) = io.netlink_of(fd) {
         let to = if dest != 0 && dest_len != 0 { Some(FdIo::read_sockaddr_nl(m, dest, dest_len)?) } else { None };
         let data = m.read(buf, (len as usize).min(1 << 22))?.to_vec();
+        let _progs = crate::tc::Progs::enter(crate::tc::progs_named(&data, &|fd| io.fds.get(fd)));
         return sock.send(io.netlink_sender(), to, &data);
     }
     if dest != 0 {

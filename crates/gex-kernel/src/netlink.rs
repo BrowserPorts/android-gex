@@ -229,6 +229,28 @@ fn route_answer(req: &[u8], net_admin: bool, portid: u32) -> Option<Vec<u8>> {
             crate::bpf::say_once("RTM_GETROUTE of one route (a lookup)");
             return change(Err(Errno::EOPNOTSUPP));
         }
+        // Traffic control ([`crate::tc`]): its dumps, and its requests
+        // with what they answer before the acknowledgement (an echo, a
+        // filter asked for).
+        crate::tc::RTM_GETQDISC | crate::tc::RTM_GETTFILTER if dump => match crate::tc::dump(req, seq, portid) {
+            Ok(m) => out.extend_from_slice(&m),
+            Err(e) => {
+                message(&mut out, NLMSG_DONE, NLM_F_MULTI, seq, &(-(e.0 as i32)).to_le_bytes());
+                return Some(out);
+            }
+        },
+        crate::tc::RTM_NEWQDISC | crate::tc::RTM_DELQDISC | crate::tc::RTM_GETQDISC | crate::tc::RTM_NEWTFILTER | crate::tc::RTM_DELTFILTER | crate::tc::RTM_GETTFILTER => {
+            return match crate::tc::request(req, net_admin, portid) {
+                Ok(m) => {
+                    let mut out = m;
+                    if let Some(ack) = change(Ok(())) {
+                        out.extend_from_slice(&ack);
+                    }
+                    (!out.is_empty()).then_some(out)
+                }
+                Err(e) => change(Err(e)),
+            };
+        }
         RTM_GETLINK if dump => links(&mut out, seq),
         // One link, by index or by name (`rtnl_getlink`).
         RTM_GETLINK => {

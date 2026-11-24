@@ -244,6 +244,7 @@ run() {
     sockdiag) check "$1" "sockdiag ok" 0 root ;;
     tracefs) check "$1" "tracefs ok" 0 root ;;
     dontneed) check "$1" "dontneed ok" 0 ;;
+    tc) check "$1" "tc ok" 0 root ;;
     btf) check "$1" "btf ok" 0 root ;;
     bpfprog) check "$1" "bpfprog ok" 0 root ;;
     bpfmaps2) check "$1" "bpfmaps2 ok" 0 root ;;
@@ -290,7 +291,7 @@ if [ "$#" -gt 0 ]; then
         run "$p"
     done
 else
-    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock fwdecho fpops simdops binderexit fdstress limits cpufreq bindernode sched hvc tun jitrace mcast pfkey appdata umount hwrng newlink dmaheap mmapacc access routes goldfishpipe goldfishas goldfishsync bpfbatch genl sockdiag tracefs dontneed"
+    all="hello tagged tbi thread simd exclusive casp prctl crc crypto block procfd mremap mainstack sigqueue futex pipesz auxv protect sigframe execfault efault pdeath signalfd mknod binder binderwork binderfreeze binderfs bindersg binderctx selinuxfs procattr filelabel kmsg sharedfutex mountns uevent rlimit sysdev dirlink loopdev ext4mount mounts dmctl owners statdev waits ptyhup rndbits oomadj ctlsock abortmsg psi ctty apexns settod seqpacket uffd bpfsysctl bpfmap btf bpfprog bpfmaps2 ringbuf bpfinfo cgroup2 cgroupbpf bpfrun sockhook cgroup1 sockopt ipv6 bpffreeze propfutex nflog rss seccomp procstatus mmaphint ptimer memfdseal faultretry dualview mapfill vsock fwdecho fpops simdops binderexit fdstress limits cpufreq bindernode sched hvc tun jitrace mcast pfkey appdata umount hwrng newlink dmaheap mmapacc access routes goldfishpipe goldfishas goldfishsync bpfbatch genl sockdiag tracefs dontneed tc"
     for p in $all; do
         run "$p"
     done
