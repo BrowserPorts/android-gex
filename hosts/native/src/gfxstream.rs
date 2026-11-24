@@ -9,10 +9,12 @@
 //! draws costs no EGL. Its display is `GEX_GFXSTREAM_DISPLAY`
 //! (`<width>x<height>[@<dpi>]`), else `GEX_VIRTIO_GPU`'s size at 480 dpi,
 //! else 1080x1920 at 480. `GEX_GFXSTREAM_FRAME=<file>` writes the frame the
-//! guest last posted there as a PPM image, at most once a second.
+//! guest last posted there as a PPM image, at most once a second. DMA
+//! pointers (the mapper's pixels) are the goldfish address space's memory,
+//! and the goldfish sync device's waits are the renderer's fence syncs.
 
 use gex_gfxstream::host::compose::Frame;
-use gex_gfxstream::host::{DisplaySize, Features, Renderer, Thread};
+use gex_gfxstream::host::{DisplaySize, Dma, Features, Renderer, Thread};
 use gex_kernel::errno::Errno;
 use gex_kernel::goldfishpipe::{Service, Services};
 use std::collections::VecDeque;
@@ -23,6 +25,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub fn install() {
     if gex_kernel::goldfishpipe::present() {
         gex_kernel::goldfishpipe::set_services(Box::new(Host));
+        gex_kernel::goldfishsync::set_host(Box::new(SyncHost));
+    }
+}
+
+/// The sync device's waits: the renderer's fence syncs.
+struct SyncHost;
+
+impl gex_kernel::goldfishsync::Host for SyncHost {
+    fn wait(&self, glsync: u64, _syncthread: u64) {
+        if let Some(r) = renderer() {
+            Renderer::wait_fence(&r, glsync);
+        }
     }
 }
 
@@ -48,6 +62,7 @@ fn renderer() -> Option<Arc<Mutex<Renderer>>> {
     static R: OnceLock<Option<Arc<Mutex<Renderer>>>> = OnceLock::new();
     R.get_or_init(|| match Renderer::new(Features::default(), size()) {
         Ok(mut r) => {
+            r.set_dma(Box::new(AddressSpace));
             if let Some(path) = std::env::var_os("GEX_GFXSTREAM_FRAME") {
                 let path = std::path::PathBuf::from(path);
                 let mut last: Option<std::time::Instant> = None;
@@ -73,6 +88,19 @@ fn renderer() -> Option<Arc<Mutex<Renderer>>> {
         }
     })
     .clone()
+}
+
+/// DMA pointers name the goldfish address space's memory.
+struct AddressSpace;
+
+impl Dma for AddressSpace {
+    fn read(&self, addr: u64, buf: &mut [u8]) -> bool {
+        gex_kernel::goldfishas::read_phys(addr, buf)
+    }
+
+    fn write(&self, addr: u64, buf: &[u8]) -> bool {
+        gex_kernel::goldfishas::write_phys(addr, buf)
+    }
 }
 
 struct Host;
