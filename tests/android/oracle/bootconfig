@@ -1,7 +1,4 @@
 androidboot.selinux = "permissive"
 androidboot.hardware = "ranchu"
-androidboot.hardwareegl = "angle"
-androidboot.hardware.vulkan = "pastel"
-androidboot.opengles.version = "196610"
-androidboot.hardware.gralloc = "minigbm"
+androidboot.opengles.version = "196609"
 androidboot.logcat = "*:V"

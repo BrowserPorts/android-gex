@@ -18,8 +18,11 @@
 # It needs gexc built with the big64 feature (GEXC; this checkout's
 # target/release/gexc unless given) and tests/android/build.sh's programs
 # (bin/firststage). The boot configuration is bootconfig here (CONFIG):
-# the emulator's guest rendering (ANGLE over SwiftShader, which
-# swiftshader.sh puts into the root) and a permissive SELinux.
+# the image's own graphics (its EGL, gralloc and composer, which reach the
+# host over the goldfish pipe: gex's gfxstream renderer on the host's
+# OpenGL ES) and a permissive SELinux. bootconfig.swiftshader is the
+# emulator's guest rendering instead (ANGLE over SwiftShader, which
+# swiftshader.sh puts into the root).
 #
 # The boot is slow (the guest's clock runs at an eighth of the host's,
 # GEX_TIME_SCALE) and large: several GB of memory. It is stopped (its whole
@@ -30,7 +33,9 @@
 #
 # Environment it passes on to gexc, each with a default: GEX_HOST_FORWARD
 # (unset; 5555 lets `adb connect 127.0.0.1:5555` reach the image's adbd),
-# GEX_VIRTIO_GPU (1080x1920), GEX_CACHE_MAX_BYTES (8 GiB of translations,
+# GEX_VIRTIO_GPU (1080x1920; the display gfxstream's renderer takes too),
+# GEX_GFXSTREAM_FRAME (OUT/screen-NAME.ppm, the frame the guest last
+# posted), GEX_CACHE_MAX_BYTES (8 GiB of translations,
 # kept in gex's usual cache directory, XDG_CACHE_HOME).
 set -u
 ROOT=${1:?usage: boot.sh ROOT OUT NAME [SECONDS]}
@@ -93,6 +98,7 @@ export MallocLargeCache=0
 # The display: gex's virtio-gpu at the emulator's phone size.
 export GEX_VIRTIO_GPU=${GEX_VIRTIO_GPU:-1080x1920}
 export GEX_VIRTIO_GPU_FRAME=${GEX_VIRTIO_GPU_FRAME:-$OUT/frame-$NAME.ppm}
+export GEX_GFXSTREAM_FRAME=${GEX_GFXSTREAM_FRAME:-$OUT/screen-$NAME.ppm}
 # The emulator's own services, over vsock (the sensors HAL wants them).
 export GEX_EMULATOR_HOST=${GEX_EMULATOR_HOST:-1}
 # Translation: dense dispatch, threads take only the code they run, the
