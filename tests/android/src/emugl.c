@@ -1,7 +1,9 @@
 // The emulator image's own OpenGL ES (its vendor libEGL_emulation and
 // libGLESv2_emulation, gfxstream's guest) drawing through gex: its EGL
 // reaches the host renderer over the goldfish pipe, its pbuffer is a host
-// color buffer; a clear and a read back. Run inside the image's root
+// color buffer; SurfaceFlinger's start (SkiaGLRenderEngine::create: a
+// config by its attributes, a context, a placeholder pbuffer or none as the
+// extensions say, made current), then a clear and a read back. Run inside the image's root
 // (--sysroot) as root, with GEX_EMULATOR_HOST=1: the drivers are loaded
 // by path (with no property service, Android's EGL loader would not find
 // them), and /dev is made here as ueventd would make it.
@@ -40,6 +42,11 @@ typedef int32_t EGLint;
 #define GL_UNSIGNED_BYTE 0x1401
 #define GL_VERSION 0x1F02
 #define GL_RENDERER 0x1F01
+#define EGL_EXTENSIONS 0x3055
+#define EGL_WINDOW_BIT 0x0004
+#define EGL_OPENGL_ES3_BIT 0x0040
+#define EGL_RECORDABLE_ANDROID 0x3142
+#define EGL_FRAMEBUFFER_TARGET_ANDROID 0x3147
 
 // logd's socket: liblog's records (id, tid, time, then priority, tag,
 // message), printed, so the drivers' own words are seen.
@@ -137,6 +144,35 @@ int main(int argc, char **argv) {
         return 1;
     }
     printf("emugl: EGL %d.%d %s\n", major, minor, queryString(dpy, EGL_VERSION));
+    // SurfaceFlinger's start. With EGL_KHR_no_config_context it makes its
+    // context with no config, and with EGL_KHR_surfaceless_context it makes
+    // no placeholder: both then rest on the driver's own choices.
+    {
+        const char *ext = queryString(dpy, EGL_EXTENSIONS);
+        int no_config = ext && strstr(ext, "EGL_KHR_no_config_context");
+        int surfaceless = ext && strstr(ext, "EGL_KHR_surfaceless_context");
+        EGLConfig sf_cfg = NULL;
+        EGLint n = 0;
+        if (!no_config) {
+            EGLint sf_attrs[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_RECORDABLE_ANDROID, 1, EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT, EGL_FRAMEBUFFER_TARGET_ANDROID, 1, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
+            if (!chooseConfig(dpy, sf_attrs, &sf_cfg, 1, &n) || n < 1) {
+                printf("emugl: SurfaceFlinger's config: none (%#x)\n", eglError());
+                return 1;
+            }
+        }
+        EGLint sf_ca[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+        EGLContext sf_ctx = createContext(dpy, sf_cfg, 0, sf_ca);
+        EGLSurface sf_pb = NULL;
+        if (!surfaceless) {
+            EGLint one[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+            sf_pb = createPbuffer(dpy, sf_cfg, one);
+        }
+        if (!sf_ctx || (!surfaceless && !sf_pb) || !makeCurrent(dpy, sf_pb, sf_pb, sf_ctx)) {
+            printf("emugl: SurfaceFlinger's placeholder (no config %d, surfaceless %d): context %p surface %p: %#x\n", !!no_config, !!surfaceless, sf_ctx, sf_pb, eglError());
+            return 1;
+        }
+        makeCurrent(dpy, NULL, NULL, NULL);
+    }
     EGLint attrs[] = {EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE};
     EGLConfig cfg;
     EGLint n = 0;
