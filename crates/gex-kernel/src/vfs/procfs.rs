@@ -1036,7 +1036,7 @@ impl ProcFs {
                 Some(sys) => stat_text(&sys, crate::cpus::count() as u64, s.wall_secs()).into_bytes(),
                 None => crate::cpus::proc_stat().into_bytes(),
             },
-            "filesystems" => b"nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tbinder\nnodev\tselinuxfs\n\text4\n".to_vec(),
+            "filesystems" => b"nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevtmpfs\nnodev\tbinder\nnodev\tselinuxfs\nnodev\ttracefs\n\text4\n".to_vec(),
             // What the kernel was started with: nothing, unless the host
             // says (Android reads its `androidboot.` settings from these).
             "cmdline" => format!("{}\n", KERNEL_CMDLINE.get().map_or("", String::as_str)).into_bytes(),

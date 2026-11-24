@@ -5204,6 +5204,14 @@ impl PathIo<'_> {
                 self.view.mount_program(&target, mounted(crate::vfs::cgroup1fs::instance(hier)));
                 Ok(0)
             }
+            // tracefs: every mount is the one tree (crate::vfs::tracefs),
+            // its options applied to it.
+            "tracefs" => {
+                let options = if a[4] == 0 { Vec::new() } else { m.read_cstr(a[4], 4096)? };
+                crate::vfs::tracefs::mount(&String::from_utf8_lossy(&options))?;
+                self.view.mount_program(&target, mounted(crate::vfs::tracefs::instance()));
+                Ok(0)
+            }
             "debugfs" => {
                 self.view.mount_unless_there(&target, || mounted(Arc::new(crate::vfs::TmpFs::new())));
                 Ok(0)

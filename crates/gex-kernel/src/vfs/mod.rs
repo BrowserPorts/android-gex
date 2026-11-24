@@ -32,6 +32,7 @@ pub mod blocks;
 pub mod selinuxfs;
 pub mod subtree;
 pub mod sysfs;
+pub mod tracefs;
 pub mod tmpfs;
 
 pub use binderfs::BinderFs;
@@ -465,6 +466,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn xattr(&self, op: XattrOp<'_>) -> Option<Result<usize, Errno>> {
         let _ = op;
         None
+    }
+    /// Opened as Linux's `stream_open` or `nonseekable_open` opens a file
+    /// (no `FMODE_PREAD`/`FMODE_PWRITE`): `pread` and `pwrite` are
+    /// `ESPIPE`. A file that only ignores its offset ([`Self::is_stream`])
+    /// may still be read and written at one.
+    fn refuses_positioned_io(&self) -> bool {
+        false
     }
     /// True when reads and writes ignore the offset, as for a terminal or
     /// pipe. Such files also report `ESPIPE` from `lseek`.

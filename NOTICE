@@ -17,6 +17,12 @@ crates/gex-gfxstream/spec/{renderControl,gles1,gles2}.{in,attrib,types}
     Source Project. Apache-2.0 (its text is the first part of
     third_party/wasmtime-49.0.2/LICENSE).
 
+crates/gex-kernel/src/vfs/tracefs_readme.txt
+    The text tracefs's README file shows, from Linux's kernel/trace/trace.c
+    (readme_msg, at Android's android17-6.18), with the sections its
+    configuration builds, unchanged. Copyright the Linux kernel's authors.
+    GPL-2.0-only.
+
 third_party/wasmtime-49.0.2/
     Wasmtime, by the Bytecode Alliance and its contributors, with local
     changes. Apache-2.0 WITH LLVM-exception (third_party/wasmtime-49.0.2/LICENSE).

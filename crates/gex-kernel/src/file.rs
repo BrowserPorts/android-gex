@@ -277,6 +277,9 @@ impl OpenFile {
         if !self.readable {
             return Err(Errno::EBADF);
         }
+        if self.handle.refuses_positioned_io() {
+            return Err(Errno::ESPIPE);
+        }
         self.handle.read_at(offset, buf)
     }
 
@@ -299,6 +302,9 @@ impl OpenFile {
     pub fn pwrite(&self, offset: u64, buf: &[u8]) -> SysResult {
         if !self.writable {
             return Err(Errno::EBADF);
+        }
+        if self.handle.refuses_positioned_io() {
+            return Err(Errno::ESPIPE);
         }
         self.handle.write_at(offset, buf)
     }

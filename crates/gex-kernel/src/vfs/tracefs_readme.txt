@@ -1,0 +1,204 @@
+tracing mini-HOWTO:
+
+By default tracefs removes all OTH file permission bits.
+When mounting tracefs an optional group id can be specified
+which adds the group to every directory and file in tracefs:
+
+	 e.g. mount -t tracefs [-o [gid=<gid>]] nodev /sys/kernel/tracing
+
+# echo 0 > tracing_on : quick way to disable tracing
+# echo 1 > tracing_on : quick way to re-enable tracing
+
+ Important files:
+  trace			- The static contents of the buffer
+			  To clear the buffer write into this file: echo > trace
+  trace_pipe		- A consuming read to see the contents of the buffer
+  current_tracer	- function and latency tracers
+  available_tracers	- list of configured tracers for current_tracer
+  error_log	- error log for failed commands (that support it)
+  buffer_size_kb	- view and modify size of per cpu buffer
+  buffer_total_size_kb  - view total size of all cpu buffers
+
+  trace_clock		- change the clock used to order events
+       local:   Per cpu clock but may not be synced across CPUs
+      global:   Synced across CPUs but slows tracing down.
+     counter:   Not a clock, but just an increment
+      uptime:   Jiffy counter from time of boot
+        perf:   Same clock that perf events use
+
+  timestamp_mode	- view the mode used to timestamp events
+       delta:   Delta difference against a buffer-wide timestamp
+    absolute:   Absolute (standalone) timestamp
+
+  trace_marker		- Writes into this file writes into the kernel buffer
+
+  trace_marker_raw		- Writes into this file writes binary data into the kernel buffer
+  tracing_cpumask	- Limit which CPUs to trace
+  instances		- Make sub-buffers with: mkdir instances/foo
+			  Remove sub-buffer with rmdir
+  trace_options		- Set format or modify how tracing happens
+			  Disable an option by prefixing 'no' to the
+			  option name
+  saved_cmdlines_size	- echo command number in here to store comm-pid list
+  dynamic_events		- Create/append/remove/show the generic dynamic events
+			  Write into this file to define/undefine new trace events.
+  kprobe_events		- Create/append/remove/show the kernel dynamic events
+			  Write into this file to define/undefine new trace events.
+  uprobe_events		- Create/append/remove/show the userspace dynamic events
+			  Write into this file to define/undefine new trace events.
+	  accepts: event-definitions (one definition per line)
+	   Format: p[:[<group>/][<event>]] <place> [<args>]
+	           r[maxactive][:[<group>/][<event>]] <place> [<args>]
+	           s:[synthetic/]<event> <field> [<field>]
+	           e[:[<group>/][<event>]] <attached-group>.<attached-event> [<args>] [if <filter>]
+	           -:[<group>/][<event>]
+	    place: [<module>:]<symbol>[+<offset>]|<memaddr>
+place (kretprobe): [<module>:]<symbol>[+<offset>]%return|<memaddr>
+   place (uprobe): <path>:<offset>[%return][(ref_ctr_offset)]
+	     args: <name>=fetcharg[:type]
+	 fetcharg: (%<register>|$<efield>), @<address>, @<symbol>[+|-<offset>],
+	           $stack<index>, $stack, $retval, $comm, $arg<N>,
+	           <argname>[->field[->field|.field...]],
+	           +|-[u]<offset>(<fetcharg>), \imm-value, \"imm-string"
+	     kernel return probes support: $retval, $arg<N>, $comm
+	     type: s8/16/32/64, u8/16/32/64, x8/16/32/64, char, string, symbol,
+	           b<bit-width>@<bit-offset>/<container-size>, ustring,
+	           symstr, %pd/%pD, <type>\[<array-size>\]
+	    field: <stype> <name>;
+	    stype: u8/u16/u32/u64, s8/s16/s32/s64, pid_t,
+	           [unsigned] char/int/long
+	    efield: For event probes ('e' types), the field is on of the fields
+	            of the <attached-group>/<attached-event>.
+  set_event		- Enables events by name written into it
+			  Can enable module events via: :mod:<module>
+  events/		- Directory containing all trace event subsystems:
+      enable		- Write 0/1 to enable/disable tracing of all events
+  events/<system>/	- Directory containing all trace events for <system>:
+      enable		- Write 0/1 to enable/disable tracing of all <system>
+			  events
+      filter		- If set, only events passing filter are traced
+  events/<system>/<event>/	- Directory containing control files for
+			  <event>:
+      enable		- Write 0/1 to enable/disable tracing of <event>
+      filter		- If set, only events passing filter are traced
+      trigger		- If set, a command to perform when event is hit
+	    Format: <trigger>[:count][if <filter>]
+	   trigger: traceon, traceoff
+	            enable_event:<system>:<event>
+	            disable_event:<system>:<event>
+	            enable_hist:<system>:<event>
+	            disable_hist:<system>:<event>
+		    stacktrace
+		    hist (see below)
+	   example: echo traceoff > events/block/block_unplug/trigger
+	            echo traceoff:3 > events/block/block_unplug/trigger
+	            echo 'enable_event:kmem:kmalloc:3 if nr_rq > 1' > \
+	                  events/block/block_unplug/trigger
+	   The first disables tracing every time block_unplug is hit.
+	   The second disables tracing the first 3 times block_unplug is hit.
+	   The third enables the kmalloc event the first 3 times block_unplug
+	     is hit and has value of greater than 1 for the 'nr_rq' event field.
+	   Like function triggers, the counter is only decremented if it
+	    enabled or disabled tracing.
+	   To remove a trigger without a count:
+	     echo '!<trigger> > <system>/<event>/trigger
+	   To remove a trigger with a count:
+	     echo '!<trigger>:0 > <system>/<event>/trigger
+	   Filters can be ignored when removing a trigger.
+      hist trigger	- If set, event hits are aggregated into a hash table
+	    Format: hist:keys=<field1[,field2,...]>
+	            [:<var1>=<field|var_ref|numeric_literal>[,<var2>=...]]
+	            [:values=<field1[,field2,...]>]
+	            [:sort=<field1[,field2,...]>]
+	            [:size=#entries]
+	            [:pause][:continue][:clear]
+	            [:name=histname1]
+	            [:nohitcount]
+	            [:<handler>.<action>]
+	            [if <filter>]
+
+	    Note, special fields can be used as well:
+	            common_timestamp - to record current timestamp
+	            common_cpu - to record the CPU the event happened on
+
+	    A hist trigger variable can be:
+	        - a reference to a field e.g. x=current_timestamp,
+	        - a reference to another variable e.g. y=$x,
+	        - a numeric literal: e.g. ms_per_sec=1000,
+	        - an arithmetic expression: e.g. time_secs=current_timestamp/1000
+
+	    hist trigger arithmetic expressions support addition(+), subtraction(-),
+	    multiplication(*) and division(/) operators. An operand can be either a
+	    variable reference, field or numeric literal.
+
+	    When a matching event is hit, an entry is added to a hash
+	    table using the key(s) and value(s) named, and the value of a
+	    sum called 'hitcount' is incremented.  Keys and values
+	    correspond to fields in the event's format description.  Keys
+	    can be any field, or the special string 'common_stacktrace'.
+	    Compound keys consisting of up to two fields can be specified
+	    by the 'keys' keyword.  Values must correspond to numeric
+	    fields.  Sort keys consisting of up to two fields can be
+	    specified using the 'sort' keyword.  The sort direction can
+	    be modified by appending '.descending' or '.ascending' to a
+	    sort field.  The 'size' parameter can be used to specify more
+	    or fewer than the default 2048 entries for the hashtable size.
+	    If a hist trigger is given a name using the 'name' parameter,
+	    its histogram data will be shared with other triggers of the
+	    same name, and trigger hits will update this common data.
+
+	    Reading the 'hist' file for the event will dump the hash
+	    table in its entirety to stdout.  If there are multiple hist
+	    triggers attached to an event, there will be a table for each
+	    trigger in the output.  The table displayed for a named
+	    trigger will be the same as any other instance having the
+	    same name.  The default format used to display a given field
+	    can be modified by appending any of the following modifiers
+	    to the field name, as applicable:
+
+	            .hex        display a number as a hex value
+	            .sym        display an address as a symbol
+	            .sym-offset display an address as a symbol and offset
+	            .execname   display a common_pid as a program name
+	            .syscall    display a syscall id as a syscall name
+	            .log2       display log2 value rather than raw number
+	            .buckets=size  display values in groups of size rather than raw number
+	            .usecs      display a common_timestamp in microseconds
+	            .percent    display a number of percentage value
+	            .graph      display a bar-graph of a value
+
+	    The 'pause' parameter can be used to pause an existing hist
+	    trigger or to start a hist trigger but not log any events
+	    until told to do so.  'continue' can be used to start or
+	    restart a paused hist trigger.
+
+	    The 'clear' parameter will clear the contents of a running
+	    hist trigger and leave its current paused/active state
+	    unchanged.
+
+	    The 'nohitcount' (or NOHC) parameter will suppress display of
+	    raw hitcount in the histogram.
+
+	    The enable_hist and disable_hist triggers can be used to
+	    have one event conditionally start and stop another event's
+	    already-attached hist trigger.  The syntax is analogous to
+	    the enable_event and disable_event triggers.
+
+	    Hist trigger handlers and actions are executed whenever a
+	    a histogram entry is added or updated.  They take the form:
+
+	        <handler>.<action>
+
+	    The available handlers are:
+
+	        onmatch(matching.event)  - invoke on addition or update
+	        onmax(var)               - invoke if var exceeds current max
+	        onchange(var)            - invoke action if var changes
+
+	    The available actions are:
+
+	        trace(<synthetic_event>,param list)  - generate synthetic event
+	        save(field,...)                      - save current event fields
+  events/synthetic_events	- Create/append/remove/show synthetic events
+	  Write into this file to define/undefine new synthetic events.
+	     example: echo 'myevent u64 lat; char name[]; long[] stack' >> synthetic_events
