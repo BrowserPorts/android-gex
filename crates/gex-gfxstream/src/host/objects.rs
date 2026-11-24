@@ -66,6 +66,11 @@ pub struct ColorBuffer {
     format_checked: bool,
     /// Kept for reads (`m_fbo`).
     fbo: u32,
+    /// Its framework format (`FrameworkFormat`): 0 for one the guest
+    /// draws in, else a YUV layout uploaded and converted ([`super::yuv`]).
+    pub framework: u32,
+    /// A YUV buffer's last upload, as it came (the YUV cache).
+    pub yuv: Vec<u8>,
     /// The guest's references (`ColorBufferRef::refcount`).
     pub refs: u32,
     /// The windows it is attached to, and the display while it shows it.
@@ -326,6 +331,17 @@ impl Renderer {
     /// `rcCreateColorBuffer`/`rcCreateColorBufferDMA`: a texture of the
     /// root's, with one reference.
     pub fn create_color_buffer(&mut self, width: u32, height: u32, internal: u32) -> u32 {
+        self.create_color_buffer_of(width, height, internal, 0)
+    }
+
+    /// The same, of a framework format: a YUV one is kept as RGBA, which
+    /// its uploads are converted to.
+    pub fn create_color_buffer_of(&mut self, width: u32, height: u32, internal: u32, framework: u32) -> u32 {
+        if framework != 0 && super::yuv::data_size(framework, width, height).is_none() {
+            eprintln!("[gex] gfxstream: a color buffer of framework format {framework} cannot be made (gfxstream's host aborts here)");
+            return 0;
+        }
+        let internal = if framework != 0 { gl::GL_RGBA } else { internal };
         let handle = self.objects.handle();
         let Some(format) = gl::color_buffer_format(internal) else {
             eprintln!("[gex] gfxstream: a color buffer of format {internal:#x} cannot be made (gfxstream's host aborts here)");
@@ -358,7 +374,7 @@ impl Renderer {
         if image.is_null() {
             eprintln!("[gex] gfxstream: no EGL image of a color buffer's texture: {:#x}", unsafe { eglGetError() });
         }
-        self.objects.color_buffers.insert(handle, ColorBuffer { tex, image, width, height, format, format_checked: false, fbo: 0, refs: 1, holds: 0 });
+        self.objects.color_buffers.insert(handle, ColorBuffer { tex, image, width, height, format, format_checked: framework != 0, fbo: 0, framework, yuv: Vec::new(), refs: 1, holds: 0 });
         handle
     }
 
@@ -389,6 +405,30 @@ impl Renderer {
     /// update in a format or type other than the buffer's makes the buffer
     /// that format (`reformat`).
     pub fn update_color_buffer(&mut self, handle: u32, x: i32, y: i32, width: i32, height: i32, format: u32, ty: u32, pixels: &[u8]) {
+        // A YUV buffer takes its whole frame, converted (`drawConvertFromFormat`).
+        if let Some(c) = self.objects.color_buffers.get_mut(&handle).filter(|c| c.framework != 0) {
+            let (fw, w, h) = (c.framework, c.width, c.height);
+            let need = super::yuv::data_size(fw, w, h).unwrap_or(0);
+            if pixels.len() < need {
+                eprintln!("[gex] gfxstream: a YUV frame of {} bytes where {need} are needed", pixels.len());
+                return;
+            }
+            c.yuv = pixels[..need].to_vec();
+            let rgba = super::yuv::to_rgba(fw, w, h, pixels).unwrap_or_default();
+            let tex = c.tex;
+            self.with_root(|f| unsafe {
+                let bound = int(f, gl::GL_TEXTURE_BINDING_2D);
+                let unpack = int(f, gl::GL_UNPACK_ALIGNMENT);
+                (f.glBindTexture)(gl::GL_TEXTURE_2D, tex);
+                (f.glPixelStorei)(gl::GL_UNPACK_ALIGNMENT, 1);
+                (f.glTexSubImage2D)(gl::GL_TEXTURE_2D, 0, 0, 0, w as i32, h as i32, gl::GL_RGBA, gl::GL_UNSIGNED_BYTE, rgba.as_ptr().cast());
+                (f.glPixelStorei)(gl::GL_UNPACK_ALIGNMENT, unpack);
+                (f.glBindTexture)(gl::GL_TEXTURE_2D, bound as u32);
+                (f.glFlush)();
+            });
+            let _ = (x, y, width, height, format, ty);
+            return;
+        }
         let display = self.display;
         let root = self.root;
         let Some(c) = self.objects.color_buffers.get(&handle) else {

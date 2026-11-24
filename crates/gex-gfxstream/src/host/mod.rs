@@ -16,6 +16,7 @@ pub mod config;
 pub mod egl;
 pub mod gl;
 mod gles;
+pub mod yuv;
 pub mod objects;
 
 use crate::{Arg, Call};
@@ -198,6 +199,8 @@ impl Renderer {
                 add("ANDROID_EMU_host_composition_v2");
             }
             add("ANDROID_EMU_sync_buffer_data");
+            // The mapper reads YUV buffers back only through the YUV cache.
+            add("ANDROID_EMU_YUV_Cache");
             let guest_version = if self.features.gles_dynamic_version {
                 add("GL_OES_EGL_image_external_essl3");
                 self.max_version
@@ -474,11 +477,7 @@ impl Thread {
             "rcCreateColorBufferDMA" => {
                 // A framework format other than 0 (`FRAMEWORK_FORMAT_GL_COMPATIBLE`)
                 // is a YUV layout converted on upload (`YUVConverter`).
-                if v(3) as i32 != 0 {
-                    eprintln!("[gex] gfxstream: a color buffer of framework format {} (YUV) is not done here yet", v(3) as i32);
-                    return reply(&[], 0);
-                }
-                reply(&[], r.create_color_buffer(v(0) as u32, v(1) as u32, v(2) as u32) as u64)
+                reply(&[], r.create_color_buffer_of(v(0) as u32, v(1) as u32, v(2) as u32, v(3) as u32) as u64)
             }
             // With the refcount pipe, opening and closing count nothing.
             "rcOpenColorBuffer" | "rcCloseColorBuffer" => None,
@@ -602,6 +601,22 @@ impl Thread {
             }
             "rcSetDisplayColorTransform" => reply(&[], if v(0) == 0 { 0 } else { u32::MAX as u64 }),
             "rcColorBufferCacheFlush" => reply(&[], 0),
+            // `readPixelsYUVCached`: the frame as last uploaded.
+            "rcReadColorBufferYUV" => {
+                let len = match a[5] {
+                    Arg::Out(n) => n as usize,
+                    _ => 0,
+                };
+                let mut b = vec![0u8; len];
+                match r.objects.color_buffers.get(&(v(0) as u32)) {
+                    Some(c) if c.framework != 0 => {
+                        let n = len.min(c.yuv.len());
+                        b[..n].copy_from_slice(&c.yuv[..n]);
+                    }
+                    _ => eprintln!("[gex] gfxstream: rcReadColorBufferYUV of color buffer {}, which is not a YUV one", v(0)),
+                }
+                reply(&[&b], 0)
+            }
             // Taken and not used here: the swap interval of a window, the
             // process's name, host-side tracing.
             "rcFBSetSwapInterval" | "rcSetProcessMetadata" | "rcSetTracingForPuid" => None,
@@ -1067,6 +1082,27 @@ mod tests {
         assert_eq!(i32_at(&t.feed(&encode("rcDestroySyncKHR", &[P::V(h)])), 0), 0);
         assert!(renderer.lock().unwrap().fences.is_empty());
         assert_eq!(i32_at(&t.feed(&encode("rcIsSyncSignaled", &[P::V(h)])), 0), 1);
+        assert!(t.broken.is_none());
+    }
+
+    /// A camera's or decoder's buffer: YUV_420_888, uploaded whole, read
+    /// back as RGB (converted) and as YUV (as it came).
+    #[test]
+    #[ignore = "needs the host's Mesa EGL"]
+    fn yuv_buffers_are_converted_and_kept() {
+        let r = Renderer::new(Features::default(), DisplaySize { width: 8, height: 8, dpi_x: 160, dpi_y: 160 }).unwrap();
+        let mut t = Thread::new(Arc::new(Mutex::new(r)));
+        let mut w = 0u32.to_le_bytes().to_vec();
+        w.extend(encode("rcCreateColorBufferDMA", &[P::V(4), P::V(2), P::V(gl::GL_RGBA as u64), P::V(yuv::YUV_420_888 as u64)]));
+        let cb = i32_at(&t.feed(&w), 0) as u64;
+        assert_ne!(cb, 0);
+        let frame = [81u8, 81, 81, 81, 81, 81, 81, 81, 90, 90, 240, 240];
+        let a = t.feed(&encode("rcUpdateColorBuffer", &[P::V(cb), P::V(0), P::V(0), P::V(4), P::V(2), P::V(gl::GL_RGBA as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::In(&frame)]));
+        assert_eq!(i32_at(&a, 0), 0);
+        let px = t.feed(&encode("rcReadColorBuffer", &[P::V(cb), P::V(0), P::V(0), P::V(4), P::V(2), P::V(gl::GL_RGBA as u64), P::V(gl::GL_UNSIGNED_BYTE as u64), P::Out(32)]));
+        assert!(px.chunks_exact(4).all(|p| p == [255, 0, 0, 255]), "{px:?}");
+        let back = t.feed(&encode("rcReadColorBufferYUV", &[P::V(cb), P::V(0), P::V(0), P::V(4), P::V(2), P::Out(12), P::V(12)]));
+        assert_eq!(back, frame);
         assert!(t.broken.is_none());
     }
 
