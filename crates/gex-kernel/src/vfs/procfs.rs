@@ -515,6 +515,8 @@ enum Setting {
     NetCore(String),
     /// `vm.mmap_rnd_bits`.
     MmapRndBits,
+    /// `vm.overcommit_memory` ([`overcommit`]).
+    Overcommit,
     /// `kernel.unprivileged_bpf_disabled`, `net.core.bpf_jit_enable`,
     /// `net.core.bpf_jit_kallsyms` ([`bpf_sysctl`]).
     Bpf(bpf_sysctl::Which),
@@ -531,6 +533,9 @@ impl Setting {
         if path == "sys/vm/mmap_rnd_bits" {
             return Some(Setting::MmapRndBits);
         }
+        if path == "sys/vm/overcommit_memory" {
+            return Some(Setting::Overcommit);
+        }
         if let Some(w) = bpf_sysctl::Which::at(path) {
             return Some(Setting::Bpf(w));
         }
@@ -543,6 +548,7 @@ impl Setting {
         let value = match self {
             Setting::NetCore(name) => crate::netlink::sysctl::get(name).unwrap_or(0),
             Setting::MmapRndBits => mmap_rnd_bits::get(),
+            Setting::Overcommit => overcommit::get(),
             Setting::Bpf(w) => w.get(),
             Setting::NetConf(p) => return crate::netconf::read(p).and_then(|r| r.ok()).unwrap_or_default(),
         };
@@ -555,6 +561,7 @@ impl Setting {
         match self {
             Setting::NetCore(_) => 0o644,
             Setting::MmapRndBits => 0o600,
+            Setting::Overcommit => 0o644,
             Setting::Bpf(w) => w.mode(),
             Setting::NetConf(p) => crate::netconf::mode(p).unwrap_or(0o444),
         }
@@ -587,6 +594,33 @@ pub mod mmap_rnd_bits {
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| eprintln!("[gex] vm.mmap_rnd_bits is kept and not applied: mappings are not placed at random"));
         BITS.store(value as u32, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// `vm.overcommit_memory`: 0 (the kernel's guess, as it starts), 1
+/// (always) or 2 (never), `proc_dointvec_minmax`'s range, anything else
+/// `EINVAL`. Android's init sets 1. **Kept and not applied:** this kernel
+/// keeps no commit charge and refuses no mapping for one, which is policy
+/// 1's behaviour whatever is set; 2 is said once.
+pub mod overcommit {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static POLICY: AtomicU32 = AtomicU32::new(0);
+
+    pub fn get() -> u32 {
+        POLICY.load(Ordering::Relaxed)
+    }
+
+    pub fn set(value: i64) -> Result<(), crate::errno::Errno> {
+        if !(0..=2).contains(&value) {
+            return Err(crate::errno::Errno::EINVAL);
+        }
+        if value == 2 {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("[gex] vm.overcommit_memory 2 is kept and not applied: no commit charge is kept, and no mapping refused for one"));
+        }
+        POLICY.store(value as u32, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -744,6 +778,7 @@ impl FileHandle for Sysctl {
         match &self.which {
             Setting::NetCore(name) => crate::netlink::sysctl::set(name, u32::try_from(value).map_err(|_| Errno::EINVAL)?)?,
             Setting::MmapRndBits => mmap_rnd_bits::set(value)?,
+            Setting::Overcommit => overcommit::set(value)?,
             Setting::Bpf(w) => w.set(value)?,
             Setting::NetConf(_) => unreachable!("written above"),
         }
@@ -1055,7 +1090,6 @@ impl ProcFs {
             p if crate::netconf::mode(p).is_some() => crate::netconf::read(p).and_then(|r| r.ok()).unwrap_or_default(),
             p if p.strip_prefix("sys/net/core/").is_some_and(|n| crate::netlink::sysctl::get(n).is_some()) => format!("{}\n", crate::netlink::sysctl::get(&p["sys/net/core/".len()..]).unwrap()).into_bytes(),
             // glibc and musl both consult this before using large mappings.
-            "sys/vm/overcommit_memory" => b"0\n".to_vec(),
             "sys/vm/mmap_rnd_bits" => format!("{}\n", mmap_rnd_bits::get()).into_bytes(),
             p if Pressure::at(p) => Pressure::text(p == "pressure/irq").as_bytes().to_vec(),
             "cgroups" => crate::cgroup1::proc_cgroups(),
@@ -1070,6 +1104,26 @@ impl ProcFs {
 impl FileSystem for ProcFs {
     fn fs_type(&self) -> &'static str {
         "proc"
+    }
+
+    /// `/proc/kmsg` keeps its mode (`proc_notify_change`); the rest accept
+    /// it and keep nothing, as before.
+    fn chmod(&self, path: &str, mode: u32) -> Result<(), Errno> {
+        if self.canonical(path).map(|(p, _)| p).as_deref() == Ok("kmsg") {
+            super::kmsg::proc_attrs().lock().unwrap_or_else(|e| e.into_inner()).0 = mode & 0o7777;
+        }
+        Ok(())
+    }
+
+    /// And its owner.
+    fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
+        if self.canonical(path).map(|(p, _)| p).as_deref() == Ok("kmsg") {
+            let mut a = super::kmsg::proc_attrs().lock().unwrap_or_else(|e| e.into_inner());
+            a.1 = uid.unwrap_or(a.1);
+            a.2 = gid.unwrap_or(a.2);
+            return Ok(());
+        }
+        self.metadata_nofollow(path).map(|_| ())
     }
 
     /// One number: each process has a view of its own of the one proc
@@ -1120,6 +1174,20 @@ impl FileSystem for ProcFs {
         if path == "self/oom_score_adj" && self.source.oom_score_adj().is_some() {
             return Ok(Arc::new(OomScoreAdj { source: Arc::clone(&self.source) }));
         }
+        // The kernel's log, read once (`super::kmsg::ProcKmsg`): who may
+        // is its mode's to say.
+        if path == "kmsg" {
+            let md = super::kmsg::proc_metadata();
+            if let Some((uid, gid)) = super::Maker::current().filter(|&(u, _)| u != 0) {
+                let (ou, og) = md.owner.unwrap_or((0, 0));
+                let bits = if uid == ou { md.mode >> 6 } else if gid == og { md.mode >> 3 } else { md.mode } & 7;
+                let acc = flags & crate::fs::oflags::ACCMODE;
+                if (acc != crate::fs::oflags::O_WRONLY && bits & 4 == 0) || (acc != crate::fs::oflags::O_RDONLY && bits & 2 == 0) {
+                    return Err(Errno::EACCES);
+                }
+            }
+            return Ok(Arc::new(super::kmsg::ProcKmsg));
+        }
         if let Some(data) = self.generate(&path, tid) {
             return Ok(Arc::new(Generated { data }));
         }
@@ -1164,7 +1232,7 @@ impl FileSystem for ProcFs {
                 for pid in pids {
                     out.push(DirEntry { name: pid.to_string(), file_type: FileType::Directory, ino: 1 });
                 }
-                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "mounts", "sys", "pressure", "cmdline", "filesystems", "cgroups"].into_iter().chain(BOOTCONFIG.get().map(|_| "bootconfig")) {
+                for name in ["self", "meminfo", "cpuinfo", "version", "uptime", "stat", "loadavg", "mounts", "sys", "pressure", "cmdline", "filesystems", "cgroups", "kmsg"].into_iter().chain(BOOTCONFIG.get().map(|_| "bootconfig")) {
                     let file_type = match name {
                         "self" => FileType::Symlink,
                         "sys" | "pressure" => FileType::Directory,
@@ -1235,6 +1303,9 @@ impl FileSystem for ProcFs {
 
     fn metadata(&self, path: &str) -> Result<Metadata, Errno> {
         let (path, tid) = self.canonical(path)?;
+        if path == "kmsg" {
+            return Ok(super::kmsg::proc_metadata());
+        }
         if let Some((_, name)) = self.attr_of(&path) {
             if name.is_empty() {
                 return Ok(Metadata { mode: 0o555, ..Metadata::dir() });
@@ -1437,6 +1508,18 @@ fn base_entries() -> Vec<DirEntry> {
 
 #[cfg(test)]
 mod tests {
+    /// `vm.overcommit_memory`: 0 to start, 0 to 2 taken, anything else
+    /// `EINVAL` and the value kept.
+    #[test]
+    fn overcommit_takes_its_three_policies() {
+        assert_eq!(super::Setting::at("sys/vm/overcommit_memory"), Some(super::Setting::Overcommit));
+        assert_eq!(super::overcommit::set(3), Err(Errno::EINVAL));
+        assert_eq!(super::overcommit::set(-1), Err(Errno::EINVAL));
+        super::overcommit::set(1).unwrap();
+        assert_eq!(super::overcommit::get(), 1);
+        super::overcommit::set(0).unwrap();
+    }
+
     use super::*;
 
     struct Fake;

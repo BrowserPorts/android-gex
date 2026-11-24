@@ -54,6 +54,11 @@ struct Log {
     /// The sequence number the next record gets.
     next: u64,
     bytes: usize,
+    /// Where `/proc/kmsg`'s readers have got to, all of them together
+    /// (`syslog_seq`), and how much of that record a read too small for it
+    /// took (`syslog_partial`).
+    syslog_seq: u64,
+    syslog_partial: usize,
 }
 
 struct Shared {
@@ -127,6 +132,101 @@ fn printed(r: &Record) -> Vec<u8> {
     }
     out.push(b'\n');
     out
+}
+
+/// A record as `/proc/kmsg` gives it (`record_print_text` with the syslog
+/// prefix and the time, as GKI is built with `CONFIG_PRINTK_TIME`): each
+/// line of its text after `<N>[seconds.microseconds] `, the bytes as they
+/// are.
+fn syslog_text(r: &Record) -> Vec<u8> {
+    let us = r.ts_ns / 1000;
+    let prefix = format!("<{}>[{:5}.{:06}] ", r.facility << 3 | r.level, us / 1_000_000, us % 1_000_000);
+    let mut out = Vec::new();
+    for line in r.text.split('\n') {
+        out.extend_from_slice(prefix.as_bytes());
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// `/proc/kmsg`'s owner and mode, as `chown` and `chmod` leave them (root's,
+/// 0400, at the start; Android's init makes it `root:system` 0440).
+pub fn proc_attrs() -> &'static Mutex<(u32, u32, u32)> {
+    static A: OnceLock<Mutex<(u32, u32, u32)>> = OnceLock::new();
+    A.get_or_init(|| Mutex::new((0o400, 0, 0)))
+}
+
+/// `/proc/kmsg` (fs/proc/kmsg.c and `syslog_print`): the log read once,
+/// whoever reads it. Every open file and `syslog`'s reads take the records
+/// from one place, so a record one reader got another does not; a read
+/// waits for one (`EAGAIN` with `O_NONBLOCK`), then takes as many whole
+/// records as fit, or as much of the first as fits when none does (the rest
+/// at the next read); records dropped meanwhile are passed over. Opening it
+/// needs `CAP_SYSLOG` on Linux, which is not checked here: who may open it
+/// is its mode's to say.
+#[derive(Debug)]
+pub struct ProcKmsg;
+
+impl FileHandle for ProcKmsg {
+    fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut log = shared().log.lock().unwrap_or_else(|e| e.into_inner());
+        let first = log.records.front().map_or(log.next, |r| r.seq);
+        if log.syslog_seq < first {
+            log.syslog_seq = first;
+            log.syslog_partial = 0;
+        }
+        let end = log.records.back().filter(|r| r.open).map_or(log.next, |r| r.seq);
+        if log.syslog_seq >= end {
+            return Err(Errno::EAGAIN);
+        }
+        let mut out: Vec<u8> = Vec::new();
+        while out.len() < buf.len() && log.syslog_seq < end {
+            let text = syslog_text(&log.records[(log.syslog_seq - first) as usize]);
+            let rest = &text[log.syslog_partial.min(text.len())..];
+            let room = buf.len() - out.len();
+            if rest.len() <= room {
+                out.extend_from_slice(rest);
+                log.syslog_seq += 1;
+                log.syslog_partial = 0;
+            } else {
+                if out.is_empty() {
+                    out.extend_from_slice(&rest[..room]);
+                    log.syslog_partial += room;
+                }
+                break;
+            }
+        }
+        buf[..out.len()].copy_from_slice(&out);
+        Ok(out.len() as u64)
+    }
+
+    fn poll_readable(&self) -> bool {
+        let log = shared().log.lock().unwrap_or_else(|e| e.into_inner());
+        let end = log.records.back().filter(|r| r.open).map_or(log.next, |r| r.seq);
+        log.syslog_seq.max(log.records.front().map_or(log.next, |r| r.seq)) < end
+    }
+
+    fn wait_queue(&self) -> u32 {
+        shared().queue.id()
+    }
+
+    fn wakes(&self) -> Option<u64> {
+        Some(shared().queue.wakes())
+    }
+
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(proc_metadata())
+    }
+}
+
+/// `/proc/kmsg`'s attributes.
+pub fn proc_metadata() -> Metadata {
+    let (mode, uid, gid) = *proc_attrs().lock().unwrap_or_else(|e| e.into_inner());
+    Metadata { file_type: super::FileType::Regular, size: 0, mode, ino: 1, mtime: 0, nlink: 1, rdev: 0, dev: 0, times: Default::default(), owner: Some((uid, gid)) }
 }
 
 /// `/dev/kmsg`, open: where its reader has got to.
