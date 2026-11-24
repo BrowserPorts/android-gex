@@ -169,6 +169,71 @@ int main(int argc, char **argv) {
         printf("emugl: GL error %#x, pixel 0 is %d %d %d %d\n", err, px[0], px[1], px[2], px[3]);
         return 1;
     }
+    // A draw as an app makes one: shaders, a program, a float uniform, a
+    // client array of vertices (the encoder sends it as data), the left
+    // half of the surface covered.
+    unsigned (*createShader)(unsigned) = sym(gles, "glCreateShader");
+    void (*shaderSource)(unsigned, int, const char *const *, const int *) = sym(gles, "glShaderSource");
+    void (*compileShader)(unsigned) = sym(gles, "glCompileShader");
+    void (*getShaderiv)(unsigned, unsigned, int *) = sym(gles, "glGetShaderiv");
+    unsigned (*createProgram)(void) = sym(gles, "glCreateProgram");
+    void (*attachShader)(unsigned, unsigned) = sym(gles, "glAttachShader");
+    void (*bindAttribLocation)(unsigned, unsigned, const char *) = sym(gles, "glBindAttribLocation");
+    void (*linkProgram)(unsigned) = sym(gles, "glLinkProgram");
+    void (*getProgramiv)(unsigned, unsigned, int *) = sym(gles, "glGetProgramiv");
+    void (*useProgram)(unsigned) = sym(gles, "glUseProgram");
+    int (*getUniformLocation)(unsigned, const char *) = sym(gles, "glGetUniformLocation");
+    void (*uniform4f)(int, float, float, float, float) = sym(gles, "glUniform4f");
+    void (*enableAttrib)(unsigned) = sym(gles, "glEnableVertexAttribArray");
+    void (*attribPointer)(unsigned, int, unsigned, unsigned char, int, const void *) = sym(gles, "glVertexAttribPointer");
+    void (*drawArrays)(unsigned, int, int) = sym(gles, "glDrawArrays");
+    const char *vs = "attribute vec2 pos; void main() { gl_Position = vec4(pos, 0.0, 1.0); }";
+    const char *fs = "precision mediump float; uniform vec4 color; void main() { gl_FragColor = color; }";
+    unsigned sh[2] = {createShader(0x8B31), createShader(0x8B30)};
+    const char *src[2] = {vs, fs};
+    unsigned prog = createProgram();
+    for (int i = 0; i < 2; i++) {
+        int compiled = 0;
+        shaderSource(sh[i], 1, &src[i], NULL);
+        compileShader(sh[i]);
+        getShaderiv(sh[i], 0x8B81, &compiled);
+        if (!compiled) {
+            printf("emugl: shader %d did not compile\n", i);
+            return 1;
+        }
+        attachShader(prog, sh[i]);
+    }
+    bindAttribLocation(prog, 3, "pos");
+    linkProgram(prog);
+    int linked = 0;
+    getProgramiv(prog, 0x8B82, &linked);
+    if (!linked) {
+        printf("emugl: the program did not link\n");
+        return 1;
+    }
+    useProgram(prog);
+    uniform4f(getUniformLocation(prog, "color"), 0.0f, 1.0f, 0.0f, 1.0f);
+    static const float quad[] = {-1, -1, 0, -1, 0, 1, -1, -1, 0, 1, -1, 1};
+    enableAttrib(3);
+    attribPointer(3, 2, 0x1406, 0, 0, quad);
+    clearColor(0.0f, 0.0f, 1.0f, 1.0f);
+    clear(GL_COLOR_BUFFER_BIT);
+    drawArrays(0x0004, 0, 6);
+    readPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    err = glError();
+    for (int y = 0; y < 16; y++) {
+        for (int x = 0; x < 16; x++) {
+            const uint8_t *p = px + (y * 16 + x) * 4;
+            int want_green = x < 8;
+            if (p[0] != 0 || p[1] != (want_green ? 255 : 0) || p[2] != (want_green ? 0 : 255) || p[3] != 255) {
+                ok = 0;
+            }
+        }
+    }
+    if (!ok || err) {
+        printf("emugl: the draw: GL error %#x, pixel (0,8) %d %d %d, (15,8) %d %d %d\n", err, px[8 * 64], px[8 * 64 + 1], px[8 * 64 + 2], px[8 * 64 + 60], px[8 * 64 + 61], px[8 * 64 + 62]);
+        return 1;
+    }
     printf("emugl ok\n");
     return 0;
 }
