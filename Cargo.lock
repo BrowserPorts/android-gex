@@ -855,6 +855,7 @@ dependencies = [
  "gex-mem",
  "gex-wayland",
  "gex-xlate",
+ "rayon",
  "wasm-encoder 0.219.2",
  "wasmparser 0.219.2",
  "wasmtime",

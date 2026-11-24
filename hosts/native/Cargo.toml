@@ -32,11 +32,13 @@ anyhow = "1"
 # bash, half a million for Mesa -- which is close to the ideal shape for
 # compiling in parallel, and it was using one core out of twenty-four.
 wasmtime = { version = "49", default-features = false, features = ["runtime", "std", "threads", "gc", "gc-null", "anyhow"] }
+# The pool wasmtime compiles on, made with a fixed size (`compile_workers`).
+rayon = { version = "1", optional = true }
 
 [features]
 default = ["translate"]
 # A wasm compiler (Cranelift) in the process.
-compile = ["wasmtime/cranelift", "wasmtime/parallel-compilation", "gex-cache/compile"]
+compile = ["wasmtime/cranelift", "wasmtime/parallel-compilation", "gex-cache/compile", "dep:rayon"]
 # gex's run-time translation: tier-1, the function JIT, unit builds. Off,
 # the runtime runs only code compiled ahead of time (`aot_only`): an
 # ejected project's runtime.

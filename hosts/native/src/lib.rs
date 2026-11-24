@@ -820,19 +820,37 @@ pub fn guest_memory_type() -> wasmtime::MemoryType {
     }
 }
 
+/// How many of the engine's workers compile a module's functions:
+/// `GEX_COMPILE_WORKERS`, 2 unless given; 0 compiles on the thread that asks.
+///
+/// Unbounded (one a core, wasmtime's own default), the workers' heap grew
+/// by 2.5 GiB in a booting Android's first minute of zygote and nothing gave
+/// it back (`gex_mem::alloc_tag`: on no thread of gex's own), and the host
+/// killed the run; with none, a large module (a Rust daemon's image, a
+/// library translated whole) compiles on one core while its process waits.
+/// A small fixed pool keeps what the workers hold to a few threads' worth.
+/// The pool is the process's (rayon's global one, which wasmtime compiles
+/// on), made at the first engine.
+fn compile_workers(config: &mut Config) {
+    let n = std::env::var("GEX_COMPILE_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2);
+    if n == 0 {
+        config.parallel_compilation(false);
+        return;
+    }
+    #[cfg(feature = "compile")]
+    static POOL: std::sync::Once = std::sync::Once::new();
+    #[cfg(feature = "compile")]
+    POOL.call_once(|| {
+        // Refused only if a pool was already made, which is then the one used.
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(n).thread_name(|i| format!("gex-compile-{i}")).build_global();
+    });
+    config.parallel_compilation(true);
+}
+
 pub fn validate_module(wasm: &[u8]) -> Result<()> {
     let mut config = Config::new();
     config.wasm_tail_call(true);
-    // A module is compiled on the thread that asks, not across the
-    // engine's worker threads: allocated there, a booting Android's
-    // compiles came to 2.5 GiB of the host's heap that nothing gave back
-    // (`gex_mem::alloc_tag`: on no thread of gex's own), and the host killed
-    // the run at its zygote; compiled where asked, nothing of it stays. Many
-    // threads translating at once are parallel enough.
-    // `GEX_PARALLEL_COMPILE=1` brings the workers back.
-    if std::env::var("GEX_PARALLEL_COMPILE").as_deref() != Ok("1") {
-        config.parallel_compilation(false);
-    }
+    compile_workers(&mut config);
     config.wasm_threads(true);
     // wasmtime 49 creates no SharedMemory unless asked: the guest's memory is one.
     config.shared_memory(true);
@@ -967,16 +985,7 @@ fn new_engine() -> Result<Engine> {
     // Tail calls are load-bearing: the whole block-per-function design
     // depends on them.
     config.wasm_tail_call(true);
-    // A module is compiled on the thread that asks, not across the
-    // engine's worker threads: allocated there, a booting Android's
-    // compiles came to 2.5 GiB of the host's heap that nothing gave back
-    // (`gex_mem::alloc_tag`: on no thread of gex's own), and the host killed
-    // the run at its zygote; compiled where asked, nothing of it stays. Many
-    // threads translating at once are parallel enough.
-    // `GEX_PARALLEL_COMPILE=1` brings the workers back.
-    if std::env::var("GEX_PARALLEL_COMPILE").as_deref() != Ok("1") {
-        config.parallel_compilation(false);
-    }
+    compile_workers(&mut config);
     config.wasm_threads(true);
     // wasmtime 49 creates no SharedMemory unless asked: the guest's memory is one.
     config.shared_memory(true);
