@@ -55,8 +55,10 @@ pipe, and keep buffers in the goldfish address space. gex has both devices
 (`GEX_EMULATOR_HOST=1`) and its own gfxstream renderer
 (`crates/gex-gfxstream`) on the host's OpenGL ES (Mesa), so the boot
 configuration (`bootconfig`) leaves the image's choices as they are and
-says OpenGL ES 3.1. `bootconfig.swiftshader` is the emulator's guest
-rendering instead: `swiftshader.sh WORK ROOT` builds SwiftShader's Vulkan
+says OpenGL ES 3.1. `emugl.sh ROOT` checks that path without a
+boot: the image's own EGL and GLES drivers, run in the root, draw and read
+back through gex's renderer. `bootconfig.swiftshader` is the emulator's
+guest rendering instead: `swiftshader.sh WORK ROOT` builds SwiftShader's Vulkan
 driver with the NDK and puts it in the tree, and that configuration
 chooses ANGLE over it. The configuration's `androidboot.logcat` is what
 the emulator gives
