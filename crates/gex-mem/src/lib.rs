@@ -204,6 +204,156 @@ impl GuestMemory {
         }
     }
 
+    /// The host's page size where [`Self::discard`] can give pages back,
+    /// else `None`.
+    pub fn discard_page() -> Option<u64> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            extern "C" {
+                fn sysconf(name: i32) -> i64;
+            }
+            #[cfg(target_os = "macos")]
+            const SC_PAGESIZE: i32 = 29;
+            #[cfg(target_os = "linux")]
+            const SC_PAGESIZE: i32 = 30;
+            // SAFETY: a read of a constant of the system's.
+            let page = unsafe { sysconf(SC_PAGESIZE) };
+            (page > 0 && (page as u64).is_power_of_two()).then_some(page as u64)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
+    /// Give the host back `[start, start + len)` (host-page aligned, inside
+    /// the memory): fresh pages of zeros in its place, which cost nothing
+    /// until written. What the guest's `madvise(MADV_DONTNEED)` asks of an
+    /// anonymous private range; writing zeros over it instead keeps every
+    /// page the host's (and on macOS, reading a page to see whether it is
+    /// zero makes the host give it). Not for a range made one with another
+    /// ([`Self::alias`]): it would no longer be. False where it cannot be
+    /// done, and nothing changed.
+    pub fn discard(&self, start: u64, len: u64) -> bool {
+        let Some(page) = Self::discard_page() else { return false };
+        if len == 0 || !start.is_multiple_of(page) || !len.is_multiple_of(page) || start.checked_add(len).is_none_or(|e| e > self.len() as u64) {
+            return false;
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            use std::ffi::c_void;
+            extern "C" {
+                fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
+            }
+            const PROT_RW: i32 = 1 | 2;
+            const MAP_PRIVATE: i32 = 2;
+            const MAP_FIXED: i32 = 0x10;
+            #[cfg(target_os = "macos")]
+            const MAP_ANON: i32 = 0x1000;
+            #[cfg(target_os = "linux")]
+            const MAP_ANON: i32 = 0x20;
+            let at = self.bytes()[start as usize..].as_mut_ptr() as *mut c_void;
+            // SAFETY: `[start, start + len)` is inside this memory's own
+            // mapping (checked above); fresh private pages of zeros replace
+            // it, read and write as the memory's accessible part is. The
+            // guest asked for its bytes to be gone, so nothing is kept.
+            let r = unsafe { mmap(at, len as usize, PROT_RW, MAP_PRIVATE | MAP_FIXED | MAP_ANON, -1, 0) };
+            if r != at {
+                eprintln!("gex: giving back {len:#x} bytes at {start:#x} failed");
+                return false;
+            }
+            true
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
+    /// Move the host's pages of `[src, src + len)` to `[dst, dst + len)`
+    /// (host-page aligned, inside the memory, apart), and leave fresh zero
+    /// pages at `src`: what `mremap` does with an anonymous private range,
+    /// without reading or writing a byte, so pages never touched stay
+    /// untouched at `dst`. What `dst` held is gone. False where it cannot be
+    /// done, and nothing changed.
+    pub fn move_pages(&self, dst: u64, src: u64, len: u64) -> bool {
+        let Some(page) = Self::discard_page() else { return false };
+        let size = self.len() as u64;
+        let fits = |a: u64| a.is_multiple_of(page) && a.checked_add(len).is_some_and(|e| e <= size);
+        if len == 0 || !len.is_multiple_of(page) || !fits(dst) || !fits(src) || (dst < src + len && src < dst + len) {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            #[allow(non_upper_case_globals)]
+            extern "C" {
+                static mach_task_self_: u32;
+                fn mach_vm_remap(
+                    target: u32,
+                    address: *mut u64,
+                    size: u64,
+                    mask: u64,
+                    flags: i32,
+                    src_task: u32,
+                    src_address: u64,
+                    copy: i32,
+                    cur: *mut i32,
+                    max: *mut i32,
+                    inherit: u32,
+                ) -> i32;
+            }
+            const VM_FLAGS_FIXED: i32 = 0;
+            const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+            const VM_INHERIT_COPY: u32 = 1;
+            const RW: i32 = 3;
+            let base = self.inner.data().as_ptr() as u64;
+            let mut at = base + dst;
+            let (mut cur, mut max) = (0i32, 0i32);
+            // SAFETY: the task's own port, a constant of the process.
+            let task = unsafe { mach_task_self_ };
+            // SAFETY: both ranges are inside this memory's own mapping and
+            // apart (checked above); `dst`'s pages are replaced by `src`'s
+            // in place, and `src` is given fresh pages next, so the two
+            // are not one memory after.
+            let kr = unsafe { mach_vm_remap(task, &mut at, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, task, base + src, 0, &mut cur, &mut max, VM_INHERIT_COPY) };
+            if kr != 0 || at != base + dst || cur & RW != RW {
+                eprintln!("gex: moving {len:#x} bytes from {src:#x} to {dst:#x}: {kr} at {:#x}, protection {cur}", at.wrapping_sub(base));
+                return false;
+            }
+            if !self.discard(src, len) {
+                // Both name the same pages now: give `dst` its own, keeping
+                // what it holds, so a write to one is not in the other.
+                eprintln!("gex: the pages moved from {src:#x} are still there");
+                let _ = self.unalias(dst, len);
+                return false;
+            }
+            true
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::c_void;
+            extern "C" {
+                fn mremap(old: *mut c_void, old_len: usize, new_len: usize, flags: i32, new: *mut c_void) -> *mut c_void;
+            }
+            const MREMAP_MAYMOVE: i32 = 1;
+            const MREMAP_FIXED: i32 = 2;
+            const MREMAP_DONTUNMAP: i32 = 4;
+            let from = self.bytes()[src as usize..].as_mut_ptr() as *mut c_void;
+            let to = self.bytes()[dst as usize..].as_mut_ptr() as *mut c_void;
+            // SAFETY: both ranges are inside this memory's own mapping and
+            // apart (checked above); the host moves `src`'s pages over
+            // `dst` and leaves `src` mapped and empty (it reads as zero, a
+            // private anonymous mapping). Refused (and nothing moved) where
+            // the memory is not one the host can so move.
+            let r = unsafe { mremap(from, len as usize, len as usize, MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP, to) };
+            r == to
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
     /// Make `[start, start + len)` (host-page aligned) memory of its own
     /// again, keeping what it holds: a range [`Self::alias`] made one with
     /// another is copied out, mapped anew, and copied back. What another

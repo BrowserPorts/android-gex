@@ -145,6 +145,10 @@ pub struct Vma {
     /// mapping of a file not open for writing, or one its file keeps
     /// read-only (a BPF map's, selinuxfs's status page).
     pub never_write: bool,
+    /// Anonymous and `MAP_SHARED`: its bytes are the shared memory behind
+    /// it, which `madvise(MADV_DONTNEED)` does not empty (the pages come
+    /// back with what they held), as it empties a private one.
+    pub shared_anon: bool,
 }
 
 impl Vma {
@@ -168,6 +172,7 @@ impl Vma {
             }
             && self.patched == next.patched
             && self.never_write == next.never_write
+            && self.shared_anon == next.shared_anon
             && continues(&self.origin, &next.origin)
             && continues(&self.code, &next.code)
     }
@@ -193,6 +198,7 @@ impl Vma {
             file_off: self.file_off.map(|o| o + (start - self.start)),
             shown: self.shown.clone(),
             never_write: self.never_write,
+            shared_anon: self.shared_anon,
         }
     }
 }
@@ -332,7 +338,8 @@ impl Mm {
     }
 
     /// Make the anonymous mapping just placed at `[start, start+len)` read
-    /// as zero. Pages that already are stay untouched, so a large
+    /// as zero. Pages that already are stay untouched (and the host's pages
+    /// wholly inside what is not are given back as fresh zeros), so a large
     /// reservation costs no memory, and ranges known to be zero
     /// ([`MemoryMap::clean_ranges`] before the mapping, `clean_before`) are
     /// not even read.
@@ -351,8 +358,16 @@ impl Mm {
                 self.lock().mark_clean(end.max(fs), fe);
             }
         }
+        // What can be is given back to the host as fresh zero pages
+        // ([`MemoryMap::discard_pages`]); the rest is zeroed here.
         for (a, b) in dirty_parts(&clean_before, start, end) {
-            m.zero_dirty(a, (b - a) as usize)?;
+            let (x, y) = self.lock().discard_pages(a, b);
+            if x < y {
+                m.zero_dirty(a, (x - a) as usize)?;
+                m.zero_dirty(y, (b - y) as usize)?;
+            } else {
+                m.zero_dirty(a, (b - a) as usize)?;
+            }
         }
         if prot_bits & prot::WRITE == 0 {
             self.lock().mark_clean(start, end);
@@ -538,6 +553,41 @@ pub struct HostAlias {
     pub unalias: std::sync::Arc<dyn Fn(u64, u64) -> bool + Send + Sync>,
 }
 
+/// The host's ways with whole pages of a process's memory, in units of
+/// `page`, the host's page size: `discard(start, len)` gives a range back
+/// as fresh zero pages (what `madvise(MADV_DONTNEED)` asks of an anonymous
+/// range), `moves(dst, src, len)` moves a range's pages and leaves fresh
+/// zeros behind (what `mremap` does), each without reading or writing a
+/// byte. Not a fork's: its memory is another (`Clone` leaves it out, as the
+/// host sets it again for each).
+#[derive(Default)]
+pub struct HostPages(Option<HostPagesFns>);
+
+#[derive(Clone)]
+struct HostPagesFns {
+    page: u64,
+    discard: std::sync::Arc<dyn Fn(u64, u64) -> bool + Send + Sync>,
+    moves: std::sync::Arc<dyn Fn(u64, u64, u64) -> bool + Send + Sync>,
+}
+
+impl HostPages {
+    pub fn new(page: u64, discard: std::sync::Arc<dyn Fn(u64, u64) -> bool + Send + Sync>, moves: std::sync::Arc<dyn Fn(u64, u64, u64) -> bool + Send + Sync>) -> HostPages {
+        HostPages(Some(HostPagesFns { page, discard, moves }))
+    }
+}
+
+impl Clone for HostPages {
+    fn clone(&self) -> HostPages {
+        HostPages(None)
+    }
+}
+
+impl std::fmt::Debug for HostPages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HostPages({:?})", self.0.as_ref().map(|h| h.page))
+    }
+}
+
 /// What of a process's memory is one with something else ([`HostAlias`]):
 /// both sides of each alias made, in host pages. A fork's copy has none
 /// (its memory is a copy), and no hook until its host gives it one.
@@ -578,6 +628,8 @@ pub struct MemoryMap {
     /// given pages of their own again before they are unmapped or mapped
     /// over ([`Self::break_aliases`]).
     aliases: Aliases,
+    /// The host's ways with whole pages ([`HostPages`]).
+    pages: HostPages,
     /// Where the program's stack began at `execve` (`mm->start_stack`),
     /// which `/proc/<pid>/stat` gives; 0 until a host says.
     start_stack: u64,
@@ -870,6 +922,7 @@ impl MemoryMap {
             uffd: crate::uffd::UffdState::default(),
             resident: None,
             aliases: Aliases::default(),
+            pages: HostPages::default(),
             start_stack: 0,
             view: ViewCell(std::sync::Arc::new(MapView::new(&[]))),
             generation: 0,
@@ -1619,6 +1672,7 @@ impl MemoryMap {
             file_off: None,
             shown: None,
             never_write: false,
+            shared_anon: false,
         });
         self.vmas.sort_by_key(|v| v.start);
     }
@@ -1696,6 +1750,7 @@ impl MemoryMap {
             file_off: None,
             shown: None,
             never_write: false,
+            shared_anon: false,
         });
         // Sorted already but for the one just pushed: move it into place.
         let at = self.vmas[..self.vmas.len() - 1].partition_point(|v| v.start < aligned);
@@ -2471,6 +2526,14 @@ impl MemoryMap {
     }
 
     /// Mark `[start, end)` as never to be made writable.
+    /// Mark the mapping at `[start, end)` anonymous and shared
+    /// ([`Vma::shared_anon`]).
+    pub fn set_shared_anon(&mut self, start: u64, end: u64) {
+        for v in self.vmas.iter_mut().filter(|v| v.start >= start && v.end <= end) {
+            v.shared_anon = true;
+        }
+    }
+
     pub fn set_never_write(&mut self, start: u64, end: u64) {
         for v in self.vmas.iter_mut().filter(|v| v.start >= start && v.end <= end) {
             v.never_write = true;
@@ -2544,6 +2607,63 @@ impl MemoryMap {
     /// ([`HostAlias`]), where it has one.
     pub fn set_host_alias(&mut self, h: HostAlias) {
         self.aliases.host = Some(h);
+    }
+
+    /// The host's ways with whole pages ([`HostPages`]).
+    pub fn set_host_pages(&mut self, p: HostPages) {
+        self.pages = p;
+    }
+
+    /// Whether the host pages of `[s, e)` (in host pages) are all the
+    /// process's own: neither part of a shared file mapping nor one with
+    /// another range.
+    fn own_pages(&self, s: u64, e: u64, p: u64) -> bool {
+        let touches = |a: u64, b: u64| a < e && s < b;
+        !self.aliases.ranges.iter().any(|&(a, b)| touches(a, b)) && !self.log.shared_maps.iter().any(|m| touches(m.start / p * p, (m.start + m.len).next_multiple_of(p)))
+    }
+
+    /// Move the host pages of `[src, src + len)` to the same places of
+    /// `[dst, dst + len)` and leave fresh zeros at `src`, where the two are
+    /// the same distance into a host page and the host can: the part moved
+    /// (`(src, src)`: none), whose edges the caller copies itself. For an
+    /// anonymous private range `mremap` moves (a Java heap's collector moves
+    /// its whole space every collection): read and written over, every page
+    /// of both became the process's, touched or not.
+    pub fn move_pages(&mut self, dst: u64, src: u64, len: u64) -> (u64, u64) {
+        let Some(h) = self.pages.0.clone() else { return (src, src) };
+        let p = h.page;
+        if !dst.abs_diff(src).is_multiple_of(p) || (dst < src + len && src < dst + len) {
+            return (src, src);
+        }
+        let (a, b) = (src.next_multiple_of(p), (src + len) / p * p);
+        let to = dst + (a - src);
+        if b <= a || !self.own_pages(a, b, p) || !self.own_pages(to, to + (b - a), p) {
+            return (src, src);
+        }
+        if !(h.moves)(to, a, b - a) {
+            return (src, src);
+        }
+        (a, b)
+    }
+
+    /// Give the host back the host pages wholly inside `[lo, hi)`, an
+    /// anonymous private range `madvise(MADV_DONTNEED)` empties: they read
+    /// as zero after, as they would on Linux, and cost nothing until
+    /// written. Returns the part given back (`(lo, lo)`: none), whose
+    /// edges the caller zeroes itself. Nothing of a shared mapping or of a
+    /// range made one with another ([`HostAlias`]) is given back: emptying
+    /// it is not zeroing it.
+    pub fn discard_pages(&mut self, lo: u64, hi: u64) -> (u64, u64) {
+        let Some(h) = self.pages.0.clone() else { return (lo, lo) };
+        let p = h.page;
+        let (a, b) = (lo.next_multiple_of(p), hi / p * p);
+        if b <= a || !self.own_pages(a, b, p) {
+            return (lo, lo);
+        }
+        if !(h.discard)(a, b - a) {
+            return (lo, lo);
+        }
+        (a, b)
     }
 
     /// The host's page size, where it can make ranges one ([`HostAlias`]).
@@ -3521,6 +3641,45 @@ mod tests {
             .unwrap();
         assert_eq!(got, a);
         assert!(m.check_access(a, 0x1000, prot::WRITE));
+    }
+
+    /// What `madvise(MADV_DONTNEED)` gives back: the host pages wholly
+    /// inside the range, never part of an alias, nothing without a host
+    /// that can, and a fork's copy has no way to.
+    #[test]
+    fn only_whole_host_pages_outside_aliases_are_given_back() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut m = MemoryMap::new(0x40_1000);
+        assert_eq!(m.discard_pages(0x10_0000, 0x20_0000), (0x10_0000, 0x10_0000), "no host to give it to");
+        let l = log.clone();
+        let l2 = log.clone();
+        m.set_host_pages(HostPages::new(
+            0x4000,
+            std::sync::Arc::new(move |s, n| {
+                l.lock().unwrap().push(format!("discard {s:#x} {n:#x}"));
+                true
+            }),
+            std::sync::Arc::new(move |d, s, n| {
+                l2.lock().unwrap().push(format!("move {d:#x} {s:#x} {n:#x}"));
+                true
+            }),
+        ));
+        // A page in from either end: the 16 KiB pages inside.
+        assert_eq!(m.discard_pages(0x10_1000, 0x10_f000), (0x10_4000, 0x10_c000));
+        // Smaller than a host page: nothing.
+        assert_eq!(m.discard_pages(0x10_1000, 0x10_3000), (0x10_1000, 0x10_1000));
+        // Touching an alias: nothing.
+        m.set_host_alias(alias_host(&log));
+        assert_eq!(m.alias_pages(0x20_0000, 0x30_0000, 0x8000), 0x8000);
+        assert_eq!(m.discard_pages(0x1f_c000, 0x20_4000), (0x1f_c000, 0x1f_c000));
+        assert_eq!(log.lock().unwrap().iter().filter(|l| l.starts_with("discard")).cloned().collect::<Vec<_>>(), vec!["discard 0x104000 0x8000".to_string()]);
+        // A move: the whole host pages, at the same distance into one.
+        assert_eq!(m.move_pages(0x50_1000, 0x40_1000, 0xe000), (0x40_4000, 0x40_c000));
+        assert!(log.lock().unwrap().contains(&"move 0x504000 0x404000 0x8000".to_string()));
+        assert_eq!(m.move_pages(0x50_2000, 0x40_1000, 0xe000), (0x40_1000, 0x40_1000), "another distance into a host page");
+        assert_eq!(m.move_pages(0x40_5000, 0x40_1000, 0xe000), (0x40_1000, 0x40_1000), "overlapping");
+        let mut child = m.clone();
+        assert_eq!(child.discard_pages(0x10_0000, 0x20_0000), (0x10_0000, 0x10_0000), "a fork's copy is another memory");
     }
 
     /// A host with 16 KiB pages that records what it is asked.

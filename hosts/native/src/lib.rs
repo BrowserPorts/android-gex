@@ -2938,6 +2938,15 @@ fn publish_vm(k: &Kernel, memory: &gex_mem::GuestMemory) {
     k.procs.set_vm(k.pid, Some(Arc::new(vm)));
     let held = memory.clone();
     k.mem.lock().set_resident(gex_kernel::mem::Resident(Arc::new(move |a, b| held.resident(a, b))));
+    // What the guest empties with `madvise(MADV_DONTNEED)` given back to
+    // the host as fresh zero pages, rather than written over with zeros
+    // and kept (`GEX_NO_DISCARD=1`: written over, and moves copied, as
+    // before).
+    // And what it moves with `mremap` moved as whole pages, not copied.
+    if let Some(page) = gex_mem::GuestMemory::discard_page().filter(|_| std::env::var_os("GEX_NO_DISCARD").is_none()) {
+        let (d, mv) = (memory.clone(), memory.clone());
+        k.mem.lock().set_host_pages(gex_kernel::mem::HostPages::new(page, Arc::new(move |start, len| d.discard(start, len)), Arc::new(move |dst, src, len| mv.move_pages(dst, src, len))));
+    }
     // Two shared mappings of one file in the process as one memory, where
     // the host can map its pages twice (`GEX_NO_ALIAS=1`: copies kept in
     // step at system calls, as before).

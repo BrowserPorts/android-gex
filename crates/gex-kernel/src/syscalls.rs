@@ -5564,16 +5564,36 @@ impl MapIo<'_> {
         drop(mm);
         self.retire_code_why(to, new_len, "mremap-fixed", prot);
         let mut mm = self.mem.lock();
-        // The bytes are read before the map changes and written after: the
-        // new range may not have been memory until it is mapped.
-        let bytes = m.read(addr, keep)?.to_vec();
+        // The host pages wholly inside are moved by the host where it can
+        // (`MemoryMap::move_pages`: no byte read or written, fresh zeros
+        // left behind); the rest is copied. The bytes copied are read
+        // before the map changes and written after: the new range may not
+        // have been memory until it is mapped.
+        let (a, b) = mm.move_pages(to, addr, keep as u64);
+        let (head, tail) = if a < b {
+            (m.read(addr, (a - addr) as usize)?.to_vec(), m.read(b, (addr + keep as u64 - b) as usize)?.to_vec())
+        } else {
+            (m.read(addr, keep)?.to_vec(), Vec::new())
+        };
         let dst = mm.mremap_to(addr, old_len, new_len, to, keep_old)?;
-        m.write(dst, &bytes)?;
+        if a < b && dst != to {
+            eprintln!("gex: BUG: mremap moved pages to {to:#x} and the mapping to {dst:#x}");
+            return Err(Errno::EFAULT);
+        }
+        m.write(dst, &head)?;
+        if a < b {
+            m.write(dst + (b - addr), &tail)?;
+        }
         if new_len as usize > keep {
             m.zero_dirty(dst + keep as u64, new_len as usize - keep)?;
         }
         if keep_old {
-            m.zero_dirty(addr, old_len as usize)?;
+            if a < b {
+                m.zero_dirty(addr, (a - addr) as usize)?;
+                m.zero_dirty(b, (addr + old_len - b) as usize)?;
+            } else {
+                m.zero_dirty(addr, old_len as usize)?;
+            }
             // The source, emptied and kept (`MREMAP_DONTUNMAP`): its pages
             // a `userfaultfd` registered are missing. (The map is held.)
             mm.uffd_emptied(addr, addr + old_len);
@@ -5713,8 +5733,17 @@ impl MapIo<'_> {
     /// does not (it frees via `munmap`, which is re-zeroed on remap). Only
     /// anonymous VMAs are zeroed; a file mapping's `MADV_DONTNEED` reloads from
     /// the file, which the demand path already does, so it is left alone.
+    /// Where the host can, the host pages wholly inside an anonymous range
+    /// are given back to it as fresh zero pages
+    /// ([`crate::mem::MemoryMap::discard_pages`]); written over with zeros,
+    /// they stayed the process's, and a Java heap's collector, which empties
+    /// what it moved out of after every collection, kept all it ever used.
     pub fn madvise(&self, m: &mut GuestMem<'_>, addr: u64, len: u64, advice: u32) -> SysResult {
         const MADV_DONTNEED: u32 = 4;
+        // `madvise_checks`: the start a page's.
+        if addr & (crate::mem::PAGE_SIZE - 1) != 0 {
+            return Err(Errno::EINVAL);
+        }
         if advice == MADV_DONTNEED {
             let end = addr.saturating_add(len);
             let anon: Vec<(u64, u64)> = self
@@ -5722,12 +5751,20 @@ impl MapIo<'_> {
                 .lock()
                 .vmas()
                 .iter()
-                .filter(|v| v.origin.is_none() && v.start < end && addr < v.end)
+                .filter(|v| v.origin.is_none() && !v.shared_anon && v.start < end && addr < v.end)
                 .map(|v| (v.start.max(addr), v.end.min(end)))
                 .collect();
             for (lo, hi) in anon {
                 if hi > lo {
-                    m.zero_dirty(lo, (hi - lo) as usize)?;
+                    // The host pages inside it given back as fresh zeros
+                    // (`MemoryMap::discard_pages`), the edges zeroed here.
+                    let (a, b) = self.mem.lock().discard_pages(lo, hi);
+                    if a < b {
+                        m.zero_dirty(lo, (a - lo) as usize)?;
+                        m.zero_dirty(b, (hi - b) as usize)?;
+                    } else {
+                        m.zero_dirty(lo, (hi - lo) as usize)?;
+                    }
                     // Emptied: a page a `userfaultfd` registered is missing.
                     self.mem.lock().uffd_emptied(lo, hi);
                 }
@@ -6084,6 +6121,9 @@ impl MapIo<'_> {
         }
         // Anonymous memory is defined to read as zero.
         self.mem.zero_new(m, start, len, prot_bits, clean_before)?;
+        if flags & crate::mem::flags::SHARED != 0 {
+            self.mem.lock().set_shared_anon(start, start + crate::mem::page_align_up(len));
+        }
         Ok(start)
     }
 
