@@ -24,26 +24,24 @@
 # build properties do not set it.
 on early-init
     setprop ro.hw_timeout_multiplier 30
-    # No JIT: the zygote's JIT keeps its code and data in a memfd mapped
-    # twice in the one process, a view to write and a view to run, which
-    # are the same memory on Linux ("Zygote memory only works with dual
-    # mappings"). gex's shared mappings are copies kept in step at system
-    # calls, so the two views of one memfd differ between them, and the
-    # zygote aborted in forkSystemServer (debugger_interface.cc: "Expected
-    # invalid entry"; boot b81). Interpreted until mappings of one file
-    # in one process are one memory here.
-    setprop dalvik.vm.usejit false
+    # ART's JIT is on, as the image has it (dalvik.vm.usejit). It was off
+    # while the zygote's two views of its JIT memfd were copies here (boot
+    # b81's "Expected invalid entry"); they are one memory since 55ce597e8,
+    # and code the JIT writes again while it runs is translated again
+    # since c29d182a0 (jitrace.c).
     # The display's density, which the emulator's host gives
     # surfaceflinger (qemu.sf.lcd_density, read before ro.sf.lcd_density;
     # the image's build properties set neither): the emulator's 420 for a
     # 1080-wide phone, as GEX_VIRTIO_GPU=1080x1920 makes the display.
     setprop qemu.sf.lcd_density 420
-    # No compiling at first boot. /data is in memory here, so every boot is a
-    # first boot, and its dexopt of every package (116, by dex2oat64 run
-    # translated, on system_server's main thread in UpdatePackagesIfNeeded)
-    # outlasted boot b121's two hours. `skip` is ArtService's compiler filter
-    # for none (pm.dexopt.<reason>); the packages run from their dex, and are
-    # compiled later as a device configured so would compile them.
+    # No compiling at first boot. Its dexopt of every package (116, by
+    # dex2oat64 run translated, on system_server's main thread in
+    # UpdatePackagesIfNeeded) outlasted boot b121's two hours, and with /data
+    # in memory (boot.sh without DATA) every boot is a first boot. `skip` is
+    # ArtService's compiler filter for none (pm.dexopt.<reason>); the
+    # packages run from their dex, and are compiled later as a device
+    # configured so would compile them: with /data kept (DATA), what is
+    # compiled then is there at the next boot.
     setprop pm.dexopt.first-boot skip
     # The composer finds its displays through DRM (the virtio-gpu's
     # connector) rather than asking the emulator's host, as a device with

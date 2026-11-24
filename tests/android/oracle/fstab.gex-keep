@@ -1,0 +1,12 @@
+# fstab.gex with /data kept from boot to boot: boot.sh binds this over the
+# image's /vendor/etc/fstab.ranchu when DATA names a host directory, which
+# gexc shows the guest at /gexdata. /data is that directory, bound there
+# (fs_mgr takes `bind` as a mount flag), so what Android writes there (its
+# packages' state, compiled code, settings) is there at the next boot, as
+# a device's /data is; the boot after the first is not a first boot.
+# The host directory keeps the files' owners and labels in its extended
+# attributes (user.gex.owner, user.gex.selinux) unless gexc is the host's
+# root. Remove the directory for a factory reset.
+#
+#<src>     <mnt_point>  <type>  <mnt_flags and options>       <fs_mgr_flags>
+/gexdata   /data        none    bind,nosuid,nodev,noatime     latemount

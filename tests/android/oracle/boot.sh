@@ -37,6 +37,11 @@
 # GEX_GFXSTREAM_FRAME (OUT/screen-NAME.ppm, the frame the guest last
 # posted), GEX_CACHE_MAX_BYTES (8 GiB of translations,
 # kept in gex's usual cache directory, XDG_CACHE_HOME).
+#
+# DATA, if set, is a host directory that is the image's /data from boot to
+# boot (fstab.gex-keep), made the first time with the owner and mode
+# Android's /data has. Without it /data is a fresh tmpfs, and every boot is
+# a first boot after a factory reset. Remove the directory to start over.
 set -u
 ROOT=${1:?usage: boot.sh ROOT OUT NAME [SECONDS]}
 OUT=${2:?usage: boot.sh ROOT OUT NAME [SECONDS]}
@@ -59,6 +64,25 @@ fail() {
 [ -x "$FIRST" ] || fail "no $FIRST (run tests/android/build.sh)"
 [ -d "$ROOT/system/bin" ] || fail "$ROOT is not a root tree made from the image (see README.md)"
 [ -f "$CONFIG" ] || fail "no boot configuration at $CONFIG"
+FSTAB=$HERE/fstab.gex
+DATA=${DATA:-}
+if [ -n "$DATA" ]; then
+    if [ ! -d "$DATA" ]; then
+        # system's, 0771, as the fstab's tmpfs makes it. Kept as gexc keeps
+        # owners: the host's own when gexc runs as the host's root, else
+        # the attribute hostfs reads.
+        mkdir -p "$DATA" && chmod 0771 "$DATA" || exit 1
+        if [ "$(id -u)" = 0 ]; then
+            chown 1000:1000 "$DATA" || exit 1
+        elif [ "$(uname -s)" = Darwin ]; then
+            xattr -w user.gex.owner "1000 1000" "$DATA" || exit 1
+        else
+            setfattr -n user.gex.owner -v "1000 1000" "$DATA" || exit 1
+        fi
+    fi
+    DATA=$(CDPATH='' cd -- "$DATA" && pwd)
+    FSTAB=$HERE/fstab.gex-keep
+fi
 mkdir -p "$OUT/gexlog-$NAME" || exit 1
 OUT=$(CDPATH='' cd -- "$OUT" && pwd)
 LOG=$OUT/init-$NAME.txt
@@ -115,10 +139,10 @@ fi
 # A shell without a terminal gives a background job no group of its own
 # (dash's `set -m` does nothing then), so on Linux setsid makes one.
 cd "$ROOT" || exit 1
-export GEXC CONFIG FIRST HERE LOGDIR ROOT LOG
+export GEXC CONFIG FIRST HERE LOGDIR ROOT LOG FSTAB DATA
 BODY='sleep 1000000 | exec "$GEXC" run --argv0 /firststage --uid 0 --mem64 --selinuxfs --bootconfig "$CONFIG" \
-    --bind "$FIRST=/firststage" --bind "$HERE/fstab.gex=/vendor/etc/fstab.ranchu" \
-    --bind "$HERE/init.gex.rc=/init.ranchu.rc" --bind "$LOGDIR=/gexlog" \
+    --bind "$FIRST=/firststage" --bind "$FSTAB=/vendor/etc/fstab.ranchu" \
+    --bind "$HERE/init.gex.rc=/init.ranchu.rc" --bind "$LOGDIR=/gexlog" ${DATA:+--bind "$DATA=/gexdata"} \
     --sysroot "$ROOT" "$FIRST" 2>"$LOG"'
 case $(uname -s) in
 Linux) setsid sh -c "$BODY" & ;;
@@ -148,6 +172,10 @@ while kill -0 "$GROUP" 2>/dev/null; do
     disk=$(disk_gb "$OUT")
     swap=$(disk_gb "$SWAP_DISK")
     [ "${swap:-100}" -lt "${disk:-100}" ] && disk=$swap
+    if [ -n "$DATA" ]; then
+        kept=$(disk_gb "$DATA")
+        [ "${kept:-100}" -lt "${disk:-100}" ] && disk=$kept
+    fi
     f=$(free_pct)
     echo "${t}s gexc=${mem:-?}MB free=${f}% disk=${disk}GB" >>"$WATCH"
     # Every five minutes, gexc's host descriptors: every guest process's

@@ -84,6 +84,13 @@ A boot is slow: the guest's clock runs at an eighth of the host's, a first
 boot translates everything (later ones find it in the cache), and the
 machine should have nothing else heavy running.
 
+With `DATA=DIR` in its environment, `/data` is the host directory `DIR`
+(`fstab.gex-keep`) and is kept from boot to boot, so only the first boot
+is a first boot: what Android compiles and sets up then is there at the
+next. Without it `/data` is in memory and every boot starts from a factory
+reset. Put `DIR` on a case-sensitive volume, as the root; remove it to
+start over.
+
 With `GEX_HOST_FORWARD=5555` in its environment, the host's
 127.0.0.1:5555 reaches the image's adbd:
 
