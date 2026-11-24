@@ -779,7 +779,10 @@ fn compile_here(engine: &Engine, wasm: &[u8]) -> Result<Module> {
     // `GEX_COMPILE_TRACE`: every compile here, its size and time, and who
     // asked (the first few frames of ours).
     let t0 = std::time::Instant::now();
-    let m = new_module(engine, wasm);
+    let m = {
+        let _slot = CompileSlot::take();
+        new_module(engine, wasm)
+    };
     if std::env::var_os("GEX_COMPILE_TRACE").is_some() {
         let bt = std::backtrace::Backtrace::force_capture().to_string();
         let who: Vec<&str> = bt
@@ -792,6 +795,55 @@ fn compile_here(engine: &Engine, wasm: &[u8]) -> Result<Module> {
         eprintln!("gex: compiled {} KiB in {:.3}s for {}", wasm.len() >> 10, t0.elapsed().as_secs_f64(), who.join(" < "));
     }
     m
+}
+
+/// How many compiles run at once in this process (`GEX_COMPILE_JOBS`, 2
+/// unless given; 0 for no limit). A compile's working memory is hundreds of
+/// MiB for a large unit, freed when it ends, and every guest thread that
+/// misses compiles its own: a booting Android's first run past the zygote
+/// had dozens compiling together and its host process grew by 8 GB in a
+/// minute (boot b131: allocations of the compile workers, 7.9 GB live at
+/// once), until the host's swap filled its disk. A thread past the limit
+/// waits for a slot; one whose module is in the cache never takes one.
+#[cfg(feature = "compile")]
+struct CompileSlot(bool);
+
+#[cfg(feature = "compile")]
+impl CompileSlot {
+    fn state() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
+        static S: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> = std::sync::OnceLock::new();
+        S.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
+    }
+
+    fn limit() -> usize {
+        static L: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *L.get_or_init(|| std::env::var("GEX_COMPILE_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(2))
+    }
+
+    fn take() -> CompileSlot {
+        let limit = Self::limit();
+        if limit == 0 {
+            return CompileSlot(false);
+        }
+        let (m, cv) = Self::state();
+        let mut n = m.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= limit {
+            n = cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        CompileSlot(true)
+    }
+}
+
+#[cfg(feature = "compile")]
+impl Drop for CompileSlot {
+    fn drop(&mut self) {
+        if self.0 {
+            let (m, cv) = Self::state();
+            *m.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            cv.notify_one();
+        }
+    }
 }
 
 #[cfg(not(feature = "compile"))]
