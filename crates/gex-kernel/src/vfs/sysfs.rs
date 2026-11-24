@@ -326,6 +326,11 @@ fn registry() -> &'static Mutex<Vec<Arc<Device>>> {
         if crate::goldfishpipe::present() {
             all.push(Arc::new(Device { subsystem: "misc".to_string(), name: crate::goldfishpipe::NAME.to_string(), major: 10, minor: crate::goldfishpipe::MISC_MINOR, mode: None, attrs: None }));
         }
+        // The address space's, registered after the pipe's in the image.
+        if crate::goldfishas::present() {
+            all.push(Arc::new(Device { subsystem: "misc".to_string(), name: crate::goldfishas::NAME.to_string(), major: 10, minor: crate::goldfishas::MISC_MINOR, mode: None, attrs: None }));
+            all.push(Arc::new(Device { subsystem: "misc".to_string(), name: crate::goldfishsync::NAME.to_string(), major: 10, minor: crate::goldfishsync::MISC_MINOR, mode: None, attrs: None }));
+        }
         // The emulator's consoles, when the kernel has them: every minor
         // of `hvc_console`'s driver, in `devices/virtual/tty` (no parent),
         // as `tty_register_driver` adds them without `TTY_DRIVER_DYNAMIC_DEV`.

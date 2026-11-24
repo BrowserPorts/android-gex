@@ -696,8 +696,26 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     fn as_drm(self: Arc<Self>) -> Option<Arc<crate::drm::DrmFile>> {
         None
     }
+    /// Memory graphics buffers live in that another party reads and writes
+    /// by address (the goldfish address space's): a process's mappings of it
+    /// are written back before it hands work over and given what is there
+    /// after.
+    fn graphics_memory(&self) -> bool {
+        false
+    }
+    /// A write that hands work to a party reading graphics memory (the
+    /// goldfish pipe's, to the host renderer): the writer's mappings of
+    /// graphics memory are written back before it and refreshed after it.
+    fn hands_over_on_write(&self) -> bool {
+        false
+    }
     /// A dma-buf, which a DRM device imports.
     fn as_dmabuf(self: Arc<Self>) -> Option<Arc<crate::drm::DmaBuf>> {
+        None
+    }
+    /// A goldfish sync timeline ([`crate::goldfishsync`]), whose work makes
+    /// a descriptor.
+    fn as_goldfish_sync(self: Arc<Self>) -> Option<Arc<crate::goldfishsync::Timeline>> {
         None
     }
     /// A sync file ([`crate::syncfile`]).

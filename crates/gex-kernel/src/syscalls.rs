@@ -6090,7 +6090,7 @@ impl MapIo<'_> {
     pub fn flush_buffers(&self, m: &GuestMem<'_>) {
         let maps: Vec<SharedMap> = {
             let mm = self.mem.lock();
-            mm.log.shared_maps.iter().filter(|map| Arc::clone(&map.file.handle).as_drm().is_some() || Arc::clone(&map.file.handle).as_dmabuf().is_some()).cloned().collect()
+            mm.log.shared_maps.iter().filter(|map| Arc::clone(&map.file.handle).as_drm().is_some() || Arc::clone(&map.file.handle).as_dmabuf().is_some() || map.file.handle.graphics_memory()).cloned().collect()
         };
         for map in maps {
             let _ = write_back(m, &map, 0, u64::MAX);
@@ -11280,7 +11280,34 @@ fn any_shared(shared: Option<&SharedMapView>) -> bool {
     shared.is_some_and(|v| !v.get().is_empty())
 }
 
+/// A write that hands work over ([`crate::vfs::FileHandle::hands_over_on_write`]):
+/// the writer's mappings of graphics memory written back before it, and
+/// given what is there after (the other party may have written them).
+fn write_handing_over(m: &mut GuestMem<'_>, file: &Arc<OpenFile>, buf: u64, len: u64, shared: Option<&SharedMapView>) -> SysResult {
+    let maps: Vec<SharedMap> = shared.map(|s| s.get().iter().filter(|map| map.file.handle.graphics_memory()).cloned().collect()).unwrap_or_default();
+    for map in &maps {
+        let _ = write_back(m, map, 0, u64::MAX);
+    }
+    let r = {
+        let data = m.read(buf, len as usize)?;
+        file.write(data)
+    };
+    if !maps.is_empty() {
+        let user = m.take_user();
+        for map in &maps {
+            let _ = refresh(m, map, true, None, false);
+        }
+        m.set_user(user);
+    }
+    r
+}
+
 fn io_write(fds: &FdTable, m: &mut GuestMem<'_>, fd: i32, buf: u64, len: u64, shared: Option<&SharedMapView>) -> SysResult {
+    if let Ok(file) = fds.get(fd) {
+        if file.handle.hands_over_on_write() {
+            return write_handing_over(m, &file, buf, len, shared);
+        }
+    }
     // Straight out of the guest's memory: a guest address is already a
     // linear-memory offset, so the bytes are a slice and a copy would be
     // pure overhead.
@@ -15436,6 +15463,10 @@ impl FdIo<'_> {
                     return self.sync_merge(m, &sync, arg);
                 }
             }
+        }
+        // A goldfish sync timeline's, whose work makes a descriptor.
+        if let Some(t) = self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_goldfish_sync()) {
+            return t.ioctl(self.fds, m, req, arg);
         }
         // A DMA-BUF heap's, whose allocation makes a descriptor.
         if let Some(heap) = self.fds.get(fd).ok().and_then(|f| Arc::clone(&f.handle).as_dma_heap()) {

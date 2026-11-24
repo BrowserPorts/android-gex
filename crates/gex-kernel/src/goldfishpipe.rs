@@ -284,6 +284,12 @@ impl FileHandle for Pipe {
     fn wait_queue(&self) -> u32 {
         self.queue.id()
     }
+
+    /// The host renderer reads and writes graphics buffers by address
+    /// while it runs what a write hands it.
+    fn hands_over_on_write(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
