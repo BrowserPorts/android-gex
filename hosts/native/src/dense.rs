@@ -122,8 +122,11 @@ impl Maps {
     }
 
     /// Give a module just compiled its range of `blocks`: `None` for a
-    /// module with no dense blocks. Under the `JitShared` lock.
-    pub(crate) fn register(&mut self, wasm: &[u8]) -> Result<Option<Section>> {
+    /// module with no dense blocks. Under the `JitShared` lock. `entries`
+    /// are its dense blocks' entries when its bytes do not carry them
+    /// (`gex_emit::with_instantiation_globals`; their section lists only how
+    /// many), else empty.
+    pub(crate) fn register(&mut self, wasm: &[u8], entries: &[u32]) -> Result<Option<Section>> {
         if !on() {
             return Ok(None);
         }
@@ -134,6 +137,12 @@ impl Maps {
             return Ok(None);
         };
         let Some(mut s) = dense::section(wasm, &at) else { bail!("a translation's dense section cannot be read") };
+        if !entries.is_empty() {
+            if entries.len() != s.entries.len() {
+                bail!("a translation lists {} dense entries and has {}", entries.len(), s.entries.len());
+            }
+            s.entries = entries.to_vec();
+        }
         s.base = self.next.max(1);
         self.next = s.base + s.span();
         Ok(Some(s))

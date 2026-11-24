@@ -1723,7 +1723,7 @@ fn lift_one(
 #[cfg(all(test, not(feature = "x86")))]
 mod tests {
     /// The same code translated twice, as two runs would: under
-    /// `with_module_id_global` the module id is not in the bytes, so the two
+    /// `with_instantiation_globals` the module id is not in the bytes, so the two
     /// are the same bytes (what a cache keyed by them needs); compiled in,
     /// the second module's id makes them differ.
     #[test]
@@ -1746,7 +1746,7 @@ mod tests {
             )
             .0
         };
-        let (a, b) = (gex_emit::with_module_id_global(once), gex_emit::with_module_id_global(once));
+        let (a, b) = (gex_emit::with_instantiation_globals(once), gex_emit::with_instantiation_globals(once));
         assert_ne!(a.module_id, b.module_id);
         assert_eq!(a.wasm, b.wasm);
         let has = |w: &[u8]| w.windows(gex_emit::MODULE_ID_GLOBAL.len()).any(|x| x == gex_emit::MODULE_ID_GLOBAL.as_bytes());

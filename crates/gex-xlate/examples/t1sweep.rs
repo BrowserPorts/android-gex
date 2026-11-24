@@ -126,6 +126,7 @@ fn main() {
                 dense_global: None,
                 alt_dir: None,
                 module_id: 0,
+                page_globals: None,
                 module_id_global: None,
                 loop_heads: Some(&heads),
                 enter: Some(10),

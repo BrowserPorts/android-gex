@@ -58,6 +58,14 @@ pub struct TranslatedModule {
     pub module_id: u64,
     /// Number of guest basic blocks translated.
     pub n_blocks: usize,
+    /// Under [`with_instantiation_globals`]: the slot base each of the
+    /// module's page-check globals must hold ([`page_base_global`]`(k)` is
+    /// `page_globals[k]`). Empty otherwise.
+    pub page_globals: Vec<u32>,
+    /// Under [`with_instantiation_globals`]: its dense blocks' entries, in
+    /// the order of its dense element segment (`crate::dense::Section`),
+    /// which its bytes do not carry. Empty otherwise.
+    pub dense_entries: Vec<u32>,
     /// For a [`Linkage::Shared`] module, the blocks it defines and the export
     /// name each is reachable under, so the host can install them in the
     /// table.
@@ -584,26 +592,39 @@ impl Reader<'_> {
 /// The next `TranslatedModule::module_id`.
 static NEXT_MODULE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// The global a module built under [`with_module_id_global`] exports: its
+/// The global a module built under [`with_instantiation_globals`] exports: its
 /// `TranslatedModule::module_id`, which the host sets once it has
 /// instantiated it.
 pub const MODULE_ID_GLOBAL: &str = "gex_module_id";
 
-thread_local! {
-    static MODULE_ID_IN_GLOBAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// The name of the global holding the slot base of a module's `k`th page
+/// (in [`TranslatedModule::page_globals`]'s order), exported by a module
+/// built under [`with_instantiation_globals`] for the host to set.
+pub fn page_base_global(k: usize) -> String {
+    format!("gex_page_base_{k}")
 }
 
-/// Run `f` with the shared-linkage modules this thread starts keeping their
-/// id in a global ([`MODULE_ID_GLOBAL`]) that the host sets at
-/// instantiation, rather than compiled into every block's page check. Ids
-/// come from one counter for every process a host runs and every thread of
-/// each, so compiled in they gave the same translation different bytes from
-/// run to run, and a cache keyed by the bytes did not hit. Only for a host
-/// that sets the global on every instance; another leaves it 0.
-pub fn with_module_id_global<R>(f: impl FnOnce() -> R) -> R {
-    let was = MODULE_ID_IN_GLOBAL.with(|g| g.replace(true));
+thread_local! {
+    static INSTANTIATION_GLOBALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the shared-linkage modules this thread starts keeping what
+/// the process numbered for them out of their bytes, for the host to give
+/// each instance: their id (a global, [`MODULE_ID_GLOBAL`]), the slot base
+/// each block's page check expects (a global a page,
+/// [`page_base_global`], in [`TranslatedModule::page_globals`]'s order),
+/// and their dense blocks' entries ([`TranslatedModule::dense_entries`];
+/// the `gex.dense` section keeps their count, each entry 0). The `gex.meta`
+/// section then carries no slots either. Ids and slots come from counters
+/// every thread of a process advances, in the order pages are first met, so
+/// compiled in they gave the same translation different bytes from run to
+/// run, and a cache keyed by the bytes did not hit. Only for a host that
+/// sets these on every instance and takes the entries from the
+/// `TranslatedModule`; another leaves the globals 0.
+pub fn with_instantiation_globals<R>(f: impl FnOnce() -> R) -> R {
+    let was = INSTANTIATION_GLOBALS.with(|g| g.replace(true));
     let r = f();
-    MODULE_ID_IN_GLOBAL.with(|g| g.set(was));
+    INSTANTIATION_GLOBALS.with(|g| g.set(was));
     r
 }
 
@@ -676,7 +697,7 @@ pub struct ModuleBuilder {
     /// The imported global holding this module's dense base, if any.
     dense_global: Option<u32>,
     /// The defined global holding this module's id, if any
-    /// ([`with_module_id_global`]).
+    /// ([`with_instantiation_globals`]).
     id_global: Option<u32>,
     /// The imported global naming the other directory
     /// ([`gex_abi::imports::ALT_DIR`]), for a module of code in the
@@ -906,7 +927,7 @@ impl ModuleBuilder {
         // after the imported ones, `dense_base` and `alt_dir` among them),
         // dense or not: without it a dense module's id is in its bytes, and
         // the native host's cache, keyed by the bytes, never finds it again.
-        if linkage == Linkage::Shared && MODULE_ID_IN_GLOBAL.with(|g| g.get()) {
+        if linkage == Linkage::Shared && INSTANTIATION_GLOBALS.with(|g| g.get()) {
             let g = b.m.add_global(ValType::I32, true, 0);
             b.m.export(MODULE_ID_GLOBAL, ExportKind::Global, g);
             b.id_global = Some(g);
@@ -1041,6 +1062,7 @@ impl ModuleBuilder {
             }
         });
         let module_id = NEXT_MODULE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut page_global_bases: Vec<u32> = Vec::new();
         let compiled: Vec<(u32, (Vec<u8>, Vec<u32>))> = {
             let gir: HashMap<u64, &Block> =
                 self.pending.iter().map(|(b, _)| (b.start, b)).collect();
@@ -1053,6 +1075,19 @@ impl ModuleBuilder {
                     if let Some(e) = self.page_table.lookup(page | alt) {
                         page_bases.insert(page | alt, e);
                     }
+                }
+            }
+            // Under `with_instantiation_globals`, a global a page for the
+            // host to set, in page order: the bytes then name no base.
+            let mut page_globals: HashMap<u64, u32> = HashMap::new();
+            if self.id_global.is_some() {
+                let mut pages: Vec<(u64, u32)> = page_bases.iter().map(|(&p, &b)| (p, b)).collect();
+                pages.sort_unstable();
+                for (k, (page, base)) in pages.into_iter().enumerate() {
+                    let g = self.m.add_global(ValType::I32, true, 0);
+                    self.m.export(&page_base_global(k), ExportKind::Global, g);
+                    page_globals.insert(page, g);
+                    page_global_bases.push(base);
                 }
             }
             let heads = tier1::loop_heads(self.pending.iter().map(|(b, _)| b));
@@ -1075,6 +1110,7 @@ impl ModuleBuilder {
                 gir: &gir,
                 profile: profile_emit.as_ref(),
                 page_bases: Some(&page_bases),
+                page_globals: (!page_globals.is_empty()).then_some(&page_globals),
                 module_id,
                 module_id_global: self.id_global,
                 dense_global: self.dense_global,
@@ -1132,6 +1168,8 @@ impl ModuleBuilder {
         }
 
         let mut dense_section: Option<Vec<u8>> = None;
+        let mut dense_entries: Vec<u32> = Vec::new();
+        let in_globals = self.id_global.is_some();
         match self.linkage {
             Linkage::Own => {
                 self.m
@@ -1354,7 +1392,14 @@ impl ModuleBuilder {
                         padded: true,
                         offset_global: self.dense_global,
                     });
-                    dense_section = Some(crate::dense::Section { base: 0, entries: dense_slots }.encode());
+                    // Under `with_instantiation_globals` the entries go to
+                    // the host beside the bytes, and the section keeps only
+                    // how many there are.
+                    let listed = if in_globals { vec![0; dense_slots.len()] } else { dense_slots.clone() };
+                    dense_section = Some(crate::dense::Section { base: 0, entries: listed }.encode());
+                    if in_globals {
+                        dense_entries = dense_slots;
+                    }
                 }
             }
         }
@@ -1365,12 +1410,18 @@ impl ModuleBuilder {
 
         // The dispatch metadata rides in a custom section, so a module is
         // self-describing: one file is enough for the host to set dispatch up.
-        let meta = Metadata {
-            text_base: self.text_base,
-            table_slots,
-            dir_entries: dir_entries.clone(),
-            next_slot: self.page_table.slots(),
-            n_blocks,
+        // Under `with_instantiation_globals`, without the process's slots:
+        // the host has them from the `TranslatedModule`.
+        let meta = if in_globals {
+            Metadata { text_base: self.text_base, table_slots: 0, dir_entries: Vec::new(), next_slot: 0, n_blocks }
+        } else {
+            Metadata {
+                text_base: self.text_base,
+                table_slots,
+                dir_entries: dir_entries.clone(),
+                next_slot: self.page_table.slots(),
+                n_blocks,
+            }
         };
         // The fillers, now that every segment is known -- only on a module
         // with passive segments, since they are three more functions for the
@@ -1425,6 +1476,8 @@ impl ModuleBuilder {
             module_id,
             n_blocks,
             exported_blocks,
+            page_globals: page_global_bases,
+            dense_entries,
         }
     }
 

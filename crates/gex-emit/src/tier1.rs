@@ -202,10 +202,14 @@ pub struct Context<'a> {
     /// are never reused) since means the block is stale, however it was
     /// reached. `None`: no check (a module that is never retired).
     pub page_bases: Option<&'a HashMap<u64, u32>>,
+    /// The globals holding those bases instead, by page, for a module built
+    /// under `crate::module::with_instantiation_globals`: the check reads
+    /// the global, so the bytes do not depend on the base.
+    pub page_globals: Option<&'a HashMap<u64, u32>>,
     /// `TranslatedModule::module_id` of the module being built.
     pub module_id: u64,
     /// The global holding it instead, set by the host at instantiation
-    /// (`crate::module::with_module_id_global`): the bytes then do not
+    /// (`crate::module::with_instantiation_globals`): the bytes then do not
     /// depend on which id the module was given.
     pub module_id_global: Option<u32>,
     /// The module's imported dense base (`crate::dense::GLOBAL`), when it
@@ -5771,7 +5775,10 @@ impl<'a> Emitter<'a> {
                     self.f.load(0x28, 2, 0); // i32.load
                 }
             }
-            self.f.i32_const(*base as i32);
+            match self.cx.page_globals.and_then(|g| g.get(key)) {
+                Some(&g) => self.f.global_get(g),
+                None => self.f.i32_const(*base as i32),
+            }
             self.f.byte(0x47); // i32.ne
             if k > 0 {
                 self.f.byte(0x72); // i32.or

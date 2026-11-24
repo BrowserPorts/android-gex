@@ -307,6 +307,7 @@ pub(crate) fn install_shared(
             bridges: Vec::new(),
             pages: Default::default(),
             dense: None,
+            page_globals: Vec::new(),
         });
         {
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());

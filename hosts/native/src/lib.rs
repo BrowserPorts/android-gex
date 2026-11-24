@@ -491,7 +491,7 @@ struct CompiledUnit {
     /// None for a unit that only writes dispatch slots (`bridges`).
     module: Option<Module>,
     /// Its `TranslatedModule::module_id`, for its `gex_module_id` global
-    /// (`gex_emit::with_module_id_global`); 0 for one without.
+    /// (`gex_emit::with_instantiation_globals`); 0 for one without.
     module_id: u64,
     exported_blocks: Vec<(u64, String)>,
     dir_entries: Vec<(u64, u32)>,
@@ -504,6 +504,10 @@ struct CompiledUnit {
     pages: std::sync::OnceLock<Vec<u64>>,
     /// Its dense blocks and their base in `blocks` (`dense`).
     dense: Option<gex_emit::dense::Section>,
+    /// The slot base each of its page-check globals holds
+    /// (`gex_emit::module::page_base_global`), set in every instance:
+    /// `TranslatedModule::page_globals`.
+    page_globals: Vec<u32>,
 }
 
 impl CompiledUnit {
@@ -6649,7 +6653,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     let volatile: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| k.mem.lock().volatile_code());
     gex_xlate::set_volatile_ranges(volatile);
     }
-    let (translated_module, stats) = gex_emit::with_module_id_global(|| {
+    let (translated_module, stats) = gex_emit::with_instantiation_globals(|| {
         let data = memory.bytes();
         // In the mode the thread runs in (a WoW64 thread's `ctx::CS`).
         let cs = read_u64(data, (caller.data().thread.ctx_addr + ctx::CS as u64) as usize) as u32;
@@ -6972,7 +6976,7 @@ fn publish_unit(
     }
     // Its range of `blocks`, when dense (the words are written as each
     // store installs it: `install_unit`).
-    let dense = shared.lock().unwrap_or_else(|e| e.into_inner()).dense.register(&translated.wasm)?;
+    let dense = shared.lock().unwrap_or_else(|e| e.into_inner()).dense.register(&translated.wasm, &translated.dense_entries)?;
     let unit = Arc::new(CompiledUnit {
         module: Some(module),
         module_id: translated.module_id,
@@ -6982,6 +6986,7 @@ fn publish_unit(
         bridges: Vec::new(),
         pages: Default::default(),
         dense,
+        page_globals: translated.page_globals.clone(),
     });
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     for &(page, base) in &translated.dir_entries {
@@ -7174,9 +7179,16 @@ fn install_unit(
         cx.as_context_mut().data_mut().alt_enter = enter;
     }
     // Its id, which its page checks pass `PAGE_STALE` (gex_emit::
-    // with_module_id_global): set before anything here can run it.
+    // with_instantiation_globals): set before anything here can run it.
     if let Some(g) = instance.get_global(cx.as_context_mut(), gex_emit::MODULE_ID_GLOBAL) {
         g.set(cx.as_context_mut(), wasmtime::Val::I32(unit.module_id as u32 as i32))?;
+    }
+    // And the slot base each page check expects, likewise.
+    for (k, &base) in unit.page_globals.iter().enumerate() {
+        let g = instance
+            .get_global(cx.as_context_mut(), &gex_emit::module::page_base_global(k))
+            .ok_or_else(|| anyhow!("a translation has no page-base global {k}"))?;
+        g.set(cx.as_context_mut(), wasmtime::Val::I32(base as i32))?;
     }
 
     // The module carries element segments for the table it imports, so
@@ -8519,7 +8531,7 @@ fn recompile_object(
     // discovery does the rest. Scanning every decodable address is complete
     // but finds ~200,000 interior blocks in libc that entry blocks cover.
     let started = std::time::Instant::now();
-    let (modules, stats) = gex_emit::with_module_id_global(|| {
+    let (modules, stats) = gex_emit::with_instantiation_globals(|| {
         let data = memory.bytes();
         gex_xlate::translate_object(
             data,
