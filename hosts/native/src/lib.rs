@@ -1706,6 +1706,8 @@ fn run_program_with(
         provider_stacks: Mutex::new(Vec::new()),
     });
     note_live_process(&spawn);
+    let pid = store.data_mut().with_kernel(|k| k.pid);
+    note_quiescence(&spawn, pid);
     store.data_mut().spawn = Some(Arc::clone(&spawn));
 
     // The interpreter is placed by gex's own loader, not by a guest `mmap`,
@@ -1964,6 +1966,12 @@ impl GuestGate {
         self.cv.notify_all();
     }
 
+    /// No thread of the process in guest code: each stopped here (a fork,
+    /// a freeze) or waiting in a system call.
+    fn quiet(&self) -> bool {
+        *self.in_guest.lock().unwrap_or_else(|e| e.into_inner()) == 0
+    }
+
     /// At a safepoint or syscall: wait here while a fork copies.
     fn pause_point(&self) {
         if self.pausing.load(std::sync::atomic::Ordering::Acquire) {
@@ -2005,6 +2013,51 @@ impl Drop for GatePaused<'_> {
         self.0.pausing.store(false, std::sync::atomic::Ordering::Release);
         self.0.cv.notify_all();
     }
+}
+
+/// A process's word to the kernel's freezer
+/// (`gex_kernel::cgroup::set_quiescent`): it runs no guest code while no
+/// thread of it is in guest code ([`GuestGate::quiet`]).
+fn note_quiescence(spawn: &Arc<SpawnContext>, pid: i32) {
+    let gate = Arc::downgrade(&spawn.gate);
+    gex_kernel::cgroup::set_quiescent(pid, Arc::new(move || gate.upgrade().is_some_and(|g| g.quiet())));
+}
+
+/// At a safepoint or syscall: stop here while this thread's process is
+/// frozen (`gex_kernel::cgroup::freezing`, `cgroup.freeze`), out of guest
+/// code, so that its group counts it frozen; go on when it is thawed, when
+/// `SIGKILL` is pending for it (which a freeze lets through), or when the
+/// process is ending. As `do_freezer_trap` stops a task on its way back to
+/// user space.
+fn freeze_point(state: &mut HostState) {
+    if !gex_kernel::cgroup::any_freezing() {
+        return;
+    }
+    let Some(spawn) = state.spawn.clone() else { return };
+    spawn.gate.leave();
+    freeze_wait(state);
+    spawn.gate.enter();
+}
+
+/// [`freeze_point`] for a thread already out of guest code (its blocking
+/// call just ended): it does not go back into guest code while frozen.
+fn freeze_wait(state: &mut HostState) {
+    if !gex_kernel::cgroup::any_freezing() {
+        return;
+    }
+    let Some(spawn) = state.spawn.clone() else { return };
+    let pid = state.with_kernel(|k| k.pid);
+    if !gex_kernel::cgroup::freezing(pid) {
+        return;
+    }
+    gex_kernel::cgroup::frozen_changed();
+    loop {
+        if !gex_kernel::cgroup::freezing(pid) || spawn.stopping.load(std::sync::atomic::Ordering::Acquire) || state.with_kernel(|k| k.signals.kill_pending()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    gex_kernel::cgroup::frozen_changed();
 }
 
 /// Bring every other guest thread to a halt after the process has exited.
@@ -3135,6 +3188,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         provider_stacks: Mutex::new(cx.provider_stacks.lock().unwrap_or_else(|e| e.into_inner()).clone()),
     });
     note_live_process(&child_cx);
+    note_quiescence(&child_cx, pid);
     let status = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         k.procs
@@ -5292,6 +5346,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(s) = &state.spawn {
                 s.gate.pause_point();
             }
+            // The process's group is frozen (`cgroup.freeze`).
+            freeze_point(state);
             let mut gm = GuestMem::new(data);
             // /proc must reflect the state this syscall will see, so the
             // snapshot is refreshed before the call rather than after.
@@ -5429,6 +5485,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     g.leave();
                 }
                 let r = perform_block(op, memory.bytes(), &service, &interrupted);
+                // Not back into guest code while frozen.
+                freeze_wait(caller.data_mut());
                 if let Some(g) = &gate {
                     g.enter();
                 }
@@ -6465,6 +6523,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if let Some(s) = &state.spawn {
                 s.gate.pause_point();
             }
+            // The process's group is frozen (`cgroup.freeze`).
+            freeze_point(state);
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
                 gex_kernel::signal::Delivery::None => Ok(()),
                 gex_kernel::signal::Delivery::Resume(target) => {

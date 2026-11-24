@@ -1041,6 +1041,12 @@ impl Signals {
         self.cur.ready(&self.proc)
     }
 
+    /// Whether `SIGKILL` is pending for this thread or its process: what
+    /// ends a stop no other signal ends.
+    pub fn kill_pending(&self) -> bool {
+        (self.cur.pending() | self.proc.shared.load(Ordering::Acquire)) & bit(sig::SIGKILL) != 0
+    }
+
     /// [`Self::would_deliver`] for a thread whose own pending set and mask
     /// are `pending` and `blocked` (with this process's dispositions and
     /// shared set).

@@ -13,8 +13,8 @@
 //! group, as a domain group has them), the limits on depth and
 //! descendants, `cgroup.events` and the wakeup at each change, `cgroup.kill`,
 //! `cpu.stat`'s time, and pressure-stall information, which here is always
-//! none (`crate::vfs::procfs`). Freezing (`cgroup.freeze` 1) and threaded
-//! groups are refused loudly. One hierarchy for every process of this host
+//! none (`crate::vfs::procfs`), and freezing (`cgroup.freeze`, below).
+//! Threaded groups are refused loudly. One hierarchy for every process of this host
 //! (as the process table is); a page's processes, each a kernel of its
 //! own, do not share it.
 
@@ -82,6 +82,11 @@ pub struct Group {
     pub events: u64,
     /// The processor time of processes that ended in it (nanoseconds).
     pub gone_ns: u64,
+    /// `cgroup.freeze` as written: its processes, and those of the groups
+    /// under it, are to stop.
+    pub freeze: bool,
+    /// Whether `cgroup.events` last said it frozen.
+    pub frozen_shown: bool,
     /// BPF programs attached here, by attach type, with the flags they
     /// were attached with and the count of changes (`revisions`, from 1).
     pub bpf: BTreeMap<u32, Vec<Attached>>,
@@ -183,6 +188,28 @@ impl Tree {
         out
     }
 
+    /// Whether `id` or a group above it has `cgroup.freeze` set: its
+    /// processes are to stop (`CGRP_FREEZE`).
+    fn freezing_group(&self, mut id: u64) -> bool {
+        loop {
+            let Some(g) = self.groups.get(&id) else { return false };
+            if g.freeze {
+                return true;
+            }
+            match g.parent {
+                Some(p) => id = p,
+                None => return false,
+            }
+        }
+    }
+
+    /// Whether `id` is frozen (`CGRP_FROZEN`): to stop, and every thread of
+    /// every process in it or under it stopped or waiting in the kernel. A
+    /// group with none to stop is frozen as soon as it is asked.
+    fn frozen(&self, id: u64) -> bool {
+        self.freezing_group(id) && self.procs_under(id).iter().all(|&p| quiescent(p))
+    }
+
     pub fn group_of(&self, pid: i32) -> u64 {
         let pid = self.threads.get(&pid).copied().unwrap_or(pid);
         self.members.get(&pid).copied().unwrap_or(ROOT)
@@ -224,6 +251,8 @@ impl Group {
             files: HashMap::new(),
             events: 0,
             gone_ns: 0,
+            freeze: false,
+            frozen_shown: false,
             bpf: BTreeMap::new(),
             bpf_flags: BTreeMap::new(),
             bpf_revision: BTreeMap::new(),
@@ -304,9 +333,93 @@ pub fn threads_for_move(tid: i32, whole: bool) -> Option<Vec<i32>> {
     Some(v)
 }
 
+/// How many groups have `cgroup.freeze` set: none, and no process is to
+/// stop, without a look at the tree.
+static FREEZING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The host's word on whether a process's threads are all stopped or
+/// waiting in the kernel, by process.
+type Quiet = Arc<dyn Fn() -> bool + Send + Sync>;
+
+fn quiet_table() -> std::sync::MutexGuard<'static, HashMap<i32, Quiet>> {
+    static Q: OnceLock<Mutex<HashMap<i32, Quiet>>> = OnceLock::new();
+    Q.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A host's way to say whether process `pid` runs no guest code: every
+/// thread stopped for a freeze, or waiting in a system call. Without one a
+/// process is never taken as frozen.
+pub fn set_quiescent(pid: i32, quiet: Quiet) {
+    quiet_table().insert(pid, quiet);
+}
+
+fn quiescent(pid: i32) -> bool {
+    let q = quiet_table().get(&pid).cloned();
+    q.is_some_and(|q| q())
+}
+
+/// Whether any group is frozen at all: a host's test before it asks after
+/// a process.
+pub fn any_freezing() -> bool {
+    FREEZING.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// Whether process `pid` is to stop (its group or one above it frozen):
+/// what a host asks at each thread's safepoints and system calls, and
+/// keeps its threads stopped while it is so. Its threads go on to die for
+/// `SIGKILL` (`cgroup_freeze_task` lets fatal signals through).
+pub fn freezing(pid: i32) -> bool {
+    if FREEZING.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    let t = tree();
+    t.freezing_group(t.group_of(pid))
+}
+
+/// `cgroup.freeze` written (`cgroup_freeze`): set or cleared on `id`.
+fn set_freeze(id: u64, on: bool) -> Result<(), Errno> {
+    {
+        let mut t = tree();
+        let g = t.groups.get_mut(&id).ok_or(Errno::ENODEV)?;
+        if g.freeze != on {
+            g.freeze = on;
+            if on {
+                FREEZING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            } else {
+                FREEZING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+    }
+    frozen_changed();
+    Ok(())
+}
+
+/// Something that decides a group's frozen state changed (a freeze, a
+/// thaw, a thread stopping or starting again, a process coming or going):
+/// each group whose `cgroup.events` now says otherwise is told.
+pub fn frozen_changed() {
+    let mut t = tree();
+    let ids: Vec<u64> = t.groups.keys().copied().collect();
+    let mut told = false;
+    for id in ids {
+        let f = t.frozen(id);
+        if let Some(g) = t.groups.get_mut(&id) {
+            if g.frozen_shown != f {
+                g.frozen_shown = f;
+                g.events += 1;
+                told = true;
+            }
+        }
+    }
+    if told {
+        events_queue().notify();
+    }
+}
+
 /// A process has ended (`cgroup_exit`): out of its group, its time kept
 /// there.
 pub fn exit(pid: i32, cpu_ns: u64) {
+    quiet_table().remove(&pid);
     let tids: Vec<i32> = {
         let t = tree();
         std::iter::once(pid).chain(t.threads.iter().filter(|(_, &p)| p == pid).map(|(&x, _)| x)).collect()
@@ -323,6 +436,10 @@ pub fn exit(pid: i32, cpu_ns: u64) {
         }
         t.threads.retain(|_, p| *p != pid);
     });
+    drop(t);
+    if FREEZING.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        frozen_changed();
+    }
 }
 
 /// `/proc/<pid>/cgroup`: a line for each version 1 hierarchy, then the
@@ -404,12 +521,13 @@ pub fn read(id: u64, name: &str) -> Result<Vec<u8>, Errno> {
         "cgroup.threads" => t.threads(id).iter().map(|p| format!("{p}\n")).collect(),
         // No controller: nothing, not even the line's end.
         "cgroup.controllers" | "cgroup.subtree_control" => String::new(),
-        "cgroup.events" => format!("populated {}\nfrozen 0\n", t.populated(id) as u8),
+        "cgroup.events" => format!("populated {}\nfrozen {}\n", t.populated(id) as u8, t.frozen(id) as u8),
         "cgroup.max.descendants" => limit(g.max_descendants),
         "cgroup.max.depth" => limit(g.max_depth),
         "cgroup.stat" => format!("nr_descendants {}\nnr_dying_descendants 0\n", t.descendants(id)),
+        // The time frozen is not counted.
         "cgroup.stat.local" => "frozen_usec 0\n".to_string(),
-        "cgroup.freeze" => "0\n".to_string(),
+        "cgroup.freeze" => format!("{}\n", g.freeze as u8),
         "cpu.stat" => {
             // All of it counted as the user's: this kernel does not part
             // a guest thread's time into user and system.
@@ -482,6 +600,11 @@ pub fn write(id: u64, name: &str, buf: &[u8], who: Option<Writer>) -> Result<u64
             t.changing(|t| {
                 t.members.insert(owner, id);
             });
+            drop(t);
+            // Into a frozen group, or out of one: its state may change.
+            if FREEZING.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                frozen_changed();
+            }
             Ok(n)
         }
         "cgroup.subtree_control" => {
@@ -519,10 +642,7 @@ pub fn write(id: u64, name: &str, buf: &[u8], who: Option<Writer>) -> Result<u64
             if !(0..=1).contains(&v) {
                 return Err(Errno::ERANGE);
             }
-            if v == 1 {
-                crate::bpf::say_once("freezing a cgroup (cgroup.freeze)");
-                return Err(Errno::EOPNOTSUPP);
-            }
+            set_freeze(id, v == 1)?;
             Ok(n)
         }
         "cgroup.kill" => {
@@ -691,6 +811,37 @@ pub fn events_of(id: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A group frozen: its processes are to stop, its events say frozen
+    /// once every one of them runs no guest code, a group under it is
+    /// frozen with it, and a thaw lets them go.
+    #[test]
+    fn a_frozen_group_and_its_processes() {
+        let g = mkdir(ROOT, "gex-unit-freeze", 0o755, (0, 0)).unwrap();
+        let under = mkdir(g, "inner", 0o755, (0, 0)).unwrap();
+        let (pid, quiet) = (900_001, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        tree().members.insert(pid, under);
+        let q = Arc::clone(&quiet);
+        set_quiescent(pid, Arc::new(move || q.load(std::sync::atomic::Ordering::SeqCst)));
+        assert!(!freezing(pid));
+        assert_eq!(write(g, "cgroup.freeze", b"2", None), Err(Errno::ERANGE));
+        assert_eq!(write(g, "cgroup.freeze", b"1", None), Ok(1));
+        assert!(freezing(pid), "frozen with the group above it");
+        let events = |id| String::from_utf8(read(id, "cgroup.events").unwrap()).unwrap();
+        assert!(events(under).contains("frozen 0\n"), "still running");
+        quiet.store(true, std::sync::atomic::Ordering::SeqCst);
+        let before = events_of(g);
+        frozen_changed();
+        assert!(events(g).contains("frozen 1\n") && events(under).contains("frozen 1\n"));
+        assert!(events_of(g) > before, "announced");
+        assert_eq!(String::from_utf8(read(g, "cgroup.freeze").unwrap()).unwrap(), "1\n");
+        assert_eq!(String::from_utf8(read(under, "cgroup.freeze").unwrap()).unwrap(), "0\n");
+        assert_eq!(write(g, "cgroup.freeze", b"0", None), Ok(1));
+        assert!(!freezing(pid) && events(g).contains("frozen 0\n"));
+        exit(pid, 0);
+        rmdir(under).unwrap();
+        rmdir(g).unwrap();
+    }
 
     #[test]
     fn numbers_as_kstrtoint_reads_them() {
