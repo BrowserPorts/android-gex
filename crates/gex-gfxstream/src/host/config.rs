@@ -1,11 +1,12 @@
 //! The EGL configs the guest sees (gfxstream's `EmulatedEglConfigList`):
-//! the host's that can make a pbuffer and have colour, numbered from 0 in the
-//! host's order, each described by the same 34 attributes, with a window
+//! the translator's ([`super::translator`]) that can make a pbuffer and have
+//! colour, numbered from 0 in the translator's order, each described by the same 34 attributes, with a window
 //! surface always among its types (the guest's windows are the host's
 //! pbuffers) and OpenGL ES 3 among its APIs only when the host offers the
 //! guest a version past 2 (`GlesDynamicVersion`).
 
 use super::egl::*;
+use super::translator::{host_infos, Display, TConfig};
 
 /// The attributes, in the order the guest reads them (the first five are
 /// read by place: depth, stencil, renderable type, surface type, id).
@@ -58,47 +59,30 @@ impl Config {
 }
 
 pub struct Configs {
-    display: EGLDisplay,
+    /// The translator's configs, which these are drawn from.
+    translator: Display,
     pub list: Vec<Config>,
     /// Whether the guest may have OpenGL ES 3.
     es3: bool,
 }
 
-fn attrib(dpy: EGLDisplay, c: EGLConfig, a: EGLint) -> EGLint {
-    let mut v = 0;
-    unsafe { eglGetConfigAttrib(dpy, c, a, &mut v) };
-    v
-}
-
 /// `isCompatibleHostConfig`: a pbuffer, and some red, green and blue.
-fn compatible(dpy: EGLDisplay, c: EGLConfig) -> bool {
-    attrib(dpy, c, EGL_SURFACE_TYPE) & EGL_PBUFFER_BIT != 0 && attrib(dpy, c, EGL_RED_SIZE) != 0 && attrib(dpy, c, EGL_GREEN_SIZE) != 0 && attrib(dpy, c, EGL_BLUE_SIZE) != 0
-}
-
-fn host_configs(dpy: EGLDisplay, attrs: Option<&[EGLint]>) -> Vec<EGLConfig> {
-    let mut n = 0;
-    unsafe { eglGetConfigs(dpy, std::ptr::null_mut(), 0, &mut n) };
-    let mut v = vec![std::ptr::null_mut(); n.max(0) as usize];
-    let ok = match attrs {
-        None => unsafe { eglGetConfigs(dpy, v.as_mut_ptr(), n, &mut n) },
-        Some(a) => unsafe { eglChooseConfig(dpy, a.as_ptr(), v.as_mut_ptr(), n, &mut n) },
-    };
-    if ok != EGL_TRUE {
-        return Vec::new();
-    }
-    v.truncate(n.max(0) as usize);
-    v
+fn compatible(c: &TConfig) -> bool {
+    let a = |x| c.attrib(x).unwrap_or(0);
+    a(EGL_SURFACE_TYPE) & EGL_PBUFFER_BIT != 0 && a(EGL_RED_SIZE) != 0 && a(EGL_GREEN_SIZE) != 0 && a(EGL_BLUE_SIZE) != 0
 }
 
 impl Configs {
     pub fn new(display: EGLDisplay, es3: bool) -> Configs {
-        let list = host_configs(display, None)
-            .into_iter()
-            .filter(|&c| compatible(display, c))
-            .map(|host| {
+        let translator = Display::new(&host_infos(display));
+        let list = translator
+            .configs
+            .iter()
+            .filter(|c| compatible(c))
+            .map(|c| {
                 let mut values = [0; ATTRIBUTES.len()];
                 for (v, &a) in values.iter_mut().zip(ATTRIBUTES.iter()) {
-                    *v = attrib(display, host, a);
+                    *v = c.attrib(a).unwrap_or(0);
                     if a == EGL_SURFACE_TYPE {
                         *v |= EGL_WINDOW_BIT;
                     }
@@ -106,10 +90,10 @@ impl Configs {
                         *v &= !EGL_OPENGL_ES3_BIT;
                     }
                 }
-                Config { host, values }
+                Config { host: c.host, values }
             })
             .collect();
-        Configs { display, list, es3 }
+        Configs { translator, list, es3 }
     }
 
     /// `packConfigs`: the attribute ids, then each config's values, as
@@ -132,9 +116,10 @@ impl Configs {
     }
 
     /// `chooseConfig`: the guest's attributes (pairs, to `EGL_NONE`), with a
-    /// surface type of 0 added when it names none; the guest's numbers of
-    /// the host's matches, at most `max` of them (none asked for: all
-    /// counted). ES3 asked of a host that offers only 2: none.
+    /// surface type of 0 added when it names none, chosen by the
+    /// translator; the guest's numbers of its matches, at most `max` of
+    /// them (none asked for: all counted), or minus the translator's error.
+    /// ES3 asked of a host that offers only 2: none.
     pub fn choose(&self, attribs: &[EGLint], max: usize, want_list: bool) -> (i32, Vec<u32>) {
         let mut a = Vec::new();
         let mut has_surface_type = false;
@@ -154,17 +139,21 @@ impl Configs {
             a.extend_from_slice(&[EGL_SURFACE_TYPE, 0]);
         }
         a.push(EGL_NONE);
+        let matched = match self.translator.choose(&a) {
+            Ok(m) => m,
+            Err(e) => return (-e, Vec::new()),
+        };
         let mut out = Vec::new();
         let mut count = 0;
-        for c in host_configs(self.display, Some(&a)) {
+        for t in matched {
             if want_list && max > 0 && count >= max {
                 break;
             }
-            if !compatible(self.display, c) {
+            let c = &self.translator.configs[t];
+            if !compatible(c) {
                 continue;
             }
-            let id = attrib(self.display, c, EGL_CONFIG_ID);
-            if let Some(i) = self.list.iter().position(|x| x.id() == id) {
+            if let Some(i) = self.list.iter().position(|x| x.id() == c.id()) {
                 if want_list && out.len() < max {
                     out.push(i as u32);
                 }

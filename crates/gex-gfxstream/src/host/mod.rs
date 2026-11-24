@@ -18,6 +18,7 @@ pub mod gl;
 mod gles;
 pub mod yuv;
 pub mod objects;
+pub mod translator;
 
 use crate::{Arg, Call};
 use egl::*;
@@ -27,6 +28,16 @@ use std::sync::{Arc, Mutex};
 
 /// gfxstream's renderer version (`rendererVersion`).
 const RENDERER_VERSION: i32 = 1;
+
+/// The EGL the guest is shown is gfxstream's translator's
+/// (`glestranslator/egl/egl_imp.cpp`), not the host's: version 1.4, and
+/// its own short list of extensions, whatever the host's EGL has. (Mesa's
+/// list offers `EGL_KHR_no_config_context` and `EGL_KHR_surfaceless_context`,
+/// which the guest's EGL takes on trust and cannot serve: SurfaceFlinger
+/// then makes a context with no config and no surface and its first
+/// `eglMakeCurrent` fails.)
+const TRANSLATOR_EGL_VERSION: (EGLint, EGLint) = (1, 4);
+const TRANSLATOR_EGL_EXTENSIONS: &str = "EGL_KHR_image EGL_KHR_image_base EGL_KHR_gl_texture_2D_image EGL_ANDROID_recordable ";
 
 const GL_VERSION: u32 = 0x1F02;
 const GL_EXTENSIONS: u32 = 0x1F03;
@@ -153,7 +164,7 @@ fn replace_es_version(s: &str, version: &str) -> String {
 impl Renderer {
     /// The host's display and root context.
     pub fn new(features: Features, size: DisplaySize) -> Result<Renderer, String> {
-        let (display, major, minor) = egl::display()?;
+        let (display, _, _) = egl::display()?;
         // A root context at the highest version the host gives, on a small
         // pbuffer of the first config that has one.
         let attrs = [EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE];
@@ -181,7 +192,7 @@ impl Renderer {
         unsafe { eglMakeCurrent(display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
         let max_version = if features.gles_dynamic_version { max_version_of(&host_version) } else { MaxVersion::Es2 };
         let configs = config::Configs::new(display, max_version > MaxVersion::Es2);
-        Ok(Renderer { display, egl_version: (major, minor), configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None, syncs: Default::default(), next_sync: 0, dma: None, fences: Default::default(), next_fence: 0 })
+        Ok(Renderer { display, egl_version: TRANSLATOR_EGL_VERSION, configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None, syncs: Default::default(), next_sync: 0, dma: None, fences: Default::default(), next_fence: 0 })
     }
 
     /// `rcGetGLString`'s answer for `name`: the host's string on the
@@ -398,8 +409,7 @@ impl Thread {
             "rcGetRendererVersion" => reply(&[], RENDERER_VERSION as u64),
             "rcGetEGLVersion" => reply(&[&r.egl_version.0.to_le_bytes(), &r.egl_version.1.to_le_bytes()], 1),
             "rcQueryEGLString" => {
-                let s = unsafe { string(eglQueryString(r.display, value(&a[0]) as EGLint)) };
-                let Some(mut s) = s else { return reply(&[], 0) };
+                let Some(mut s) = r.egl_string(value(&a[0]) as EGLenum) else { return reply(&[], 0) };
                 if r.max_version > MaxVersion::Es2 && r.features.gles_dynamic_version && !s.contains("EGL_KHR_create_context") {
                     s.push_str("EGL_KHR_create_context ");
                 }
@@ -710,6 +720,17 @@ impl Drop for Thread {
 }
 
 impl Renderer {
+    /// The translator's `eglQueryString`: the vendor is the host's
+    /// (`EglOsEglDisplay`'s), anything but the three names none.
+    fn egl_string(&self, name: EGLenum) -> Option<String> {
+        match name {
+            egl::EGL_VENDOR => unsafe { string(eglQueryString(self.display, name as EGLint)) },
+            egl::EGL_VERSION => Some(format!("{}.{}", TRANSLATOR_EGL_VERSION.0, TRANSLATOR_EGL_VERSION.1)),
+            egl::EGL_EXTENSIONS => Some(TRANSLATOR_EGL_EXTENSIONS.into()),
+            _ => None,
+        }
+    }
+
     /// `EmulatedEglFenceSync::create`: a fence on the current context, the
     /// context flushed; 0 if the host makes none.
     fn create_fence(&mut self, destroy_when_signaled: bool) -> u64 {
