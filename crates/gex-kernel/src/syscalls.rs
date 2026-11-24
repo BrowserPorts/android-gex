@@ -6583,7 +6583,7 @@ impl NetIo<'_> {
                 return Err(Errno::ESOCKTNOSUPPORT);
             }
             let protocol = protocol as u32;
-            if protocol != crate::netlink::NETLINK_ROUTE && protocol != crate::netlink::NETLINK_KOBJECT_UEVENT && protocol != crate::netlink::NETLINK_XFRM && protocol != crate::netlink::NETLINK_NETFILTER {
+            if protocol != crate::netlink::NETLINK_ROUTE && protocol != crate::netlink::NETLINK_KOBJECT_UEVENT && protocol != crate::netlink::NETLINK_XFRM && protocol != crate::netlink::NETLINK_NETFILTER && protocol != crate::netlink::NETLINK_GENERIC {
                 return Err(Errno::EPROTONOSUPPORT);
             }
             let handle: Arc<dyn crate::vfs::FileHandle> = crate::netlink::Socket::new(protocol, kind as u32, io.netlink_sender());

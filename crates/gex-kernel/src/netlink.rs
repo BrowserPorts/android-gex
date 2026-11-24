@@ -270,6 +270,165 @@ pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
 pub const NETLINK_XFRM: u32 = 6;
 /// `NETLINK_NETFILTER`: nfnetlink ([`nfnl_answer`]).
 pub const NETLINK_NETFILTER: u32 = 12;
+/// `NETLINK_GENERIC`: generic netlink ([`genl_answer`]).
+pub const NETLINK_GENERIC: u32 = 16;
+
+/// Generic netlink (`net/netlink/genetlink.c`), with its controller
+/// (`nlctrl`, id `GENL_ID_CTRL`) the one family registered: this kernel has
+/// none of the subsystems that register others (wireless's `nl80211`,
+/// ethtool, `netdev`, taskstats, thermal), so a family asked for by any
+/// other name or id is `ENOENT`, as on a kernel built without them.
+///
+/// - A message's type is its family; under a whole `genlmsghdr` is
+///   `EINVAL`; a command from `resv_start_op` (11) on with `reserved` set,
+///   or with flags past request, ack, echo and dump, is `EINVAL`
+///   (`genl_header_check`); one the family has not for a do or a dump is
+///   `EOPNOTSUPP`.
+/// - `CTRL_CMD_GETFAMILY` by `CTRL_ATTR_FAMILY_ID` or `_NAME` (the name
+///   wins), attributes checked as `ctrl_policy_family` says without strict
+///   validation (a short id or an over-long or unterminated name is
+///   `ERANGE` or `EINVAL`; unknown ones ignored); neither is `EINVAL`.
+///   Answered with `CTRL_CMD_NEWFAMILY` as `ctrl_fill_info` fills it; a
+///   dump gives every family.
+/// - `CTRL_CMD_GETPOLICY`'s dump (the policies' own description) is not
+///   here, and is refused loudly.
+fn genl_answer(req: &[u8]) -> Option<Vec<u8>> {
+    const GENL_ID_CTRL: u16 = 0x10;
+    const CTRL_CMD_NEWFAMILY: u8 = 1;
+    const CTRL_CMD_GETFAMILY: u8 = 3;
+    const CTRL_CMD_GETPOLICY: u8 = 10;
+    const RESV_START_OP: u8 = CTRL_CMD_GETPOLICY + 1;
+    const CTRL_ATTR_FAMILY_ID: u16 = 1;
+    const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+    const CTRL_ATTR_VERSION: u16 = 3;
+    const CTRL_ATTR_HDRSIZE: u16 = 4;
+    const CTRL_ATTR_MAXATTR: u16 = 5;
+    const CTRL_ATTR_OPS: u16 = 6;
+    const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+    const CAP_DO: u32 = 0x02;
+    const CAP_DUMP: u32 = 0x04;
+    const CAP_HASPOL: u32 = 0x08;
+    const NLM_F_ECHO: u16 = 0x08;
+    const NLA_TYPE_MASK: u16 = !(0x8000 | 0x4000);
+    let kind = u16::from_le_bytes(req[4..6].try_into().unwrap());
+    let flags = u16::from_le_bytes(req[6..8].try_into().unwrap());
+    let seq = u32::from_le_bytes(req[8..12].try_into().unwrap());
+    if kind != GENL_ID_CTRL {
+        return change_reply(req, Err(Errno::ENOENT));
+    }
+    if req.len() < 20 {
+        return change_reply(req, Err(Errno::EINVAL));
+    }
+    let cmd = req[16];
+    let reserved = u16::from_le_bytes(req[18..20].try_into().unwrap());
+    let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+    if cmd >= RESV_START_OP {
+        let rest = if dump { flags & !NLM_F_DUMP } else { flags };
+        if reserved != 0 || rest & !(NLM_F_REQUEST | NLM_F_ACK | NLM_F_ECHO) != 0 {
+            return change_reply(req, Err(Errno::EINVAL));
+        }
+    }
+    // `ctrl_fill_info` for nlctrl: version 2, no header or attributes of
+    // its own (a family of split ops keeps no `maxattr`), its two commands
+    // (GETFAMILY for a do and a dump, GETPOLICY for a dump, both with a
+    // policy), its one group, "notify", at GENL_ID_CTRL.
+    let family = |out: &mut Vec<u8>, msg_flags: u16| {
+        let mut b = vec![CTRL_CMD_NEWFAMILY, 2, 0, 0];
+        attr(&mut b, CTRL_ATTR_FAMILY_NAME, b"nlctrl\0");
+        attr(&mut b, CTRL_ATTR_FAMILY_ID, &GENL_ID_CTRL.to_le_bytes());
+        attr(&mut b, CTRL_ATTR_VERSION, &2u32.to_le_bytes());
+        attr(&mut b, CTRL_ATTR_HDRSIZE, &0u32.to_le_bytes());
+        attr(&mut b, CTRL_ATTR_MAXATTR, &0u32.to_le_bytes());
+        let mut ops = Vec::new();
+        for (i, (op, op_flags)) in [(CTRL_CMD_GETFAMILY as u32, CAP_DO | CAP_DUMP | CAP_HASPOL), (CTRL_CMD_GETPOLICY as u32, CAP_DUMP | CAP_HASPOL)].iter().enumerate() {
+            let mut one = Vec::new();
+            attr(&mut one, 1, &op.to_le_bytes());
+            attr(&mut one, 2, &op_flags.to_le_bytes());
+            attr(&mut ops, i as u16 + 1, &one);
+        }
+        attr(&mut b, CTRL_ATTR_OPS, &ops);
+        let mut grp = Vec::new();
+        attr(&mut grp, 2, &(GENL_ID_CTRL as u32).to_le_bytes());
+        attr(&mut grp, 1, b"notify\0");
+        let mut grps = Vec::new();
+        attr(&mut grps, 1, &grp);
+        attr(&mut b, CTRL_ATTR_MCAST_GROUPS, &grps);
+        message(out, GENL_ID_CTRL, msg_flags, seq, &b);
+    };
+    match (cmd, dump) {
+        (CTRL_CMD_GETFAMILY, true) => {
+            let mut out = Vec::new();
+            family(&mut out, NLM_F_MULTI);
+            message(&mut out, NLMSG_DONE, NLM_F_MULTI, seq, &0i32.to_le_bytes());
+            Some(out)
+        }
+        (CTRL_CMD_GETFAMILY, false) => {
+            // `nla_parse_deprecated` against `ctrl_policy_family`: the last
+            // of a type counts, types past 2 are ignored, a malformed tail
+            // ends the walk.
+            let mut id: Option<&[u8]> = None;
+            let mut name: Option<&[u8]> = None;
+            let mut at = 20;
+            while at + 4 <= req.len() {
+                let len = u16::from_le_bytes(req[at..at + 2].try_into().unwrap()) as usize;
+                if len < 4 || at + len > req.len() {
+                    break;
+                }
+                let ty = u16::from_le_bytes(req[at + 2..at + 4].try_into().unwrap()) & NLA_TYPE_MASK;
+                let data = &req[at + 4..at + len];
+                match ty {
+                    // `NLA_U16`: at least two bytes.
+                    CTRL_ATTR_FAMILY_ID => {
+                        if data.len() < 2 {
+                            return change_reply(req, Err(Errno::ERANGE));
+                        }
+                        id = Some(data);
+                    }
+                    // `NLA_NUL_STRING` of at most 15: a NUL within the first
+                    // 16 bytes, and no more than 15 before the last NUL.
+                    CTRL_ATTR_FAMILY_NAME => {
+                        let minlen = data.len().min(16);
+                        if minlen == 0 || !data[..minlen].contains(&0) {
+                            return change_reply(req, Err(Errno::EINVAL));
+                        }
+                        let n = if data[data.len() - 1] == 0 { data.len() - 1 } else { data.len() };
+                        if n > 15 {
+                            return change_reply(req, Err(Errno::ERANGE));
+                        }
+                        name = Some(data);
+                    }
+                    _ => {}
+                }
+                at += (len + 3) & !3;
+            }
+            let mut found = None;
+            let mut err = Errno::EINVAL;
+            if let Some(d) = id {
+                found = (u16::from_le_bytes([d[0], d[1]]) == GENL_ID_CTRL).then_some(());
+                err = Errno::ENOENT;
+            }
+            if let Some(d) = name {
+                let s = &d[..d.iter().position(|b| *b == 0).unwrap()];
+                found = (s == b"nlctrl").then_some(());
+                err = Errno::ENOENT;
+            }
+            if found.is_none() {
+                return change_reply(req, Err(err));
+            }
+            let mut out = Vec::new();
+            family(&mut out, 0);
+            if let Some(ack) = change_reply(req, Ok(())) {
+                out.extend_from_slice(&ack);
+            }
+            Some(out)
+        }
+        (CTRL_CMD_GETPOLICY, true) => {
+            crate::bpf::say_once("generic netlink's policy dump (CTRL_CMD_GETPOLICY)");
+            change_reply(req, Err(Errno::EOPNOTSUPP))
+        }
+        _ => change_reply(req, Err(Errno::EOPNOTSUPP)),
+    }
+}
 
 /// nfnetlink_log's instances: each log group bound, and the port of the
 /// socket that bound it (`instance_create`).
@@ -916,7 +1075,7 @@ impl Socket {
     /// address.
     fn to_kernel(&self, who: Sender, named: bool, data: &[u8]) {
         match self.protocol {
-            NETLINK_ROUTE | NETLINK_XFRM | NETLINK_NETFILTER => {
+            NETLINK_ROUTE | NETLINK_XFRM | NETLINK_NETFILTER | NETLINK_GENERIC => {
                 // A request is answered; the answers to one datagram are
                 // one datagram.
                 let mut at = 0;
@@ -932,6 +1091,7 @@ impl Socket {
                         let r = match self.protocol {
                             NETLINK_XFRM => xfrm_answer(&data[at..at + len], who.net_admin),
                             NETLINK_NETFILTER => nfnl_answer(&data[at..at + len], who.net_admin, portid),
+                            NETLINK_GENERIC => genl_answer(&data[at..at + len]),
                             _ => route_answer(&data[at..at + len], who.net_admin, portid),
                         };
                         if let Some(r) = r {
@@ -1582,5 +1742,57 @@ mod tests {
             sender.send(root(7009), None, &req).unwrap();
         }
         assert!(listener.recv(4096, false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod genl_tests {
+    use super::*;
+
+    /// A generic netlink request to nlctrl: command, flags, attributes.
+    fn req(family: u16, cmd: u8, flags: u16, attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut b = vec![cmd, 1, 0, 0];
+        for (t, d) in attrs {
+            attr(&mut b, *t, d);
+        }
+        let mut out = Vec::new();
+        message(&mut out, family, flags | NLM_F_REQUEST, 7, &b);
+        out
+    }
+
+    fn error_of(r: &[u8]) -> i32 {
+        assert_eq!(u16::from_le_bytes([r[4], r[5]]), NLMSG_ERROR);
+        i32::from_le_bytes(r[16..20].try_into().unwrap())
+    }
+
+    #[test]
+    fn nlctrl_is_the_one_family() {
+        // By name: NEWFAMILY, version 2, the controller's id and name.
+        let r = genl_answer(&req(0x10, 3, 0, &[(2, b"nlctrl\0")])).unwrap();
+        assert_eq!(u16::from_le_bytes([r[4], r[5]]), 0x10);
+        assert_eq!((r[16], r[17]), (1, 2));
+        assert!(r.windows(7).any(|w| w == b"nlctrl\0"));
+        assert!(r.windows(7).any(|w| w == b"notify\0"));
+        // With an ack asked for, the ack follows.
+        let r2 = genl_answer(&req(0x10, 3, NLM_F_ACK, &[(1, &0x10u16.to_le_bytes())])).unwrap();
+        let first = u32::from_le_bytes(r2[0..4].try_into().unwrap()) as usize;
+        assert_eq!(error_of(&r2[(first + 3) & !3..]), 0);
+        // Others are not here; neither attribute is EINVAL.
+        assert_eq!(error_of(&genl_answer(&req(0x10, 3, 0, &[(2, b"nl80211\0")])).unwrap()), -(Errno::ENOENT.0 as i32));
+        assert_eq!(error_of(&genl_answer(&req(0x10, 3, 0, &[(1, &0x1cu16.to_le_bytes())])).unwrap()), -(Errno::ENOENT.0 as i32));
+        assert_eq!(error_of(&genl_answer(&req(0x10, 3, 0, &[])).unwrap()), -(Errno::EINVAL.0 as i32));
+        assert_eq!(error_of(&genl_answer(&req(0x20, 3, 0, &[])).unwrap()), -(Errno::ENOENT.0 as i32));
+        // The policy: a short id, an unterminated or too long name.
+        assert_eq!(error_of(&genl_answer(&req(0x10, 3, 0, &[(1, &[0x10])])).unwrap()), -(Errno::ERANGE.0 as i32));
+        assert_eq!(error_of(&genl_answer(&req(0x10, 3, 0, &[(2, b"nlctrl")])).unwrap()), -(Errno::EINVAL.0 as i32));
+        assert_eq!(error_of(&genl_answer(&req(0x10, 3, 0, &[(2, b"0123456789abcdef\0")])).unwrap()), -(Errno::EINVAL.0 as i32));
+        // A NUL early, and more after it than a name may have.
+        assert_eq!(error_of(&genl_answer(&req(0x10, 3, 0, &[(2, b"abc\0xxxxxxxxxxxxx")])).unwrap()), -(Errno::ERANGE.0 as i32));
+        // A dump: the family, then done; a command it has not.
+        let d = genl_answer(&req(0x10, 3, NLM_F_DUMP, &[])).unwrap();
+        let first = u32::from_le_bytes(d[0..4].try_into().unwrap()) as usize;
+        let next = (first + 3) & !3;
+        assert_eq!(u16::from_le_bytes([d[next + 4], d[next + 5]]), NLMSG_DONE);
+        assert_eq!(error_of(&genl_answer(&req(0x10, 9, 0, &[])).unwrap()), -(Errno::EOPNOTSUPP.0 as i32));
     }
 }
