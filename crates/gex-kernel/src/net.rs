@@ -702,6 +702,14 @@ pub struct Socket {
     /// A UDP socket `connect`ed (a `sendto` only remembers where its reply
     /// comes from, in `peer`).
     udp_connected: AtomicBool,
+    /// Bound by `bind`, not by the kernel at a first send (`BINDPORT_LOCK`).
+    bound_explicit: AtomicBool,
+    /// An error for the owner's next call (`sk_err`): a destroyed socket's
+    /// `ECONNABORTED`, taken once.
+    pending: Mutex<Option<Errno>>,
+    /// Destroyed by sock_diag (`tcp_abort`): a TCP socket now closed, its
+    /// reads at end of file, its writes `EPIPE`.
+    aborted: AtomicBool,
 }
 
 /// The sockets of this kernel, while they last: what sock_diag reports.
@@ -850,7 +858,72 @@ impl Socket {
             cgroup: std::sync::atomic::AtomicU64::new(0),
             ino: next_ino(),
             udp_connected: AtomicBool::new(false),
+            bound_explicit: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            aborted: AtomicBool::new(false),
         }
+    }
+
+    /// The pending error, taken (`sock_error`).
+    pub fn take_error(&self) -> Option<Errno> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// `SOCK_DESTROY`'s abort (`tcp_abort`, `udp_abort`) with
+    /// `ECONNABORTED`. TCP: a closed socket is `ENOENT`; a listener stops
+    /// listening and the connections it had not handed out go; a
+    /// connection is closed (the host's end let go); either way the
+    /// owner's next call has the error, and then the socket is closed.
+    /// UDP: the error first, and the socket disconnected, its port given
+    /// back unless `bind` chose it.
+    pub fn abort(&self) -> Result<(), Errno> {
+        if self.moved().is_some() || self.remote_listener.lock().unwrap().is_some() {
+            crate::bpf::say_once("SOCK_DESTROY of a socket the global kernel holds");
+            return Err(Errno::EOPNOTSUPP);
+        }
+        match self.kind {
+            Kind::Tcp => {
+                if let Some(q) = self.backlog.lock().unwrap().take() {
+                    let port = self.local.lock().unwrap().map_or(0, |l| l.1);
+                    let mut listeners = self.ports.listeners.lock().unwrap();
+                    let me = self.me.lock().unwrap().clone();
+                    if listeners.get(&port).is_some_and(|w| w.ptr_eq(&me)) {
+                        listeners.remove(&port);
+                    }
+                    for (t, _) in q {
+                        t.close();
+                    }
+                } else {
+                    let mut t = self.transport.lock().unwrap();
+                    match t.as_ref().map(|t| t.status()) {
+                        None | Some(Status::Refused) => return Err(Errno::ENOENT),
+                        Some(_) => t.take().unwrap().close(),
+                    }
+                }
+                self.aborted.store(true, Ordering::Release);
+            }
+            Kind::Udp => {
+                self.udp_connected.store(false, Ordering::Relaxed);
+                *self.peer.lock().unwrap() = None;
+                self.opts.lock().unwrap_or_else(|e| e.into_inner()).bound_dev_if = 0;
+                if !self.bound_explicit.load(Ordering::Relaxed) {
+                    if let Some((_, port)) = self.local.lock().unwrap().take() {
+                        let mut udp = self.ports.udp.lock().unwrap();
+                        let me = self.me.lock().unwrap().clone();
+                        if udp.get(&port).is_some_and(|w| w.ptr_eq(&me)) {
+                            udp.remove(&port);
+                        }
+                    }
+                }
+            }
+        }
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(Errno::ECONNABORTED);
+        Ok(())
+    }
+
+    /// Whether sock_diag destroyed it (TCP).
+    pub fn aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
     }
 
     /// Its inode number.
@@ -869,6 +942,7 @@ impl Socket {
         let listening = self.kind == Kind::Tcp && self.is_listening();
         let has_transport = self.moved().is_some() || self.transport.lock().unwrap().is_some();
         let (state, hashed) = match self.kind {
+            Kind::Tcp if self.aborted() => (7, false),
             Kind::Tcp if listening => (10, true),
             Kind::Tcp if has_transport => match self.status() {
                 Status::Connecting => (2, true),
@@ -971,7 +1045,9 @@ impl Socket {
             return Err(Errno::EINVAL);
         }
         if self.kind == Kind::Udp {
-            return self.udp_take(addr, port);
+            self.udp_take(addr, port)?;
+            self.bound_explicit.store(true, Ordering::Relaxed);
+            return Ok(());
         }
         // (In a page the global kernel answers at `listen`: its name table
         // keeps a closed listener's name until the name is bound again.)
@@ -1603,6 +1679,10 @@ impl Socket {
         if let Some(v) = self.fwd(op::READ, 0, 0, buf) {
             return Socket::count(v);
         }
+        // A pending error before any datagram (`__skb_recv_udp`).
+        if let Some(e) = self.take_error() {
+            return Err(e);
+        }
         self.udp_pump();
         match self.dgrams.lock().unwrap().pop_front() {
             Some((d, from)) => {
@@ -2173,6 +2253,10 @@ impl FileHandle for Socket {
         if self.kind == Kind::Udp {
             return self.recv_dgram(buf);
         }
+        // Destroyed: the error once, then end of file.
+        if self.aborted() {
+            return self.take_error().map_or(Ok(0), Err);
+        }
         let t = self.transport.lock().unwrap();
         let Some(t) = t.as_ref() else {
             return Err(Errno::ENOTCONN);
@@ -2201,6 +2285,10 @@ impl FileHandle for Socket {
         }
         if let Some(v) = self.fwd_write(buf) {
             return Socket::count(v);
+        }
+        // Destroyed: the error once, then `EPIPE`.
+        if self.aborted() {
+            return Err(self.take_error().unwrap_or(Errno::EPIPE));
         }
         let t = self.transport.lock().unwrap();
         let Some(t) = t.as_ref() else {
@@ -2293,6 +2381,9 @@ impl FileHandle for Socket {
             self.udp_pump();
             return !self.dgrams.lock().unwrap().is_empty();
         }
+        if self.aborted() {
+            return true;
+        }
         // A listener is readable when a connection waits.
         if let (Some(id), Some(r)) = (*self.remote_listener.lock().unwrap(), self.remote) {
             return (r.pending)(id) != 0;
@@ -2327,6 +2418,20 @@ impl FileHandle for Socket {
     /// finished either way. This is how a non-blocking connect reports itself:
     /// the caller waits for writable, then asks `SO_ERROR`. The trait's
     /// default `true` would signal "finished" before it was.
+    /// A pending error (a destroyed socket's) is `POLLERR`.
+    fn poll_err(&self) -> bool {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// A destroyed TCP socket is closed both ways.
+    fn poll_hup(&self) -> bool {
+        self.kind == Kind::Tcp && self.aborted()
+    }
+
+    fn poll_rdhup(&self) -> bool {
+        self.kind == Kind::Tcp && self.aborted()
+    }
+
     fn poll_writable(&self) -> bool {
         if let Some(v) = self.fwd(op::WRITABLE, 0, 0, &mut []) {
             return v != 0;
@@ -2345,6 +2450,12 @@ impl FileHandle for Socket {
 
 impl Drop for Socket {
     fn drop(&mut self) {
+        // Its destroy broadcast to sock_diag's listeners, with its cookie
+        // (`__sk_free`).
+        if self.moved().is_none() {
+            let cookie = crate::bpfsock::cookie_at_end(self as *const Socket as *const () as usize);
+            crate::sockdiag::destroyed(&self.diag_view(), cookie);
+        }
         // Its flows off the machine: this holder's hold on each.
         for f in std::mem::take(&mut *self.flows.lock().unwrap()) {
             f.t.close();

@@ -15,7 +15,6 @@ static COOKIES: Mutex<Option<HashMap<usize, (Weak<dyn FileHandle>, u64)>>> = Mut
 /// A socket's cookie: a number no other socket has had, given when it is
 /// first asked for (`SO_COOKIE`, `bpf_get_socket_cookie`).
 pub fn cookie_of(sock: &Arc<dyn FileHandle>) -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let at = Arc::as_ptr(sock) as *const () as usize;
     let mut t = COOKIES.lock().unwrap_or_else(|e| e.into_inner());
     let t = t.get_or_insert_with(HashMap::new);
@@ -27,9 +26,26 @@ pub fn cookie_of(sock: &Arc<dyn FileHandle>) -> u64 {
     if t.len() > 1024 {
         t.retain(|_, (w, _)| w.strong_count() > 0);
     }
-    let c = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let c = next_cookie();
     t.insert(at, (Arc::downgrade(sock), c));
     c
+}
+
+/// The cookie of the socket at `at` as it goes, taken from the table; a
+/// fresh one for a socket never asked for its own (`sock_gen_cookie` at
+/// its destroy broadcast).
+pub fn cookie_at_end(at: usize) -> u64 {
+    let mut t = COOKIES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, c)) = t.as_mut().and_then(|t| t.remove(&at)) {
+        return c;
+    }
+    drop(t);
+    next_cookie()
+}
+
+fn next_cookie() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What a socket keeps that a program or `setsockopt` may set: its mark,

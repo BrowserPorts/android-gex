@@ -7374,15 +7374,19 @@ fn getsockopt_kernel(io: &FdIo<'_>, m: &mut GuestMem<'_>, fd: i32, level: u64, n
                 socket_family_type(io, fd)?;
                 0
             }
-            Ok(sock) => match sock.status() {
-                net::Status::Refused => Errno::ECONNREFUSED.0,
+            // A pending error first, taken (a destroyed socket's).
+            Ok(sock) => match sock.take_error() {
+                Some(e) => e.0,
+                None => match sock.status() {
+                    net::Status::Refused => Errno::ECONNREFUSED.0,
                 // Not `EINPROGRESS`. `SO_ERROR` reports how a connect
                 // *finished*, and Linux leaves it zero until one has; a
                 // caller is meant to learn "not yet" from the descriptor not
                 // being writable, which is what `poll_writable` now says.
                 // Reporting it here made `apt` treat "still connecting" as
                 // the error that stopped it.
-                _ => 0,
+                    _ => 0,
+                },
             },
         };
         if val != 0 {

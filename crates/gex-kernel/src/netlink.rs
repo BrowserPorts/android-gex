@@ -100,6 +100,16 @@ pub fn iface_exists(index: u32) -> bool {
     crate::netdev::by_index(index).is_some()
 }
 
+/// A message from the kernel to a group of a protocol's.
+pub(crate) fn notify(protocol: u32, msg: Vec<u8>, group: u32) {
+    broadcast(protocol, None, &Datagram { data: msg, from: 0, group, cred: (0, 0, 0) }, 0, group);
+}
+
+/// Whether any socket of a protocol listens to a group.
+pub(crate) fn has_listeners(protocol: u32, group: u32) -> bool {
+    sockets(protocol).iter().any(|s| s.state().groups & group_mask(group) != 0)
+}
+
 /// A message from the kernel to a group of `NETLINK_ROUTE`'s
 /// (`rtnl_notify`): a device's link coming, changing or going.
 pub(crate) fn route_notify(msg: Vec<u8>, group: u32) {
@@ -1082,7 +1092,7 @@ impl Socket {
             // dump's end apart from its messages (`sockdiag::answer`).
             crate::sockdiag::NETLINK_SOCK_DIAG => {
                 let portid = self.state().portid;
-                let asker = crate::sockdiag::Asker { net_admin: who.net_admin && self.opener.net_admin };
+                let asker = crate::sockdiag::Asker { net_admin: who.net_admin && self.opener.net_admin, caller_admin: who.net_admin };
                 let mut at = 0;
                 while at + 16 <= data.len() {
                     let len = u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;

@@ -15,7 +15,11 @@
 //   ENOENT;
 // - refusals: a family with no handler ENOENT, a short request EINVAL,
 //   type 19 EINVAL, a bad program EINVAL, an unknown protocol's dump a
-//   DONE carrying -ENOENT.
+//   DONE carrying -ENOENT;
+// - SOCK_DESTROY: a TCP end gets ECONNABORTED once, then end of file and
+//   EPIPE, POLLERR|POLLHUP; again ENOENT; a destroyed listener's accept
+//   EINVAL; a UDP socket ECONNABORTED before anything, then nothing;
+// - a UDP socket let go is told to group 2 with its cookie (96 bytes).
 //
 // As root. Prints nothing when all is as the source says.
 #define _GNU_SOURCE
@@ -26,6 +30,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/sock_diag.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -260,6 +265,71 @@ int main(void) {
     want("a short inet request", send(nl, &shortq, sizeof shortq, 0), sizeof shortq);
     n = recv(nl, buf, sizeof buf, 0);
     want("is EINVAL", n > 0 && ((struct nlmsghdr *)buf)->nlmsg_type == NLMSG_ERROR ? ((struct nlmsgerr *)NLMSG_DATA((struct nlmsghdr *)buf))->error : 0, -EINVAL);
+
+    // Destroy the connecting end, with an ack: ECONNABORTED once, then end
+    // of file, and EPIPE to a write; POLLERR and POLLHUP before the error
+    // is read. A second destroy finds nothing.
+    memset(&id, 0, sizeof id);
+    id.idiag_sport = htons(cport);
+    id.idiag_dport = htons(lport);
+    id.idiag_src[0] = lo;
+    id.idiag_dst[0] = lo;
+    id.idiag_cookie[0] = (uint32_t)cookie_of(cli);
+    id.idiag_cookie[1] = (uint32_t)(cookie_of(cli) >> 32);
+    want("destroy", send_req(nl, SOCK_DESTROY, NLM_F_ACK, AF_INET, IPPROTO_TCP, 0, 0, &id, NULL, 0), 0);
+    struct pollfd pf = {.fd = cli, .events = POLLIN | POLLOUT};
+    want("poll after destroy", poll(&pf, 1, 0), 1);
+    want("POLLERR and POLLHUP", pf.revents & (POLLERR | POLLHUP), POLLERR | POLLHUP);
+    char b1[8];
+    want("recv after destroy", recv(cli, b1, sizeof b1, MSG_DONTWAIT) < 0 ? -errno : 0, -ECONNABORTED);
+    want("then end of file", recv(cli, b1, sizeof b1, MSG_DONTWAIT), 0);
+    want("send after destroy", send(cli, "x", 1, MSG_NOSIGNAL) < 0 ? -errno : 0, -EPIPE);
+    want("destroy again", send_req(nl, SOCK_DESTROY, NLM_F_ACK, AF_INET, IPPROTO_TCP, 0, 0, &id, NULL, 0), -ENOENT);
+
+    // Destroy the listener: accept is EINVAL.
+    memset(&id, 0, sizeof id);
+    id.idiag_sport = htons(lport);
+    id.idiag_src[0] = lo;
+    id.idiag_cookie[0] = id.idiag_cookie[1] = INET_DIAG_NOCOOKIE;
+    want("destroy the listener", send_req(nl, SOCK_DESTROY, NLM_F_ACK, AF_INET, IPPROTO_TCP, 0, 0, &id, NULL, 0), 0);
+    want("accept after", accept4(lis, NULL, NULL, SOCK_NONBLOCK) < 0 ? -errno : 0, -EINVAL);
+
+    // Destroy the UDP socket by its cookie (src its own end, as QUIC's
+    // close does): ECONNABORTED before anything else, then nothing.
+    memset(&id, 0, sizeof id);
+    id.idiag_sport = htons(uport);
+    id.idiag_src[0] = lo;
+    id.idiag_cookie[0] = (uint32_t)cookie_of(udp);
+    id.idiag_cookie[1] = (uint32_t)(cookie_of(udp) >> 32);
+    want("destroy the udp socket", send_req(nl, SOCK_DESTROY, NLM_F_ACK, AF_INET, IPPROTO_UDP, 0, 0, &id, NULL, 0), 0);
+    want("udp recv after destroy", recv(udp, b1, sizeof b1, MSG_DONTWAIT) < 0 ? -errno : 0, -ECONNABORTED);
+    want("then nothing", recv(udp, b1, sizeof b1, MSG_DONTWAIT) < 0 ? -errno : 0, -EAGAIN);
+
+    // A socket let go is told to the group listening for its kind (UDP over
+    // IPv4: group 2), with its cookie.
+    int mon = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+    struct sockaddr_nl sa = {.nl_family = AF_NETLINK, .nl_groups = 1 << (SKNLGRP_INET_UDP_DESTROY - 1)};
+    want("bind to the group", bind(mon, (struct sockaddr *)&sa, sizeof sa), 0);
+    int gone = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in g = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    bind(gone, (struct sockaddr *)&g, sizeof g);
+    uint64_t gone_cookie = cookie_of(gone);
+    close(gone);
+    struct pollfd mp = {.fd = mon, .events = POLLIN};
+    int heard = 0;
+    while (!heard && poll(&mp, 1, 3000) == 1) {
+        n = recv(mon, buf, sizeof buf, 0);
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; n > 0 && NLMSG_OK(h, n); h = NLMSG_NEXT(h, n)) {
+            struct inet_diag_msg *m = NLMSG_DATA(h);
+            if (h->nlmsg_type == SOCK_DIAG_BY_FAMILY && msg_cookie(m) == gone_cookie) {
+                heard = 1;
+                want("its state", m->idiag_state, 7);
+                want("its length", h->nlmsg_len, 96);
+            }
+        }
+    }
+    want("the socket let go is told", heard, 1);
+    close(mon);
 
     close(srv);
     close(cli);

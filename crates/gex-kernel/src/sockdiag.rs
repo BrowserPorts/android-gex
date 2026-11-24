@@ -5,7 +5,9 @@
 //! exact lookups for a connection's owner).
 //!
 //! - Types: `SOCK_DIAG_BY_FAMILY` (20) dumps or looks up; `SOCK_DESTROY`
-//!   (21) is refused loudly here (the abort of a socket is not done yet);
+//!   (21) looks up as an exact request does and aborts the socket
+//!   ([`crate::net::Socket::abort`]: `ECONNABORTED` to its owner once),
+//!   with `CAP_NET_ADMIN` asked after the lookup;
 //!   `TCPDIAG_GETSOCK`'s old form is refused loudly; any other type from
 //!   16 is `EINVAL`. A payload under two bytes or a family past `AF_MAX`
 //!   is `EINVAL`, a family other than IPv4 and IPv6 `ENOENT`, an inet
@@ -83,10 +85,12 @@ mod at {
 const TCP_INFO_LEN: usize = 280;
 
 /// Who asks: whether they may see marks and test them (`CAP_NET_ADMIN`,
-/// of both the socket's opener and the caller).
+/// of both the socket's opener and the caller: `netlink_net_capable`),
+/// and whether they may destroy (the caller's alone: `ns_capable`).
 #[derive(Clone, Copy, Debug)]
 pub struct Asker {
     pub net_admin: bool,
+    pub caller_admin: bool,
 }
 
 /// A socket of this kernel as sock_diag sees it.
@@ -220,6 +224,42 @@ fn fill(e: &Entry, ext: u8, asker: Asker, kind: u16, flags: u16, seq: u32, porti
         }
     }
     message(kind, flags, seq, portid, &b)
+}
+
+/// `sock_diag_broadcast_destroy`: a socket finally let go, told to the
+/// group for its family and protocol (TCP 1, UDP 2, IPv6's 3 and 4), as
+/// `inet_diag_handler_get_info` fills it: the message with its ends and
+/// cookie (and, for TCP, state CLOSE; for UDP, ESTABLISHED if still
+/// connected), the protocol, and for TCP its `tcp_info`.
+pub fn destroyed(v: &DiagView, cookie: u64) {
+    let group = match (v.tcp, v.v6) {
+        (true, false) => 1,
+        (false, false) => 2,
+        (true, true) => 3,
+        (false, true) => 4,
+    };
+    if !crate::netlink::has_listeners(NETLINK_SOCK_DIAG, group) {
+        return;
+    }
+    let state = if v.tcp { TCP_CLOSE } else if v.state == 1 { 1 } else { TCP_CLOSE };
+    let mut b = vec![0u8; 72];
+    b[0] = if v.v6 { AF_INET6 } else { AF_INET };
+    b[1] = state;
+    b[4..6].copy_from_slice(&v.local.1.to_be_bytes());
+    b[6..8].copy_from_slice(&v.peer.1.to_be_bytes());
+    b[8..24].copy_from_slice(&addr16(v.v6, v.local.0));
+    b[24..40].copy_from_slice(&addr16(v.v6, v.peer.0));
+    b[40..44].copy_from_slice(&v.opts.bound_dev_if.to_le_bytes());
+    b[44..48].copy_from_slice(&(cookie as u32).to_le_bytes());
+    b[48..52].copy_from_slice(&((cookie >> 32) as u32).to_le_bytes());
+    const PROTOCOL: u16 = 10;
+    put_attr(&mut b, PROTOCOL, &[if v.tcp { IPPROTO_TCP } else { IPPROTO_UDP }]);
+    if v.tcp {
+        let mut info = [0u8; TCP_INFO_LEN];
+        info[0] = state;
+        put_attr(&mut b, at::INFO, &info);
+    }
+    crate::netlink::notify(NETLINK_SOCK_DIAG, message(SOCK_DIAG_BY_FAMILY, 0, 0, 0, &b), group);
 }
 
 // -- bytecode ----------------------------------------------------------------
@@ -570,15 +610,14 @@ pub fn answer(req: &[u8], asker: Asker, portid: u32) -> Vec<Vec<u8>> {
     // other way round; its destroy does not.
     let (local_a, local_p, remote_a, remote_p) = if tcp || kind == SOCK_DESTROY { (src, sport, dst, dport) } else { (dst, dport, src, sport) };
     let family_ok = |e: &Entry| if v4_lookup { true } else { e.view.v6 };
-    let found = if tcp {
+    let found: Option<&(Arc<crate::net::Socket>, Entry)> = if tcp {
         all.iter()
-            .map(|(_, e)| e)
-            .find(|e| {
+            .find(|(_, e)| {
                 let v = &e.view;
                 v.tcp && v.hashed && !v.listening && family_ok(e) && v.local.1 == local_p && v.peer.1 == remote_p && same(e, v.local.0, local_a) && same(e, v.peer.0, remote_a) && dev_ok(e)
             })
             .or_else(|| {
-                all.iter().map(|(_, e)| e).find(|e| {
+                all.iter().find(|(_, e)| {
                     let v = &e.view;
                     v.tcp && v.listening && family_ok(e) && v.local.1 == local_p && (v.local.0 == 0 || same(e, v.local.0, local_a)) && dev_ok(e)
                 })
@@ -606,20 +645,25 @@ pub fn answer(req: &[u8], asker: Asker, portid: u32) -> Vec<Vec<u8>> {
             }
             Some(s)
         };
-        all.iter().map(|(_, e)| e).filter_map(|e| score(e).map(|s| (s, e))).max_by_key(|(s, _)| *s).map(|(_, e)| e)
+        all.iter().filter_map(|p| score(&p.1).map(|s| (s, p))).max_by_key(|(s, _)| *s).map(|(_, p)| p)
     } else {
         None
     };
-    let Some(e) = found else { return fail(Errno::ENOENT) };
+    let Some((sock, e)) = found else { return fail(Errno::ENOENT) };
     if cookie != (NOCOOKIE, NOCOOKIE) && (cookie.0 as u64 | (cookie.1 as u64) << 32) != e.cookie {
         return fail(if tcp || kind == SOCK_DESTROY { Errno::ENOENT } else { Errno::ESTALE });
     }
+    // `sock_diag_destroy`: after the lookup, the caller's CAP_NET_ADMIN;
+    // then the protocol's abort.
     if kind == SOCK_DESTROY {
-        if !asker.net_admin {
+        if !asker.caller_admin {
             return fail(Errno::EPERM);
         }
-        crate::bpf::say_once("SOCK_DESTROY (aborting a socket)");
-        return fail(Errno::EOPNOTSUPP);
+        return match sock.abort() {
+            Ok(()) if wants_ack => vec![ack(req, 0, portid)],
+            Ok(()) => Vec::new(),
+            Err(e) => fail(e),
+        };
     }
     let mut out = vec![fill(e, ext, asker, SOCK_DIAG_BY_FAMILY, 0, seq, portid)];
     if wants_ack {
@@ -634,7 +678,7 @@ mod tests {
 
     #[test]
     fn netds_programs_pass_the_audit() {
-        let admin = Asker { net_admin: true };
+        let admin = Asker { net_admin: true, caller_admin: true };
         // R1: one S_COND on an IPv4 /32: yes = its length, no = past it.
         let mut r1 = vec![BC_S_COND, 16, 20, 0, AF_INET, 32, 0, 0];
         r1.extend_from_slice(&(-1i32).to_le_bytes());
@@ -649,7 +693,7 @@ mod tests {
         r2.extend_from_slice(&(1u32 << 16).to_le_bytes());
         r2.extend_from_slice(&[BC_JMP, 4, 8, 0]);
         assert_eq!(audit(&r2, admin), Ok(()));
-        assert_eq!(audit(&r2, Asker { net_admin: false }), Err(Errno::EPERM));
+        assert_eq!(audit(&r2, Asker { net_admin: false, caller_admin: false }), Err(Errno::EPERM));
         // Bad: an unknown op, a jump past the end, a short condition.
         assert_eq!(audit(&[99, 4, 8, 0], admin), Err(Errno::EINVAL));
         assert_eq!(audit(&[BC_NOP, 8, 8, 0], admin), Err(Errno::EINVAL));
@@ -686,13 +730,13 @@ mod tests {
     #[test]
     fn a_socket_fills_as_the_kernel_lays_it_out() {
         let e = entry((0x7f00_0001, 4000), (0x7f00_0001, 5000), 7);
-        let m = fill(&e, 0, Asker { net_admin: true }, 20, NLM_F_MULTI, 3, 9);
+        let m = fill(&e, 0, Asker { net_admin: true, caller_admin: true }, 20, NLM_F_MULTI, 3, 9);
         // 16 + 72 + shutdown 8 + mark 8 + cgroup 12 + sockopt 8.
         assert_eq!(m.len(), 124);
         assert_eq!(&m[16 + 4..16 + 6], &4000u16.to_be_bytes());
         assert_eq!(&m[16 + 8..16 + 12], &[127, 0, 0, 1]);
         assert_eq!(&m[16 + 44..16 + 48], &42u32.to_le_bytes());
-        assert_eq!(fill(&e, 0, Asker { net_admin: false }, 20, NLM_F_MULTI, 3, 9).len(), 116);
-        assert_eq!(fill(&e, 0x02, Asker { net_admin: true }, 20, NLM_F_MULTI, 3, 9).len(), 124 + 284);
+        assert_eq!(fill(&e, 0, Asker { net_admin: false, caller_admin: false }, 20, NLM_F_MULTI, 3, 9).len(), 116);
+        assert_eq!(fill(&e, 0x02, Asker { net_admin: true, caller_admin: true }, 20, NLM_F_MULTI, 3, 9).len(), 124 + 284);
     }
 }
