@@ -6,7 +6,7 @@
 
 # The Wine fork: branch w64/gex-surface.
 WINE64_REPO   := https://github.com/MercuryWorkshop/wine-wasm.git
-WINE64_COMMIT := 037e07d0dd7457ca765958829406d7e5ceea84e0
+WINE64_COMMIT := b84976f66f75644c489714b12ca1f98e4f5fd2ea
 
 # The 32-bit Wine tree (branch wasm32-w3-next): the wineserver's build, and
 # the legacy 32-bit dist (make wine32).
