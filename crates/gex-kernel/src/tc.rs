@@ -764,7 +764,7 @@ fn chain_of(r: &Req<'_>) -> Result<u32, Errno> {
 
 /// `tc_new_tfilter` and `cls_bpf_change`.
 fn new_tfilter(r: &Req<'_>) -> Answer {
-    let mut prio = r.info & TC_H_MAJ;
+    let prio = r.info & TC_H_MAJ;
     let protocol = (r.info & 0xFFFF) as u16;
     let auto = prio == 0;
     if auto && r.flags & NLM_F_CREATE == 0 {
