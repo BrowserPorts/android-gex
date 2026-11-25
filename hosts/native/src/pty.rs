@@ -25,6 +25,11 @@ fn table() -> &'static Mutex<Vec<Arc<Pty>>> {
 
 static PROCS: OnceLock<Arc<ProcTable>> = OnceLock::new();
 
+/// The machine's process table, once the host has set it up.
+pub fn procs() -> Option<Arc<ProcTable>> {
+    PROCS.get().cloned()
+}
+
 fn at(id: i32) -> Option<Arc<Pty>> {
     let t = table().lock().unwrap_or_else(|e| e.into_inner());
     t.get(usize::try_from(id).ok()?).cloned()

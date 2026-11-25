@@ -1034,6 +1034,28 @@ fn new_engine() -> Result<Engine> {
 /// counts so far, one line on standard error: what was published, installed
 /// into a store (once per store that takes it), compiled or found in the
 /// cache, and slots given the miss stub. For seeing what grows with threads.
+/// `GEX_PROC_STATS=<seconds>`: every so often, the guest processes' resident
+/// memory as each last said it (`ProcTable::set_usage`): the total, then the
+/// largest 25 with their threads. What a boot's memory is in, by process.
+fn proc_stats_every() {
+    let Some(secs) = std::env::var("GEX_PROC_STATS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else {
+        return;
+    };
+    let start = std::time::Instant::now();
+    let _ = std::thread::Builder::new().name("gex-proc-stats".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        let Some(procs) = pty::procs() else { continue };
+        let mut all: Vec<_> = procs.entries().into_iter().filter(|e| !e.zombie).collect();
+        all.sort_by_key(|e| std::cmp::Reverse(e.usage.rss));
+        let total: u64 = all.iter().map(|e| e.usage.rss).sum();
+        let mut line = format!("gex: procs at {}s: {} MiB resident in {} processes;", start.elapsed().as_secs(), total >> 20, all.len());
+        for e in all.iter().take(25) {
+            line.push_str(&format!(" {}:{}={}M/{}t", e.pid, e.comm(), e.usage.rss >> 20, e.tasks().len()));
+        }
+        eprintln!("{line}");
+    });
+}
+
 fn jit_stats_every() {
     let Some(secs) = std::env::var("GEX_JIT_STATS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else {
         return;
@@ -1077,6 +1099,7 @@ fn fixed_random() {
         gex_mem::tune_heap();
         gex_mem::heap_stats_every();
         jit_stats_every();
+        proc_stats_every();
         if let Ok(seed) = std::env::var("GEX_FIXED_RANDOM") {
             match seed.parse::<u64>() {
                 Ok(seed) => gex_kernel::entropy::fix(seed),
