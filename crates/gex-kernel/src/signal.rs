@@ -15,7 +15,7 @@ use crate::errno::Errno;
 use crate::GuestMem;
 use gex_abi::ctx;
 use crate::sync::{Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Signal numbers.
@@ -192,6 +192,36 @@ pub struct ProcSig {
     /// The auxiliary vector the program was started with, zero after its
     /// end (Linux's `mm->saved_auxv`, which `PR_GET_AUXV` reads).
     saved_auxv: Mutex<[u8; crate::prctl::SAVED_AUXV_BYTES]>,
+    /// A stop signal a delivery found with its default action, for the host
+    /// to stop the process with ([`Signals::take_stop`]); 0 for none.
+    stop: AtomicU32,
+}
+
+/// Whether a stop signal's default action stops the process
+/// ([`enable_job_control`]). Otherwise `SIGSTOP` ends it and the three a
+/// terminal raises do nothing, for a host that cannot hold a stopped
+/// process's threads.
+static JOB_CONTROL: AtomicBool = AtomicBool::new(false);
+
+/// How many processes have a stop for their host to take
+/// ([`Signals::take_stop`]), so a host's safepoint asks only when some do.
+static STOPS_ASKED: AtomicU32 = AtomicU32::new(0);
+
+/// A host that parks a stopped process's threads (the native one) turns
+/// stops on: a stop signal with its default action then stops the process
+/// ([`Signals::take_stop`], [`crate::proc::ProcTable::stop`]).
+pub fn enable_job_control() {
+    JOB_CONTROL.store(true, Ordering::Release);
+}
+
+/// Whether stops are on ([`enable_job_control`]).
+pub fn job_control() -> bool {
+    JOB_CONTROL.load(Ordering::Acquire)
+}
+
+/// Whether any process has a stop for its host to take.
+pub fn stops_asked() -> bool {
+    STOPS_ASKED.load(Ordering::Acquire) != 0
 }
 
 impl std::fmt::Debug for ProcSig {
@@ -218,6 +248,7 @@ impl ProcSig {
             fault_send: Mutex::new(None),
             prctl: Mutex::new(crate::prctl::Proc::default()),
             saved_auxv: Mutex::new([0; crate::prctl::SAVED_AUXV_BYTES]),
+            stop: AtomicU32::new(0),
         }
     }
 
@@ -509,8 +540,14 @@ impl ProcSig {
             }
         }
         // A child's end, with which child and how it ended.
+        let mut inbox = inbox;
         if inbox & (1u64 << (sig::SIGCHLD - 1)) != 0 && sources[sig::SIGCHLD as usize].is_none() {
             sources[sig::SIGCHLD as usize] = procs.take_child_end(pid);
+            // A child's stop or continue raises no SIGCHLD for a parent that
+            // asked for none (`SA_NOCLDSTOP`, `do_notify_parent_cldstop`).
+            if sources[sig::SIGCHLD as usize].is_some_and(|s| matches!(s.code, 5 | 6)) && self.action(sig::SIGCHLD).flags & sa::NOCLDSTOP != 0 {
+                inbox &= !(1u64 << (sig::SIGCHLD - 1));
+            }
         }
         for signo in 1..=64u32 {
             if inbox & (1u64 << (signo - 1)) != 0 {
@@ -1039,6 +1076,22 @@ impl Signals {
     /// for nothing.
     pub fn would_deliver(&self) -> bool {
         self.cur.ready(&self.proc)
+    }
+
+    /// The stop signal a delivery asked its host to stop the process with
+    /// ([`dispatch`]), taken: the host stops it ([`crate::proc::ProcTable::stop`]).
+    /// `None` too when a `SIGCONT` has come since and waits to be
+    /// delivered: the stop is cancelled, as `prepare_signal` clears a stop
+    /// pending when a `SIGCONT` is sent (a `SIGCONT` sent before the stop
+    /// signal would have been delivered first, being the lower number).
+    pub fn take_stop(&self) -> Option<u32> {
+        let s = self.proc.stop.swap(0, Ordering::AcqRel);
+        if s == 0 {
+            return None;
+        }
+        STOPS_ASKED.fetch_sub(1, Ordering::AcqRel);
+        let pending = self.cur.pending() | self.proc.shared.load(Ordering::Acquire);
+        (pending & bit(sig::SIGCONT) == 0).then_some(s)
     }
 
     /// Whether `SIGKILL` is pending for this thread or its process: what
@@ -2105,8 +2158,18 @@ pub fn dispatch(
     if action.handler == SIG_DFL {
         let d = match default_action(signal) {
             DefaultAction::Ignore => Delivery::None,
-            // The three a terminal raises, with no handler and no scheduler to
-            // resume from: doing nothing matches a shell with no job control (a
+            // A stop, for the host to make (`do_signal_stop`): it stops the
+            // process, the table telling its parent, and holds its threads
+            // until a `SIGCONT` or `SIGKILL`. Whether a terminal's three are
+            // discarded instead (an orphaned group's) is the table's to say.
+            DefaultAction::Stop if job_control() => {
+                if signals.proc.stop.swap(signal, Ordering::AcqRel) == 0 {
+                    STOPS_ASKED.fetch_add(1, Ordering::AcqRel);
+                }
+                return Ok(Delivery::None);
+            }
+            // With no host to hold a stopped process: the three a terminal
+            // raises do nothing, which matches a shell with no job control (a
             // `^Z` there does nothing on real hardware too), and is far better
             // than killing a backgrounded reader. `SIGSTOP` is excluded -- it
             // can't be handled, so ending the process at least does something.

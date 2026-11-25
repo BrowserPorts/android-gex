@@ -18,6 +18,44 @@ use std::sync::{Arc, Mutex};
 use crate::errno::Errno;
 use crate::syscalls::{Child, ChildHandle};
 
+/// A process's job-control state, which its parent's waits read as they
+/// read its exit status ([`ProcTable::stop`], [`ProcTable::cont`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobState {
+    /// Stopped, by this signal.
+    pub stopped: Option<u32>,
+    /// A change its parent has not waited for yet, as a wait status: a stop
+    /// (`signal << 8 | 0x7f`) or a continue (`0xffff`). Linux keeps one, the
+    /// last (`SIGNAL_STOP_STOPPED`'s exit code, `SIGNAL_STOP_CONTINUED`).
+    pub report: Option<u32>,
+}
+
+impl JobState {
+    /// The wait status of a continue (`WIFCONTINUED`).
+    pub const CONTINUED: u32 = 0xffff;
+    /// The wait status of a stop by `signal` (`WIFSTOPPED`).
+    pub fn stopped_status(signal: u32) -> u32 {
+        (signal << 8) | 0x7f
+    }
+}
+
+/// How many processes are stopped, in any table: a thread asks
+/// [`ProcTable::is_stopped`] only when some are.
+static STOPPED: AtomicU32 = AtomicU32::new(0);
+
+/// Whether any process is stopped ([`ProcTable::stop`]).
+pub fn any_stopped() -> bool {
+    STOPPED.load(Ordering::Acquire) != 0
+}
+
+const SIGCONT: u32 = 18;
+/// `SIGSTOP`, `SIGTSTP`, `SIGTTIN`, `SIGTTOU`, as a set.
+const STOP_SET: u64 = (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21);
+const CONT_BIT: u64 = 1 << (SIGCONT - 1);
+/// `si_code`s of a `SIGCHLD` for a stop and a continue.
+const CLD_STOPPED: i32 = 5;
+const CLD_CONTINUED: i32 = 6;
+
 /// The pid the kernel gives the first process, and the one orphans go to.
 pub const INIT_PID: i32 = 1;
 
@@ -232,6 +270,8 @@ pub struct ProcEntry {
     pub sid: i32,
     /// Exited and not yet collected by its parent.
     pub zombie: bool,
+    /// Stopped by a signal ([`ProcTable::stop`]): `T` in its `stat`.
+    pub stopped: bool,
     /// What the process published: its name, a newline, then its command
     /// line (NUL-separated arguments). Empty until it has said.
     pub info: Vec<u8>,
@@ -279,14 +319,14 @@ impl ProcEntry {
 }
 
 /// The wire form of a process list: per entry five `i32`s (pid, ppid, pgid,
-/// sid, zombie), the thread count and the info's length, the [`Usage`] as
+/// sid, and zombie and stopped as bits 0 and 1), the thread count and the info's length, the [`Usage`] as
 /// five `u64`s, the thread ids, each task's [`TaskUsage`] (its time, then its
 /// 16-byte name; the first thread's first), the info and the creds, padded
 /// to four bytes.
 pub fn encode_entries(entries: &[ProcEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     for e in entries {
-        for v in [e.pid, e.ppid, e.pgid, e.sid, i32::from(e.zombie), e.tids.len() as i32, e.info.len() as i32, e.creds.len() as i32] {
+        for v in [e.pid, e.ppid, e.pgid, e.sid, i32::from(e.zombie) | (i32::from(e.stopped) << 1), e.tids.len() as i32, e.info.len() as i32, e.creds.len() as i32] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         let u = &e.usage;
@@ -335,7 +375,8 @@ pub fn decode_entries(mut b: &[u8]) -> Vec<ProcEntry> {
             ppid: word(b, 1),
             pgid: word(b, 2),
             sid: word(b, 3),
-            zombie: word(b, 4) != 0,
+            zombie: word(b, 4) & 1 != 0,
+            stopped: word(b, 4) & 2 != 0,
             tids: (0..t).map(|i| word(b, HEAD / 4 + i)).collect(),
             info: b[at..at + n].to_vec(),
             creds: b[at + n..at + n + c].to_vec(),
@@ -564,6 +605,72 @@ struct Table {
 }
 
 impl Table {
+    /// Tell `procs[i]`'s parent it stopped or continued
+    /// (`do_notify_parent_cldstop`): a `SIGCHLD` with `code` (`CLD_STOPPED`,
+    /// `CLD_CONTINUED`) and `value` (the stop signal, `SIGCONT`). The parent
+    /// drops it if its `SIGCHLD` has `SA_NOCLDSTOP` (`ProcSig::collect`).
+    /// A virtual init is told nothing, as of an end. The parent's queue, to
+    /// notify once the table is let go; 0 for none.
+    fn notify_stop_change(&mut self, i: usize, code: i32, value: u32, virtual_init: bool) -> u32 {
+        let (pid, ppid) = (self.procs[i].pid, self.procs[i].ppid);
+        let uid = self.procs[i].creds.get(..4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+        if virtual_init && ppid == INIT_PID {
+            return 0;
+        }
+        let Some(parent) = self.procs.iter_mut().find(|p| p.pid == ppid) else { return 0 };
+        let was = parent.pending.fetch_or(1u64 << (SIGCHLD - 1), Ordering::AcqRel);
+        if was & (1u64 << (SIGCHLD - 1)) == 0 {
+            parent.child_end = Some((code, pid, uid, value));
+        }
+        SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+        parent.queue.id()
+    }
+
+    /// What sending `signo` to `procs[i]` does besides making it pending
+    /// (`prepare_signal`): a stop signal takes back a pending `SIGCONT`; a
+    /// `SIGCONT` takes back pending stop signals and continues the process
+    /// if it is stopped, whether or not it blocks, ignores or handles
+    /// `SIGCONT`. The continued process's wait cell and its parent's queue,
+    /// to notify once the table is let go.
+    fn before_send(&mut self, i: usize, signo: u32, virtual_init: bool) -> Option<(Arc<std::sync::Condvar>, u32)> {
+        let bit = 1u64 << (signo - 1);
+        if bit & STOP_SET != 0 {
+            self.procs[i].pending.fetch_and(!CONT_BIT, Ordering::AcqRel);
+            return None;
+        }
+        if signo != SIGCONT {
+            return None;
+        }
+        self.procs[i].pending.fetch_and(!STOP_SET, Ordering::AcqRel);
+        let job = Arc::clone(&self.procs[i].child.job);
+        {
+            let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
+            j.stopped.take()?;
+            j.report = Some(JobState::CONTINUED);
+        }
+        STOPPED.fetch_sub(1, Ordering::AcqRel);
+        let q = self.notify_stop_change(i, CLD_CONTINUED, SIGCONT, virtual_init);
+        Some((Arc::clone(&self.procs[i].child.done), q))
+    }
+
+    /// Whether process group `pgid` is orphaned, `ignore` not counted
+    /// (`will_become_orphaned_pgrp`): no member that has not ended has a
+    /// parent in another group of its session, init not counting.
+    fn orphaned(&self, pgid: i32, ignore: i32) -> bool {
+        !self.procs.iter().any(|p| {
+            p.pgid == pgid
+                && p.pid != ignore
+                && !p.ended
+                && p.ppid != INIT_PID
+                && self.procs.iter().any(|q| q.pid == p.ppid && q.pgid != pgid && q.sid == p.sid)
+        })
+    }
+
+    /// Whether any process of group `pgid` is stopped (`has_stopped_jobs`).
+    fn has_stopped(&self, pgid: i32) -> bool {
+        self.procs.iter().any(|p| p.pgid == pgid && p.child.job.lock().unwrap_or_else(|e| e.into_inner()).stopped.is_some())
+    }
+
     /// Process `pid`'s crash, if ending with `status` is one: heard by the
     /// host's hook and kept for the reader. Whether it was.
     fn record_crash(&mut self, pid: i32, status: i32) -> bool {
@@ -958,7 +1065,7 @@ impl ProcTable {
                     let mut tids: Vec<i32> = t.threads.iter().filter(|&(_, &o)| o == p.pid).map(|(&tid, _)| tid).collect();
                     tids.sort_unstable();
                     let task_usage = std::iter::once(p.pid).chain(tids.iter().copied()).map(|id| t.tasks.get(&id).copied().unwrap_or_default()).collect();
-                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, info: p.info.clone(), creds: p.creds.clone(), tids, usage: p.usage, task_usage };
+                    let e = ProcEntry { pid: p.pid, ppid: p.ppid, pgid: p.pgid, sid: p.sid, zombie: false, stopped: p.child.job.lock().unwrap_or_else(|e| e.into_inner()).stopped.is_some(), info: p.info.clone(), creds: p.creds.clone(), tids, usage: p.usage, task_usage };
                     (e, Arc::clone(&p.child.status))
                 })
                 .collect()
@@ -1051,9 +1158,24 @@ impl ProcTable {
         let virtual_init = self.virtual_init.load(Ordering::Acquire);
         let crashed;
         let left_group: Option<u64>;
+        let mut woken = Vec::new();
         let (cell, done, was_ppid, own_q, orphans) = {
             let mut t = self.lock();
             let ppid = t.procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
+            // The groups its end may orphan (`kill_orphaned_pgrp`): its own,
+            // when its parent is in another group of its session, and each
+            // child's in another group of its session.
+            let mut groups: Vec<i32> = Vec::new();
+            if let Some(me) = t.procs.iter().find(|p| p.pid == pid) {
+                if t.procs.iter().any(|q| q.pid == me.ppid && q.pgid != me.pgid && q.sid == me.sid) {
+                    groups.push(me.pgid);
+                }
+                for c in t.procs.iter().filter(|c| c.ppid == pid && c.pgid != me.pgid && c.sid == me.sid) {
+                    if !groups.contains(&c.pgid) {
+                        groups.push(c.pgid);
+                    }
+                }
+            }
             // Who its children go to (`find_new_reaper`): the nearest of
             // its ancestors that is still running and has asked for its
             // descendants' orphans (`PR_SET_CHILD_SUBREAPER`), else init.
@@ -1098,6 +1220,28 @@ impl ProcTable {
                 t.threads.remove(&tid);
                 t.tasks.remove(&tid);
             }
+            // Stopped no more.
+            if let Some(p) = t.procs.iter().find(|p| p.pid == pid) {
+                if p.child.job.lock().unwrap_or_else(|e| e.into_inner()).stopped.take().is_some() {
+                    STOPPED.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            // A group its end orphans that has a stopped process is sent
+            // `SIGHUP` and then `SIGCONT`, from the kernel: nothing would
+            // ever continue it otherwise.
+            for g in groups {
+                if !(t.orphaned(g, pid) && t.has_stopped(g)) {
+                    continue;
+                }
+                let members: Vec<usize> = (0..t.procs.len()).filter(|&i| t.procs[i].pgid == g && !t.procs[i].ended).collect();
+                for &i in &members {
+                    t.procs[i].pending.fetch_or(1u64 << (crate::signal::sig::SIGHUP - 1), Ordering::AcqRel);
+                    woken.extend(t.before_send(i, SIGCONT, virtual_init));
+                    t.procs[i].pending.fetch_or(CONT_BIT, Ordering::AcqRel);
+                    t.procs[i].queue.notify();
+                }
+                SIGNAL_SEQ.fetch_add(1, Ordering::Release);
+            }
             crashed = t.record_crash(pid, word);
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
@@ -1111,6 +1255,7 @@ impl ProcTable {
                 None => return,
             }
         };
+        Self::woken(woken);
         if let Some(cpu_ns) = left_group {
             crate::cgroup::exit(pid, cpu_ns);
         }
@@ -1451,11 +1596,13 @@ impl ProcTable {
         if signo > 0 {
             let bit = 1u64 << (signo - 1);
             let virtual_init = self.virtual_init.load(Ordering::Acquire);
+            let mut woken = Vec::new();
             for &i in &hits {
-                let p = &mut t.procs[i];
-                if virtual_init && p.pid == INIT_PID {
+                if virtual_init && t.procs[i].pid == INIT_PID {
                     continue;
                 }
+                woken.extend(t.before_send(i, signo, virtual_init));
+                let p = &mut t.procs[i];
                 p.killed |= bit;
                 p.senders[signo as usize - 1] = caller;
                 p.pending.fetch_or(bit, Ordering::AcqRel);
@@ -1465,8 +1612,66 @@ impl ProcTable {
             for &i in &hits {
                 t.procs[i].queue.notify();
             }
+            drop(t);
+            Self::woken(woken);
         }
         Ok(hits.len())
+    }
+
+    /// Tell the waits of continued processes ([`Table::before_send`]): their
+    /// parents' `wait`s, and their parents' queues for the `SIGCHLD`.
+    fn woken(woken: Vec<(Arc<std::sync::Condvar>, u32)>) {
+        for (done, q) in woken {
+            done.notify_all();
+            crate::wait::notify(q);
+        }
+    }
+
+    /// `pid` stops, as `do_signal_stop` stops a thread group, by `signal`,
+    /// a stop signal its delivery found with its default action
+    /// ([`crate::signal::Signals::take_stop`]); its parent is told. `false`
+    /// when it does not: `SIGTSTP`, `SIGTTIN` and `SIGTTOU` are discarded
+    /// in an orphaned process group, and a table that is another kernel's
+    /// keeps no stops. The host then holds its threads while
+    /// [`Self::is_stopped`].
+    pub fn stop(&self, pid: i32, signal: u32) -> bool {
+        if self.remote.is_some() {
+            return false;
+        }
+        let virtual_init = self.virtual_init.load(Ordering::Acquire);
+        let mut t = self.lock();
+        let Some(i) = t.procs.iter().position(|p| p.pid == pid) else { return false };
+        if signal != crate::signal::sig::SIGSTOP && t.orphaned(t.procs[i].pgid, 0) {
+            return false;
+        }
+        // A `SIGCONT` sent since the stop signal was delivered, not yet
+        // collected, cancels it (`prepare_signal`).
+        if t.procs[i].pending.load(Ordering::Acquire) & CONT_BIT != 0 {
+            return false;
+        }
+        let (job, done) = (Arc::clone(&t.procs[i].child.job), Arc::clone(&t.procs[i].child.done));
+        {
+            let mut j = job.lock().unwrap_or_else(|e| e.into_inner());
+            if j.stopped.is_some() {
+                return true;
+            }
+            j.stopped = Some(signal);
+            j.report = Some(JobState::stopped_status(signal));
+        }
+        STOPPED.fetch_add(1, Ordering::AcqRel);
+        let q = t.notify_stop_change(i, CLD_STOPPED, signal, virtual_init);
+        drop(t);
+        Self::woken(vec![(done, q)]);
+        true
+    }
+
+    /// Whether `pid` is stopped ([`Self::stop`]) and not yet continued.
+    pub fn is_stopped(&self, pid: i32) -> bool {
+        if !any_stopped() || self.remote.is_some() {
+            return false;
+        }
+        let job = self.lock().procs.iter().find(|p| p.pid == pid).map(|p| Arc::clone(&p.child.job));
+        job.is_some_and(|j| j.lock().unwrap_or_else(|e| e.into_inner()).stopped.is_some())
     }
 
     /// Signal every process in group `pgid`, which is named positively.
@@ -1479,20 +1684,25 @@ impl ProcTable {
         if signo > 64 {
             return Err(Errno::EINVAL);
         }
-        let t = self.lock();
-        let hits: Vec<&Proc> = t.procs.iter().filter(|p| p.pgid == pgid).collect();
+        let virtual_init = self.virtual_init.load(Ordering::Acquire);
+        let mut t = self.lock();
+        let hits: Vec<usize> = (0..t.procs.len()).filter(|&i| t.procs[i].pgid == pgid).collect();
         if hits.is_empty() {
             return Err(Errno::ESRCH);
         }
         if signo > 0 {
             let bit = 1u64 << (signo - 1);
-            for p in &hits {
-                p.pending.fetch_or(bit, Ordering::AcqRel);
+            let mut woken = Vec::new();
+            for &i in &hits {
+                woken.extend(t.before_send(i, signo, virtual_init));
+                t.procs[i].pending.fetch_or(bit, Ordering::AcqRel);
             }
             SIGNAL_SEQ.fetch_add(1, Ordering::Release);
-            for p in &hits {
-                p.queue.notify();
+            for &i in &hits {
+                t.procs[i].queue.notify();
             }
+            drop(t);
+            Self::woken(woken);
         }
         Ok(hits.len())
     }
@@ -1509,14 +1719,21 @@ impl ProcTable {
         if signo > 64 || tid <= 0 {
             return Err(Errno::EINVAL);
         }
+        let virtual_init = self.virtual_init.load(Ordering::Acquire);
         let mut t = self.lock();
-        let p = t.procs.iter_mut().find(|p| p.pid == pid).ok_or(Errno::ESRCH)?;
+        let i = t.procs.iter().position(|p| p.pid == pid).ok_or(Errno::ESRCH)?;
         if signo > 0 {
+            // A thread's `SIGCONT` continues its whole process, as a stop
+            // stops it.
+            let woken: Vec<_> = t.before_send(i, signo, virtual_init).into_iter().collect();
+            let p = &mut t.procs[i];
             p.to_threads.push((tid, signo, caller));
             // As `kill`: move the sequence the lock-free askers watch, and
             // end the target's waits so the thread collects it.
             SIGNAL_SEQ.fetch_add(1, Ordering::Release);
             p.queue.notify();
+            drop(t);
+            Self::woken(woken);
         }
         Ok(())
     }
@@ -1778,6 +1995,88 @@ fn errno_or(v: i32) -> Result<i32, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `SIGCHLD` `a` has been sent, and with what: (`si_code`, child,
+    /// `si_status`).
+    fn chld(t: &ProcTable, a: i32) -> Option<(i32, i32, u64)> {
+        (t.take_signals(a) & (1 << (SIGCHLD - 1)) != 0).then(|| t.take_child_end(a).map(|s| (s.code, s.pid, s.value))).flatten()
+    }
+
+    #[test]
+    fn a_stop_and_a_continue_are_told_to_the_parent_and_its_wait() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        let c = t.spawn(a);
+        let h = t.children(a).into_iter().find(|h| h.pid == c).unwrap();
+        assert!(!t.is_stopped(c));
+        assert!(t.stop(c, 19));
+        assert!(t.is_stopped(c));
+        assert!(t.entries().iter().find(|e| e.pid == c).unwrap().stopped);
+        assert_eq!(h.job.lock().unwrap().report, Some(19 << 8 | 0x7f));
+        assert_eq!(chld(&t, a), Some((5, c, 19)));
+        // A second stop while stopped changes nothing and tells nobody.
+        assert!(t.stop(c, 19));
+        assert_eq!(chld(&t, a), None);
+        // `SIGCONT` continues it, at the send, and is still sent.
+        t.kill(a, c, 18).unwrap();
+        assert!(!t.is_stopped(c));
+        assert_eq!(h.job.lock().unwrap().report, Some(0xffff));
+        assert_eq!(t.take_signals(c), 1 << 17);
+        assert_eq!(chld(&t, a), Some((6, c, 18)));
+        // A `SIGCONT` to a process that is not stopped continues nothing.
+        t.kill(a, c, 18).unwrap();
+        assert_eq!(chld(&t, a), None);
+        t.take_signals(c);
+        // Killed while stopped: no longer stopped.
+        assert!(t.stop(c, 19));
+        t.exit(c, 9);
+        assert!(!t.is_stopped(c));
+    }
+
+    #[test]
+    fn stop_signals_and_a_continue_take_each_other_back() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        let c = t.spawn(a);
+        t.kill(a, c, 18).unwrap();
+        t.kill(a, c, 20).unwrap();
+        assert_eq!(t.take_signals(c), 1 << 19);
+        t.kill(a, c, 19).unwrap();
+        t.kill(a, c, 21).unwrap();
+        t.kill(a, c, 18).unwrap();
+        assert_eq!(t.take_signals(c), 1 << 17);
+        // A stop whose signal was delivered before a `SIGCONT` that is not
+        // yet collected does not happen.
+        t.kill(a, c, 18).unwrap();
+        assert!(!t.stop(c, 19));
+        assert!(!t.is_stopped(c));
+    }
+
+    #[test]
+    fn a_terminal_stop_is_discarded_in_an_orphaned_group() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        let c = t.spawn(a);
+        // c and a in one group, under init: orphaned, so `SIGTSTP` does
+        // nothing and `SIGSTOP` still stops.
+        assert!(!t.stop(c, 20));
+        assert!(t.stop(c, 19));
+        t.kill(a, c, 18).unwrap();
+        t.take_signals(c);
+        // c in a group of its own, its parent in another group of the
+        // session: not orphaned.
+        t.setpgid(c, c, c).unwrap();
+        assert!(t.stop(c, 20));
+        t.take_signals(c);
+        // a ends: c's group is orphaned with a process stopped in it, so it
+        // is sent SIGHUP and SIGCONT, and continued.
+        t.exit(a, 0);
+        assert!(!t.is_stopped(c));
+        assert_eq!(t.take_signals(c), 1 | 1 << 17);
+        assert!(!t.stop(c, 20));
+        assert!(!t.stop(c, 22));
+        assert!(t.stop(c, 19));
+    }
 
     #[test]
     fn a_crash_is_reported_once_with_what_the_process_said() {

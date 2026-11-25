@@ -322,7 +322,11 @@ pub fn stat_line_at(id: i32, comm: &str, state: char, ppid: i32, pgid: i32, sid:
 /// host keeps no way to it (the page's other processes).
 pub fn status_text(id: i32, tgid: i32, comm: &str, state: char, ppid: i32, threads: usize, creds: &[u8], u: &Usage, umask: Option<u32>) -> String {
     let umask = umask.unwrap_or(0o022);
-    let st = if state == 'Z' { "Z (zombie)" } else { "R (running)" };
+    let st = match state {
+        'Z' => "Z (zombie)",
+        'T' => "T (stopped)",
+        _ => "R (running)",
+    };
     let (uid, gid, caps) = status_ids(creds);
     let (size, rss) = (u.vsize >> 10, u.rss >> 10);
     format!(
@@ -966,7 +970,13 @@ impl ProcFs {
     }
 
     fn generate_other(&self, e: &crate::proc::ProcEntry, rest: &str, tid: i32) -> Option<Vec<u8>> {
-        let state = if e.zombie { 'Z' } else { 'S' };
+        let state = if e.zombie {
+            'Z'
+        } else if e.stopped {
+            'T'
+        } else {
+            'S'
+        };
         let (id, threads) = (if tid != 0 { tid } else { e.pid }, e.tasks().len());
         // a task's own name and time; the process's for `/proc/<pid>/…`
         let (comm, usage) = if tid != 0 {
@@ -1564,6 +1574,7 @@ mod tests {
                 pgid: pid,
                 sid: 1,
                 zombie: false,
+                stopped: false,
                 info: info.to_vec(),
                 tids: tids.to_vec(),
                 creds: Vec::new(),

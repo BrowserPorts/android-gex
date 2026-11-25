@@ -1072,6 +1072,8 @@ fn fixed_random() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         gex_mem::raise_open_files();
+        // This host holds a stopped process's threads (`freeze_wait`).
+        gex_kernel::signal::enable_job_control();
         gex_mem::tune_heap();
         gex_mem::heap_stats_every();
         jit_stats_every();
@@ -2023,41 +2025,118 @@ fn note_quiescence(spawn: &Arc<SpawnContext>, pid: i32) {
     gex_kernel::cgroup::set_quiescent(pid, Arc::new(move || gate.upgrade().is_some_and(|g| g.quiet())));
 }
 
+/// Whether any process may have to be held: frozen, stopped, or with a
+/// stop to make.
+fn holds_any() -> bool {
+    gex_kernel::cgroup::any_freezing() || gex_kernel::proc::any_stopped() || gex_kernel::signal::stops_asked()
+}
+
 /// At a safepoint or syscall: stop here while this thread's process is
-/// frozen (`gex_kernel::cgroup::freezing`, `cgroup.freeze`), out of guest
-/// code, so that its group counts it frozen; go on when it is thawed, when
-/// `SIGKILL` is pending for it (which a freeze lets through), or when the
-/// process is ending. As `do_freezer_trap` stops a task on its way back to
-/// user space.
-fn freeze_point(state: &mut HostState) {
-    if !gex_kernel::cgroup::any_freezing() {
-        return;
+/// frozen (`gex_kernel::cgroup::freezing`, `cgroup.freeze`) or stopped by
+/// a signal (`ProcTable::is_stopped`), out of guest code, so that its
+/// group counts it frozen; go on when it is thawed or continued, when
+/// `SIGKILL` is pending for it (which both let through), or when the
+/// process is ending. As `do_freezer_trap` and `do_signal_stop` stop a
+/// task on its way back to user space.
+/// Whether it held the thread.
+fn freeze_point(state: &mut HostState) -> bool {
+    if !holds_any() {
+        return false;
     }
-    let Some(spawn) = state.spawn.clone() else { return };
+    let Some(spawn) = state.spawn.clone() else { return false };
     spawn.gate.leave();
-    freeze_wait(state);
+    let held = freeze_wait(state);
     spawn.gate.enter();
+    held
+}
+
+/// [`freeze_point`] on the way back to guest code at `pc` (a syscall's
+/// return, a safepoint's), and then, if it held the thread, what arrived
+/// meanwhile is delivered before guest code runs again, as `get_signal`
+/// goes on dequeuing after `do_signal_stop`: a stopped process's `SIGHUP`
+/// handler runs when it is continued, before anything else it does.
+/// `Ok(())` goes on at `pc`; a delivery leaves a resume or an exit set.
+fn hold_then_deliver(caller: &mut Caller<'_, HostState>, pc: u64, cause: &'static str) -> Result<()> {
+    if !freeze_point(caller.data_mut()) {
+        return Ok(());
+    }
+    let memory = caller.data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+    loop {
+        // The process ended in another thread (a `SIGKILL` to the stopped
+        // process that the other thread took): this one goes too, as at a
+        // safepoint. Held again instead, it would find nothing to deliver
+        // and the process still stopped, for ever.
+        if caller.data().spawn.as_ref().is_some_and(|s| s.stopping.load(std::sync::atomic::Ordering::Acquire)) {
+            caller.data_mut().exit = Some(Exit::Status(0));
+            return Err(StopExecution.into());
+        }
+        let ctx_addr = caller.data().thread.ctx_addr;
+        let delivery = {
+            let mut gm = GuestMem::new(memory.bytes());
+            let _ = gm.write_u64(ctx_addr + ctx::PC as u64, pc);
+            caller.data_mut().with_kernel(|k| k.deliver_pending(&mut gm))
+        };
+        match delivery {
+            gex_kernel::signal::Delivery::None => {
+                // Stopped again by what it delivered.
+                if freeze_point(caller.data_mut()) {
+                    continue;
+                }
+                return Ok(());
+            }
+            gex_kernel::signal::Delivery::Resume(target) => {
+                if run_signal_frames(caller, pc)? {
+                    return Err(StopExecution.into());
+                }
+                let state = caller.data_mut();
+                state.resume_cause = Some(cause.into());
+                state.resume_at = Some(target);
+                return Err(StopExecution.into());
+            }
+            gex_kernel::signal::Delivery::Terminate { signal, core } => {
+                caller.data_mut().exit = Some(Exit::Signal {
+                    signal: signal as i32,
+                    pc,
+                    detail: format!("killed by signal {signal}{}", if core { " (core dumped)" } else { "" }),
+                    internal: false,
+                });
+                return Err(StopExecution.into());
+            }
+        }
+    }
 }
 
 /// [`freeze_point`] for a thread already out of guest code (its blocking
 /// call just ended): it does not go back into guest code while frozen.
-fn freeze_wait(state: &mut HostState) {
-    if !gex_kernel::cgroup::any_freezing() {
-        return;
+/// Whether it held the thread.
+fn freeze_wait(state: &mut HostState) -> bool {
+    if !holds_any() {
+        return false;
     }
-    let Some(spawn) = state.spawn.clone() else { return };
-    let pid = state.with_kernel(|k| k.pid);
-    if !gex_kernel::cgroup::freezing(pid) {
-        return;
+    let Some(spawn) = state.spawn.clone() else { return false };
+    // A stop a delivery found (a stop signal with its default action):
+    // made here, its parent told, unless the table discards it.
+    let pid = state.with_kernel(|k| {
+        if let Some(signal) = k.signals.take_stop() {
+            k.procs.stop(k.pid, signal);
+        }
+        k.pid
+    });
+    let held = |state: &mut HostState| gex_kernel::cgroup::freezing(pid) || state.with_kernel(|k| k.procs.is_stopped(pid));
+    if !held(state) {
+        return false;
     }
     gex_kernel::cgroup::frozen_changed();
     loop {
-        if !gex_kernel::cgroup::freezing(pid) || spawn.stopping.load(std::sync::atomic::Ordering::Acquire) || state.with_kernel(|k| k.signals.kill_pending()) {
+        // What other processes have sent is collected while held: a
+        // `SIGKILL` lets it go.
+        if spawn.stopping.load(std::sync::atomic::Ordering::Acquire) || state.with_kernel(|k| k.signal_pending() && k.signals.kill_pending()) || !held(state) {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
     gex_kernel::cgroup::frozen_changed();
+    true
 }
 
 /// Bring every other guest thread to a halt after the process has exited.
@@ -2440,6 +2519,9 @@ fn perform_block(
             wstatus,
             nohang,
             waitid,
+            stops,
+            continues,
+            exits,
             // The children list passed in is already this process's, so ppid
             // is redundant here.
             ppid: _,
@@ -2454,6 +2536,34 @@ fn perform_block(
             }
             loop {
                 for c in &candidates {
+                    // A stop or a continue not yet reported, when asked for
+                    // and the child has not ended (`wait_task_stopped`,
+                    // `wait_task_continued`): reported once, unless `WNOWAIT`.
+                    if (stops || continues) && c.status.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                        let mut job = c.job.lock().unwrap_or_else(|e| e.into_inner());
+                        let wanted = match job.report {
+                            Some(gex_kernel::proc::JobState::CONTINUED) => continues,
+                            Some(_) => stops,
+                            None => false,
+                        };
+                        if let (true, Some(word)) = (wanted, job.report) {
+                            if !nowait {
+                                job.report = None;
+                            }
+                            drop(job);
+                            let mut mem = GuestMem::new(data);
+                            if let Some(w) = waitid {
+                                return w.report(&mut mem, c.pid, word);
+                            }
+                            if wstatus != 0 {
+                                mem.write_u32(wstatus, word)?;
+                            }
+                            return Ok(c.pid as u64);
+                        }
+                    }
+                    if !exits {
+                        continue;
+                    }
                     let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(code) = if nowait { *st } else { st.take() } {
                         if let Some(w) = waitid {
@@ -5583,7 +5693,9 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             check_i386_high(&caller, "a syscall");
             let state = caller.data_mut();
             match outcome {
-                SyscallOutcome::Continue => Ok(()),
+                // A stop the call's return delivered is made here, before
+                // guest code (`do_signal_stop` on the way to user space).
+                SyscallOutcome::Continue => hold_then_deliver(&mut caller, pc as u64 & !NATIVE_SYSCALL, "signal after a stop"),
                 SyscallOutcome::Resume(target) => {
                     state.resume_cause = Some("linux syscall".into());
                     state.resume_at = Some(target);
@@ -6526,7 +6638,8 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // The process's group is frozen (`cgroup.freeze`).
             freeze_point(state);
             match state.with_kernel(|k| k.deliver_pending(&mut gm)) {
-                gex_kernel::signal::Delivery::None => Ok(()),
+                // A stop it delivered is made at once, before guest code.
+                gex_kernel::signal::Delivery::None => hold_then_deliver(&mut caller, pc as u64, "signal after a stop"),
                 gex_kernel::signal::Delivery::Resume(target) => {
                     if run_signal_frames(&mut caller, pc as u64)? {
                         return Err(StopExecution.into());

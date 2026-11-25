@@ -15289,6 +15289,7 @@ fn finish_parked(
             wstatus,
             nohang,
             waitid,
+            ..
         } => {
             let nowait = waitid.is_some_and(|w| w.nowait);
             // A shared table already holds the status in the form `wait4`

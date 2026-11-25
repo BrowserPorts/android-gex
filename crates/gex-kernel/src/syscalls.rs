@@ -555,6 +555,13 @@ pub enum BlockOp {
         /// `waitid`'s answer instead of `wait4`'s: a `siginfo_t` and zero.
         /// (`si_uid` is left zero.)
         waitid: Option<WaitidOut>,
+        /// What it reports besides an end: a stop (`WUNTRACED`,
+        /// `WSTOPPED`) and a continue (`WCONTINUED`), each once
+        /// ([`crate::proc::JobState::report`]); and whether an end at all
+        /// (`waitid` without `WEXITED`). Natively; the page keeps no stops.
+        stops: bool,
+        continues: bool,
+        exits: bool,
     },
     /// `fcntl(F_SETLKW)`, `F_OFD_SETLKW` or a blocking `flock` with the
     /// lock held in the way: until `locks` would grant `req`
@@ -591,8 +598,13 @@ impl WaitidOut {
         if pid <= 0 {
             return Ok(0);
         }
-        // CLD_EXITED with the exit code, CLD_KILLED or CLD_DUMPED with the signal.
-        let (code, status) = if word & 0x7f == 0 {
+        // CLD_EXITED with the exit code, CLD_KILLED or CLD_DUMPED with the
+        // signal, CLD_STOPPED with the stop signal, CLD_CONTINUED with SIGCONT.
+        let (code, status) = if word == crate::proc::JobState::CONTINUED {
+            (6, crate::signal::sig::SIGCONT)
+        } else if word & 0xff == 0x7f {
+            (5, (word >> 8) & 0xff)
+        } else if word & 0x7f == 0 {
             (1, (word >> 8) & 0xff)
         } else if word & 0x80 != 0 {
             (3, word & 0x7f)
@@ -8837,13 +8849,17 @@ fn wait_child(procs: &Arc<ProcTable>, pid: i32, a: [u64; 6]) -> BlockOp {
         wstatus: a[1],
         nohang: a[2] & 1 != 0,
         waitid: None,
+        stops: a[2] & 2 != 0,
+        continues: a[2] & 8 != 0,
+        exits: true,
     }
 }
 
 /// `waitid(idtype, id, infop, options, rusage)` as `wait4`'s park: `P_ALL`
 /// and `P_PID` (and `P_PGID`, as any child: process groups are not told
-/// apart, as for `wait4`), `WEXITED` with `WNOHANG` and `WNOWAIT`. No child
-/// stops or continues here, so `WSTOPPED`/`WCONTINUED` alone find nothing.
+/// apart, as for `wait4`), `WEXITED`, `WSTOPPED` and `WCONTINUED` with
+/// `WNOHANG` and `WNOWAIT`. Where nothing stops (job control off: the
+/// page), `WSTOPPED`/`WCONTINUED` alone find nothing.
 /// `P_PIDFD` waits for the child a process descriptor names (`crate::pidfd`):
 /// `EBADF` for no descriptor, `EINVAL` for one that is not a process's,
 /// `ECHILD` for a process that is not the caller's child, and `EAGAIN` for
@@ -8877,11 +8893,19 @@ fn waitid_child(procs: &Arc<ProcTable>, fds: &FdTable, pid: i32, mut a: [u64; 6]
     let mut op = wait_child(procs, pid, [want as u64, 0, options & WNOHANG, 0, 0, 0]);
     if let BlockOp::WaitChild { waitid, nohang, .. } = &mut op {
         *waitid = Some(WaitidOut { info: a[2], nowait: options & WNOWAIT != 0, compat });
-        // Only exits are ever waited for here: without WEXITED a wait would
-        // never end, so it reports none (zero, or ECHILD with no children).
-        if options & WEXITED == 0 {
-            *nohang = true;
+        if !crate::signal::job_control() {
+            // Only exits are ever waited for here: without WEXITED a wait
+            // would never end, so it reports none (zero, or ECHILD with no
+            // children).
+            if options & WEXITED == 0 {
+                *nohang = true;
+            }
         }
+    }
+    if let BlockOp::WaitChild { stops, continues, exits, .. } = &mut op {
+        *stops = options & WSTOPPED != 0;
+        *continues = options & WCONTINUED != 0;
+        *exits = options & WEXITED != 0;
     }
     Ok(op)
 }
@@ -12512,6 +12536,9 @@ pub struct Child {
     /// Set once a `wait4` has collected this child, so a second one reports
     /// `ECHILD` rather than blocking forever.
     pub reaped: Arc<std::sync::atomic::AtomicBool>,
+    /// Stopped or continued, and what its parent's waits have still to
+    /// see of that ([`crate::proc::JobState`]). A change notifies `done`.
+    pub job: Arc<Mutex<crate::proc::JobState>>,
 }
 
 impl Child {
@@ -12521,6 +12548,7 @@ impl Child {
             status: Arc::new(Mutex::new(None)),
             done: Arc::new(std::sync::Condvar::new()),
             reaped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            job: Arc::new(Mutex::new(crate::proc::JobState::default())),
         }
     }
 
@@ -12531,6 +12559,7 @@ impl Child {
             status: Arc::clone(&self.status),
             done: Arc::clone(&self.done),
             reaped: Arc::clone(&self.reaped),
+            job: Arc::clone(&self.job),
         }
     }
 }
@@ -12542,6 +12571,7 @@ pub struct ChildHandle {
     pub status: Arc<Mutex<Option<i32>>>,
     pub done: Arc<std::sync::Condvar>,
     pub reaped: Arc<std::sync::atomic::AtomicBool>,
+    pub job: Arc<Mutex<crate::proc::JobState>>,
 }
 
 /// A blocking call's state that waits in the kernel for the host to finish
