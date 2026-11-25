@@ -45,6 +45,11 @@ pub trait ProcSource: Send + Sync {
         Err(Errno::ENOENT)
     }
     /// Set one of the process's SELinux ids.
+    /// Task `tid` of this process takes `name` as its name (`comm_write`,
+    /// a write to its `comm`). A source that keeps no names refuses.
+    fn set_comm(&self, _tid: i32, _name: &[u8]) -> Result<(), Errno> {
+        Err(Errno::EINVAL)
+    }
     fn set_attr_id(&self, which: usize, sid: u32) {
         let _ = (which, sid);
     }
@@ -361,6 +366,38 @@ pub fn status_ids(creds: &[u8]) -> (String, String, String) {
 #[derive(Debug)]
 struct Generated {
     data: Vec<u8>,
+}
+
+/// `/proc/self/comm` and `/proc/self/task/<tid>/comm` opened for writing:
+/// a write names the task with its first 15 bytes as they are, a newline
+/// included, up to a NUL (`comm_write`, `set_task_comm`), and answers the
+/// whole count. bionic's `pthread_setname_np` names a thread other than
+/// the caller this way. (Another process's is refused, `EINVAL`, by not
+/// being this file.)
+struct Comm {
+    source: Arc<dyn ProcSource>,
+    tid: i32,
+    read: Generated,
+}
+
+impl std::fmt::Debug for Comm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Comm").field("tid", &self.tid).finish()
+    }
+}
+
+impl FileHandle for Comm {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        self.read.read_at(offset, buf)
+    }
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        // TASK_COMM_LEN less its NUL.
+        self.source.set_comm(self.tid, &buf[..buf.len().min(15)])?;
+        Ok(buf.len() as u64)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { mode: 0o644, ..Generated { data: Vec::new() }.metadata()? })
+    }
 }
 
 /// `/proc/<pid>/oom_score_adj`: how much to prefer the process when one
@@ -1180,6 +1217,12 @@ impl FileSystem for ProcFs {
         }
         if Pressure::at(&path) {
             return Ok(Arc::new(Pressure::new(path == "pressure/irq")));
+        }
+        // A task's name, written (`comm_write`): see [`Comm`].
+        if path == "self/comm" && super::writes(flags) {
+            let tid = if tid != 0 { tid } else { self.source.pid() };
+            let data = self.generate(&path, tid).unwrap_or_default();
+            return Ok(Arc::new(Comm { source: Arc::clone(&self.source), tid, read: Generated { data } }));
         }
         if path == "self/oom_score_adj" && self.source.oom_score_adj().is_some() {
             return Ok(Arc::new(OomScoreAdj { source: Arc::clone(&self.source) }));

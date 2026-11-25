@@ -129,6 +129,11 @@ impl ProcSource for KernelProcSource {
         let l = self.0.get().ok_or(crate::errno::Errno::ESRCH)?;
         l.creds.set_oom_score_adj(value)
     }
+    fn set_comm(&self, tid: i32, name: &[u8]) -> Result<(), crate::errno::Errno> {
+        let l = self.0.get().ok_or(crate::errno::Errno::ESRCH)?;
+        l.procs.set_task_name(tid, name);
+        Ok(())
+    }
     fn set_attr_id(&self, which: usize, sid: u32) {
         if let Some(l) = self.0.get() {
             l.creds.set_sec(which, sid);
