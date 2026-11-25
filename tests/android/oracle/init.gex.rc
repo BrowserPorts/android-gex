@@ -43,9 +43,15 @@ on early-init
     # configured so would compile them: with /data kept (DATA), what is
     # compiled then is there at the next boot.
     setprop pm.dexopt.first-boot skip
-    # The composer finds its displays through DRM (the virtio-gpu's
-    # connector) rather than asking the emulator's host, as a device with
-    # guest rendering and no host renderer has it configured.
+
+# With guest rendering (bootconfig.swiftshader: minigbm's buffers, the
+# composer drawing them itself) the composer finds its displays through
+# DRM, the virtio-gpu's connector, as a device with no host renderer has it
+# configured. With the image's own graphics (bootconfig: gralloc ranchu,
+# gfxstream's host composing) it asks the emulator's host, the property
+# unset; told to look in DRM there, it finds no display and SurfaceFlinger
+# aborts with "Can't create AidlComposerClient".
+on early-init && property:ro.boot.hardware.gralloc=minigbm
     setprop ro.vendor.hwcomposer.display_finder_mode drm
 
 on post-fs
