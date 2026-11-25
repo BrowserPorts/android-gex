@@ -368,6 +368,18 @@ pub fn cache_dir() -> Option<PathBuf> {
     Some(gex_cache_root()?.join("modules"))
 }
 
+/// Where programs' image modules live (each program translated whole at
+/// exec, keyed by its image): apart from [`cache_dir`], with a budget and
+/// eviction of their own. A boot makes far more runtime units than its
+/// budget holds, most of them never asked for again (a threaded region's
+/// translation depends on timing), and in one directory their eviction,
+/// least recently used first, took the image modules too, which every
+/// boot asks for again: each boot compiled SurfaceFlinger's whole image,
+/// some 13 GB of compiling at once.
+pub fn image_cache_dir() -> Option<PathBuf> {
+    Some(gex_cache_root()?.join("images"))
+}
+
 /// Where the learned 64-bit memory records live: one
 /// file per program image that needed more address space than a wasm32
 /// memory has, named by the sha256 of the image.

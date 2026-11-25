@@ -1223,7 +1223,8 @@ fn run_program_with(
         let seed = gex_xlate::seed_module(true);
         (gex_cache::compile(&engine, &seed.wasm).context("compiling the seed of a program on its unit")?, seed.metadata())
     } else {
-        match use_cache.then(gex_cache::cache_dir).flatten() {
+        // Image modules apart from runtime units ([`gex_cache::image_cache_dir`]).
+        match use_cache.then(gex_cache::image_cache_dir).flatten() {
         Some(dir) => {
             let t_key = std::time::Instant::now();
             let key = cache_key_memo(image, xlate, &build);
