@@ -170,9 +170,11 @@ pub struct ProcKmsg;
 
 impl FileHandle for ProcKmsg {
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
-        if buf.is_empty() {
-            return Ok(0);
-        }
+        // Nothing unread is EAGAIN before the length is looked at
+        // (`kmsg_read`, then `do_syslog`'s 0 for a zero-length read).
+        // Not as Linux: a blocking zero-length read with nothing unread
+        // waits here for a record, where Linux answers 0 at once (the
+        // handle is not told how it was opened).
         let mut log = shared().log.lock().unwrap_or_else(|e| e.into_inner());
         let first = log.records.front().map_or(log.next, |r| r.seq);
         if log.syslog_seq < first {
@@ -182,6 +184,9 @@ impl FileHandle for ProcKmsg {
         let end = log.records.back().filter(|r| r.open).map_or(log.next, |r| r.seq);
         if log.syslog_seq >= end {
             return Err(Errno::EAGAIN);
+        }
+        if buf.is_empty() {
+            return Ok(0);
         }
         let mut out: Vec<u8> = Vec::new();
         while out.len() < buf.len() && log.syslog_seq < end {

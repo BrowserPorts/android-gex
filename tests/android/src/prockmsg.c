@@ -4,7 +4,8 @@
 // there is nothing more), a record written to /dev/kmsg arrives as
 // `<14>[%5lu.%06lu] text\n` (facility user, level info), a read too short
 // for the next record takes the first bytes of it and the next read the
-// rest, a zero-length read is 0, and poll says when there is something.
+// rest, a zero-length read with nothing unread is EAGAIN (non-blocking),
+// and poll says when there is something.
 // chown and chmod hold. As root; it reads (and so takes) what the log
 // holds unread.
 #define _GNU_SOURCE
@@ -42,12 +43,16 @@ int main(void) {
     want("nothing unread", read(fd, buf, sizeof buf) < 0 ? errno : 0, EAGAIN);
     struct pollfd p = {.fd = fd, .events = POLLIN};
     want("poll with nothing", poll(&p, 1, 0), 0);
-    want("a zero-length read", read(fd, buf, 0), 0);
+    // With nothing unread a non-blocking read is EAGAIN whatever its
+    // length (kmsg_read asks before do_syslog's 0 for a zero length).
+    want("a zero-length read with nothing unread", read(fd, buf, 0) < 0 ? errno : 0, EAGAIN);
 
     int k = open("/dev/kmsg", O_WRONLY);
     const char *line = "<14>gex prockmsg marker 0123456789\n";
     want("write to /dev/kmsg", write(k, line, strlen(line)), (long)strlen(line));
     want("poll with a record", poll(&p, 1, 0), 1);
+    // With one unread, a zero-length read is 0 and takes nothing.
+    want("a zero-length read with a record", read(fd, buf, 0), 0);
     // A read of 10 bytes: the record's first 10; then the rest.
     char a[16], b[512];
     long n = read(fd, a, 10);
