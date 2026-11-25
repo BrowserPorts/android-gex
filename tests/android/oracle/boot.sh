@@ -35,8 +35,12 @@
 # (unset; 5555 lets `adb connect 127.0.0.1:5555` reach the image's adbd),
 # GEX_VIRTIO_GPU (1080x1920; the display gfxstream's renderer takes too),
 # GEX_GFXSTREAM_FRAME (OUT/screen-NAME.ppm, the frame the guest last
-# posted), GEX_CACHE_MAX_BYTES (8 GiB of translations,
-# kept in gex's usual cache directory, XDG_CACHE_HOME).
+# posted), GEX_CACHE_MAX_BYTES (10 GiB of translations,
+# kept in gex's usual cache directory, XDG_CACHE_HOME: a boot past
+# the zygote makes more than 8, and a budget under one boot's evicts its
+# own first minutes, which the next boot then translates again; give the
+# boot a cache no other gexc run with a smaller budget shares, since a
+# run evicts down to its own budget).
 #
 # DATA, if set, is a host directory that is the image's /data from boot to
 # boot (fstab.gex-keep), made the first time with the owner and mode
@@ -129,7 +133,7 @@ export GEX_EMULATOR_HOST=${GEX_EMULATOR_HOST:-1}
 # guest's clock slowed to the translated code's pace, and the same random
 # numbers every boot, so that libraries load where the cache has them.
 export GEX_DENSE=${GEX_DENSE:-1} GEX_LAZY_CATCH_UP=1 GEX_TIME_SCALE=${GEX_TIME_SCALE:-8} GEX_FIXED_RANDOM=1
-export GEX_CACHE_MAX_BYTES=${GEX_CACHE_MAX_BYTES:-8589934592}
+export GEX_CACHE_MAX_BYTES=${GEX_CACHE_MAX_BYTES:-10737418240}
 if [ -z "${GEX_CACHE_BUILD:-}" ] && name=$(sh "$HERE/cache-id.sh" "$GEXC" 2>/dev/null); then
     export GEX_CACHE_BUILD="$name"
 fi
