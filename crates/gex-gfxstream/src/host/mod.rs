@@ -109,6 +109,10 @@ pub struct Renderer {
     posts: u64,
     /// The displays the guest's composer made ([`displays::Displays`]).
     displays: displays::Displays,
+    /// The host thread each guest context was last made current on: a
+    /// context current on one thread cannot be made current on another
+    /// (EGL_BAD_ACCESS), and a failure says which thread holds it.
+    current_on: std::collections::HashMap<u32, std::thread::ThreadId>,
     sink: Option<compose::Sink>,
     /// The guest's syncs (`glFenceSyncAEMU`) by handle, from 1.
     syncs: std::collections::HashMap<u64, usize>,
@@ -209,7 +213,7 @@ impl Renderer {
         unsafe { eglMakeCurrent(display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
         let max_version = if features.gles_dynamic_version { max_version_of(&host_version) } else { MaxVersion::Es2 };
         let configs = config::Configs::new(display, max_version > MaxVersion::Es2);
-        Ok(Renderer { display, egl_version: TRANSLATOR_EGL_VERSION, configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, displays: Default::default(), sink: None, syncs: Default::default(), next_sync: 0, dma: None, fences: Default::default(), next_fence: 0 })
+        Ok(Renderer { display, egl_version: TRANSLATOR_EGL_VERSION, configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, displays: Default::default(), current_on: Default::default(), sink: None, syncs: Default::default(), next_sync: 0, dma: None, fences: Default::default(), next_fence: 0 })
     }
 
     /// `rcGetGLString`'s answer for `name`: the translator's string for the
@@ -325,12 +329,33 @@ impl Thread {
     /// The host thread feeding this stream has the stream's context current,
     /// or none: a host thread may serve more than one stream.
     fn rebind(&self) {
-        let r = self.renderer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut r = self.renderer.lock().unwrap_or_else(|e| e.into_inner());
         let want = r.objects.contexts.get(&self.context).map(|c| c.egl).unwrap_or(std::ptr::null_mut());
         let surf = |h: u32| r.objects.windows.get(&h).map(|w| w.surface).unwrap_or(std::ptr::null_mut());
         let (draw, read) = (surf(self.draw), surf(self.read));
-        if !Binding::current(r.display).is(want, draw, read) && unsafe { eglMakeCurrent(r.display, draw, read, want) } != EGL_TRUE {
-            eprintln!("[gex] gfxstream: render thread {}: its context could not be made current here: {:#x}", self.id, unsafe { eglGetError() });
+        if Binding::current(r.display).is(want, draw, read) {
+            return;
+        }
+        let me = std::thread::current().id();
+        if unsafe { eglMakeCurrent(r.display, draw, read, want) } != EGL_TRUE {
+            // Which context, whose, on which host thread, and which host
+            // thread had it last: Mesa answers EGL_BAD_ACCESS for a context
+            // still current on another thread.
+            let err = unsafe { eglGetError() };
+            eprintln!(
+                "[gex] gfxstream: render thread {} (process {}): its context {} could not be made current on host thread {:?} (last current on {:?}): {:#x}",
+                self.id,
+                self.puid,
+                self.context,
+                me,
+                r.current_on.get(&self.context),
+                err
+            );
+        } else {
+            r.current_on.retain(|_, t| *t != me);
+            if self.context != 0 {
+                r.current_on.insert(self.context, me);
+            }
         }
     }
 
@@ -352,9 +377,19 @@ impl Thread {
                 d
             };
         }
+        let me = std::thread::current().id();
         if unsafe { eglMakeCurrent(r.display, d, rd, egl) } != EGL_TRUE {
-            eprintln!("[gex] gfxstream: eglMakeCurrent failed: {:#x}", unsafe { eglGetError() });
+            eprintln!(
+                "[gex] gfxstream: render thread {}: rcMakeCurrent of context {context} on host thread {me:?} (last current on {:?}) failed: {:#x}",
+                self.id,
+                r.current_on.get(&context),
+                unsafe { eglGetError() }
+            );
             return false;
+        }
+        r.current_on.retain(|_, t| *t != me);
+        if context != 0 {
+            r.current_on.insert(context, me);
         }
         // The surfaces bound are told their contexts; unbinding tells the
         // ones bound before that they have none.
