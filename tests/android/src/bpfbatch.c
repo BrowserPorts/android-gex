@@ -15,7 +15,8 @@
 //   batch (ENOTSUPP, 524);
 // - a delete batch stops at the first key not there, counting the ones it
 //   deleted;
-// - the checks: flags on a hash's lookup, elem_flags, a short attribute,
+// - the checks: flags on a hash's lookup, elem_flags, a short attribute (the
+//   rest zero, as bpf(2) copies one: a lookup),
 //   a count of 0.
 //
 // Prints nothing when all is as the source says; as root.
@@ -181,7 +182,10 @@ int main(void) {
     count = 4;
     want("flags", batch(BPF_MAP_LOOKUP_BATCH, h, NULL, &out, keys, values, &count, 0, 1, sizeof(union bpf_attr)), -EINVAL);
     want("elem_flags", batch(BPF_MAP_LOOKUP_BATCH, h, NULL, &out, keys, values, &count, BPF_F_LOCK, 0, sizeof(union bpf_attr)), -EINVAL);
-    want("a short attribute", batch(BPF_MAP_LOOKUP_BATCH, h, NULL, &out, keys, values, &count, 0, 0, offsetof(union bpf_attr, batch.flags)), -EINVAL);
+    // A short attribute: the rest is zero (bpf(2)'s copy), so one that
+    // stops before flags is a lookup from the start.
+    count = 4;
+    want("a short attribute", batch(BPF_MAP_LOOKUP_BATCH, h, NULL, &out, keys, values, &count, 0, 0, offsetof(union bpf_attr, batch.flags)), 0);
 
     // Delete by keys: 1 and 2 go, 99 is not there and stops it.
     uint32_t del[3] = {1, 2, 99};

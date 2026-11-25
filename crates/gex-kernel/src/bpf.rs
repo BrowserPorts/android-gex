@@ -1435,10 +1435,9 @@ pub fn call(c: &Caller<'_>, m: &mut GuestMem<'_>, cmd: u64, attr: u64, size: u64
         // A hash walks its buckets (`__htab_map_lookup_and_delete_batch`),
         // the others go a key at a time (`generic_map_*_batch`); a map with
         // no such command is `ENOTSUPP`.
+        // A short attribute is the rest zero, as for every command (Linux
+        // 7.0 answers one that stops before `flags`).
         cmd::MAP_LOOKUP_BATCH | cmd::MAP_LOOKUP_AND_DELETE_BATCH | cmd::MAP_UPDATE_BATCH | cmd::MAP_DELETE_BATCH => {
-            if size < 56 {
-                return Err(Errno::EINVAL);
-            }
             zero_from(56)?;
             let (map, r, w) = map_of(c, u32_at(36) as i32)?;
             let reads = matches!(cmd, cmd::MAP_LOOKUP_BATCH | cmd::MAP_LOOKUP_AND_DELETE_BATCH);
