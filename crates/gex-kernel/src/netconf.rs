@@ -25,6 +25,20 @@ fn interfaces() -> Vec<String> {
     crate::netlink::interface_names()
 }
 
+/// `net.ipv4.ip_forward` is `net.ipv4.conf.all.forwarding` by another
+/// name (`ipv4_net_table`'s entry: the same `devconf_all` field and
+/// `devinet_sysctl_forward`), so a write to it carries to `default` and
+/// every interface as one to `all` does. TetherController writes it.
+const IP_FORWARD: &str = "sys/net/ipv4/ip_forward";
+
+fn aliased(path: &str) -> &str {
+    if path == IP_FORWARD {
+        "sys/net/ipv4/conf/all/forwarding"
+    } else {
+        path
+    }
+}
+
 /// `(family, kind, entry, file)` of a path under `/proc`.
 fn parse(path: &str) -> Option<(&str, &str, &str, Option<&str>)> {
     let rest = path.strip_prefix("sys/net/")?;
@@ -82,7 +96,8 @@ pub fn is_dir(path: &str) -> bool {
 /// A directory's entries: `(name, is a directory)`.
 pub fn list(path: &str) -> Option<Vec<(String, bool)>> {
     match path {
-        "sys/net/ipv4" | "sys/net/ipv6" => return Some(vec![("conf".into(), true), ("neigh".into(), true)]),
+        "sys/net/ipv4" => return Some(vec![("conf".into(), true), ("ip_forward".into(), false), ("neigh".into(), true)]),
+        "sys/net/ipv6" => return Some(vec![("conf".into(), true), ("neigh".into(), true)]),
         "sys/net/ipv4/conf" | "sys/net/ipv6/conf" => return Some(entries("conf").into_iter().map(|e| (e, true)).collect()),
         "sys/net/ipv4/neigh" | "sys/net/ipv6/neigh" => return Some(entries("neigh").into_iter().map(|e| (e, true)).collect()),
         _ => {}
@@ -101,6 +116,7 @@ pub fn list(path: &str) -> Option<Vec<(String, bool)>> {
 
 /// A file's mode, where `path` is one.
 pub fn mode(path: &str) -> Option<u32> {
+    let path = aliased(path);
     let (family, kind, entry, Some(name)) = parse(path)? else { return None };
     file(family, kind, entry, name).map(|(m, _)| m)
 }
@@ -108,6 +124,7 @@ pub fn mode(path: &str) -> Option<u32> {
 /// What a file reads: `EIO` for one not yet set that has no value
 /// (`stable_secret`).
 pub fn read(path: &str) -> Option<Result<Vec<u8>, Errno>> {
+    let path = aliased(path);
     let (family, kind, entry, Some(name)) = parse(path)? else { return None };
     let (_, start) = file(family, kind, entry, name)?;
     let key = path["sys/net/".len()..].to_string();
@@ -121,6 +138,7 @@ pub fn read(path: &str) -> Option<Result<Vec<u8>, Errno>> {
 
 /// A write: how much of `buf` was taken.
 pub fn write(path: &str, buf: &[u8]) -> Option<Result<u64, Errno>> {
+    let path = aliased(path);
     let (family, kind, entry, Some(name)) = parse(path)? else { return None };
     let (mode, _) = file(family, kind, entry, name)?;
     Some((|| {
@@ -176,6 +194,14 @@ mod tests {
         write("sys/net/ipv6/conf/all/forwarding", b"1\n").unwrap().unwrap();
         assert_eq!(text("sys/net/ipv6/conf/lo/forwarding").unwrap(), "1\n");
         assert_eq!(text("sys/net/ipv6/conf/default/forwarding").unwrap(), "1\n");
+        // ip_forward is all/forwarding by another name, carried the same way.
+        assert_eq!(mode("sys/net/ipv4/ip_forward"), Some(0o644));
+        write("sys/net/ipv4/ip_forward", b"1").unwrap().unwrap();
+        assert_eq!(text("sys/net/ipv4/conf/all/forwarding").unwrap(), "1\n");
+        assert_eq!(text("sys/net/ipv4/conf/lo/forwarding").unwrap(), "1\n");
+        write("sys/net/ipv4/conf/all/forwarding", b"0").unwrap().unwrap();
+        assert_eq!(text("sys/net/ipv4/ip_forward").unwrap(), "0\n");
+        assert!(list("sys/net/ipv4").unwrap().contains(&("ip_forward".to_string(), false)));
         assert_eq!(text("sys/net/ipv6/conf/lo/stable_secret"), Err(Errno::EIO));
         write("sys/net/ipv6/conf/lo/stable_secret", b"::1\n").unwrap().unwrap();
         assert_eq!(text("sys/net/ipv6/conf/lo/stable_secret").unwrap(), "::1\n");
