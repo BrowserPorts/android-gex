@@ -6,7 +6,8 @@
 // bad device, kind (ENOENT into the empty slot, EINVAL over a clsact),
 // parent or missing NLM_F_CREATE; then BPF classifiers
 // on its ingress block: a SCHED_CLS program by descriptor, direct action,
-// named (handle 1, its id and FLAGS_GEN 8 in the dump after a header
+// named (its chain made and told first, RTM_NEWCHAIN; handle 1, its id
+// and FLAGS_GEN 8 in the dump after a header
 // message, the request's flags in the notification), the same again
 // (handle 2), asked for (handle 1 found, 0 not), the refusals (no
 // clsact, wrong program type, bad descriptor, bad flags, no protocol, a
@@ -276,6 +277,9 @@ int main(void) {
     want("an empty chain asked for", ask(RTM_GETTFILTER, 0, ifindex, 1, IN, info, NULL, 0), -EINVAL);
     drain();
     want("add a classifier", ask(RTM_NEWTFILTER, NLM_F_EXCL | NLM_F_CREATE, ifindex, 0, IN, info, bpf, full), 0);
+    // Its chain is made first, and told (__tcf_chain_get's first reference).
+    want("its chain's notification", notified(ifindex, &fl), RTM_NEWCHAIN);
+    want("its chain's flags", fl, NLM_F_CREATE | NLM_F_EXCL);
     want("its notification", notified(ifindex, &fl), RTM_NEWTFILTER);
     want("its flags", fl, NLM_F_REQUEST | NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE);
     want("dumped: a header and the program", dump(RTM_GETTFILTER, ifindex, IN), 2);

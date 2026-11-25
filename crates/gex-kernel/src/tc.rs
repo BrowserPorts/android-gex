@@ -38,6 +38,8 @@ pub const RTM_DELQDISC: u16 = 37;
 pub const RTM_GETQDISC: u16 = 38;
 pub const RTM_NEWTFILTER: u16 = 44;
 pub const RTM_DELTFILTER: u16 = 45;
+pub const RTM_NEWCHAIN: u16 = 100;
+pub const RTM_DELCHAIN: u16 = 101;
 pub const RTM_GETTFILTER: u16 = 46;
 /// `RTNLGRP_TC`.
 const RTNLGRP_TC: u32 = 4;
@@ -479,6 +481,18 @@ fn kind_is(k: Option<&[u8]>, name: &str) -> bool {
     k.is_none_or(|k| k == name.as_bytes())
 }
 
+/// A chain of the ingress qdisc's block made or gone (`tc_chain_notify`,
+/// `tc_chain_notify_delete`, `tc_chain_fill_node` with no template): to
+/// the group alone, from no one, as `__tcf_chain_get` tells a chain's
+/// first reference (`RTM_NEWCHAIN`, `NLM_F_CREATE | NLM_F_EXCL`) and
+/// `__tcf_chain_put` its last (`RTM_DELCHAIN`).
+fn chain_notify(kind: u16, ifindex: u32, chain: u32) {
+    let flags = if kind == RTM_NEWCHAIN { NLM_F_CREATE | NLM_F_EXCL } else { 0 };
+    let mut body = tcmsg(ifindex, 0, INGRESS_HANDLE, 0);
+    put(&mut body, TCA_CHAIN, &chain.to_le_bytes());
+    crate::netlink::route_notify(message(kind, flags, 0, 0, &body), RTNLGRP_TC);
+}
+
 /// To the group, and to the asker with `NLM_F_ECHO` (its copy among its
 /// answers).
 fn notify(r: &Req<'_>, msgs: Vec<u8>, echo_to: &mut Vec<u8>) {
@@ -662,10 +676,15 @@ fn get_qdisc(r: &Req<'_>, del: bool) -> Answer {
             return Err(Errno::ENOENT);
         }
         let Q::Ingress(k) = q else { return Err(Errno::ENOENT) };
-        if let Some(t) = s.get_mut(&r.ifindex) {
-            t.ingress = None;
-        }
+        let gone = s.get_mut(&r.ifindex).and_then(|t| t.ingress.take());
         notify(r, message(RTM_DELQDISC, 0, r.seq, r.portid, &fill_ingress(r.ifindex, k, clid, 0)), &mut echo);
+        // Its blocks' chains go after it (`notify_and_destroy`, then
+        // `tcf_block_flush_all_chains`), each told.
+        for block in gone.iter().flat_map(|i| i.blocks.iter()) {
+            for &c in block.chains.keys() {
+                chain_notify(RTM_DELCHAIN, r.ifindex, c);
+            }
+        }
         return Ok(echo);
     }
     // A get answers the group, and the asker only with `NLM_F_ECHO`.
@@ -754,6 +773,22 @@ fn new_tfilter(r: &Req<'_>) -> Answer {
     let mut s = state();
     let block = block_of(&mut s, r)?;
     let chain_index = chain_of(r)?;
+    // The chain taken (`tcf_chain_get`): made and told if it was not there,
+    // and given back with the filter's failure, told again then.
+    let made = !block.chains.contains_key(&chain_index);
+    if made {
+        chain_notify(RTM_NEWCHAIN, r.ifindex, chain_index);
+    }
+    let answer = add_tfilter(r, block, chain_index, prio, protocol, auto);
+    if made && !block.chains.get(&chain_index).is_some_and(|c| !c.is_empty()) {
+        block.chains.remove(&chain_index);
+        chain_notify(RTM_DELCHAIN, r.ifindex, chain_index);
+    }
+    answer
+}
+
+/// [`new_tfilter`] with its chain taken.
+fn add_tfilter(r: &Req<'_>, block: &mut Block, chain_index: u32, mut prio: u32, protocol: u16, auto: bool) -> Answer {
     block.classid = r.parent;
     let chain = block.chains.entry(chain_index).or_default();
     let existing = if auto { None } else { chain.iter().position(|tp| tp.prio == prio) };
@@ -915,6 +950,7 @@ fn del_tfilter(r: &Req<'_>) -> Answer {
         if !msgs.is_empty() {
             notify(r, msgs, &mut echo);
         }
+        chain_notify(RTM_DELCHAIN, r.ifindex, chain_index);
         return Ok(echo);
     }
     let i = chain.iter().position(|tp| tp.prio == prio).ok_or(Errno::ENOENT)?;
@@ -927,10 +963,14 @@ fn del_tfilter(r: &Req<'_>) -> Answer {
     if r.handle == 0 {
         let tp = chain.remove(i);
         let body = fill_filter(r.ifindex, r.parent, &tp, chain_index, None);
-        if chain.is_empty() {
+        let emptied = chain.is_empty();
+        if emptied {
             block.chains.remove(&chain_index);
         }
         notify(r, message(RTM_DELTFILTER, r.flags, r.seq, r.portid, &body), &mut echo);
+        if emptied {
+            chain_notify(RTM_DELCHAIN, r.ifindex, chain_index);
+        }
         return Ok(echo);
     }
     let at = chain[i].filters.iter().position(|f| f.handle == r.handle).ok_or(Errno::ENOENT)?;
@@ -939,10 +979,14 @@ fn del_tfilter(r: &Req<'_>) -> Answer {
     if chain[i].filters.is_empty() {
         chain.remove(i);
     }
-    if chain.is_empty() {
+    let emptied = chain.is_empty();
+    if emptied {
         block.chains.remove(&chain_index);
     }
     notify(r, message(RTM_DELTFILTER, r.flags, r.seq, r.portid, &body), &mut echo);
+    if emptied {
+        chain_notify(RTM_DELCHAIN, r.ifindex, chain_index);
+    }
     Ok(echo)
 }
 
