@@ -142,6 +142,20 @@ fn gl_string(name: u32) -> String {
     unsafe { string(f(name) as *const c_char) }.unwrap_or_default()
 }
 
+/// The host's `glGetIntegerv` of `name` on the current context (0 when it
+/// has none).
+fn gl_integer(name: u32) -> i32 {
+    type GetIntegerv = unsafe extern "C" fn(u32, *mut i32);
+    let p = proc_address("glGetIntegerv");
+    if p.is_null() {
+        return 0;
+    }
+    let f: GetIntegerv = unsafe { std::mem::transmute(p) };
+    let mut v = 0;
+    unsafe { f(name, &mut v) };
+    v
+}
+
 /// The version an OpenGL ES version string names (`OpenGL ES 3.1 Mesa ...`).
 fn max_version_of(version: &str) -> MaxVersion {
     let v = version.trim_start_matches("OpenGL ES ").split(|c: char| c == ' ' || c == '-').next().unwrap_or("");
@@ -195,9 +209,10 @@ impl Renderer {
         Ok(Renderer { display, egl_version: TRANSLATOR_EGL_VERSION, configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None, syncs: Default::default(), next_sync: 0, dma: None, fences: Default::default(), next_fence: 0 })
     }
 
-    /// `rcGetGLString`'s answer for `name`: the host's string on the
-    /// thread's current context (none: empty), then for `GL_EXTENSIONS` what
-    /// the host offers, and for `GL_VERSION` the version the guest may use.
+    /// `rcGetGLString`'s answer for `name`: the translator's string for the
+    /// thread's current context (none: empty; [`translator::gl_string`]),
+    /// then for `GL_EXTENSIONS` what the host offers, and for `GL_VERSION`
+    /// the version the guest may use.
     fn gl_string(&self, name: u32, current: Option<String>) -> String {
         let mut s = current.unwrap_or_default();
         if name == GL_EXTENSIONS {
@@ -421,10 +436,12 @@ impl Thread {
                 reply(&[&b], ret as u32 as u64)
             }
             "rcGetGLString" | "rcGetHostExtensionsString" => {
-                // The host's string on the thread's current context, if it
-                // has one (`rcGetHostExtensionsString` is GL_EXTENSIONS's).
+                // The translator's string for the thread's current context,
+                // if it has one (`EmulationGl::getGlString`, which asks the
+                // translator's `glGetString`; `rcGetHostExtensionsString`
+                // is GL_EXTENSIONS's).
                 let (name, out, size) = if call.name == "rcGetGLString" { (v(0) as u32, 1, 2) } else { (GL_EXTENSIONS, 1, 0) };
-                let current = (self.context != 0).then(|| gl_string(name));
+                let current = r.objects.contexts.get(&self.context).map(|c| translator::gl_string(name, c.version, &gl_string, &gl_integer).unwrap_or_default());
                 let s = r.gl_string(name, current);
                 let room = match a[out] {
                     Arg::Out(n) => n as i32,

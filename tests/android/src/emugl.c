@@ -171,6 +171,70 @@ int main(int argc, char **argv) {
             printf("emugl: SurfaceFlinger's placeholder (no config %d, surfaceless %d): context %p surface %p: %#x\n", !!no_config, !!surfaceless, sf_ctx, sf_pb, eglError());
             return 1;
         }
+        {
+            const char *(*str)(unsigned) = sym(gles, "glGetString");
+            const char *v = str ? str(GL_VERSION) : NULL, *sl = str ? str(0x8B8C) : NULL;
+            printf("emugl: SurfaceFlinger's context: '%s', GLSL '%s'\n", v ? v : "(null)", sl ? sl : "(null)");
+            // Skia reads an ES3 context's extensions one by one
+            // (GrGLExtensions::init) and takes every function from
+            // eglGetProcAddress (GrGLMakeEGLInterface): a missing one fails
+            // GrGLInterface::validate.
+            void (*getIntegerv)(unsigned, int *) = sym(gles, "glGetIntegerv");
+            const char *(*getStringi)(unsigned, unsigned) = sym(gles, "glGetStringi");
+            void *(*getProc)(const char *) = sym(egl, "eglGetProcAddress");
+            int count = -1, nulls = 0;
+            if (getIntegerv) getIntegerv(0x821D, &count); // GL_NUM_EXTENSIONS
+            for (int i = 0; getStringi && i < count; i++) {
+                if (!getStringi(0x1F03, i)) nulls++;
+            }
+            printf("emugl: GL_NUM_EXTENSIONS %d, %d of them null by glGetStringi\n", count, nulls);
+            static const char *const want[] = {
+                "glActiveTexture", "glAttachShader", "glBindAttribLocation", "glBindBuffer", "glBindFramebuffer",
+                "glBindRenderbuffer", "glBindSampler", "glBindTexture", "glBindVertexArray", "glBlendColor",
+                "glBlendEquation", "glBlendFunc", "glBlitFramebuffer", "glBufferData", "glBufferSubData",
+                "glCheckFramebufferStatus", "glClear", "glClearColor", "glClearStencil", "glClientWaitSync",
+                "glColorMask", "glCompileShader", "glCompressedTexImage2D", "glCompressedTexSubImage2D",
+                "glCopyBufferSubData", "glCopyTexSubImage2D", "glCreateProgram", "glCreateShader", "glCullFace",
+                "glDeleteBuffers", "glDeleteFramebuffers", "glDeleteProgram", "glDeleteRenderbuffers",
+                "glDeleteSamplers", "glDeleteShader", "glDeleteSync", "glDeleteTextures", "glDeleteVertexArrays",
+                "glDepthMask", "glDisable", "glDisableVertexAttribArray", "glDrawArrays", "glDrawArraysIndirect",
+                "glDrawArraysInstanced", "glDrawBuffers", "glDrawElements", "glDrawElementsIndirect",
+                "glDrawElementsInstanced", "glDrawRangeElements", "glEnable", "glEnableVertexAttribArray",
+                "glFenceSync", "glFinish", "glFlush", "glFlushMappedBufferRange", "glFramebufferRenderbuffer",
+                "glFramebufferTexture2D", "glFrontFace", "glGenBuffers", "glGenFramebuffers", "glGenRenderbuffers",
+                "glGenSamplers", "glGenTextures", "glGenVertexArrays", "glGenerateMipmap", "glGetBufferParameteriv",
+                "glGetError", "glGetFramebufferAttachmentParameteriv", "glGetIntegerv", "glGetInternalformativ",
+                "glGetProgramBinary", "glGetProgramInfoLog", "glGetProgramiv", "glGetRenderbufferParameteriv",
+                "glGetShaderInfoLog", "glGetShaderPrecisionFormat", "glGetShaderiv", "glGetString", "glGetStringi",
+                "glGetUniformLocation", "glInvalidateFramebuffer", "glInvalidateSubFramebuffer", "glIsTexture",
+                "glLineWidth", "glLinkProgram", "glMapBufferRange", "glPixelStorei", "glProgramBinary",
+                "glProgramParameteri", "glReadBuffer", "glReadPixels", "glRenderbufferStorage",
+                "glRenderbufferStorageMultisample", "glSamplerParameterf", "glSamplerParameteri",
+                "glSamplerParameteriv", "glScissor", "glShaderSource", "glStencilFunc", "glStencilFuncSeparate",
+                "glStencilMask", "glStencilMaskSeparate", "glStencilOp", "glStencilOpSeparate", "glTexImage2D",
+                "glTexParameterf", "glTexParameterfv", "glTexParameteri", "glTexParameteriv", "glTexStorage2D",
+                "glTexSubImage2D", "glUniform1f", "glUniform1fv", "glUniform1i", "glUniform1iv", "glUniform2f",
+                "glUniform2fv", "glUniform2i", "glUniform2iv", "glUniform3f", "glUniform3fv", "glUniform3i",
+                "glUniform3iv", "glUniform4f", "glUniform4fv", "glUniform4i", "glUniform4iv",
+                "glUniformMatrix2fv", "glUniformMatrix3fv", "glUniformMatrix4fv", "glUnmapBuffer", "glUseProgram",
+                "glVertexAttrib1f", "glVertexAttrib2fv", "glVertexAttrib3fv", "glVertexAttrib4fv",
+                "glVertexAttribDivisor", "glVertexAttribIPointer", "glVertexAttribPointer", "glViewport",
+                "glWaitSync", "glGetSynciv", "glIsSync", "glTexBufferEXT", "glEGLImageTargetTexture2DOES",
+                "glEGLImageTargetRenderbufferStorageOES", "glPushGroupMarkerEXT", "glPopGroupMarkerEXT",
+                "glInsertEventMarkerEXT", "glDebugMessageCallbackKHR", "glObjectLabelKHR", "glBlendBarrierKHR",
+                "glDrawArraysInstancedBaseInstanceEXT", "glMultiDrawArraysIndirectEXT", "glCopyImageSubData",
+                "glGetQueryObjectuiv", "glGenQueries", "glBeginQuery", "glEndQuery", "glDeleteQueries",
+                "glGetQueryiv", "glGetBufferPointerv", "glMapBufferOES", "glUnmapBufferOES",
+            };
+            int missing = 0;
+            for (unsigned i = 0; getProc && i < sizeof want / sizeof *want; i++) {
+                if (!getProc(want[i])) {
+                    printf("emugl: eglGetProcAddress has no %s\n", want[i]);
+                    missing++;
+                }
+            }
+            printf("emugl: %d of %zu entry points missing\n", missing, sizeof want / sizeof *want);
+        }
         makeCurrent(dpy, NULL, NULL, NULL);
     }
     EGLint attrs[] = {EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_NONE};
@@ -189,6 +253,15 @@ int main(int argc, char **argv) {
         return 1;
     }
     printf("emugl: %s / %s\n", getString(GL_VERSION), getString(GL_RENDERER));
+    // What Skia's GrGLContext::Make parses (GrGLGetVersion,
+    // GrGLGetGLSLGeneration, GrGLGetVendor): a null or unparsable string
+    // makes GrDirectContext creation fail, which aborts SurfaceFlinger.
+    {
+        const char *sl = getString(0x8B8C); // GL_SHADING_LANGUAGE_VERSION
+        const char *vendor = getString(0x1F00); // GL_VENDOR
+        const char *ext = getString(0x1F03); // GL_EXTENSIONS
+        printf("emugl: GLSL '%s', vendor '%s', %zu bytes of extensions\n", sl ? sl : "(null)", vendor ? vendor : "(null)", ext ? strlen(ext) : 0);
+    }
     clearColor(1.0f, 0.5f, 0.0f, 1.0f);
     clear(GL_COLOR_BUFFER_BIT);
     uint8_t px[16 * 16 * 4];

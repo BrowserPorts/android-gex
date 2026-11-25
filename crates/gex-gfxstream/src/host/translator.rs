@@ -590,8 +590,294 @@ pub fn host_infos(dpy: EGLDisplay) -> Vec<(EGLConfig, HostInfo)> {
         .collect()
 }
 
+/// The translator's OpenGL ES strings, which are what the guest is told
+/// (`EmulationGl::getGlString` asks the translator's `glGetString`, not the
+/// host driver's): `glestranslator`'s `GLEScontext::buildStrings`,
+/// `initCapsLocked`, `GLESv2Context::initExtensionString` with
+/// `InitExtensionString`, `GLEScmContext::initExtensionString`, and
+/// `glGetString` in `gles_v2_imp.cpp`, for a context of `version` (one of
+/// [`super::objects`]' `GLES_API_*`) on a host that is OpenGL ES
+/// (`isGles2Gles`) and not a core profile. `host` is the host's own
+/// `glGetString` on that context, `host_integer` its `glGetIntegerv`.
+///
+/// The extensions offered are only those the guest's encoder can serve:
+/// offered the host's whole list, the guest's Skia found extensions whose
+/// functions the encoder has not (`GL_EXT_debug_marker`, `GL_KHR_debug`,
+/// ...), and SurfaceFlinger's `GrDirectContext` creation failed.
+pub fn gl_string(name: u32, version: u32, host: &dyn Fn(u32) -> String, host_integer: &dyn Fn(u32) -> i32) -> Option<String> {
+    const GL_VENDOR: u32 = 0x1F00;
+    const GL_RENDERER: u32 = 0x1F01;
+    const GL_VERSION: u32 = 0x1F02;
+    const GL_EXTENSIONS: u32 = 0x1F03;
+    const GL_SHADING_LANGUAGE_VERSION: u32 = 0x8B8C;
+    let gles1 = version == super::objects::GLES_API_CM;
+    let (major, minor) = match version {
+        super::objects::GLES_API_CM => (1, 1),
+        super::objects::GLES_API_2 => (2, 0),
+        super::objects::GLES_API_3_0 => (3, 0),
+        _ => (3, 1),
+    };
+    let base = |n: u32| {
+        let s = host(n);
+        if s.is_empty() {
+            "N/A".to_string()
+        } else {
+            s
+        }
+    };
+    Some(match name {
+        GL_VENDOR => format!("Google ({})", base(GL_VENDOR)),
+        GL_RENDERER => format!("Android Emulator OpenGL ES Translator ({})", base(GL_RENDERER)),
+        GL_VERSION => {
+            // `sPickVersionStringPart`, or ES-CM's.
+            let part = match (major, minor) {
+                (1, _) => "OpenGL ES-CM 1.1",
+                (2, _) => "OpenGL ES 2.0",
+                (3, 0) => "OpenGL ES 3.0",
+                _ => "OpenGL ES 3.1",
+            };
+            format!("{part} ({})", base(GL_VERSION))
+        }
+        // GLES 1's comes from the host (`gles_cm_imp.cpp` passes it
+        // through); GLES 2 and 3's are the translator's.
+        GL_SHADING_LANGUAGE_VERSION if gles1 => host(GL_SHADING_LANGUAGE_VERSION),
+        GL_SHADING_LANGUAGE_VERSION => match (major, minor) {
+            (3, 0) => "OpenGL ES GLSL ES 3.00",
+            (3, _) => "OpenGL ES GLSL ES 3.10",
+            _ => "OpenGL ES GLSL ES 1.0.17",
+        }
+        .to_string(),
+        GL_EXTENSIONS => {
+            let caps = Caps::of(&host(GL_EXTENSIONS), &host(GL_VERSION));
+            if gles1 {
+                caps.gles1_extensions(host_integer)
+            } else {
+                caps.gles2_extensions()
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// gfxstream's `Version` of a string: two or three numbers by `sscanf`
+/// at its start, else 0.0 (Mesa's "OpenGL ES 3.1 Mesa ..." is 0.0).
+fn version_of(s: &str) -> (u32, u32) {
+    let t = s.trim_start();
+    let num = |t: &str| -> Option<(u32, usize)> {
+        let t2 = t.trim_start();
+        let skip = t.len() - t2.len();
+        let (sign, body) = match t2.as_bytes().first() {
+            Some(b'+') | Some(b'-') => (1, &t2[1..]),
+            _ => (0, t2),
+        };
+        let n = body.bytes().take_while(u8::is_ascii_digit).count();
+        (n > 0).then(|| (body[..n].parse::<u32>().unwrap_or(0), skip + sign + n))
+    };
+    match num(t) {
+        Some((major, used)) if t[used..].starts_with('.') => match num(&t[used + 1..]) {
+            Some((minor, _)) => (major, minor),
+            None => (0, 0),
+        },
+        _ => (0, 0),
+    }
+}
+
+/// What `initCapsLocked` finds in the host's extensions (`getHostExtensionsString`:
+/// the list with a space before and after) for the strings it builds, as
+/// on a host that is OpenGL ES and not a core profile.
+struct Caps {
+    half_float_pixel: bool,
+    nv_half_float: bool,
+    packed_depth_stencil: bool,
+    half_float_vertex: bool,
+    standard_derivatives: bool,
+    texture_npot: bool,
+    rgb8_rgba8: bool,
+    ovr_multiview2: bool,
+    multiview_texture_multisample: bool,
+    color_buffer_float: bool,
+    color_buffer_half_float: bool,
+    shader_framebuffer_fetch: bool,
+    bgra8888: bool,
+    ext_texture_buffer: bool,
+    oes_texture_buffer: bool,
+    draw_buffers_indexed: bool,
+    clip_cull_distance: bool,
+    read_format: bool,
+    framebuffer_object: bool,
+    matrix_palette: bool,
+    vertex_blend: bool,
+}
+
+impl Caps {
+    fn of(extensions: &str, gl_version: &str) -> Caps {
+        let s = format!(" {} ", extensions.trim());
+        let has = |x: &str| s.contains(x);
+        Caps {
+            half_float_pixel: has("GL_ARB_half_float_pixel ") || has("GL_OES_texture_half_float "),
+            nv_half_float: has("GL_NV_half_float "),
+            packed_depth_stencil: has("GL_EXT_packed_depth_stencil ") || has("GL_OES_packed_depth_stencil "),
+            half_float_vertex: has("GL_ARB_half_float_vertex ") || has("GL_OES_vertex_half_float "),
+            standard_derivatives: has("GL_OES_standard_derivatives "),
+            texture_npot: has("GL_ARB_texture_non_power_of_two") || has("GL_OES_texture_npot"),
+            rgb8_rgba8: version_of(gl_version) >= (3, 0) || has("GL_OES_rgb8_rgba8"),
+            ovr_multiview2: has("GL_OVR_multiview2"),
+            multiview_texture_multisample: has("GL_EXT_multiview_texture_multisample"),
+            color_buffer_float: has("GL_ARB_color_buffer_float") || has("GL_EXT_color_buffer_float"),
+            color_buffer_half_float: has("GL_EXT_color_buffer_half_float"),
+            // On a host that is OpenGL ES only (b/203446380).
+            shader_framebuffer_fetch: has("GL_EXT_shader_framebuffer_fetch"),
+            bgra8888: has("GL_EXT_bgra ") || has("GL_EXT_texture_format_BGRA8888"),
+            ext_texture_buffer: has("GL_EXT_texture_buffer"),
+            oes_texture_buffer: has("GL_OES_texture_buffer"),
+            draw_buffers_indexed: has("GL_EXT_draw_buffers_indexed"),
+            clip_cull_distance: has("GL_EXT_clip_cull_distance"),
+            read_format: has("GL_OES_read_format "),
+            framebuffer_object: has("GL_EXT_framebuffer_object "),
+            matrix_palette: has("GL_ARB_matrix_palette "),
+            vertex_blend: has("GL_ARB_vertex_blend "),
+        }
+    }
+
+    /// `InitExtensionString`: OpenGL ES 2 and 3's.
+    fn gles2_extensions(&self) -> String {
+        let mut ext = String::from(
+            "GL_OES_EGL_sync GL_OES_EGL_image GL_OES_EGL_image_external GL_OES_depth24 GL_OES_depth32 \
+             GL_OES_element_index_uint \
+             GL_OES_texture_float GL_OES_texture_float_linear \
+             GL_OES_compressed_paletted_texture GL_OES_compressed_ETC1_RGB8_texture \
+             GL_OES_depth_texture ",
+        );
+        let mut add = |on: bool, x: &str| {
+            if on {
+                ext.push_str(x);
+            }
+        };
+        add(self.half_float_pixel || self.nv_half_float, "GL_OES_texture_half_float GL_OES_texture_half_float_linear ");
+        add(self.packed_depth_stencil, "GL_OES_packed_depth_stencil ");
+        add(self.half_float_vertex, "GL_OES_vertex_half_float ");
+        add(self.standard_derivatives, "GL_OES_standard_derivatives ");
+        add(self.texture_npot, "GL_OES_texture_npot ");
+        add(self.rgb8_rgba8, "GL_OES_rgb8_rgba8 ");
+        add(self.ovr_multiview2, "GL_OVR_multiview2 ");
+        add(self.multiview_texture_multisample, "GL_EXT_multiview_texture_multisample ");
+        add(self.color_buffer_float, "GL_EXT_color_buffer_float ");
+        add(self.color_buffer_half_float, "GL_EXT_color_buffer_half_float ");
+        add(self.shader_framebuffer_fetch, "GL_EXT_shader_framebuffer_fetch ");
+        add(self.bgra8888, "GL_EXT_texture_format_BGRA8888 GL_APPLE_texture_format_BGRA8888 ");
+        add(self.ext_texture_buffer, "GL_EXT_texture_buffer ");
+        add(self.oes_texture_buffer, "GL_OES_texture_buffer ");
+        add(self.draw_buffers_indexed, "GL_EXT_draw_buffers_indexed ");
+        add(self.clip_cull_distance, "GL_EXT_clip_cull_distance ");
+        ext
+    }
+
+    /// `GLEScmContext::initExtensionString`: OpenGL ES 1's.
+    fn gles1_extensions(&self, host_integer: &dyn Fn(u32) -> i32) -> String {
+        let mut ext = String::from(
+            "GL_OES_blend_func_separate GL_OES_blend_equation_separate GL_OES_blend_subtract \
+             GL_OES_byte_coordinates GL_OES_compressed_paletted_texture GL_OES_point_size_array \
+             GL_OES_point_sprite GL_OES_single_precision GL_OES_stencil_wrap GL_OES_texture_env_crossbar \
+             GL_OES_texture_mirored_repeat GL_OES_EGL_image GL_OES_element_index_uint GL_OES_draw_texture \
+             GL_OES_texture_cube_map GL_OES_draw_texture ",
+        );
+        if self.read_format {
+            ext.push_str("GL_OES_read_format ");
+        }
+        if self.framebuffer_object {
+            ext.push_str(
+                "GL_OES_framebuffer_object GL_OES_depth24 GL_OES_depth32 GL_OES_fbo_render_mipmap \
+                 GL_OES_rgb8_rgba8 GL_OES_stencil1 GL_OES_stencil4 GL_OES_stencil8 ",
+            );
+        }
+        if self.packed_depth_stencil {
+            ext.push_str("GL_OES_packed_depth_stencil ");
+        }
+        if self.bgra8888 {
+            ext.push_str("GL_EXT_texture_format_BGRA8888 GL_APPLE_texture_format_BGRA8888 ");
+        }
+        if self.matrix_palette && self.vertex_blend {
+            ext.push_str("GL_OES_matrix_palette ");
+            const GL_MAX_PALETTE_MATRICES_OES: u32 = 0x8842;
+            const GL_MAX_VERTEX_UNITS_OES: u32 = 0x86A4;
+            if host_integer(GL_MAX_PALETTE_MATRICES_OES) >= 32 && host_integer(GL_MAX_VERTEX_UNITS_OES) >= 4 {
+                ext.push_str("GL_OES_extended_matrix_palette ");
+            }
+        }
+        ext.push_str("GL_OES_compressed_ETC1_RGB8_texture ");
+        ext
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// A host as this Mac's Mesa answers: an OpenGL ES 3.1 driver whose
+    /// extensions include ones the guest's encoder cannot serve.
+    fn mesa(name: u32) -> String {
+        match name {
+            0x1F00 => "Mesa".into(),
+            0x1F01 => "llvmpipe (LLVM 23.1.5, 128 bits)".into(),
+            0x1F02 => "OpenGL ES 3.1 Mesa 26.3.0".into(),
+            0x8B8C => "OpenGL ES GLSL ES 3.20".into(),
+            0x1F03 => "GL_EXT_blend_minmax GL_EXT_debug_marker GL_KHR_debug GL_KHR_blend_equation_advanced \
+                       GL_EXT_base_instance GL_EXT_multi_draw_indirect GL_OES_texture_half_float GL_OES_texture_half_float_linear \
+                       GL_OES_packed_depth_stencil GL_OES_standard_derivatives GL_OES_texture_npot GL_OES_rgb8_rgba8 \
+                       GL_EXT_color_buffer_float GL_EXT_color_buffer_half_float GL_EXT_texture_format_BGRA8888 \
+                       GL_EXT_texture_buffer GL_OES_texture_buffer GL_EXT_draw_buffers_indexed GL_EXT_clip_cull_distance \
+                       GL_EXT_shader_framebuffer_fetch GL_OES_vertex_half_float"
+                .into(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn the_guest_is_told_the_translators_strings_not_the_hosts() {
+        use super::super::objects::{GLES_API_2, GLES_API_3_0, GLES_API_3_1, GLES_API_CM};
+        let s = |name, v| gl_string(name, v, &mesa, &|_| 0).unwrap();
+        assert_eq!(s(0x1F00, GLES_API_3_1), "Google (Mesa)");
+        assert_eq!(s(0x1F01, GLES_API_3_1), "Android Emulator OpenGL ES Translator (llvmpipe (LLVM 23.1.5, 128 bits))");
+        assert_eq!(s(0x1F02, GLES_API_3_1), "OpenGL ES 3.1 (OpenGL ES 3.1 Mesa 26.3.0)");
+        assert_eq!(s(0x1F02, GLES_API_3_0), "OpenGL ES 3.0 (OpenGL ES 3.1 Mesa 26.3.0)");
+        assert_eq!(s(0x1F02, GLES_API_2), "OpenGL ES 2.0 (OpenGL ES 3.1 Mesa 26.3.0)");
+        assert_eq!(s(0x1F02, GLES_API_CM), "OpenGL ES-CM 1.1 (OpenGL ES 3.1 Mesa 26.3.0)");
+        assert_eq!(s(0x8B8C, GLES_API_3_1), "OpenGL ES GLSL ES 3.10");
+        assert_eq!(s(0x8B8C, GLES_API_3_0), "OpenGL ES GLSL ES 3.00");
+        assert_eq!(s(0x8B8C, GLES_API_2), "OpenGL ES GLSL ES 1.0.17");
+        assert_eq!(gl_string(0x1234, GLES_API_2, &mesa, &|_| 0), None);
+        // Only what the translator offers: none of the host's debug,
+        // blend-equation or multi-draw extensions.
+        let ext = s(0x1F03, GLES_API_3_1);
+        for x in ["GL_EXT_debug_marker", "GL_KHR_debug", "GL_KHR_blend_equation_advanced", "GL_EXT_base_instance", "GL_EXT_multi_draw_indirect", "GL_EXT_blend_minmax"] {
+            assert!(!ext.contains(x), "{x} in {ext}");
+        }
+        assert_eq!(
+            ext,
+            "GL_OES_EGL_sync GL_OES_EGL_image GL_OES_EGL_image_external GL_OES_depth24 GL_OES_depth32 \
+             GL_OES_element_index_uint GL_OES_texture_float GL_OES_texture_float_linear \
+             GL_OES_compressed_paletted_texture GL_OES_compressed_ETC1_RGB8_texture GL_OES_depth_texture \
+             GL_OES_texture_half_float GL_OES_texture_half_float_linear GL_OES_packed_depth_stencil \
+             GL_OES_vertex_half_float GL_OES_standard_derivatives GL_OES_texture_npot GL_OES_rgb8_rgba8 \
+             GL_EXT_color_buffer_float GL_EXT_color_buffer_half_float GL_EXT_shader_framebuffer_fetch \
+             GL_EXT_texture_format_BGRA8888 GL_APPLE_texture_format_BGRA8888 GL_EXT_texture_buffer \
+             GL_OES_texture_buffer GL_EXT_draw_buffers_indexed GL_EXT_clip_cull_distance "
+        );
+        let es1 = s(0x1F03, GLES_API_CM);
+        assert!(es1.starts_with("GL_OES_blend_func_separate ") && es1.ends_with("GL_OES_compressed_ETC1_RGB8_texture "));
+        assert!(es1.contains("GL_OES_packed_depth_stencil ") && !es1.contains("GL_OES_framebuffer_object"));
+    }
+
+    #[test]
+    fn a_version_is_read_as_sscanf_reads_it() {
+        assert_eq!(version_of("OpenGL ES 3.1 Mesa 26.3.0"), (0, 0));
+        assert_eq!(version_of("4.6.0 NVIDIA 550"), (4, 6));
+        assert_eq!(version_of("  3.0"), (3, 0));
+        assert_eq!(version_of("3"), (0, 0));
+        // Without GL_OES_rgb8_rgba8, a host whose version does not parse
+        // as 3.0 or more is not taken to have it.
+        let host = |n: u32| if n == 0x1F02 { "OpenGL ES 3.1 Mesa".to_string() } else { String::new() };
+        assert!(!gl_string(0x1F03, super::super::objects::GLES_API_2, &host, &|_| 0).unwrap().contains("rgb8_rgba8"));
+    }
     use super::*;
 
     fn host(r: EGLint, g: EGLint, b: EGLint, a: EGLint, depth: EGLint, stencil: EGLint) -> HostInfo {
