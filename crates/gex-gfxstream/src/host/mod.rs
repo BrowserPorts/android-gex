@@ -13,6 +13,7 @@
 
 pub mod compose;
 pub mod config;
+pub mod displays;
 pub mod egl;
 pub mod gl;
 mod gles;
@@ -106,6 +107,8 @@ pub struct Renderer {
     /// The color buffer the display shows, and how many posts there were.
     shown: u32,
     posts: u64,
+    /// The displays the guest's composer made ([`displays::Displays`]).
+    displays: displays::Displays,
     sink: Option<compose::Sink>,
     /// The guest's syncs (`glFenceSyncAEMU`) by handle, from 1.
     syncs: std::collections::HashMap<u64, usize>,
@@ -206,7 +209,7 @@ impl Renderer {
         unsafe { eglMakeCurrent(display, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
         let max_version = if features.gles_dynamic_version { max_version_of(&host_version) } else { MaxVersion::Es2 };
         let configs = config::Configs::new(display, max_version > MaxVersion::Es2);
-        Ok(Renderer { display, egl_version: TRANSLATOR_EGL_VERSION, configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, sink: None, syncs: Default::default(), next_sync: 0, dma: None, fences: Default::default(), next_fence: 0 })
+        Ok(Renderer { display, egl_version: TRANSLATOR_EGL_VERSION, configs, features, max_version, host_extensions, root, root_surface, size, objects: Default::default(), threads: 0, drawer: None, shown: 0, posts: 0, displays: Default::default(), sink: None, syncs: Default::default(), next_sync: 0, dma: None, fences: Default::default(), next_fence: 0 })
     }
 
     /// `rcGetGLString`'s answer for `name`: the translator's string for the
@@ -591,42 +594,67 @@ impl Thread {
                 };
                 reply(&[], p as u32 as u64)
             }
-            "rcGetDisplayPose" => {
-                if v(0) != 0 {
-                    return reply(&[], u32::MAX as u64);
+            // The displays, as gfxstream's default multi-display operations
+            // keep them ([`displays`]): -1 for a display that is not there.
+            "rcGetDisplayPose" => match r.displays.get(v(0) as u32) {
+                Some(d) => reply(&[&d.x.to_le_bytes(), &d.y.to_le_bytes(), &d.width.to_le_bytes(), &d.height.to_le_bytes()], 0),
+                None => reply(&[&[0; 4], &[0; 4], &[0; 4], &[0; 4]], u32::MAX as u64),
+            },
+            "rcSetDisplayPose" | "rcSetDisplayPoseDpi" => match r.displays.get_mut(v(0) as u32) {
+                Some(d) => {
+                    (d.x, d.y, d.width, d.height) = (v(1) as i32, v(2) as i32, v(3) as u32, v(4) as u32);
+                    d.dpi = if call.name == "rcSetDisplayPoseDpi" { v(5) as u32 } else { 0 };
+                    reply(&[], 0)
                 }
-                let (w, h) = (r.size.width as u32, r.size.height as u32);
-                reply(&[&0i32.to_le_bytes(), &0i32.to_le_bytes(), &w.to_le_bytes(), &h.to_le_bytes()], 0)
-            }
-            "rcSetDisplayPose" | "rcSetDisplayPoseDpi" | "rcSetDisplayColorBuffer" => reply(&[], if v(0) == 0 { 0 } else { u32::MAX as u64 }),
-            "rcGetDisplayColorBuffer" => {
-                if v(0) != 0 {
-                    return reply(&[], u32::MAX as u64);
+                None => reply(&[], u32::MAX as u64),
+            },
+            "rcSetDisplayColorBuffer" => match r.displays.get_mut(v(0) as u32) {
+                Some(d) => {
+                    d.color_buffer = v(1) as u32;
+                    reply(&[], 0)
                 }
-                reply(&[&r.shown.to_le_bytes()], 0)
+                None => reply(&[], u32::MAX as u64),
+            },
+            "rcGetDisplayColorBuffer" => match r.displays.get(v(0) as u32) {
+                Some(d) => reply(&[&d.color_buffer.to_le_bytes()], 0),
+                None => reply(&[&[0; 4]], u32::MAX as u64),
+            },
+            "rcGetColorBufferDisplay" => match r.displays.showing(v(0) as u32) {
+                Some(id) => reply(&[&id.to_le_bytes()], 0),
+                None => reply(&[&[0; 4]], u32::MAX as u64),
+            },
+            // `rcCreateDisplay` always asks for a new id.
+            "rcCreateDisplay" => match r.displays.create(displays::INVALID_DISPLAY_ID) {
+                Some(id) => reply(&[&id.to_le_bytes()], 0),
+                None => reply(&[&displays::INVALID_DISPLAY_ID.to_le_bytes()], u32::MAX as u64),
+            },
+            "rcCreateDisplayById" => reply(&[], if r.displays.create(v(0) as u32).is_some() { 0 } else { u32::MAX as u64 }),
+            "rcDestroyDisplay" => {
+                r.displays.destroy(v(0) as u32);
+                reply(&[], 0)
             }
-            "rcGetColorBufferDisplay" => {
-                let shown = v(0) as u32 == r.shown && r.shown != 0;
-                reply(&[&0u32.to_le_bytes()], if shown { 0 } else { u32::MAX as u64 })
-            }
-            "rcCreateDisplay" | "rcCreateDisplayById" | "rcDestroyDisplay" => {
-                eprintln!("[gex] gfxstream: {}: there is one display here, 0", call.name);
-                if entry.answers() {
-                    reply(&[], u32::MAX as u64)
-                } else {
-                    None
+            "rcGetDisplayColorTransform" => match r.displays.get(v(0) as u32) {
+                Some(d) => {
+                    let b: Vec<u8> = d.color_transform.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    reply(&[&b], 0)
+                }
+                None => reply(&[&[0; 64]], u32::MAX as u64),
+            },
+            "rcSetDisplayColorTransform" => {
+                let m = match a[1] {
+                    Arg::In(d) if d.len() >= 64 => Some(d),
+                    _ => None,
+                };
+                match (r.displays.get_mut(v(0) as u32), m) {
+                    (Some(d), Some(m)) => {
+                        for (i, c) in m.chunks_exact(4).take(16).enumerate() {
+                            d.color_transform[i] = f32::from_le_bytes(c.try_into().unwrap());
+                        }
+                        reply(&[], 0)
+                    }
+                    _ => reply(&[], u32::MAX as u64),
                 }
             }
-            // The identity until set (`rcGetDisplayColorTransform`).
-            "rcGetDisplayColorTransform" => {
-                let mut m = [0f32; 16];
-                for i in 0..4 {
-                    m[i * 5] = 1.0;
-                }
-                let b: Vec<u8> = m.iter().flat_map(|x| x.to_le_bytes()).collect();
-                reply(&[&b], if v(0) == 0 { 0 } else { u32::MAX as u64 })
-            }
-            "rcSetDisplayColorTransform" => reply(&[], if v(0) == 0 { 0 } else { u32::MAX as u64 }),
             "rcColorBufferCacheFlush" => reply(&[], 0),
             // `readPixelsYUVCached`: the frame as last uploaded.
             "rcReadColorBufferYUV" => {
@@ -876,6 +904,35 @@ mod tests {
 
     fn i32_at(b: &[u8], at: usize) -> i32 {
         i32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    /// The composer's displays (HWC3's `HostFrameComposer::onDisplayCreate`
+    /// and the goldfish display finder): none until made, the primary by
+    /// its id, one more numbered from 6, each pose kept.
+    #[test]
+    #[ignore = "needs the host's Mesa EGL"]
+    fn the_composer_makes_its_displays() {
+        let r = Renderer::new(Features::default(), DisplaySize { width: 1080, height: 1920, dpi_x: 480, dpi_y: 480 }).unwrap();
+        let mut t = Thread::new(Arc::new(Mutex::new(r)));
+        let mut w = 0u32.to_le_bytes().to_vec();
+        w.extend(encode("rcGetDisplayPose", &[P::V(0), P::Out(4), P::Out(4), P::Out(4), P::Out(4)]));
+        let a = t.feed(&w);
+        assert_eq!(i32_at(&a, 16), -1, "no display before the composer makes one");
+        assert_eq!(i32_at(&t.feed(&encode("rcCreateDisplayById", &[P::V(0)])), 0), 0);
+        assert_eq!(i32_at(&t.feed(&encode("rcCreateDisplayById", &[P::V(0)])), 0), 0, "there already");
+        let neg = |x: i32| P::V(x as u32 as u64);
+        assert_eq!(i32_at(&t.feed(&encode("rcSetDisplayPoseDpi", &[P::V(0), neg(-1), neg(-1), P::V(1080), P::V(1920), P::V(480)])), 0), 0);
+        let a = t.feed(&encode("rcGetDisplayPose", &[P::V(0), P::Out(4), P::Out(4), P::Out(4), P::Out(4)]));
+        assert_eq!((i32_at(&a, 0), i32_at(&a, 4), i32_at(&a, 8), i32_at(&a, 12), i32_at(&a, 16)), (-1, -1, 1080, 1920, 0));
+        // A secondary display: rcCreateDisplay gives 6.
+        let a = t.feed(&encode("rcCreateDisplay", &[P::Out(4)]));
+        assert_eq!((i32_at(&a, 0), i32_at(&a, 4)), (6, 0));
+        assert_eq!(i32_at(&t.feed(&encode("rcSetDisplayColorBuffer", &[P::V(6), P::V(42)])), 0), 0);
+        let a = t.feed(&encode("rcGetColorBufferDisplay", &[P::V(42), P::Out(4)]));
+        assert_eq!((i32_at(&a, 0), i32_at(&a, 4)), (6, 0));
+        assert_eq!(i32_at(&t.feed(&encode("rcDestroyDisplay", &[P::V(6)])), 0), 0);
+        assert_eq!(i32_at(&t.feed(&encode("rcSetDisplayPose", &[P::V(6), P::V(0), P::V(0), P::V(1), P::V(1)])), 0), -1);
+        assert!(t.broken.is_none());
     }
 
     /// What the guest's EGL asks first (`HostConnection`, `egl.cpp`'s
