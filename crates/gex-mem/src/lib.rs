@@ -204,6 +204,71 @@ impl GuestMemory {
         }
     }
 
+    /// Make `[at, at + len)` of this memory a copy of the same range of
+    /// `src`, copy-on-write (`mach_vm_remap` with copy): the same host pages
+    /// until either side writes one, which then gets its own. What this
+    /// memory held there is gone. Host-page aligned and within both. False
+    /// where it cannot be done, and nothing changed.
+    ///
+    /// How a fork's child takes its parent's memory without copying it
+    /// (`dup_mmap`'s copy-on-write, which wasm memories cannot have): a
+    /// zygote's children share its preloaded heap and boot image until they
+    /// write, where each one had a whole copy.
+    pub fn cow_from(&self, src: &GuestMemory, at: u64, len: u64) -> bool {
+        let Some(page) = Self::alias_page() else { return false };
+        let fits = |m: &GuestMemory| at.checked_add(len).is_some_and(|e| e <= m.len() as u64);
+        if len == 0 || !at.is_multiple_of(page) || !len.is_multiple_of(page) || !fits(self) || !fits(src) {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            #[allow(non_upper_case_globals)]
+            extern "C" {
+                static mach_task_self_: u32;
+                fn mach_vm_remap(
+                    target: u32,
+                    address: *mut u64,
+                    size: u64,
+                    mask: u64,
+                    flags: i32,
+                    src_task: u32,
+                    src_address: u64,
+                    copy: i32,
+                    cur: *mut i32,
+                    max: *mut i32,
+                    inherit: u32,
+                ) -> i32;
+            }
+            const VM_FLAGS_FIXED: i32 = 0;
+            const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+            const VM_INHERIT_COPY: u32 = 1;
+            const RW: i32 = 3;
+            let base = self.inner.data().as_ptr() as u64;
+            let src_base = src.inner.data().as_ptr() as u64;
+            let mut to = base + at;
+            let (mut cur, mut max) = (0i32, 0i32);
+            // SAFETY: the task's own port, a constant of the process.
+            let task = unsafe { mach_task_self_ };
+            // SAFETY: both ranges are inside their memories' own mappings
+            // (checked above), two memories that are apart; the remap
+            // replaces this memory's pages there with a copy-on-write copy
+            // of `src`'s, read and write as before (`cur` checked below),
+            // and moves nothing else. Nothing runs in this memory yet (a
+            // fork's child, before its first thread).
+            let kr = unsafe { mach_vm_remap(task, &mut to, len, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, task, src_base + at, 1, &mut cur, &mut max, VM_INHERIT_COPY) };
+            if kr != 0 || to != base + at || cur & RW != RW {
+                eprintln!("gex: copy-on-write mach_vm_remap of {len:#x} bytes at {at:#x}: {kr}, protection {cur}");
+                return false;
+            }
+            true
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = src;
+            false
+        }
+    }
+
     /// The host's page size where [`Self::discard`] can give pages back,
     /// else `None`.
     pub fn discard_page() -> Option<u64> {

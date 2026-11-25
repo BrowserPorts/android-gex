@@ -2997,6 +2997,26 @@ struct SparseCopy {
 
 impl SparseCopy {
     const PAGE: usize = 4096;
+
+    /// [`Self::copy`] of `[a, b)` from `from` (bytes `src`) into `to` (bytes
+    /// `dst`), its host-page-aligned interior taken copy-on-write instead
+    /// where the host can ([`gex_mem::GuestMemory::cow_from`]): the child
+    /// shares the parent's pages until one writes, as a fork's do on
+    /// Linux. The edges, and all of it where the remap is refused or
+    /// `GEX_FORK_COPY=1`, are copied. Bytes copied, and bytes shared.
+    fn copy_or_share(&mut self, from: &gex_mem::GuestMemory, to: &gex_mem::GuestMemory, src: &[u8], dst: &mut [u8], a: usize, b: usize) -> (usize, usize) {
+        static COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let copy_only = *COPY.get_or_init(|| std::env::var_os("GEX_FORK_COPY").is_some());
+        if let (false, Some(page)) = (copy_only, gex_mem::GuestMemory::alias_page()) {
+            let page = page as usize;
+            let (ia, ib) = (a.next_multiple_of(page), b / page * page);
+            if ia < ib && to.cow_from(from, ia as u64, (ib - ia) as u64) {
+                let edges = self.copy(src, dst, a, ia) + self.copy(src, dst, ib, b);
+                return (edges, ib - ia);
+            }
+        }
+        (self.copy(src, dst, a, b), 0)
+    }
     /// Pages looked up per `pagemap` read.
     const BATCH: usize = 4096;
 
@@ -3204,6 +3224,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     let child_mem = gex_mem::GuestMemory::new(shared);
     let copy_t0 = std::time::Instant::now();
     let mut copied = 0usize;
+    let mut shared_total = 0usize;
     {
         let src = parent_mem.bytes();
         let dst = child_mem.bytes();
@@ -3217,22 +3238,30 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // directory is 66 MiB, mostly untouched, which a whole copy made
         // the host give both processes (on macOS, a read alone does).
         let mut sparse = SparseCopy::new();
+        let mut shared_bytes = 0usize;
+        let mut take = |sparse: &mut SparseCopy, a: usize, b: usize| {
+            let (c, sh) = sparse.copy_or_share(&parent_mem, &child_mem, src, dst, a, b);
+            shared_bytes += sh;
+            c
+        };
         let low = gex_abi::DISPATCH_DIR_END as usize;
-        copied += sparse.copy(src, dst, 0, low);
+        copied += take(&mut sparse, 0, low);
         // An M64 memory's directory and patched bits are its dense tables
         // above 4 GiB instead.
         if gex_abi::mem64() {
             // (not the protection table after them: the child's kernel
             // writes its own, `Kernel::flush_perms`)
             let (a, b) = (gex_abi::DISPATCH_DIR64 as usize, gex_abi::PERM_TABLE64 as usize);
-            copied += sparse.copy(src, dst, a, b);
+            copied += take(&mut sparse, a, b);
         }
         for (start, end) in &regions {
             let (a, b) = (*start as usize, (*end as usize).min(src.len()));
             if a < b {
-                copied += sparse.copy(src, dst, a, b);
+                copied += take(&mut sparse, a, b);
             }
         }
+        drop(take);
+        shared_total = shared_bytes;
         // `fork` returns zero in the child, and a clone that named a stack
         // starts on it.
         let mut gm = GuestMem::new(dst);
@@ -3253,8 +3282,9 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
 
     if std::env::var_os("GEX_WASM_TRACE").is_some() {
         eprintln!(
-            "gex: fork {pid}: copied {} MiB of the parent's memory in {:.2}s",
+            "gex: fork {pid}: copied {} MiB of the parent's memory and shared {} MiB copy-on-write in {:.2}s",
             copied >> 20,
+            shared_total >> 20,
             copy_t0.elapsed().as_secs_f64()
         );
     }
