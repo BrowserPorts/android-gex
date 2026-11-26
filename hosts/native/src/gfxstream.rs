@@ -112,7 +112,7 @@ impl Services for Host {
             _ => return None,
         };
         Some(match name {
-            "opengles" => Box::new(OpenGles { thread: Thread::new(r), out: VecDeque::new() }),
+            "opengles" => Box::new(OpenGles::new(r)?),
             "GLProcessPipe" => Box::new(ProcessPipe::new(r)),
             _ => Box::new(Refcount { renderer: r, handle: 0 }),
         })
@@ -120,28 +120,65 @@ impl Services for Host {
 }
 
 /// `EmuglPipe`: the guest's command stream to a render thread, and its
-/// answers back.
+/// answers back. The stream is decoded on a host thread of its own, as
+/// gfxstream's `RenderThread` is, whichever guest thread writes: its EGL
+/// context is current on that one host thread, which a context must be
+/// (Mesa refuses one still current on another thread with
+/// EGL_BAD_ACCESS), and its end unbinds it there.
 struct OpenGles {
-    thread: Thread,
+    to: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    from: std::sync::mpsc::Receiver<(Vec<u8>, Option<String>)>,
     out: VecDeque<u8>,
+    broken: Option<String>,
+}
+
+impl OpenGles {
+    fn new(renderer: Arc<Mutex<Renderer>>) -> Option<OpenGles> {
+        let (to, input) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (answers, from) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("gex-render".into())
+            .stack_size(8 << 20)
+            .spawn(move || {
+                let mut thread = Thread::new(renderer);
+                while let Ok(buf) = input.recv() {
+                    let answer = thread.feed(&buf);
+                    let broken = thread.broken.as_ref().map(|e| format!("{e:?}"));
+                    if answers.send((answer, broken)).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("[gex] gfxstream: no host thread for a render thread: {e}");
+            return None;
+        }
+        Some(OpenGles { to: Some(to), from, out: VecDeque::new(), broken: None })
+    }
 }
 
 impl Service for OpenGles {
     fn send(&mut self, buf: &[u8]) -> Result<usize, Errno> {
-        if self.thread.broken.is_some() {
+        if self.broken.is_some() {
             return Err(Errno::EIO);
         }
-        let answer = self.thread.feed(buf);
+        let reply = self.to.as_ref().and_then(|to| to.send(buf.to_vec()).ok()).and_then(|()| self.from.recv().ok());
+        let Some((answer, broken)) = reply else {
+            self.broken = Some("its host thread ended".into());
+            eprintln!("[gex] gfxstream: a render thread's host thread ended; the pipe is closed");
+            return Err(Errno::EIO);
+        };
         self.out.extend(answer);
-        if let Some(e) = &self.thread.broken {
-            eprintln!("[gex] gfxstream: a render thread's stream is malformed ({e:?}); the pipe is closed");
+        if let Some(e) = broken {
+            eprintln!("[gex] gfxstream: a render thread's stream is malformed ({e}); the pipe is closed");
+            self.broken = Some(e);
         }
         Ok(buf.len())
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Errno> {
         if self.out.is_empty() {
-            return Err(if self.thread.broken.is_some() { Errno::EIO } else { Errno::EAGAIN });
+            return Err(if self.broken.is_some() { Errno::EIO } else { Errno::EAGAIN });
         }
         let n = buf.len().min(self.out.len());
         for (b, o) in buf.iter_mut().zip(self.out.drain(..n)) {
@@ -155,7 +192,15 @@ impl Service for OpenGles {
     }
 
     fn hung_up(&self) -> bool {
-        self.thread.broken.is_some()
+        self.broken.is_some()
+    }
+}
+
+impl Drop for OpenGles {
+    /// Its host thread ends once the stream is closed, dropping the render
+    /// thread there.
+    fn drop(&mut self) {
+        self.to = None;
     }
 }
 
