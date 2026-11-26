@@ -40,7 +40,11 @@
 # the zygote makes more than 8, and a budget under one boot's evicts its
 # own first minutes, which the next boot then translates again; give the
 # boot a cache no other gexc run with a smaller budget shares, since a
-# run evicts down to its own budget).
+# run evicts down to its own budget). That budget is each of the cache's
+# two directories', the runtime units' and the image modules', so the
+# cache can take twice it on disk; GEX_IMAGE_CACHE_MAX_BYTES, if set, is
+# the image modules' alone (worth more of a small disk: an evicted image
+# is a whole program compiled again).
 #
 # DATA, if set, is a host directory that is the image's /data from boot to
 # boot (fstab.gex-keep), made the first time with the owner and mode

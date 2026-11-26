@@ -230,6 +230,21 @@ fn budget() -> u64 {
         .unwrap_or(DEFAULT_BUDGET)
 }
 
+/// The budget of the cache directory `dir`: [`budget`], except that the
+/// image modules' directory ([`image_cache_dir`]) takes
+/// `GEX_IMAGE_CACHE_MAX_BYTES` when it is set. An image module evicted is a
+/// whole program compiled again at its next exec (gigabytes of compiling at
+/// once for a large one), where a runtime unit evicted is a small region
+/// translated again, so a disk that holds only so much is better spent on
+/// the images.
+fn budget_for(dir: &Path) -> u64 {
+    let images = image_cache_dir().is_some_and(|d| d == dir);
+    images
+        .then(|| std::env::var("GEX_IMAGE_CACHE_MAX_BYTES").ok().and_then(|v| v.parse().ok()))
+        .flatten()
+        .unwrap_or_else(budget)
+}
+
 /// Delete least-recently-used entries until the cache is under budget.
 ///
 /// "Least recently used" is the metadata file's mtime, which
@@ -502,7 +517,7 @@ pub fn load_or_compile(
         // what publishes the entry.
         store(dir, &meta_path, &metadata);
         store(dir, &path, &serialized);
-        account_store(dir, (metadata.len() + serialized.len()) as u64, budget());
+        account_store(dir, (metadata.len() + serialized.len()) as u64, budget_for(dir));
         module = mapped_instead(engine, &path, module);
     }
     Ok(Loaded {
