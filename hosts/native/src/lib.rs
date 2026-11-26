@@ -4285,14 +4285,29 @@ fn replay_into(mut cx: impl wasmtime::AsContextMut<Data = HostState>, take: Take
     // A lazy unit only gets room in the tables: it is instantiated at
     // this thread's first miss into it (`install_provider`).
     let mut room = 0;
+    let mut lazy = Vec::new();
     for unit in wanted {
         if unit.lazy {
             room = room.max(unit.table_slots);
+            lazy.push(unit);
         } else {
             install_unit(cx.as_context_mut(), &unit)?;
         }
     }
     grow_tables(cx.as_context_mut(), room)?;
+    // And its directory entries, in this process's memory. A forked family
+    // shares one registry, but each process has a directory of its own: a
+    // page another process gave its base to has no entry here until one is
+    // written here, and a later unit with code on the page names the base
+    // without the entry. Dispatch there then missed for good (netd, whose
+    // children translate before they exec). The slots stay empty until a
+    // miss installs the unit; the entry only says where they are.
+    if !lazy.is_empty() {
+        let memory = cx.as_context().data().memory.clone().ok_or_else(|| anyhow!("guest memory unavailable"))?;
+        for unit in &lazy {
+            write_current_dir(&cx.as_context(), memory.clone(), unit)?;
+        }
+    }
     Ok(installed)
 }
 
@@ -7352,10 +7367,46 @@ fn remiss(caller: &mut Caller<'_, HostState>, shared: &Arc<Mutex<JitShared>>, pc
     let retired = sh.retired_pages.get(&page).copied().unwrap_or(0);
     let sources = sh.remiss[&pc].1;
     let (n_units, stale) = (sh.registry.len(), sh.stale_blocks);
+    // Who should have written the directory entry: the units that gave the
+    // page a base, and the one a miss installs (`install_provider`), each
+    // with whether it is lazy and whether this store has instantiated it.
+    let (installed, replayed, deferred) = caller
+        .data()
+        .jit
+        .as_ref()
+        .map(|j| (j.installed.clone(), j.replayed, j.deferred.units.iter().flatten().map(|u| u.module_id).collect::<std::collections::HashSet<u64>>()))
+        .unwrap_or_default();
+    let describe = |i: usize| {
+        let u = &sh.registry[i];
+        let what = if deferred.contains(&u.module_id) {
+            "deferred"
+        } else if !u.lazy {
+            "eager"
+        } else if installed.contains(&u.module_id) {
+            "installed"
+        } else {
+            "lazy, not installed"
+        };
+        format!("#{i} id {:#x} {what}", u.module_id)
+    };
+    let numbered: Vec<String> = sh
+        .registry
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| u.dir_entries.iter().any(|&(p, _)| p == page))
+        .map(|(i, u)| format!("{} base {:?}", describe(i), u.dir_entries.iter().find(|&&(p, _)| p == page).map(|&(_, b)| b)))
+        .collect();
+    let provider = sh.provider.get(&pc).copied();
+    let provider_at = provider.and_then(|id| sh.by_module.get(&id).copied().or_else(|| sh.registry.iter().position(|u| u.module_id == id)));
+    let detail = format!(
+        "numbered by [{}]; provider {provider:#x?} at {}; this store has replayed {replayed} of {n_units}",
+        numbered.join(", "),
+        provider_at.map_or("none".to_string(), describe),
+    );
     drop(sh);
     let writable = caller.data_mut().with_kernel(|k| k.mem.lock().check_access(addr, 1, prot::WRITE));
     eprintln!(
-        "gex: BUG: {pc:#x} is translated but missed dispatch {n} times: page {page:#x} directory          entry {dir} (shared table: {base:?}, slot {slot:?}, base owned by page {owner:x?});          in units {:?} of {n_units} (first, last); page retired {retired} times; writable now:          {writable}; stale blocks so far {stale}; last miss sources {sources:x?}",
+        "gex: BUG: {pc:#x} is translated but missed dispatch {n} times: page {page:#x} directory          entry {dir} (shared table: {base:?}, slot {slot:?}, base owned by page {owner:x?});          in units {:?} of {n_units} (first, last); page retired {retired} times; writable now:          {writable}; stale blocks so far {stale}; last miss sources {sources:x?}; {detail}",
         (units.first(), units.last())
     );
     bail!("{pc:#x} keeps missing dispatch after translation (retranslation livelock)")
