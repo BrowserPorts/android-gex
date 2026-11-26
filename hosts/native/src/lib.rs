@@ -293,6 +293,9 @@ struct HostState {
     /// The function tier's call-outs in progress on this thread, innermost
     /// last (`call_out`).
     callouts: Vec<Callout>,
+    /// The host functions translated modules import, each made a `Func` in
+    /// this store once ([`resolve_import`]).
+    host_imports: std::collections::HashMap<(Box<str>, Box<str>), wasmtime::Extern>,
     /// The `enter` of the module this thread's loop started in, for nested
     /// loops entered from code that has none (a function-tier unit or a
     /// function JIT module) when no runtime-translated module exists yet.
@@ -1494,6 +1497,7 @@ fn run_program_with(
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
+            host_imports: std::collections::HashMap::new(),
             root_enter: None,
             alt_enter: None,
             callout_signal: None,
@@ -3577,6 +3581,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
+            host_imports: std::collections::HashMap::new(),
             root_enter: None,
             alt_enter: None,
             callout_signal: None,
@@ -3977,6 +3982,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             resume_at: None,
             resume_cause: None,
             callouts: Vec::new(),
+            host_imports: std::collections::HashMap::new(),
             root_enter: None,
             alt_enter: None,
             callout_signal: None,
@@ -7331,6 +7337,27 @@ fn publish_unit(
 
 /// Instantiate one compiled unit into this store and point its table slots at
 /// the result.
+/// An import of a translated module: a host function from the store's own
+/// (made from the linker the first time), anything else from the linker as
+/// this install defined it.
+fn resolve_import(
+    cx: &mut impl wasmtime::AsContextMut<Data = HostState>,
+    linker: &wasmtime::Linker<HostState>,
+    module: &str,
+    name: &str,
+) -> Result<wasmtime::Extern> {
+    if let Some(e) = cx.as_context().data().host_imports.get(&(Box::from(module), Box::from(name))) {
+        return Ok(e.clone());
+    }
+    let e = linker
+        .get(cx.as_context_mut(), module, name)
+        .with_context(|| format!("a translated module's import {module}::{name}"))?;
+    if matches!(e, wasmtime::Extern::Func(_)) {
+        cx.as_context_mut().data_mut().host_imports.insert((module.into(), name.into()), e.clone());
+    }
+    Ok(e)
+}
+
 fn install_unit(
     mut cx: impl wasmtime::AsContextMut<Data = HostState>,
     unit: &CompiledUnit,
@@ -7453,8 +7480,17 @@ fn install_unit(
             unit.exported_blocks.iter().filter_map(|(a, _)| dispatch_slot_of(&memory, *a, alt_dir)).collect();
         note_overwritten(&mut cx, &|s| slots.contains(&s));
     }
-    let instance = linker
-        .instantiate(cx.as_context_mut(), unit.module.as_ref().unwrap())
+    // Not `Linker::instantiate`: that roots the whole import list in the
+    // store again at each instantiation, and makes each host function a
+    // new `Func` there, all kept for the store's life (some 2.5 KB an
+    // install, and a booting Android installs over a million). The host
+    // functions are made once a store; the rest are this install's.
+    let module = unit.module.as_ref().unwrap();
+    let mut imports = Vec::with_capacity(module.imports().len());
+    for import in module.imports() {
+        imports.push(resolve_import(&mut cx, &linker, import.module(), import.name())?);
+    }
+    let instance = wasmtime::Instance::new(cx.as_context_mut(), module, &imports)
         .context("instantiating a runtime-translated module")?;
     profile::attach(cx.as_context_mut(), &instance)?;
     if gex_abi::X86 && cx.as_context().data().alt_enter.is_none() && unit.dir_entries.iter().any(|&(p, _)| p & gex_abi::ALT_PAGE != 0) {

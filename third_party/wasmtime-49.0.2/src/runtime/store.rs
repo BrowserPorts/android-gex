@@ -469,6 +469,11 @@ pub struct StoreOpaque {
     continuations: Vec<Box<VMContRef>>,
 
     instances: TryPrimaryMap<InstanceId, StoreInstance>,
+    /// gex: the import made for each shared memory this store has imported
+    /// (by the address of its inner `Arc`), so that importing it again
+    /// reuses it rather than making another instance; the instance it points
+    /// into is kept for the store's life.
+    pub(crate) shared_memory_imports: alloc::vec::Vec<(usize, crate::runtime::vm::VMMemoryImport)>,
 
     signal_handler: Option<SignalHandler>,
     modules: ModuleRegistry,
@@ -731,6 +736,7 @@ impl<T> Store<T> {
             #[cfg(feature = "stack-switching")]
             continuations: Vec::new(),
             instances: TryPrimaryMap::new(),
+            shared_memory_imports: alloc::vec::Vec::new(),
             signal_handler: None,
             gc_store: None,
             #[cfg(feature = "gc")]

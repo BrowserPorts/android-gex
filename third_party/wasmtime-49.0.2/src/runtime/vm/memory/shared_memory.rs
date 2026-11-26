@@ -30,6 +30,13 @@ struct SharedMemoryInner {
 }
 
 impl SharedMemory {
+    /// gex: the identity of the memory these handles share.
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
+impl SharedMemory {
     /// Construct a new [`SharedMemory`].
     pub fn new(engine: &Engine, ty: &wasmtime_environ::Memory) -> Result<Self> {
         let tunables = engine.tunables();

@@ -1067,6 +1067,14 @@ impl SharedMemory {
     /// Construct a single-memory instance to provide a way to import
     /// [`SharedMemory`] into other modules.
     pub(crate) fn vmimport(&self, store: &mut StoreOpaque) -> crate::runtime::vm::VMMemoryImport {
+        // gex: each import made an instance of its own for the memory, kept
+        // until the store goes (thousands a thread where every translated
+        // module imports the guest's memory); one a store is enough, since
+        // the import is only the memory's address and that instance's.
+        let key = self.vm.identity();
+        if let Some(&(_, import)) = store.shared_memory_imports.iter().find(|(k, _)| *k == key) {
+            return import;
+        }
         // Note `vm::assert_ready` shouldn't panic here because this isn't
         // actually allocating any new memory (also no limiter), so resource
         // limiting shouldn't kick in.
@@ -1079,7 +1087,10 @@ impl SharedMemory {
         .unwrap();
         match memory {
             ExportMemory::Unshared(_) => unreachable!(),
-            ExportMemory::Shared(_shared, vmimport) => vmimport,
+            ExportMemory::Shared(_shared, vmimport) => {
+                store.shared_memory_imports.push((key, vmimport));
+                vmimport
+            }
         }
     }
 
