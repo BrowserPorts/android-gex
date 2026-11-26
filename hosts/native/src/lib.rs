@@ -468,12 +468,15 @@ struct Jit {
     cache: Option<(std::path::PathBuf, String)>,
     /// Instances live here because the table holds funcrefs into them.
     instances: Vec<wasmtime::Instance>,
-    /// Registry entries already instantiated into this store.
+    /// Registry entries this store has caught up on: instantiated, or for a
+    /// lazy unit only given room in the tables.
     replayed: usize,
     /// Units of the registry this store has passed over without taking
     /// them, in the registry's order ([`replay_into`]): what a thread that
     /// takes code only as it needs it has not needed yet.
     deferred: Deferred,
+    /// The lazy units instantiated in this store, by module id.
+    installed: std::collections::HashSet<u64>,
     limits: gex_xlate::BlockLimits,
     /// This store's function table (`ftab`), made at the first need.
     ftab: Option<ftab::Store>,
@@ -511,6 +514,21 @@ struct CompiledUnit {
     /// (`gex_emit::module::page_base_global`), set in every instance:
     /// `TranslatedModule::page_globals`.
     page_globals: Vec<u32>,
+    /// A store that did not make this unit instantiates it at its first
+    /// miss into it (`install_provider`), not when it catches up: tier-1's
+    /// translations, of which a large program has tens of thousands and a
+    /// thread runs few.
+    lazy: bool,
+}
+
+/// Whether a thread instantiates tier-1's translations as it first reaches
+/// them (the default) or all of them as it catches up
+/// (`GEX_TIER1_INSTALL=eager`). A hundred threads catching up on eighty
+/// thousand modules is eight million instances: an Unreal Engine game held
+/// 24 GB of them three minutes in.
+fn lazy_tier1() -> bool {
+    static LAZY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LAZY.get_or_init(|| std::env::var("GEX_TIER1_INSTALL").as_deref() != Ok("eager"))
 }
 
 impl CompiledUnit {
@@ -555,6 +573,9 @@ struct JitShared {
     /// translation was made from those bytes ([`page_hash`]): a flush of
     /// its instruction cache that finds them unchanged retires nothing.
     page_hash: std::collections::HashMap<u64, u64>,
+    /// When each page was last retired, and the bases translations running
+    /// at once have claimed since (`snapshot`).
+    claims: Arc<Mutex<Claims>>,
     /// Blocks a publish did not count as translated because their page was
     /// retired after the translation's snapshot (their slots are abandoned).
     stale_blocks: usize,
@@ -562,6 +583,9 @@ struct JitShared {
     /// translated address: a block failing its page check is translated
     /// again only while its own module still does (`PAGE_STALE`).
     provider: std::collections::HashMap<u64, u64>,
+    /// Where in `registry` each lazy unit is, by its module id: how a miss
+    /// finds the unit that provides its address.
+    by_module: std::collections::HashMap<u64, usize>,
     /// The function table's process half (`ftab`).
     ftab: ftab::Shared,
     /// A native wasm32 program (`wasmprog`): its native frames cannot be
@@ -599,12 +623,54 @@ struct JitShared {
     calls: usize,
 }
 
+/// Pages' retirements and the bases translations claim between them
+/// (`JitShared::claims`).
+#[derive(Default)]
+struct Claims {
+    /// Retirements so far: the clock `retired` and a snapshot's are on.
+    clock: u64,
+    /// When each page was last retired.
+    retired: std::collections::HashMap<u64, u64>,
+    /// The base the first translation to find a page without one gave it,
+    /// since the page was last retired.
+    bases: std::collections::HashMap<u64, u32>,
+}
+
+impl Claims {
+    /// Whether `page` was retired after `since` (a snapshot's clock).
+    fn retired_since(&self, page: u64, since: u64) -> bool {
+        self.retired.get(&page).is_some_and(|&r| r > since)
+    }
+}
+
+/// A translation's copy of the page table, and the retirement clock it was
+/// taken at. A page it finds without a base takes the one another
+/// translation running at once gave it, or claims its own for the others:
+/// threads that miss in a page retired under them (a JIT rewriting code its
+/// threads share) each allocated it a base, and all but the first to
+/// publish came out stale and translated again, more than once while the
+/// page kept being retired. (A translation of a page's old bytes is still
+/// caught: a block of a page whose code is written guards its own bytes.)
+fn snapshot(sh: &JitShared) -> (gex_xlate::PageTable, u64) {
+    let mut table = sh.page_table.clone();
+    let since = sh.claims.lock().unwrap_or_else(|e| e.into_inner()).clock;
+    let (a, p) = (Arc::clone(&sh.claims), Arc::clone(&sh.claims));
+    table.set_identity(Arc::new(gex_xlate::Identity {
+        adopt: Box::new(move |page| a.lock().unwrap_or_else(|e| e.into_inner()).bases.get(&page).copied()),
+        publish: Box::new(move |page, entry| {
+            p.lock().unwrap_or_else(|e| e.into_inner()).bases.entry(page).or_insert(entry);
+        }),
+    }));
+    (table, since)
+}
+
 impl JitShared {
     /// A forked child's own copy (`fork_process`): what the child's memory,
     /// a copy of this address space's, was installed and relocated with.
     fn fork_copy(&self) -> JitShared {
         JitShared {
             page_table: self.page_table.clone(),
+            claims: Default::default(),
             translated: self.translated.clone(),
             alt_dir: self.alt_dir,
             registry: self.registry.clone(),
@@ -614,6 +680,7 @@ impl JitShared {
             page_hash: self.page_hash.clone(),
             stale_blocks: self.stale_blocks,
             provider: self.provider.clone(),
+            by_module: self.by_module.clone(),
             ftab: self.ftab.fork_copy(),
             wasm_program: self.wasm_program,
             wine_pe: self.wine_pe.clone(),
@@ -1551,6 +1618,8 @@ fn run_program_with(
     let phase = std::time::Instant::now();
 
     let memory = gex_mem::GuestMemory::new(shared.clone());
+    // the process's KUSER_SHARED_DATA clock (`gex.usd_tick`) goes with it
+    let usd_guard = door::UsdGuard::new(&memory);
     store.data_mut().memory = Some(memory.clone());
     store.data_mut().with_kernel(|k| publish_vm(k, &memory));
     // The memory is new, so all of the guest's part of it reads as zero: an
@@ -1587,6 +1656,7 @@ fn run_program_with(
         store.data_mut().jit = Some(Jit {
             shared: Arc::new(Mutex::new(JitShared {
                 page_table: gex_xlate::PageTable::from_entries(&meta.dir_entries, first_runtime_slot(meta.next_slot)),
+                claims: Default::default(),
                 translated: Default::default(),
                 alt_dir: 0,
                 registry: Vec::new(),
@@ -1598,6 +1668,7 @@ fn run_program_with(
                 page_hash: Default::default(),
                 stale_blocks: 0,
                 provider: Default::default(),
+                by_module: Default::default(),
                 ftab: Default::default(),
                 wasm_program: false,
                 wine_pe: None,
@@ -1616,6 +1687,7 @@ fn run_program_with(
             instances: Vec::new(),
             replayed: 0,
             deferred: Deferred::default(),
+            installed: Default::default(),
             limits: xlate.limits,
             ftab: None,
             blocks: None,
@@ -1799,7 +1871,14 @@ fn run_program_with(
             }
             let pid = k.pid;
             drop(k);
-            let exit = Exit::Signal { signal: signal::SIGSEGV, pc: 0, detail: format!("{e:#}"), internal: true };
+            let detail = format!("{e:#}");
+            // A program's own abort is its crash, said as SIGILL's (an
+            // `unreachable` is `ud2`), not as gex's.
+            let exit = if detail.starts_with("the program aborted") {
+                Exit::Signal { signal: signal::SIGILL, pc: 0, detail, internal: false }
+            } else {
+                Exit::Signal { signal: signal::SIGSEGV, pc: 0, detail, internal: true }
+            };
             report_first_end(&spawn, pid, &exit);
             return Ok((exit, Stats::default()));
         }
@@ -1834,6 +1913,7 @@ fn run_program_with(
         // The old image's memory goes before the new one runs: every holder
         // of it is dropped here, or it stays resident for the new program's
         // whole life.
+        drop(usd_guard);
         drop(store);
         drop(linker);
         drop(spawn);
@@ -2296,6 +2376,7 @@ fn perform_block(
             val,
             deadline,
             parked,
+            ..
         } => {
             // The re-read has to happen under the queue's own lock, which is
             // what closes the race between checking the word and sleeping.
@@ -3394,7 +3475,10 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                     // caught, a trap gex has no signal for). Anything else
                     // (an ABI refusal) is said as gex's own and is no crash.
                     if program_failed(&e) {
-                        procs.set_crash_unless_said(pid, format!("\0gex could not run it on: {e:#}").as_bytes());
+                        // A program's own abort is said as its own, not as gex's.
+                        let what = format!("{e:#}");
+                        let note = if what.starts_with("the program aborted") { format!("\0SIGILL: {what}") } else { format!("\0gex could not run it on: {what}") };
+                        procs.set_crash_unless_said(pid, note.as_bytes());
                     } else {
                         eprintln!("gexc: child {pid} failed: {e:#}");
                     }
@@ -3563,6 +3647,11 @@ fn abort_message(state: &mut HostState, data: &[u8]) -> Option<String> {
 /// A crash's one line on the host's console.
 fn crash_line(c: &gex_kernel::proc::Crash) {
     let name = if c.name.is_empty() { String::new() } else { format!(" ({})", c.name) };
+    if c.notice {
+        // a running program's notice: said by default, as gex's few are
+        eprintln!("gex: pid {}{name}: {}", c.pid, c.reason);
+        return;
+    }
     eprintln!("[gex] pid {}{name} crashed: {}", c.pid, c.reason);
 }
 
@@ -3626,6 +3715,7 @@ fn run_guest_process(cx: Arc<SpawnContext>, thread: ThreadState, entry: u64) -> 
             instances: Vec::new(),
             replayed: 0,
             deferred: Deferred::default(),
+            installed: Default::default(),
             limits: cx.limits,
             ftab: None,
             blocks: None,
@@ -4032,6 +4122,7 @@ fn run_guest_thread(cx: Arc<SpawnContext>, thread: ThreadState) -> Result<Option
             instances: Vec::new(),
             replayed: 0,
             deferred: Deferred::default(),
+            installed: Default::default(),
             limits: cx.limits,
             ftab: None,
             blocks: None,
@@ -4191,9 +4282,17 @@ fn replay_into(mut cx: impl wasmtime::AsContextMut<Data = HostState>, take: Take
         }
     };
     let installed = !wanted.is_empty();
+    // A lazy unit only gets room in the tables: it is instantiated at
+    // this thread's first miss into it (`install_provider`).
+    let mut room = 0;
     for unit in wanted {
-        install_unit(cx.as_context_mut(), &unit)?;
+        if unit.lazy {
+            room = room.max(unit.table_slots);
+        } else {
+            install_unit(cx.as_context_mut(), &unit)?;
+        }
     }
+    grow_tables(cx.as_context_mut(), room)?;
     Ok(installed)
 }
 
@@ -4347,7 +4446,12 @@ fn mount_filesystems(
     kernel.vfs.mount("/dev", Arc::new(devfs));
     // POSIX shared memory (shm_open) lives in /dev/shm: a guest's own,
     // in memory (Chromium's, in a CEF game, refuses to start without it).
-    kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::new()));
+    // Over the host's root, the host's directories there stay the host's
+    // (a ramdisk work tree: `gex_kernel::vfs::mount_dev_shm`).
+    match opts.sysroot {
+        None => gex_kernel::vfs::mount_dev_shm(&mut kernel.vfs, "/dev/shm", std::path::Path::new("/dev/shm")),
+        Some(_) => kernel.vfs.mount("/dev/shm", Arc::new(TmpFs::new())),
+    }
     match gex_kernel::vfs::BinderFs::new(gex_kernel::vfs::BinderFs::options("").expect("no options")) {
         Ok(binderfs) => kernel.vfs.mount("/dev/binderfs", Arc::new(binderfs)),
         Err(e) => eprintln!("[gex] no binderfs: {e:?}"),
@@ -5127,6 +5231,10 @@ fn place_image(
     id: Identity,
 ) -> Result<()> {
     let image = &program.exe;
+    // A native wasm32 program's module rides in its image (wasm-elf.py), but
+    // nothing in the guest reads it there: the host takes it from the
+    // program (`wasmprog::install`). Not placed, its pages are never touched.
+    let module = gex_cgen::image::program_flags::module(image).map(|(at, len)| (at as usize, (at + len) as usize));
     // Segments first: the executable's, then the interpreter's.
     for seg in program.segments() {
         let data = memory.bytes();
@@ -5140,8 +5248,16 @@ fn place_image(
             );
         }
         gex_kernel::big_op("segment", end - start);
-        data[start..end].fill(0);
-        data[start..start + seg.bytes.len()].copy_from_slice(&seg.bytes);
+        let filled = start + seg.bytes.len();
+        let (ma, mb) = module.filter(|&(a, b)| a >= start && b <= filled).unwrap_or((filled, filled));
+        data[start..ma].fill(0);
+        data[mb..end].fill(0);
+        data[start..ma].copy_from_slice(&seg.bytes[..ma - start]);
+        data[mb..start + seg.bytes.len()].copy_from_slice(&seg.bytes[mb - start..]);
+        // (zeroes already where nothing wrote: a page is touched only to clear it)
+        if data[ma..mb].iter().any(|&b| b != 0) {
+            data[ma..mb].fill(0);
+        }
 
         let mut p = 0;
         if seg.readable {
@@ -5468,6 +5584,7 @@ fn alt_enter_in_store(store: &mut Store<HostState>, ctx_addr: u64, pc: u64) -> R
 fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let m = IMPORT_MODULE;
     libprov::register(linker)?;
+    ftab::register_ffi(linker)?;
 
     linker.func_wrap(
         m,
@@ -6217,6 +6334,39 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 }
                 return Err(StopExecution.into());
             }
+            // An instruction running onto memory that is not executable: an
+            // access violation, executing, at the first byte of it there
+            // (the fault hook's); else SIGSEGV with that address.
+            if imm == gex_abi::imports::BRK_FETCH_FAULT {
+                let pc = pc as u64;
+                let at = gex_abi::fetch_fault_addr(pc);
+                if deliver_guest_fault_kind(&mut caller, fault_code::ACCESS_VIOLATION, pc, at, 8)? {
+                    return Err(StopExecution.into());
+                }
+                let memory = caller
+                    .data()
+                    .memory
+                    .clone()
+                    .ok_or_else(|| anyhow!("guest memory unavailable"))?;
+                let data = memory.bytes();
+                let state = caller.data_mut();
+                let mut gm = GuestMem::new(data);
+                match state.with_kernel(|k| k.raise_fault(&mut gm, signal::SIGSEGV as u32, pc, at)) {
+                    gex_kernel::signal::Delivery::Resume(target) => {
+                        state.resume_cause = Some("SIGSEGV".into());
+                        state.resume_at = Some(target)
+                    }
+                    _ => {
+                        state.exit = Some(Exit::Signal {
+                            signal: signal::SIGSEGV,
+                            pc,
+                            detail: format!("instruction at 0x{pc:x} runs onto 0x{at:x}, which is not executable guest memory"),
+                            internal: false,
+                        })
+                    }
+                }
+                return Err(StopExecution.into());
+            }
             // An x87 exception the control word unmasks: not delivered, so
             // the process dies of SIGFPE, saying so.
             if imm == gex_abi::imports::BRK_X87_EXCEPTION {
@@ -6553,8 +6703,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 );
                 return Ok(());
             }
-            if op == gex_abi::cache_op::IC_INVALIDATE {
-                let addr = addr as u64;
+            if op == gex_abi::cache_op::IC_INVALIDATE || op == gex_abi::cache_op::GUARD_HIT {
+                // A guard names its block in `pc` (and its module in `addr`);
+                // the native host retires the page either way.
+                let addr = if op == gex_abi::cache_op::GUARD_HIT { pc as u64 } else { addr as u64 };
                 if std::env::var_os("GEX_TRACE_GUARD").is_some() {
                     eprintln!("[guard] {addr:#x} changed (block {:#x})", pc as u64);
                 }
@@ -6700,7 +6852,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // it: a whole trap-out and re-entry per safepoint on every
                 // thread but the main one (wined3d's command-stream thread
                 // spun at a crawl, and a game drew no frame).
-                if co.ret != 0 && sp.is_some_and(|sp| sp > co.sp_want + co.unwound) && !at_function() {
+                if co.ret != 0 && sp.is_some_and(|sp| co.left(sp)) && !at_function() {
                     if wasm_trace() {
                         eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {:#x}, want {:#x})", co.ret, sp.unwrap_or(0), co.sp_want);
                     }
@@ -6816,9 +6968,35 @@ pub(crate) fn ensure_alt_dir_in(state: &mut HostState, shared: &Arc<Mutex<JitSha
 /// running and can branch into it through the table.
 fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<bool> {
     let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::TRANSLATE);
+    // A page retired under its translation is translated again, for as long
+    // as other threads keep running and retiring it (a JIT's threads each
+    // rewriting their own code in one page retire it at every rewrite they
+    // run): each retry is a fresh chance, and a count of them failed a run
+    // whose threads were all making progress. Bounded in time, so a page
+    // that keeps changing under its translator still reports.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut first = None;
+    let mut tries = 0u32;
+    loop {
+        if let Some(r) = translate_once(caller, pc)? {
+            return Ok(r);
+        }
+        jit_stats::STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tries += 1;
+        let since = *first.get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() > PATIENCE {
+            bail!("translated blocks but none covered 0x{pc:x} (its page kept being retired: {tries} translations in {}s)", PATIENCE.as_secs());
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// [`translate_and_install`] once: `None` when what it translated is stale,
+/// its page retired since its snapshot.
+fn translate_once(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<bool>> {
     // No translator in this build: nothing is ever translated.
     if cfg!(not(feature = "translate")) {
-        return Ok(false);
+        return Ok(Some(false));
     }
     // With runtime translation off, a miss is still worth catching up on --
     // another thread or a freshly mapped object may already have covered this
@@ -6832,24 +7010,26 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     let key = gex_abi::addr_key(pc, alt);
     if !JIT_ON.load(std::sync::atomic::Ordering::Relaxed) {
         let replayed = replay_registry(caller)?;
-        let covered = replayed && {
+        let covered = install_provider(caller, key)? || replayed && {
             let jit = caller.data().jit.as_ref().unwrap();
             let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.translated.contains(&key)
         };
-        return Ok(covered);
+        return Ok(Some(covered));
     }
     // Another thread may already have translated this code. Catching up on
     // the shared registry is far cheaper than translating again, and it is
     // also how a newly spawned thread fills a table that starts out holding
     // only what the image module put there.
     let replayed_any = replay_registry_taking(caller, Take::at(pc))?;
-    if replayed_any && {
+    // A translation another thread made is instantiated here only now, at
+    // this thread's first miss into it (`CompiledUnit::lazy`).
+    if install_provider(caller, key)? || replayed_any && {
         let jit = caller.data().jit.as_ref().unwrap();
         let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
         sh.translated.contains(&key)
     } {
-        return Ok(true);
+        return Ok(Some(true));
     }
 
     // 32-bit Wine: an image Wine relocated gets its function-tier unit at its first
@@ -6860,7 +7040,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         // A function the table holds, or the run-time translator can make,
         // serves this address: tier-1 reaches it through the bridge.
         if ftab::serve(caller, pc)? {
-            return Ok(true);
+            return Ok(Some(true));
         }
     }
     let (limits, shared) = {
@@ -6876,18 +7056,16 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         // An i386 Wine module's function bound there (WoW64's 32-bit
         // builtins as native modules): its bridge, in the other directory.
         if ftab::serve_alt(caller, pc)? {
-            return Ok(true);
+            return Ok(Some(true));
         }
     }
     remiss(caller, &shared, key)?;
     // Not serialised: misses on several threads translate concurrently, each
-    // from this snapshot, and two that both lack a page each allocate it a
-    // base (the shared mark keeps the two distinct). The first to publish
-    // keeps it (`PageTable::insert_entries`); the other's blocks there are
-    // stale from the start and are not counted as translated.
-    let page_table = {
+    // from this snapshot, and two that both lack a page give it the same
+    // base (`snapshot`'s claims).
+    let (page_table, since) = {
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.page_table.clone()
+        snapshot(&sh)
     };
     // The bytes of the page the translation starts on and the next, as they
     // are before it reads them: a page found the same after is one it was
@@ -6899,7 +7077,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         (first..first + 2).map(|p| (p, page_table.lookup(p), page_hash(&memory_of(caller), p))).collect()
     };
     if pc % gex_abi::INST_ALIGN != 0 || pc >= gex_abi::dispatch_max_pages() * gex_abi::DISPATCH_PAGE {
-        return Ok(false);
+        return Ok(Some(false));
     }
     // Only translate what the guest says is executable, so a wild branch into
     // data reports SIGSEGV rather than running whatever bytes are there.
@@ -6907,7 +7085,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         .data_mut()
         .with_kernel(|k| k.mem.lock().check_access(pc, gex_abi::INST_ALIGN, prot::EXEC))
     {
-        return Ok(false);
+        return Ok(Some(false));
     }
 
     let memory = caller
@@ -6989,7 +7167,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         );
     }
     if translated_module.exported_blocks.is_empty() {
-        return Ok(false);
+        return Ok(Some(false));
     }
 
     let engine = {
@@ -7037,7 +7215,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
     // whenever another thread appended between the catch-up above and this
     // push -- which is exactly what filled one store with ten thousand
     // instances of the same modules.
-    publish_unit(&shared, &translated_module, module, stats.blocks)?;
+    let unit = publish_unit(&shared, &translated_module, module, stats.blocks)?;
     // A page this translation gave a base of its own, unchanged while it
     // was made: every translation under that base is of these bytes, and
     // the page's hash says so. A page that had a base already keeps a hash
@@ -7063,20 +7241,32 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         }
     }
     replay_registry_taking(caller, Take::at(pc))?;
+    // Its own translation, which catching up left for a first miss
+    // (`CompiledUnit::lazy`): this thread is that miss, and a page numbered
+    // for it has no directory entry until an install writes one.
+    if unit.lazy && !caller.data().jit.as_ref().is_some_and(|j| j.installed.contains(&unit.module_id)) {
+        install_unit(&mut *caller, &unit)?;
+        refresh_callouts(&mut *caller)?;
+    }
 
     // If the address that faulted did not end up with code, resuming would
     // fault again at the same place forever. Say so instead -- unless its
     // page was retired while this translation was being made (another
     // thread's block guard saw a JIT rewrite code there, or an munmap or
     // mprotect): `publish_unit` then counts the block stale, and translating
-    // again from the current memory is the answer. Bounded, so a page that
-    // keeps changing under its translator still reports.
+    // again from the current memory is the answer (None). (Retired since the
+    // snapshot by the clock: the page may have its base back since, the one
+    // a translation running at once claimed.)
     let (covered, retired) = {
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         let page = gex_abi::page_key(pc, alt);
-        (sh.translated.contains(&key), sh.page_table.lookup(page) != translated_module.page_table.lookup(page))
+        let lately = sh.claims.lock().unwrap_or_else(|e| e.into_inner()).retired_since(page, since);
+        (sh.translated.contains(&key), lately || sh.page_table.lookup(page) != translated_module.page_table.lookup(page))
     };
     if !covered {
+        if retired {
+            return Ok(None);
+        }
         thread_local! {
             static RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
@@ -7096,7 +7286,7 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
             RETRIES.with(|r| r.set(r.get() + 1));
             let again = translate_and_install(caller, pc);
             RETRIES.with(|r| r.set(r.get() - 1));
-            return again;
+            return again.map(Some);
         }
         let word = memory.bytes().get(pc as usize..pc as usize + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
         let below = translated_module.exported_blocks.iter().map(|(a, _)| *a).filter(|a| *a < pc).max();
@@ -7108,11 +7298,11 @@ fn translate_and_install(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<
         };
         bail!(
             "translated blocks but none covered 0x{pc:x}{} (a block made there: {made}; the instruction: {word:x?}; {} blocks made, the nearest at {below:x?} and {above:x?}; its page's slots: shared {shared_base:?}, this translation's {own_base:?})",
-            if retired { " (its page kept being retired)" } else { "" },
+            "",
             translated_module.exported_blocks.len(),
         );
     }
-    Ok(true)
+    Ok(Some(true))
 }
 
 /// How many times an address already translated may miss dispatch again
@@ -7246,6 +7436,37 @@ fn replay_registry_taking(caller: &mut Caller<'_, HostState>, take: Take) -> Res
     Ok(true)
 }
 
+/// Instantiate the lazy unit that provides `key` (`gex_abi::addr_key`) into
+/// this store, when it is translated and this store has not yet: a miss at
+/// code another thread translated. Whether it did. The unit's directory
+/// entries are written only where still current (`write_current_dir`), and a
+/// page retired since has no provider, so a retired translation is never
+/// brought back.
+fn install_provider(caller: &mut Caller<'_, HostState>, key: u64) -> Result<bool> {
+    let unit = {
+        let Some(jit) = caller.data().jit.as_ref() else {
+            return Ok(false);
+        };
+        let sh = jit.shared.lock().unwrap_or_else(|e| e.into_inner());
+        if !sh.translated.contains(&key) {
+            return Ok(false);
+        }
+        let Some(id) = sh.provider.get(&key) else {
+            return Ok(false);
+        };
+        if jit.installed.contains(id) {
+            return Ok(false);
+        }
+        let Some(&at) = sh.by_module.get(id) else {
+            return Ok(false);
+        };
+        Arc::clone(&sh.registry[at])
+    };
+    install_unit(&mut *caller, &unit)?;
+    refresh_callouts(&mut *caller)?;
+    Ok(true)
+}
+
 /// Merge a finished translation into the shared state, checking the invariant
 /// that no dispatch base is owned by two guest pages — if it were, an indirect
 /// branch would land inside the wrong function and fail somewhere unrelated.
@@ -7276,6 +7497,8 @@ fn publish_unit(
         pages: Default::default(),
         dense,
         page_globals: translated.page_globals.clone(),
+        // By its id, which is how a miss finds it: one without stays eager.
+        lazy: lazy_tier1() && translated.module_id != 0,
     });
     let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
     for &(page, base) in &translated.dir_entries {
@@ -7328,6 +7551,10 @@ fn publish_unit(
             *by.entry(*a / gex_abi::DISPATCH_PAGE).or_default() += 1;
         }
     }
+    if unit.lazy {
+        let at = sh.registry.len();
+        sh.by_module.insert(unit.module_id, at);
+    }
     sh.registry.push(Arc::clone(&unit));
     crate::REGISTRY_LEN.fetch_max(sh.registry.len(), std::sync::atomic::Ordering::Release);
     sh.blocks += blocks;
@@ -7378,6 +7605,20 @@ fn install_unit(
             jit.blocks.clone(),
         )
     };
+    grow_tables(cx.as_context_mut(), unit.table_slots)?;
+    install_unit_grown(cx, unit, memory, linker, tables, blocks)
+}
+
+/// Give this store's dispatch tables room for `table_slots` slots, each new
+/// one a miss: what a unit needs before it is instantiated, and all a lazy
+/// unit gets until a thread reaches it.
+fn grow_tables(mut cx: impl wasmtime::AsContextMut<Data = HostState>, table_slots: u64) -> Result<()> {
+    if table_slots == 0 {
+        return Ok(());
+    }
+    let Some((tables, blocks)) = cx.as_context().data().jit.as_ref().map(|j| (j.tables.clone(), j.blocks.clone())) else {
+        return Ok(());
+    };
     // Slots are allocated in one space that spans every table, so the figure
     // the unit carries is a running total and each table's share is that
     // total clamped to its own window.
@@ -7390,7 +7631,7 @@ fn install_unit(
         if blocks.is_some() && gex_emit::dense::table(i) {
             continue;
         }
-        let want = (unit.table_slots as u64)
+        let want = table_slots
             .saturating_sub(i as u64 * per)
             .min(per);
         let have = t.size(cx.as_context_mut());
@@ -7413,7 +7654,18 @@ fn install_unit(
                 .with_context(|| format!("growing dispatch table {i}"))?;
         }
     }
+    Ok(())
+}
 
+/// [`install_unit`] once the tables have its slots.
+fn install_unit_grown(
+    mut cx: impl wasmtime::AsContextMut<Data = HostState>,
+    unit: &CompiledUnit,
+    memory: gex_mem::GuestMemory,
+    linker: Linker<HostState>,
+    tables: Vec<Table>,
+    blocks: Option<dense::Blocks>,
+) -> Result<()> {
     if unit.module.is_none() {
         // Bridges only: tier-1's slots for addresses a function serves.
         ftab::install_bridges(cx.as_context_mut(), &unit.bridges)?;
@@ -7520,13 +7772,12 @@ fn install_unit(
         b.write(&memory, d)?;
     }
     write_current_dir(&cx, memory, unit)?;
-    cx.as_context_mut()
-        .data_mut()
-        .jit
-        .as_mut()
-        .unwrap()
-        .instances
-        .push(instance);
+    let mut c = cx.as_context_mut();
+    let jit = c.data_mut().jit.as_mut().unwrap();
+    jit.instances.push(instance);
+    if unit.lazy {
+        jit.installed.insert(unit.module_id);
+    }
     store_stats(cx.as_context_mut());
     Ok(())
 }
@@ -7594,8 +7845,10 @@ struct Callout {
     sp_want: u64,
     /// How far above `sp_want` a safepoint must find the stack pointer to
     /// call the caller unwound: `CALLOUT_UNWOUND`, or for a guest call from
-    /// native Wine its callee's argument bytes (`ftab::need_args`), or
-    /// `NATIVE_UNWOUND` when it names none.
+    /// native Wine its callee's argument bytes (`ftab::need_args`), none
+    /// when it names none and its stack is known (`stack_top`: anything
+    /// above its frame there is the native frames' or the guest's below
+    /// them), else `NATIVE_UNWOUND`.
     unwound: u64,
     /// How far above `sp_want` the awaited return may come back:
     /// `CALLOUT_UNWOUND`, or for a guest call from native Wine that names its
@@ -7605,10 +7858,21 @@ struct Callout {
     /// Made from code in the mode its process's class is not (`thread_alt`):
     /// a WoW64 process's 32-bit code, whose frames are on the 32-bit stack.
     alt: bool,
+    /// The top of the stack it was made on (`x86::callout_stack_top`): a
+    /// stack pointer above it is another fiber's, not past the caller.
+    stack_top: u64,
     /// `(slot, what the slot held)` while watched.
     slot: Option<(Slot, wasmtime::Ref)>,
     /// The slot holds the watch stub (an install may have written over it).
     live: bool,
+}
+
+impl Callout {
+    /// Whether the guest, at `sp`, has unwound past this call-out's caller:
+    /// above its frame on the stack it was made on.
+    fn left(&self, sp: u64) -> bool {
+        sp > self.sp_want.saturating_add(self.unwound) && sp <= self.stack_top
+    }
 }
 
 /// What the watch stub found when a dispatch reached a watched slot.
@@ -7679,14 +7943,15 @@ pub(crate) fn innermost_native_unwound(caller: &Caller<'_, HostState>, sp: u64) 
         .data()
         .callouts
         .last()
-        .is_some_and(|co| co.ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD && sp > co.sp_want + co.unwound)
+        .is_some_and(|co| co.ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD && co.left(sp))
 }
 
 /// The same for a guest call from native Wine (its return address is
-/// `tramp::NATIVE_RETURN_PAD`): the callee's frame is built just below the
-/// native caller's (gexrt `__gexw_guest_call`), so anything past its
-/// arguments is the native frames' and the guest has left them -- a catch
-/// block continuing in an outer frame. Its native callers then leave
+/// `tramp::NATIVE_RETURN_PAD`) that names no argument bytes, made on a stack
+/// the TEB does not name (`x86::callout_stack_top`): the callee's frame is
+/// built just below the native caller's (gexrt `__gexw_guest_call`), so
+/// anything past its arguments is the native frames' and the guest has left
+/// them -- a catch block continuing in an outer frame. Its native callers then leave
 /// (gexrt's `run_until` drops them), instead of the guest running on
 /// nested inside them.
 const NATIVE_UNWOUND: u64 = 512;
@@ -8398,7 +8663,22 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
         }
     }
     let alt = thread_alt(caller);
-    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, span, alt, slot: None, live: false });
+    // (a WoW64 stop's sp_want of 0 is on no stack and never unwound past)
+    let stack_top = if gex_abi::X86 && sp_want != 0 {
+        let class32 = gex_xlate::default_compat() != alt;
+        gex_kernel::x86::callout_stack_top(&GuestMem::new(memory.bytes()), ctx_addr, class32, sp_want)
+    } else {
+        u64::MAX
+    };
+    // A guest call from native Wine whose stack is known is left by any
+    // jump out of it to a guest frame below (a longjmp or a catch past the
+    // native frames, however small they are), not only one past
+    // NATIVE_UNWOUND: each jump that lands within it would hold one more
+    // call-out open.
+    if pad && args.is_none() && stack_top != u64::MAX {
+        unwound = 0;
+    }
+    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, span, alt, stack_top, slot: None, live: false });
     let me = caller.data().callouts.len() - 1;
     refresh_callouts(&mut *caller)?;
     let mut next: Option<wasmtime::Func> = None;
@@ -8702,6 +8982,17 @@ fn retire_translations(
             start / gex_abi::DISPATCH_PAGE,
             (end - 1) / gex_abi::DISPATCH_PAGE,
         );
+        {
+            let mut c = sh.claims.lock().unwrap_or_else(|e| e.into_inner());
+            c.clock += 1;
+            let now = c.clock;
+            for page in first..=last {
+                for key in [page, page | gex_abi::ALT_PAGE] {
+                    c.retired.insert(key, now);
+                    c.bases.remove(&key);
+                }
+            }
+        }
         for page in first..=last {
             sh.page_hash.remove(&page);
             if sh.page_table.forget(page).is_some() {
@@ -8841,9 +9132,9 @@ fn recompile_object(
         let jit = caller.as_context().data().jit.as_ref().unwrap();
         (jit.limits, Arc::clone(&jit.shared))
     };
-    let page_table = {
+    let (page_table, _) = {
         let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        sh.page_table.clone()
+        snapshot(&sh)
     };
     // What is already translated, asked of the shared state per address
     // rather than copied: a copy of the set (half a million entries for
@@ -9131,6 +9422,12 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
             wasmtime::Trap::IntegerDivisionByZero => {
                 "integer division by zero escaped the lifter's guard".to_string()
             }
+            // A Windows program's own `unreachable` (its fault hook takes
+            // access violations only): the program aborted, as a Rust panic
+            // under panic=abort, abort() or __builtin_trap end one.
+            wasmtime::Trap::UnreachableCodeReached => {
+                "the program aborted: its own code reached an unreachable instruction (an abort: a Rust panic under panic=abort, abort(), __builtin_trap)".to_string()
+            }
             wasmtime::Trap::BadSignature | wasmtime::Trap::TableOutOfBounds | wasmtime::Trap::IndirectCallToNull
                 if crate::dylink::behind(store.data()) =>
             {
@@ -9140,7 +9437,8 @@ fn classify_trap(e: anyhow::Error, store: &Store<HostState>) -> anyhow::Error {
         };
         // The wasm frames, when the engine kept them (GEX_WASM_BACKTRACE=1).
         let bt = e.downcast_ref::<wasmtime::WasmBacktrace>().map(|b| format!("\n{b:?}")).unwrap_or_default();
-        return anyhow::Error::new(GuestTrap(format!("{detail} (pc≈0x{pc:x}){bt}")));
+        let at = if pc != 0 { format!(" (pc≈0x{pc:x})") } else { String::new() };
+        return anyhow::Error::new(GuestTrap(format!("{detail}{at}{bt}")));
     }
     e
 }

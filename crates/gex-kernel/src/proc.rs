@@ -439,9 +439,6 @@ struct Proc {
     /// `PR_SET_CHILD_SUBREAPER`: its descendants whose parents end are
     /// given to it, not to init.
     subreaper: bool,
-    /// Whether it has ended (a zombie until collected): no reaper of
-    /// orphans then.
-    ended: bool,
     /// Started by the host as a child of the virtual init, which the host
     /// collects (with `wait` as pid 1) rather than the table at its exit.
     host_child: bool,
@@ -452,6 +449,13 @@ struct Proc {
     crash: Vec<u8>,
     /// A line gex adds to its crash's reason ([`ProcTable::add_crash_line`]).
     crash_more: Vec<u8>,
+    /// The notices it has given ([`ProcTable::notice`]), each given once.
+    noticed: Vec<String>,
+    /// Its end as a wait status, once it has ended ([`ProcTable::exit`]):
+    /// a crash said after that is reported then ([`ProcTable::set_crash`]).
+    ended: Option<i32>,
+    /// Its crash has been reported: once a process.
+    crash_told: bool,
 }
 
 /// Another process's memory as a host holds it: bytes at a guest address,
@@ -483,8 +487,33 @@ pub const PR_GEX_CRASH: u64 = 0x4745_0002;
 /// `prctl` option gex adds: a reservation of `arg2` bytes with no address
 /// could not be placed in the calling process's lowered memory (64-bit
 /// Wine's `map_view`, which looks for room itself and never asks the
-/// kernel for a mapping it has no gap for). `Kernel::note_short`.
+/// kernel for a mapping it has no gap for). `Kernel::note_short`. With
+/// `arg3` 1 the caller can start its program again itself, and 1 back says
+/// to, in place of its end (`outgrow_restart`).
 pub const PR_GEX_SHORT: u64 = 0x4745_0003;
+
+/// `prctl` option gex adds: why the calling process cannot work as it
+/// should, for whoever runs it to see while it runs (`arg2` the text's
+/// address, `arg3` its length): a need no memory gex has can meet, which
+/// the program goes on without. [`ProcTable::notice`].
+pub const PR_GEX_NOTICE: u64 = 0x4745_0004;
+
+/// TEST (`prctl` option gex adds, a test's stand-in for a panic in the
+/// runtime): the kernel panics in the calling process's syscall, once a
+/// host has armed it ([`arm_debug_trap`], the page's `debugpanic=prctl`).
+/// Unarmed, EINVAL as any unknown option.
+pub const PR_GEX_DEBUG_TRAP: u64 = 0x4745_00f0;
+
+static DEBUG_TRAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Let [`PR_GEX_DEBUG_TRAP`] panic (a test's switch).
+pub fn arm_debug_trap() {
+    DEBUG_TRAP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn debug_trap_armed() -> bool {
+    DEBUG_TRAP.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// A note's first byte when it gives way to one the process gave itself
 /// ([`ProcTable::set_crash_unless_said`]).
@@ -493,6 +522,17 @@ const UNLESS_SAID: u8 = 1;
 /// A note's first byte when the rest is one more line for its crash's
 /// reason ([`ProcTable::add_crash_line`]).
 const ADD_LINE: u8 = 2;
+
+/// A note's first byte when the rest is a notice, not a crash
+/// ([`ProcTable::notice`]).
+const NOTICE: u8 = 3;
+
+/// A note's first byte when the rest is a line for the process's crash if
+/// it says how it crashed, else a notice ([`ProcTable::end_line_or_notice`]).
+const LINE_OR_NOTICE: u8 = 4;
+
+/// The longest notice kept.
+const NOTICE_MAX: usize = 512;
 
 /// The most crashes kept for a reader that has not taken them.
 const CRASHES_KEPT: usize = 64;
@@ -511,6 +551,23 @@ pub struct Crash {
     pub code: u32,
     /// The signal that ended it, 0 for none.
     pub signal: u32,
+    /// A notice of a process that is still running ([`ProcTable::notice`]),
+    /// `reason` its text, not a crash.
+    pub notice: bool,
+    /// Its command line (`/proc`'s `cmdline`, its arguments joined by
+    /// spaces): what a page names the program by when `name` is its loader's
+    /// (a Wine process's notice comes before Wine names it).
+    pub cmdline: String,
+}
+
+/// `/proc`'s `info` (its name, a newline, its NUL-separated arguments)'s
+/// arguments, joined by spaces.
+fn cmdline_of(info: &[u8]) -> String {
+    let args = match info.iter().position(|&b| b == b'\n') {
+        Some(i) => &info[i + 1..],
+        None => &[][..],
+    };
+    args.split(|&b| b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect::<Vec<_>>().join(" ")
 }
 
 /// The signals whose default action dumps core: a program's crash.
@@ -556,10 +613,13 @@ impl Crash {
             },
             code,
             signal: if signaled { sig } else { 0 },
+            notice: false,
+            cmdline: cmdline_of(info),
         })
     }
 
-    /// As one line of JSON: `{"pid","name","reason","code","signal"}`.
+    /// As one line of JSON: `{"pid","name","reason","code","signal"}`, and
+    /// `"notice":true` for a notice.
     pub fn json(&self) -> String {
         fn q(s: &str) -> String {
             let mut o = String::from('"');
@@ -574,7 +634,9 @@ impl Crash {
             o.push('"');
             o
         }
-        format!(r#"{{"pid":{},"name":{},"reason":{},"code":{},"signal":{}}}"#, self.pid, q(&self.name), q(&self.reason), self.code, self.signal)
+        let notice = if self.notice { r#","notice":true"# } else { "" };
+        let cmdline = if self.cmdline.is_empty() { String::new() } else { format!(r#","cmdline":{}"#, q(&self.cmdline)) };
+        format!(r#"{{"pid":{},"name":{},"reason":{},"code":{},"signal":{}{notice}{cmdline}}}"#, self.pid, q(&self.name), q(&self.reason), self.code, self.signal)
     }
 }
 
@@ -584,6 +646,11 @@ static CRASH_HOOK: std::sync::OnceLock<fn(&Crash)> = std::sync::OnceLock::new();
 /// Have `f` hear of each crash the table records (a native host's line).
 pub fn set_crash_hook(f: fn(&Crash)) {
     let _ = CRASH_HOOK.set(f);
+}
+
+/// Whether this host reports crashes and notices itself ([`set_crash_hook`]).
+pub fn crash_hook_set() -> bool {
+    CRASH_HOOK.get().is_some()
 }
 
 struct Table {
@@ -660,7 +727,7 @@ impl Table {
         !self.procs.iter().any(|p| {
             p.pgid == pgid
                 && p.pid != ignore
-                && !p.ended
+                && p.ended.is_none()
                 && p.ppid != INIT_PID
                 && self.procs.iter().any(|q| q.pid == p.ppid && q.pgid != pgid && q.sid == p.sid)
         })
@@ -674,9 +741,35 @@ impl Table {
     /// Process `pid`'s crash, if ending with `status` is one: heard by the
     /// host's hook and kept for the reader. Whether it was.
     fn record_crash(&mut self, pid: i32, status: i32) -> bool {
-        let Some(c) = self.procs.iter_mut().find(|p| p.pid == pid).and_then(|p| Crash::of(pid, &p.info, std::mem::take(&mut p.crash), std::mem::take(&mut p.crash_more), status)) else {
+        let Some(c) = self.procs.iter_mut().find(|p| p.pid == pid && !p.crash_told).and_then(|p| {
+            let c = Crash::of(pid, &p.info, std::mem::take(&mut p.crash), std::mem::take(&mut p.crash_more), status)?;
+            p.crash_told = true;
+            Some(c)
+        }) else {
             return false;
         };
+        if let Some(f) = CRASH_HOOK.get() {
+            f(&c);
+        }
+        if self.crashes.len() >= CRASHES_KEPT {
+            self.crashes.pop_front();
+        }
+        self.crashes.push_back(c);
+        true
+    }
+
+    /// Process `pid`'s notice `text` ([`ProcTable::notice`]), unless it gave
+    /// it before: heard by the host's hook and kept for the reader. Whether
+    /// it was new.
+    fn record_notice(&mut self, pid: i32, text: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(text).into_owned();
+        let Some(p) = self.procs.iter_mut().find(|p| p.pid == pid) else { return false };
+        if text.is_empty() || p.noticed.contains(&text) {
+            return false;
+        }
+        p.noticed.push(text.clone());
+        let end = p.info.iter().position(|&b| b == b'\n').unwrap_or(p.info.len());
+        let c = Crash { pid, name: String::from_utf8_lossy(&p.info[..end]).into_owned(), reason: text, code: 0, signal: 0, notice: true, cmdline: cmdline_of(&p.info) };
         if let Some(f) = CRASH_HOOK.get() {
             f(&c);
         }
@@ -793,11 +886,13 @@ impl ProcTable {
                     vm: None,
                     pdeathsig: 0,
                     subreaper: false,
-                    ended: false,
                     host_child: false,
                     usage: Usage::default(),
                     crash: Vec::new(),
                     crash_more: Vec::new(),
+                    ended: None,
+                    crash_told: false,
+                    noticed: Vec::new(),
                 }],
                 gone_cpu_ns: 0,
                 load: Load::default(),
@@ -844,11 +939,13 @@ impl ProcTable {
             vm: None,
             pdeathsig: 0,
             subreaper: false,
-            ended: false,
             host_child,
             usage: Usage::default(),
             crash: Vec::new(),
             crash_more: Vec::new(),
+            ended: None,
+            crash_told: false,
+            noticed: Vec::new(),
         });
         drop(t);
         crate::cgroup::fork(ppid, pid);
@@ -967,12 +1064,57 @@ impl ProcTable {
         if let Some(r) = self.remote {
             return (r.set_crash)(pid, note.as_ptr() as usize as crate::PAddr, note.len() as u32);
         }
-        if let Some(p) = self.lock().procs.iter_mut().find(|p| p.pid == pid) {
-            match note.split_first() {
-                Some((&UNLESS_SAID, rest)) if p.crash.is_empty() => p.crash = rest.to_vec(),
-                Some((&UNLESS_SAID, _)) => {}
-                Some((&ADD_LINE, rest)) => p.crash_more = rest.to_vec(),
-                _ => p.crash = note.to_vec(),
+        if let Some((&NOTICE, text)) = note.split_first() {
+            if self.lock().record_notice(pid, text) {
+                self.crash_notify();
+            }
+            return;
+        }
+        if let Some((&LINE_OR_NOTICE, text)) = note.split_first() {
+            let mut t = self.lock();
+            let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else { return };
+            if !p.crash.is_empty() {
+                p.crash_more = text.to_vec();
+            } else if t.record_notice(pid, text) {
+                drop(t);
+                self.crash_notify();
+            }
+            return;
+        }
+        let mut t = self.lock();
+        let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) else {
+            // Ended and collected already: a host's account of a trap (its
+            // Worker's abandon, `UNLESS_SAID`) still makes its crash, which
+            // nothing else reported (a kill's end is none).
+            if let Some((&UNLESS_SAID, rest)) = note.split_first() {
+                let mut parts = rest.split(|&b| b == 0).map(|b| String::from_utf8_lossy(b).into_owned());
+                let (name, reason) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+                let c = Crash { pid, name, reason: if reason.is_empty() { "crashed".into() } else { reason }, code: 137, signal: 9, notice: false, cmdline: String::new() };
+                if let Some(f) = CRASH_HOOK.get() {
+                    f(&c);
+                }
+                if t.crashes.len() >= CRASHES_KEPT {
+                    t.crashes.pop_front();
+                }
+                t.crashes.push_back(c);
+                drop(t);
+                self.crash_notify();
+            }
+            return;
+        };
+        match note.split_first() {
+            Some((&UNLESS_SAID, rest)) if p.crash.is_empty() => p.crash = rest.to_vec(),
+            Some((&UNLESS_SAID, _)) => {}
+            Some((&ADD_LINE, rest)) => p.crash_more = rest.to_vec(),
+            _ => p.crash = note.to_vec(),
+        }
+        // Said after its end was published (a host's account of a Worker
+        // that trapped while another task's kill ended the process first):
+        // reported now, as its end would have.
+        if let Some(word) = p.ended.filter(|_| !p.crash.is_empty()) {
+            if t.record_crash(pid, word) {
+                drop(t);
+                self.crash_notify();
             }
         }
     }
@@ -995,6 +1137,38 @@ impl ProcTable {
         let mut v = Vec::with_capacity(line.len() + 1);
         v.push(ADD_LINE);
         v.extend_from_slice(line.as_bytes());
+        self.set_crash(pid, &v);
+    }
+
+    /// What gex knows of why process `pid` is ending, which is no crash of
+    /// its own (a program moving to a 64-bit memory at its next start,
+    /// `outgrow_ending`): one more line for its crash's reason if it says
+    /// how it crashed itself, and otherwise a notice ([`Crash::notice`]),
+    /// its end then no crash, even a nonzero exit (its exit status is kept).
+    pub fn end_line_or_notice(&self, pid: i32, line: &str) {
+        let line = line.trim_end();
+        let mut cut = line.len().min(NOTICE_MAX);
+        while !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut v = Vec::with_capacity(cut + 1);
+        v.push(LINE_OR_NOTICE);
+        v.extend_from_slice(&line.as_bytes()[..cut]);
+        self.set_crash(pid, &v);
+    }
+
+    /// Why process `pid`, still running, cannot work as it should (`text`,
+    /// one line), for the reader of crashes as a notice ([`Crash::notice`])
+    /// and the host's crash hook: each text once a process.
+    pub fn notice(&self, pid: i32, text: &str) {
+        let text = text.trim_end();
+        let mut cut = text.len().min(NOTICE_MAX);
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut v = Vec::with_capacity(cut + 1);
+        v.push(NOTICE);
+        v.extend_from_slice(&text.as_bytes()[..cut]);
         self.set_crash(pid, &v);
     }
 
@@ -1184,7 +1358,7 @@ impl ProcTable {
                 loop {
                     match t.procs.iter().find(|p| p.pid == at) {
                         Some(p) if p.pid == INIT_PID => break INIT_PID,
-                        Some(p) if p.subreaper && !p.ended => break p.pid,
+                        Some(p) if p.subreaper && p.ended.is_none() => break p.pid,
                         Some(p) => at = p.ppid,
                         None => break INIT_PID,
                     }
@@ -1201,7 +1375,7 @@ impl ProcTable {
                     // The signal it asked for at its parent's end
                     // (`forget_original_parent`): to the process, from the
                     // parent, as `kill` sends one.
-                    if p.pdeathsig != 0 && !p.ended {
+                    if p.pdeathsig != 0 && p.ended.is_none() {
                         let bit = 1u64 << (p.pdeathsig - 1);
                         p.killed |= bit;
                         p.senders[p.pdeathsig as usize - 1] = pid;
@@ -1233,7 +1407,7 @@ impl ProcTable {
                 if !(t.orphaned(g, pid) && t.has_stopped(g)) {
                     continue;
                 }
-                let members: Vec<usize> = (0..t.procs.len()).filter(|&i| t.procs[i].pgid == g && !t.procs[i].ended).collect();
+                let members: Vec<usize> = (0..t.procs.len()).filter(|&i| t.procs[i].pgid == g && t.procs[i].ended.is_none()).collect();
                 for &i in &members {
                     t.procs[i].pending.fetch_or(1u64 << (crate::signal::sig::SIGHUP - 1), Ordering::AcqRel);
                     woken.extend(t.before_send(i, SIGCONT, virtual_init));
@@ -1246,7 +1420,7 @@ impl ProcTable {
             match t.procs.iter_mut().find(|p| p.pid == pid) {
                 Some(p) => {
                     p.vm = None;
-                    p.ended = true;
+                    p.ended.get_or_insert(word);
                     // Out of its control group (`cgroup_exit`), its time
                     // kept there; told once the table is let go.
                     left_group = Some(p.usage.cpu_ns);
@@ -2095,9 +2269,27 @@ mod tests {
         t.exit(d, 15);
         let got = t.take_crashes();
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0], Crash { pid: a, name: "prog".into(), reason: "SIGSEGV at 0x1234".into(), code: 139, signal: 11 });
-        assert_eq!(got[1], Crash { pid: b, name: "app.exe".into(), reason: "page fault on read access to 00000000".into(), code: 0xc0000005, signal: 0 });
+        assert_eq!(got[0], Crash { pid: a, name: "prog".into(), reason: "SIGSEGV at 0x1234".into(), code: 139, signal: 11, notice: false, cmdline: "prog".into() });
+        assert_eq!(got[1], Crash { pid: b, name: "app.exe".into(), reason: "page fault on read access to 00000000".into(), code: 0xc0000005, signal: 0, notice: false, cmdline: String::new() });
         assert_eq!(got[1].json(), format!(r#"{{"pid":{b},"name":"app.exe","reason":"page fault on read access to 00000000","code":3221225477,"signal":0}}"#));
+        assert!(t.take_crashes().is_empty());
+    }
+
+    #[test]
+    fn a_notice_is_given_once_and_is_no_crash() {
+        let t = ProcTable::new();
+        let a = t.spawn(INIT_PID);
+        t.set_info(a, b"big.exe\nbig.exe\0");
+        t.notice(a, "needs more than 16 GiB of address space\n");
+        t.notice(a, "needs more than 16 GiB of address space");
+        t.notice(a, "another");
+        let got = t.take_crashes();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], Crash { pid: a, name: "big.exe".into(), reason: "needs more than 16 GiB of address space".into(), code: 0, signal: 0, notice: true, cmdline: "big.exe".into() });
+        assert_eq!(got[0].json(), format!(r#"{{"pid":{a},"name":"big.exe","reason":"needs more than 16 GiB of address space","code":0,"signal":0,"notice":true,"cmdline":"big.exe"}}"#));
+        assert_eq!(got[1].reason, "another");
+        // it ends normally afterwards: no crash
+        t.exit(a, 0);
         assert!(t.take_crashes().is_empty());
     }
 

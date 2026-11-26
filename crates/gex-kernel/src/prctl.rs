@@ -335,7 +335,7 @@ pub fn call(cx: &Cx<'_>, m: &mut GuestMem<'_>, a: [u64; 6]) -> Option<SysResult>
     let [option, arg2, arg3, arg4, arg5, _] = a;
     // The option is an `int`.
     let option = option as u32 as u64;
-    if matches!(option, pr::SET_NAME | pr::GET_NAME | pr::SET_VMA | crate::proc::PR_GEX_CRASH | crate::proc::PR_GEX_SHORT) {
+    if matches!(option, pr::SET_NAME | pr::GET_NAME | pr::SET_VMA | crate::proc::PR_GEX_CRASH | crate::proc::PR_GEX_SHORT | crate::proc::PR_GEX_NOTICE | crate::proc::PR_GEX_DEBUG_TRAP) {
         return None;
     }
     Some(match option {

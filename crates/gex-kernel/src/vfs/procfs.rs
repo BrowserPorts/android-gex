@@ -45,11 +45,6 @@ pub trait ProcSource: Send + Sync {
         Err(Errno::ENOENT)
     }
     /// Set one of the process's SELinux ids.
-    /// Task `tid` of this process takes `name` as its name (`comm_write`,
-    /// a write to its `comm`). A source that keeps no names refuses.
-    fn set_comm(&self, _tid: i32, _name: &[u8]) -> Result<(), Errno> {
-        Err(Errno::EINVAL)
-    }
     fn set_attr_id(&self, which: usize, sid: u32) {
         let _ = (which, sid);
     }
@@ -107,6 +102,13 @@ pub trait ProcSource: Send + Sync {
     /// thread's process's, as Linux shows it.
     fn task_owner(&self, _id: i32) -> Option<i32> {
         None
+    }
+    /// Task `tid` of this process is now called `name`: a write of
+    /// `/proc/self/comm` or `/proc/self/task/<tid>/comm`, as
+    /// `prctl(PR_SET_NAME)` does it (Wine's SetThreadDescription takes this
+    /// path). False where the kernel keeps no names: the write fails.
+    fn set_task_name(&self, _tid: i32, _name: &[u8]) -> bool {
+        false
     }
     /// The process's mounts ([`crate::vfs::Namespace::mount_table`]).
     fn mount_table(&self) -> Vec<crate::vfs::MountLine> {
@@ -366,38 +368,6 @@ pub fn status_ids(creds: &[u8]) -> (String, String, String) {
 #[derive(Debug)]
 struct Generated {
     data: Vec<u8>,
-}
-
-/// `/proc/self/comm` and `/proc/self/task/<tid>/comm` opened for writing:
-/// a write names the task with its first 15 bytes as they are, a newline
-/// included, up to a NUL (`comm_write`, `set_task_comm`), and answers the
-/// whole count. bionic's `pthread_setname_np` names a thread other than
-/// the caller this way. (Another process's is refused, `EINVAL`, by not
-/// being this file.)
-struct Comm {
-    source: Arc<dyn ProcSource>,
-    tid: i32,
-    read: Generated,
-}
-
-impl std::fmt::Debug for Comm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Comm").field("tid", &self.tid).finish()
-    }
-}
-
-impl FileHandle for Comm {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
-        self.read.read_at(offset, buf)
-    }
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
-        // TASK_COMM_LEN less its NUL.
-        self.source.set_comm(self.tid, &buf[..buf.len().min(15)])?;
-        Ok(buf.len() as u64)
-    }
-    fn metadata(&self) -> Result<Metadata, Errno> {
-        Ok(Metadata { mode: 0o644, ..Generated { data: Vec::new() }.metadata()? })
-    }
 }
 
 /// `/proc/<pid>/oom_score_adj`: how much to prefer the process when one
@@ -871,6 +841,36 @@ impl FileHandle for MountInfo {
     }
 }
 
+/// `/proc/self/comm` or `/proc/self/task/<tid>/comm` opened for writing: a
+/// write names task `tid` (at most 15 bytes, up to a NUL), as Linux's
+/// `comm_write` does.
+struct CommFile {
+    file: Generated,
+    source: Arc<dyn ProcSource>,
+    tid: i32,
+}
+
+impl std::fmt::Debug for CommFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommFile").field("tid", &self.tid).finish()
+    }
+}
+
+impl FileHandle for CommFile {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
+        self.file.read_at(offset, buf)
+    }
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> SysResult {
+        if !self.source.set_task_name(self.tid, &buf[..buf.len().min(15)]) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(buf.len() as u64)
+    }
+    fn metadata(&self) -> Result<Metadata, Errno> {
+        Ok(Metadata { mode: 0o644, ..self.file.metadata()? })
+    }
+}
+
 impl FileHandle for Generated {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         let start = (offset as usize).min(self.data.len());
@@ -1073,26 +1073,25 @@ impl ProcFs {
                 // A fixed 4 GiB total: the browser does not say how much
                 // the machine has. In use: what the processes have mapped
                 // and accessible, summed.
+                // Shmem: what the kernel's file system holds in memory, as
+                // Linux counts tmpfs's pages there.
                 Some(sys) => {
                     let free = (4u64 << 30).saturating_sub(sys.rss) >> 10;
+                    let shmem = super::tmpfs::TMPFS_BYTES.load(core::sync::atomic::Ordering::Relaxed) >> 10;
                     format!(
                         "MemTotal:        4194304 kB\nMemFree:        {free:8} kB\nMemAvailable:   {free:8} kB\n\
                          Buffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\n\
-                         SwapFree:              0 kB\n"
+                         SwapFree:              0 kB\nShmem:          {shmem:8} kB\n"
                     )
                     .into_bytes()
                 }
-                None => concat!(
-                    "MemTotal:        4194304 kB\n",
-                    "MemFree:         2097152 kB\n",
-                    "MemAvailable:    3145728 kB\n",
-                    "Buffers:               0 kB\n",
-                    "Cached:                0 kB\n",
-                    "SwapTotal:             0 kB\n",
-                    "SwapFree:              0 kB\n",
+                None => format!(
+                    "MemTotal:        4194304 kB\nMemFree:         2097152 kB\nMemAvailable:    3145728 kB\n\
+                     Buffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\n\
+                     SwapFree:              0 kB\nShmem:          {:8} kB\n",
+                    super::tmpfs::TMPFS_BYTES.load(core::sync::atomic::Ordering::Relaxed) >> 10
                 )
-                .as_bytes()
-                .to_vec(),
+                .into_bytes(),
             },
             "cpuinfo" if gex_abi::X86 => crate::cpus::proc_cpuinfo(crate::x86::CPUINFO).into_bytes(),
             "cpuinfo" => crate::cpus::proc_cpuinfo(concat!(
@@ -1186,6 +1185,13 @@ impl FileSystem for ProcFs {
             return Err(Errno::EISDIR);
         }
         let (path, tid) = self.canonical(path)?;
+        // A task of this process renamed (`CommFile`): only its own tasks'
+        // names are this process's to write, as on Linux without ptrace.
+        if path == "self/comm" && super::writes(flags) {
+            let data = self.generate(&path, tid).unwrap_or_default();
+            let tid = if tid != 0 { tid } else { self.source.pid() };
+            return Ok(Arc::new(CommFile { file: Generated { data }, source: Arc::clone(&self.source), tid }));
+        }
         if path == "self/mountinfo" {
             // The count before the table: a change after it is one this
             // reader has not seen.
@@ -1217,12 +1223,6 @@ impl FileSystem for ProcFs {
         }
         if Pressure::at(&path) {
             return Ok(Arc::new(Pressure::new(path == "pressure/irq")));
-        }
-        // A task's name, written (`comm_write`): see [`Comm`].
-        if path == "self/comm" && super::writes(flags) {
-            let tid = if tid != 0 { tid } else { self.source.pid() };
-            let data = self.generate(&path, tid).unwrap_or_default();
-            return Ok(Arc::new(Comm { source: Arc::clone(&self.source), tid, read: Generated { data } }));
         }
         if path == "self/oom_score_adj" && self.source.oom_score_adj().is_some() {
             return Ok(Arc::new(OomScoreAdj { source: Arc::clone(&self.source) }));
@@ -1372,7 +1372,8 @@ impl FileSystem for ProcFs {
             return Ok(Metadata {
                 file_type: FileType::Regular,
                 size: 0,
-                mode: settable.map_or(if path == "self/oom_score_adj" { 0o644 } else if Pressure::at(&path) { 0o666 } else { 0o444 }, |s| s.mode()),
+                // (a task's name is its process's to write: `CommFile`)
+                mode: settable.map_or(if path == "self/oom_score_adj" || path == "self/comm" { 0o644 } else if Pressure::at(&path) { 0o666 } else { 0o444 }, |s| s.mode()),
                 ino: 1,
                 mtime: 0,
                 nlink: 1,
@@ -1631,6 +1632,78 @@ mod tests {
             xterm.task_usage = vec![TaskUsage::default(), TaskUsage { cpu_ns: 2_500_000_000, name: io, sched: 0 }, TaskUsage { cpu_ns: 1_500_000_000, name: [0; 16], sched: 0 }];
             vec![e(1, 0, b"bash\n/bin/bash\0/etc/session\0", &[]), xterm, e(42, 7, b"prog\n", &[43])]
         }
+    }
+
+    /// A source whose writes of a task's name are kept, for the comm test.
+    struct Named(std::sync::Mutex<Vec<(i32, Vec<u8>)>>);
+    impl ProcSource for Named {
+        fn pid(&self) -> i32 {
+            42
+        }
+        fn maps(&self) -> String {
+            String::new()
+        }
+        fn auxv(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn cmdline(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn environ(&self) -> Vec<u8> {
+            Vec::new()
+        }
+        fn exe(&self) -> String {
+            "/bin/prog".into()
+        }
+        fn cwd(&self) -> String {
+            "/".into()
+        }
+        fn fds(&self) -> Vec<(i32, String)> {
+            Vec::new()
+        }
+        fn stat(&self, tid: i32, threads: usize, _task: Option<&TaskUsage>) -> String {
+            stat_line(tid, "prog", 'R', 1, 42, 1, None, threads, &Usage::default(), crate::sched::Sched::from_word(0))
+        }
+        fn status(&self, tid: i32, threads: usize, _task: Option<&TaskUsage>) -> String {
+            status_text(tid, 42, "prog", 'R', 1, threads, &[], &Usage::default(), None)
+        }
+        fn task_owner(&self, id: i32) -> Option<i32> {
+            (id == 43).then_some(42)
+        }
+        fn others(&self) -> Vec<crate::proc::ProcEntry> {
+            vec![crate::proc::ProcEntry {
+                pid: 42,
+                ppid: 1,
+                pgid: 42,
+                sid: 1,
+                zombie: false,
+                info: b"prog\n".to_vec(),
+                tids: vec![43],
+                creds: Vec::new(),
+                usage: Usage::default(),
+                task_usage: Vec::new(),
+                stopped: false,
+            }]
+        }
+        fn set_task_name(&self, tid: i32, name: &[u8]) -> bool {
+            self.0.lock().unwrap().push((tid, name.to_vec()));
+            true
+        }
+    }
+
+    #[test]
+    fn a_write_of_comm_names_the_task() {
+        let src = Arc::new(Named(std::sync::Mutex::new(Vec::new())));
+        let f = ProcFs::new(src.clone());
+        const O_WRONLY: u64 = 1;
+        // what Wine's set_native_thread_name writes: a thread of its own process
+        f.open("42/task/43/comm", O_WRONLY, 0).unwrap().write_at(0, b"Socket Thread").unwrap();
+        // the process's own, through self; and a name past 15 bytes cut there
+        f.open("self/comm", O_WRONLY, 0).unwrap().write_at(0, b"a name longer than fifteen").unwrap();
+        assert_eq!(*src.0.lock().unwrap(), vec![(43, b"Socket Thread".to_vec()), (42, b"a name longer t".to_vec())]);
+        assert_eq!(f.metadata("self/comm").unwrap().mode, 0o644);
+        // still read-only where it is not ours to write
+        assert!(f.open("self/stat", O_WRONLY, 0).unwrap().write_at(0, b"x").is_err());
     }
 
     fn read(f: &ProcFs, path: &str) -> String {

@@ -818,6 +818,12 @@ pub const EXCLUSIVE_SCRATCH: u64 = RESERVED_END - 64;
 /// low region, never guest-observable.
 pub const SPLIT_LOCK: u64 = RESERVED_END - 128;
 
+/// The tear debug switch's counters (`?tear=`, gex-emit `set_tear`): plain
+/// misaligned 8-byte loads at [`TEAR_COUNTS`], stores at `TEAR_COUNTS + 8`
+/// (`u64`s, atomic adds). Per process, in the reserved low region, never
+/// guest-observable; nothing touches them with the switch off.
+pub const TEAR_COUNTS: u64 = RESERVED_END - 112;
+
 /// One bit per dispatch-directory page (bit `page & 7` of byte `page >> 3`),
 /// set by the host once a page's code changed after a function-tier unit was
 /// installed over it (Detours patching a prologue, a JIT rewriting code).
@@ -1063,6 +1069,13 @@ pub const fn ctx_addr(slot: u32) -> u64 {
 pub const IMPORT_MODULE: &str = "gex";
 
 /// Names of the functions translated code imports from the host.
+/// Where an instruction fetch at `pc` that `imports::BRK_FETCH_FAULT`
+/// reports faults: the first byte past `pc`'s 4 KiB page, the memory the
+/// instruction runs onto.
+pub fn fetch_fault_addr(pc: u64) -> u64 {
+    (pc | 0xfff).wrapping_add(1)
+}
+
 pub mod imports {
     /// `svc #0`. Signature `(ctx: i32, pc: i64) -> ()`. Reads the number and
     /// args from the context, writes the result to `x0`. Guest exit is
@@ -1155,7 +1168,14 @@ pub mod imports {
     /// multiple of sixteen. Linux reports it as SIGBUS with `BUS_ADRALN` at
     /// the instruction. The address reported is 0, as for the misaligned
     /// atomics the engine itself traps on.
-    pub const BRK_ALIGNMENT: i32 = -10;
+    pub const BRK_ALIGNMENT: i32 = -11;
+    /// Not a `brk`: a `Stmt::Trap` for an instruction at a block's start
+    /// whose bytes run onto memory that is not executable (the next page
+    /// unmapped or not executable). As a processor's instruction fetch, an
+    /// access violation, executing, at the first byte past `pc`'s page
+    /// (Windows' ExceptionInformation 8 and that address; SIGSEGV with it
+    /// on Linux). The host does not return.
+    pub const BRK_FETCH_FAULT: i32 = -10;
 
     /// A system register read the compiler could not resolve statically.
     /// Signature `(ctx: i32, pc: i64, sysreg: i32) -> i64`.
@@ -1316,6 +1336,11 @@ pub mod cache_op {
     /// aligned 8-byte words, at the address given, which runs under
     /// [`super::SPLIT_LOCK`] -- atomic against other such accesses only.
     pub const SPLIT_LOCK: i32 = 10;
+    /// Not a cache operation: one of the first plain misaligned 8-byte
+    /// loads (`TEAR_STORE`: stores) the tear debug switch counts
+    /// ([`super::TEAR_COUNTS`]), at the address given.
+    pub const TEAR_LOAD: i32 = 16;
+    pub const TEAR_STORE: i32 = 17;
     /// Not a cache operation: a locked access below [`super::GUEST_FLOOR`],
     /// in the runtime's own memory, at the address given. The host raises
     /// an access violation (NT) or SIGSEGV (Linux) and does not return.
@@ -1342,9 +1367,9 @@ pub mod cache_op {
     /// host asks the process's map: an access it allows after all (the
     /// table was behind) runs again, any other is the fault. The operation
     /// carries the access's size above its low byte ([`perm`]).
-    pub const PERM_READ: i32 = 15;
+    pub const PERM_READ: i32 = 18;
     /// The same for a store, or an atomic access.
-    pub const PERM_WRITE: i32 = 16;
+    pub const PERM_WRITE: i32 = 19;
 
     /// The operation for a failed check of an access of `size` bytes.
     pub const fn perm(write: bool, size: u32) -> i32 {
@@ -1360,6 +1385,11 @@ pub mod cache_op {
             _ => None,
         }
     }
+    /// Not a cache operation: the block at `pc` found its code bytes changed
+    /// since it was lifted (its self-modifying-code guard), and `addr` is its
+    /// module, as for [`PAGE_STALE`]. The host retires that block, or its
+    /// page, and the block then dispatches to `pc` again.
+    pub const GUARD_HIT: i32 = 15;
 }
 
 /// The lowest address a guest access may name: below it are the runtime's

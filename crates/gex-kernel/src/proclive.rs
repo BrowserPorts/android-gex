@@ -129,11 +129,6 @@ impl ProcSource for KernelProcSource {
         let l = self.0.get().ok_or(crate::errno::Errno::ESRCH)?;
         l.creds.set_oom_score_adj(value)
     }
-    fn set_comm(&self, tid: i32, name: &[u8]) -> Result<(), crate::errno::Errno> {
-        let l = self.0.get().ok_or(crate::errno::Errno::ESRCH)?;
-        l.procs.set_task_name(tid, name);
-        Ok(())
-    }
     fn set_attr_id(&self, which: usize, sid: u32) {
         if let Some(l) = self.0.get() {
             l.creds.set_sec(which, sid);
@@ -314,6 +309,11 @@ impl ProcSource for KernelProcSource {
     }
     fn task_owner(&self, id: i32) -> Option<i32> {
         self.0.get()?.procs.task_owner(id)
+    }
+    fn set_task_name(&self, tid: i32, name: &[u8]) -> bool {
+        let Some(l) = self.0.get() else { return false };
+        l.procs.set_task_name(tid, name);
+        true
     }
     fn status(&self, tid: i32, threads: usize, task: Option<&crate::proc::TaskUsage>) -> String {
         let Some(l) = self.0.get() else { return String::new() };
