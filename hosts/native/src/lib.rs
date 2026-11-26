@@ -5253,6 +5253,42 @@ fn low_access(caller: &mut Caller<'_, HostState>, what: &str, addr: u64, pc: u64
     Err(StopExecution.into())
 }
 
+/// `GEX_TRACE_ACCERR=1`: an access a mapping is there for and its protection
+/// does not allow (`SEGV_ACCERR`; not a missing mapping, nor a page a
+/// userfaultfd has yet to fill), said with the process, thread and mapping.
+/// Rare in a boot, where `GEX_TRACE_GUEST_FAULT` would say every one of
+/// ART's own faults.
+fn trace_accerr(state: &mut HostState, what: &str, addr: u64, pc: u64, write: bool, how: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("GEX_TRACE_ACCERR").is_some()) {
+        return;
+    }
+    let tid = state.thread.tid;
+    let line = state.with_kernel(|k| {
+        let mm = k.mem.lock();
+        let v = mm.vma_at(addr)?;
+        let allowed = if write { v.prot & 2 != 0 } else { v.prot & 1 != 0 };
+        if allowed {
+            return None;
+        }
+        let p = |bit: u32, c: char| if v.prot & bit != 0 { c } else { '-' };
+        let name = if v.name.is_empty() { "[anon]" } else { &v.name };
+        let at_pc = mm.vma_at(pc).map(|c| if c.name.is_empty() { "[anon]".to_string() } else { c.name.clone() }).unwrap_or_else(|| "nothing".into());
+        Some(format!(
+            "gex: SEGV_ACCERR in pid {} tid {tid}: {what} at {addr:#x} by pc {pc:#x} ({at_pc}) in {:#x}-{:#x} {}{}{} {name}, SIGSEGV {how}",
+            k.pid,
+            v.start,
+            v.end,
+            p(1, 'r'),
+            p(2, 'w'),
+            p(4, 'x')
+        ))
+    });
+    if let Some(line) = line {
+        eprintln!("{line}");
+    }
+}
+
 /// An access check failed (`cache_op::PERM_READ`, `PERM_WRITE`): the
 /// instruction at `pc`, whose registers the context holds, would load from
 /// or store to the `size` bytes at `addr`. The kernel decides (`Kernel::access_fault`): the
@@ -5317,10 +5353,12 @@ fn access_fault(caller: &mut Caller<'_, HostState>, addr: u64, pc: u64, size: u3
             if std::env::var_os("GEX_TRACE_GUEST_FAULT").is_some() {
                 eprintln!("gex: {what} at {addr:#x} its page does not allow, at pc {pc:#x}: SIGSEGV to the handler at {target:#x}");
             }
+            trace_accerr(state, what, addr, pc, write, "to the handler");
             state.resume_cause = Some("SIGSEGV".into());
             state.resume_at = Some(target);
         }
         gex_kernel::syscalls::AccessFault::Raised(_) => {
+            trace_accerr(state, what, addr, pc, write, "with no handler");
             state.exit = Some(Exit::Signal {
                 signal: signal::SIGSEGV,
                 pc,
@@ -8193,6 +8231,25 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
             return Err(StopExecution.into());
         }
     }
+    // What the target is in: the mapping that holds it (its range,
+    // protection and name), or the ones either side of it when none does.
+    let place = caller.data_mut().with_kernel(|k| {
+        let mm = k.mem.lock();
+        let say = |v: &gex_kernel::mem::Vma| {
+            let p = |bit: u32, c: char| if v.prot & bit != 0 { c } else { '-' };
+            format!("{:#x}-{:#x} {}{}{} {}", v.start, v.end, p(1, 'r'), p(2, 'w'), p(4, 'x'), if v.name.is_empty() { "[anon]" } else { &v.name })
+        };
+        match mm.vma_at(pc) {
+            Some(v) => format!("in {}", say(v)),
+            None => {
+                let vmas = mm.vmas();
+                let i = vmas.partition_point(|v| v.start <= pc);
+                let below = i.checked_sub(1).and_then(|j| vmas.get(j)).map(say).unwrap_or_else(|| "nothing".into());
+                let above = vmas.get(i).map(say).unwrap_or_else(|| "nothing".into());
+                format!("in no mapping (below: {below}; above: {above})")
+            }
+        }
+    });
     // A wild branch is nearly always a bad return address or
     // function pointer: say where the last indirect branch
     // was aimed and what the stack holds, so the caller can
@@ -8215,12 +8272,12 @@ pub(crate) fn branch_not_executable(caller: &mut Caller<'_, HostState>, pc: u64)
                     .map(|i| format!("{:#x}", gm.read_u64(sp + i * 8).unwrap_or(0)))
                     .collect();
                 format!(
-                    "branch to 0x{pc:x}, which is not executable guest memory (last indirect target {last:#x} from block {src:#x} [{}]; sp={sp:#x} stack=[{}])",
+                    "branch to 0x{pc:x}, which is not executable guest memory ({place}; last indirect target {last:#x} from block {src:#x} [{}]; sp={sp:#x} stack=[{}])",
                     code.join(" "),
                     stack.join(", ")
                 )
             }
-            None => format!("branch to 0x{pc:x}, which is not executable guest memory"),
+            None => format!("branch to 0x{pc:x}, which is not executable guest memory ({place})"),
         }
     };
     caller.data_mut().exit = Some(Exit::Signal {
