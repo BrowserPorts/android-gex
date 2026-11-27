@@ -23,8 +23,10 @@ status=0
 # threads, two waiting on a condition variable's futexes and one sleeping,
 # each with its own id and thread-local value. snapthree: an event loop on
 # epoll over a periodic timerfd, an eventfd and a signalfd, and an
-# absolute deadline on the monotonic clock taken at its start.
-for p in snapone snaptwo snapthree; do
+# absolute deadline on the monotonic clock taken at its start. snapfour:
+# two processes, a parent and its forked child, talking over two pipes,
+# the child's state in its own memory and its end waited for.
+for p in snapone snaptwo snapthree snapfour; do
 case $p in
     snapone) set -- "$HERE/bin/$p" "$HERE/src/$p.c" ;;
     *) set -- "$HERE/bin/$p" ;;
