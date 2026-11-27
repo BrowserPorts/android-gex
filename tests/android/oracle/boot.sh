@@ -197,6 +197,10 @@ while kill -0 "$GROUP" 2>/dev/null; do
     if [ "${f:-100}" -lt "$MIN_FREE" ]; then stop "memory ${f}% free"; break; fi
     if [ "${disk:-100}" -lt "$MIN_DISK_GB" ]; then stop "disk ${disk} GB free"; break; fi
     if [ -n "${mem:-}" ] && [ "$mem" -gt $((MAX_GB * 1024)) ]; then stop "gexc at ${mem} MB"; break; fi
+    # gexc gone while the group lives (the console's `sleep` holds it): it
+    # ended or was killed (on macOS, a binary copied over in place is killed
+    # at its first page for its signature), and nothing more will happen.
+    if [ -z "$pid" ] && [ "$t" -ge 30 ]; then stop "gexc is not running"; break; fi
 done
 wait "$GROUP" 2>/dev/null
 echo "boot $NAME ended after $(($(date +%s) - start))s" | tee -a "$WATCH"
