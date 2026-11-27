@@ -677,6 +677,83 @@ impl std::fmt::Debug for ThreadSig {
 }
 
 impl ThreadSig {
+    /// This thread's own signal state written for a snapshot
+    /// ([`crate::snap`]): pending and blocked sets, who sent each pending
+    /// signal, the alternate stack and handler state, `clear_child_tid`,
+    /// the tagged address ABI, `prctl`'s per-thread settings and seccomp.
+    pub fn snap(&self, w: &mut crate::snap::W) {
+        w.u64(self.pending());
+        w.u64(self.blocked());
+        let given: Vec<(usize, Source)> = self.sources.lock().iter().enumerate().filter_map(|(i, s)| s.map(|s| (i, s))).collect();
+        w.len_of(given.len());
+        for (i, s) in given {
+            w.len_of(i);
+            w.i32(s.code);
+            w.i32(s.pid);
+            w.u32(s.uid);
+            w.u64(s.value);
+            w.i32(s.errno);
+        }
+        {
+            let own = self.own.lock();
+            w.u64(own.alt_stack.sp);
+            w.u32(own.alt_stack.flags);
+            w.u64(own.alt_stack.size);
+            w.bool(own.in_handler);
+            w.bool(own.legacy_frame);
+            w.opt(own.suspend_restore, |w, m| w.u64(m));
+        }
+        w.u64(self.clear_child_tid.load(Ordering::Acquire));
+        w.bool(self.tagged_addr.load(Ordering::Acquire));
+        let t = *self.prctl.lock();
+        w.u64(t.timer_slack_ns);
+        w.u64(t.default_timer_slack_ns);
+        w.bool(t.no_new_privs);
+        w.u8(t.mce);
+        w.bool(t.io_flusher);
+        w.u8(t.pdeathsig);
+        w.u8(self.seccomp_mode());
+        w.bytes(&self.seccomp.lock().to_bytes());
+    }
+
+    /// A thread's signal state as [`ThreadSig::snap`] wrote it.
+    pub fn unsnap(r: &mut crate::snap::R<'_>) -> Result<ThreadSig, crate::snap::Refused> {
+        let t = ThreadSig::new_thread(0);
+        t.pending.store(r.u64()?, Ordering::Release);
+        t.blocked.store(r.u64()?, Ordering::Release);
+        let n = r.len_of()?;
+        {
+            let mut sources = t.sources.lock();
+            for _ in 0..n {
+                let i = r.len_of()?;
+                let s = Source { code: r.i32()?, pid: r.i32()?, uid: r.u32()?, value: r.u64()?, errno: r.i32()? };
+                *sources.get_mut(i).ok_or_else(|| crate::snap::Refused::new(format!("a sender of signal {i}, past the last")))? = Some(s);
+            }
+        }
+        {
+            let mut own = t.own.lock();
+            own.alt_stack = SigAltStack { sp: r.u64()?, flags: r.u32()?, size: r.u64()? };
+            own.in_handler = r.bool()?;
+            own.legacy_frame = r.bool()?;
+            own.suspend_restore = r.opt(|r| r.u64())?;
+        }
+        t.clear_child_tid.store(r.u64()?, Ordering::Release);
+        t.tagged_addr.store(r.bool()?, Ordering::Release);
+        {
+            let mut p = t.prctl.lock();
+            p.timer_slack_ns = r.u64()?;
+            p.default_timer_slack_ns = r.u64()?;
+            p.no_new_privs = r.bool()?;
+            p.mce = r.u8()?;
+            p.io_flusher = r.bool()?;
+            p.pdeathsig = r.u8()?;
+        }
+        t.seccomp_mode.store(r.u8()?, Ordering::Release);
+        let sc = r.bytes()?;
+        *t.seccomp.lock() = crate::seccomp::State::from_bytes(sc).ok_or_else(|| crate::snap::Refused::new("a thread's seccomp state that does not read back"))?;
+        Ok(t)
+    }
+
     /// A new thread's: its creator's mask, nothing pending, no alternate
     /// stack (a thread sets its own), not in a handler.
     pub fn new_thread(blocked: u64) -> ThreadSig {
@@ -2307,6 +2384,35 @@ fn write_pstate(m: &mut GuestMem<'_>, ctx_addr: u64, pstate: u64) -> Result<(), 
 #[cfg(all(test, not(feature = "x86")))]
 mod tests {
     use super::*;
+
+    /// A thread's signal state written for a snapshot and read back: the
+    /// same sets, senders, stack, flags and settings.
+    #[test]
+    fn a_threads_signals_come_back_from_a_snapshot() {
+        let t = ThreadSig::new_thread(1 << 4);
+        t.raise(10, Some(Source { code: -6, pid: 42, uid: 1000, value: 7, errno: 0 }));
+        t.raise(12, None);
+        t.set_clear_child_tid(0x7000_1234);
+        t.own.lock().alt_stack = SigAltStack { sp: 0x9000, flags: 0, size: 0x4000 };
+        t.own.lock().suspend_restore = Some(0xff);
+        t.tagged_addr.store(true, Ordering::Release);
+        t.prctl.lock().timer_slack_ns = 123;
+        let mut w = crate::snap::W::new();
+        t.snap(&mut w);
+        let b = w.into_bytes();
+        let mut r = crate::snap::R::new(&b);
+        let back = ThreadSig::unsnap(&mut r).unwrap();
+        assert!(r.done());
+        assert_eq!((back.pending(), back.blocked()), (t.pending(), t.blocked()));
+        assert_eq!(*back.sources.lock(), *t.sources.lock());
+        assert_eq!(back.clear_child_tid(), 0x7000_1234);
+        {
+            let (a, b2) = (back.own.lock(), t.own.lock());
+            assert_eq!((a.alt_stack.sp, a.alt_stack.size, a.suspend_restore), (b2.alt_stack.sp, b2.alt_stack.size, b2.suspend_restore));
+        }
+        assert!(back.tagged_addr.load(Ordering::Acquire));
+        assert_eq!(*back.prctl.lock(), *t.prctl.lock());
+    }
 
     const CTX: u64 = 0x1000;
 

@@ -48,7 +48,7 @@ pub fn clock_was_set() {
     clock_set_queue().notify();
 }
 
-fn clock_sets() -> u64 {
+pub fn clock_sets() -> u64 {
     CLOCK_SETS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
@@ -236,7 +236,52 @@ impl Drop for TimerFd {
     }
 }
 
+impl TimerFd {
+    /// A timer as [`FileHandle::snap`] wrote it, on `clock`, with the
+    /// kernel's monotonic and wall-clock readings (`monotonic`, `wall`) for
+    /// a timer that was on one of those.
+    pub fn unsnap(clock: ClockFn, monotonic: fn((u64, u32)) -> (u64, u32), wall: fn((u64, u32)) -> (u64, u32), r: &mut crate::snap::R<'_>) -> Result<TimerFd, crate::snap::Refused> {
+        let mut t = TimerFd::new(clock);
+        t = match r.u8()? {
+            0 => t,
+            1 => t.monotonic(monotonic),
+            2 => t.wall(wall),
+            k => return Err(crate::snap::Refused::new(format!("a timerfd on a clock of kind {k}"))),
+        };
+        let s = State { next: r.u64()?, interval: r.u64()?, might_cancel: r.bool()?, seen: r.u64()?, stale: r.bool()? };
+        *t.state.lock().unwrap() = s;
+        Ok(t)
+    }
+}
+
+/// [`CLOCK_SETS`] as a resumed snapshot had it ([`clock_sets`] is what a
+/// snapshot keeps): its timers compare what they have seen with it.
+pub fn set_clock_sets(n: u64) {
+    CLOCK_SETS.store(n, std::sync::atomic::Ordering::Release);
+}
+
 impl FileHandle for TimerFd {
+    /// Which clock it is on (the host's, the monotonic, the wall) and its
+    /// state: when it next goes off, its interval, and what it knows of
+    /// clock sets. Its expiry is on the guest's clock, which a resumed
+    /// snapshot's goes on from.
+    fn snap(&self, w: &mut crate::snap::W, _ids: &mut crate::snap::Ids) -> Result<crate::snap::Kind, crate::snap::Refused> {
+        w.u8(if self.wall {
+            2
+        } else if self.map.is_some() {
+            1
+        } else {
+            0
+        });
+        let s = *self.state.lock().unwrap();
+        w.u64(s.next);
+        w.u64(s.interval);
+        w.bool(s.might_cancel);
+        w.u64(s.seen);
+        w.bool(s.stale);
+        Ok(crate::snap::KIND_TIMERFD)
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         if buf.len() < 8 {
             return Err(Errno::EINVAL);

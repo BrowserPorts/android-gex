@@ -83,6 +83,51 @@ impl Pipe {
         }
     }
 
+    /// The pipe as a snapshot keeps it ([`crate::snap`]): what is in it,
+    /// its capacity and its counters. Its ends are written by their
+    /// descriptors, and count themselves in again when made
+    /// ([`Pipe::unsnap`]).
+    pub fn snap(&self, w: &mut crate::snap::W) {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, b) = s.buf.as_slices();
+        w.len_of(a.len() + b.len());
+        for part in [a, b] {
+            for &c in part {
+                w.u8(c);
+            }
+        }
+        w.len_of(s.cap);
+        for v in [s.short, s.refused, s.writes, s.written, s.broken] {
+            w.u64(v);
+        }
+        w.bytes(&s.last);
+    }
+
+    /// A pipe as [`Pipe::snap`] wrote it, with no ends yet: each end made
+    /// for it calls [`Pipe::open_end`].
+    pub fn unsnap(r: &mut crate::snap::R<'_>) -> Result<Pipe, crate::snap::Refused> {
+        let n = r.len_of()?;
+        let mut buf = VecDeque::with_capacity(n);
+        for _ in 0..n {
+            buf.push_back(r.u8()?);
+        }
+        let p = Pipe::new();
+        {
+            let mut s = p.state.lock().unwrap();
+            s.buf = buf;
+            s.cap = r.len_of()?;
+            s.readers = 0;
+            s.writers = 0;
+            s.short = r.u64()?;
+            s.refused = r.u64()?;
+            s.writes = r.u64()?;
+            s.written = r.u64()?;
+            s.broken = r.u64()?;
+            s.last = r.bytes()?.to_vec();
+        }
+        Ok(p)
+    }
+
     /// The wait queue both ends' waiters register on.
     pub fn wait_queue(&self) -> u32 {
         self.queue.id()

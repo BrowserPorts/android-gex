@@ -993,6 +993,24 @@ impl ProcTable {
         tid
     }
 
+    /// Thread `tid` of `pid` again, as a snapshot had it: the same number
+    /// (a thread's id is in its memory, in futex owners and in `/proc`), and
+    /// the numbering past it.
+    pub fn adopt_tid(&self, pid: i32, tid: i32) -> Result<(), crate::errno::Errno> {
+        if self.remote.is_some() {
+            return Err(crate::errno::Errno::ENOSYS);
+        }
+        let mut t = self.lock();
+        if t.threads.get(&tid).is_some_and(|&p| p != pid) || (tid != pid && t.procs.iter().any(|p| p.pid == tid)) {
+            return Err(crate::errno::Errno::EEXIST);
+        }
+        t.threads.insert(tid, pid);
+        t.next_pid = t.next_pid.max(tid + 1);
+        drop(t);
+        crate::cgroup::thread_start(pid, tid);
+        Ok(())
+    }
+
     /// Thread `tid` has ended (`exit`, or the others at an `execve`).
     pub fn end_tid(&self, tid: i32) {
         if let Some(r) = self.remote {

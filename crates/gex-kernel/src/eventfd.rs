@@ -47,6 +47,13 @@ impl EventFd {
 }
 
 impl FileHandle for EventFd {
+    /// Its count and whether it counts as a semaphore: all an eventfd is.
+    fn snap(&self, w: &mut crate::snap::W, _ids: &mut crate::snap::Ids) -> Result<crate::snap::Kind, crate::snap::Refused> {
+        w.u64(*self.count.lock().unwrap_or_else(|e| e.into_inner()));
+        w.bool(self.semaphore);
+        Ok(crate::snap::KIND_EVENTFD)
+    }
+
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {
         // The read must take a whole `u64`. A shorter buffer is `EINVAL`, not
         // a short read: the object has no bytes to give in pieces.

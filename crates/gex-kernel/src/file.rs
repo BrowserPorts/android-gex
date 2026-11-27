@@ -917,6 +917,20 @@ pub struct PipeEnd {
 }
 
 impl FileHandle for PipeEnd {
+    /// Which end, and its pipe: the pipe's contents the first time a
+    /// snapshot meets it (its number after), so both ends, in however many
+    /// descriptors and processes, are of one pipe again.
+    fn snap(&self, w: &mut crate::snap::W, ids: &mut crate::snap::Ids) -> Result<crate::snap::Kind, crate::snap::Refused> {
+        w.bool(self.write);
+        let (id, first) = ids.of(&self.pipe);
+        w.u32(id);
+        w.bool(first);
+        if first {
+            self.pipe.snap(w);
+        }
+        Ok(crate::snap::KIND_PIPE)
+    }
+
     /// A pipe is in the pipes' filesystem.
     fn fs_dev(&self) -> u64 {
         crate::vfs::anon_dev(crate::vfs::DevKey::Kind("pipefs"))

@@ -136,6 +136,13 @@ pub fn siginfo(signal: u32, source: Option<Source>) -> [u8; SIGINFO_SIZE] {
 }
 
 impl FileHandle for SignalFd {
+    /// Its mask: what it reads is the process's own pending signals, which
+    /// the snapshot keeps with the process.
+    fn snap(&self, w: &mut crate::snap::W, _ids: &mut crate::snap::Ids) -> Result<crate::snap::Kind, crate::snap::Refused> {
+        w.u64(self.mask.load(Ordering::Acquire));
+        Ok(crate::snap::KIND_SIGNALFD)
+    }
+
     /// As many of the mask's pending signals as the buffer holds, lowest
     /// first; `EAGAIN` with none, which a read that may wait parks on.
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> SysResult {

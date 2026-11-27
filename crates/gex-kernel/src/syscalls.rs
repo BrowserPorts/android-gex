@@ -8825,6 +8825,25 @@ impl CtxSlots {
         Self { next: std::sync::atomic::AtomicU32::new(self.load()), free: std::sync::Mutex::new(self.free_list().clone()) }
     }
 
+    /// The slots as a snapshot keeps them: the next number and those given
+    /// back.
+    pub fn snap(&self, w: &mut crate::snap::W) {
+        w.u32(self.load());
+        let free = self.free_list().clone();
+        w.len_of(free.len());
+        for f in free {
+            w.u32(f);
+        }
+    }
+
+    /// Slots as [`CtxSlots::snap`] wrote them.
+    pub fn unsnap(r: &mut crate::snap::R<'_>) -> Result<CtxSlots, crate::snap::Refused> {
+        let next = r.u32()?;
+        let n = r.len_of()?;
+        let free = (0..n).map(|_| r.u32()).collect::<Result<Vec<u32>, _>>()?;
+        Ok(CtxSlots { next: std::sync::atomic::AtomicU32::new(next), free: std::sync::Mutex::new(free) })
+    }
+
     fn free_list(&self) -> std::sync::MutexGuard<'_, Vec<u32>> {
         self.free.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -11891,24 +11910,91 @@ pub fn resume_clocks() {
     }
 }
 
+/// Nanoseconds the guest's clocks are set ahead of (or, negative, behind)
+/// the host's as slowed and paused ([`resume_guest_clock_at`]): a resumed
+/// snapshot's clocks go on from where the snapshot was taken, not from the
+/// host's time when it is resumed.
+static GUEST_OFFSET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// [`system_clock`] before [`GUEST_OFFSET`], in nanoseconds.
+#[cfg(not(target_family = "wasm"))]
+fn host_guest_ns() -> u64 {
+    // While paused, the moment they were paused; and less all the time
+    // they have spent paused ([`pause_clocks`]).
+    let paused_at = PAUSED_AT.load(std::sync::atomic::Ordering::Acquire);
+    let host = if paused_at != 0 { paused_at } else { host_epoch_ns() };
+    let mut now = host.saturating_sub(PAUSED_FOR.load(std::sync::atomic::Ordering::Acquire));
+    // Slowed ([`set_time_scale`]): from when the first slowed reading
+    // was taken, that much less of the host's time has gone by.
+    let scale = time_scale() as u64;
+    if scale > 1 {
+        static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let start = *START.get_or_init(|| now);
+        now = start + now.saturating_sub(start) / scale;
+    }
+    now
+}
+
+/// The guest's clocks, in nanoseconds since the epoch, as
+/// [`system_clock`] gives them: what a snapshot keeps to resume from.
+#[cfg(not(target_family = "wasm"))]
+pub fn guest_clock_ns() -> u64 {
+    host_guest_ns().saturating_add_signed(GUEST_OFFSET.load(std::sync::atomic::Ordering::Acquire))
+}
+
+/// From now the guest's clocks read `ns` (nanoseconds since the epoch) and
+/// go on from there: a resumed snapshot's time, so its timers, sleeps and
+/// deadlines are where they were.
+#[cfg(not(target_family = "wasm"))]
+pub fn resume_guest_clock_at(ns: u64) {
+    let off = ns as i128 - host_guest_ns() as i128;
+    GUEST_OFFSET.store(off.clamp(i64::MIN as i128, i64::MAX as i128) as i64, std::sync::atomic::Ordering::Release);
+}
+
+/// The guest's time written for a snapshot ([`crate::snap`]): its clocks'
+/// reading at the hold, the monotonic clock's base and what has been held
+/// from it, the clock scale, and the wall clock's shift and any time a
+/// `settimeofday` set. A resumed snapshot's clocks go on from these.
+#[cfg(not(target_family = "wasm"))]
+pub fn clocks_snap(w: &mut crate::snap::W) {
+    use std::sync::atomic::Ordering::Acquire;
+    w.u64(guest_clock_ns());
+    w.u64(MONOTONIC_BASE.load(Acquire));
+    w.u64(MONOTONIC_HELD.load(Acquire));
+    w.u64(CLOCK_SCALE.load(Acquire));
+    w.i64(WALL_SHIFT.load(Acquire));
+    w.i64(WALL_SET.load(Acquire));
+    w.u64(crate::timerfd::clock_sets());
+}
+
+/// A timerfd as its `FileHandle::snap` wrote it, on the process's clock
+/// with this kernel's monotonic and wall readings.
+pub fn timerfd_unsnap(clock: ClockFn, r: &mut crate::snap::R<'_>) -> Result<crate::timerfd::TimerFd, crate::snap::Refused> {
+    crate::timerfd::TimerFd::unsnap(clock, monotonic_from, guest_wall, r)
+}
+
+/// The guest's time as [`clocks_snap`] wrote it: from now the clocks read
+/// what they read at the snapshot, and go on from there.
+#[cfg(not(target_family = "wasm"))]
+pub fn clocks_unsnap(r: &mut crate::snap::R<'_>) -> Result<(), crate::snap::Refused> {
+    use std::sync::atomic::Ordering::Release;
+    let now = r.u64()?;
+    let (base, held, scale, shift, set) = (r.u64()?, r.u64()?, r.u64()?, r.i64()?, r.i64()?);
+    resume_guest_clock_at(now);
+    MONOTONIC_BASE.store(base, Release);
+    MONOTONIC_HELD.store(held, Release);
+    CLOCK_SCALE.store(scale, Release);
+    WALL_SHIFT.store(shift, Release);
+    WALL_SET.store(set, Release);
+    crate::timerfd::set_clock_sets(r.u64()?);
+    Ok(())
+}
+
 pub fn system_clock() -> (u64, u32) {
     #[cfg(not(target_family = "wasm"))]
     {
-        // While paused, the moment they were paused; and less all the time
-        // they have spent paused ([`pause_clocks`]).
-        let paused_at = PAUSED_AT.load(std::sync::atomic::Ordering::Acquire);
-        let host = if paused_at != 0 { paused_at } else { host_epoch_ns() };
-        let host = host.saturating_sub(PAUSED_FOR.load(std::sync::atomic::Ordering::Acquire));
-        let mut now = std::time::Duration::from_nanos(host);
-        // Slowed ([`set_time_scale`]): from when the first slowed reading
-        // was taken, that much less of the host's time has gone by.
-        let scale = time_scale();
-        if scale > 1 {
-            static START: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-            let start = *START.get_or_init(|| now);
-            now = start + now.saturating_sub(start) / scale;
-        }
-        (now.as_secs(), now.subsec_nanos())
+        let now = guest_clock_ns();
+        (now / 1_000_000_000, (now % 1_000_000_000) as u32)
     }
     // Standing still is wrong but it is not a panic, and a host that cares
     // replaces this.

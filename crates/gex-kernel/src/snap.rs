@@ -31,6 +31,16 @@ pub type Kind = u16;
 pub const KIND_STDIO: Kind = 1;
 /// A file of the host's, opened again by its path ([`crate::vfs::hostfs`]).
 pub const KIND_HOST_FILE: Kind = 2;
+/// An eventfd ([`crate::eventfd::EventFd`]).
+pub const KIND_EVENTFD: Kind = 3;
+/// A timerfd ([`crate::timerfd::TimerFd`]).
+pub const KIND_TIMERFD: Kind = 4;
+/// A signalfd ([`crate::signalfd::SignalFd`]).
+pub const KIND_SIGNALFD: Kind = 5;
+/// An epoll set ([`crate::unix::EpollSet`]).
+pub const KIND_EPOLL: Kind = 6;
+/// An end of a pipe ([`crate::file::PipeEnd`]).
+pub const KIND_PIPE: Kind = 7;
 
 /// Why a snapshot could not be taken or read: what stopped it, as a
 /// person reading the error needs it ("a binder thread with a reply

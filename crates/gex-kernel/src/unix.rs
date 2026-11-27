@@ -2173,7 +2173,59 @@ impl Drop for EpollSet {
     }
 }
 
+impl EpollSet {
+    /// The set's watches as a snapshot keeps them: each watched number, its
+    /// events and data, its edge and one-shot state, and whether it watches
+    /// an open file (and that file's access); restore watches the same
+    /// numbers again once every descriptor is back ([`EpollSet::rewatch`]).
+    pub fn snap_watches(&self, w: &mut crate::snap::W) {
+        let watched = self.watched.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|x| (x.fd, x.events, x.data, x.seen, x.armed)).collect::<Vec<_>>();
+        let files: Vec<(i32, bool)> = self.files.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|x| (x.0, x.2)).collect();
+        w.len_of(watched.len());
+        for (fd, events, data, seen, armed) in watched {
+            w.i32(fd);
+            w.u32(events);
+            w.u64(data);
+            w.opt(seen, |w, s| w.u64(s));
+            w.bool(armed);
+            w.opt(files.iter().find(|f| f.0 == fd).map(|f| f.1), |w, wr| w.bool(wr));
+        }
+    }
+
+    /// Watch again what [`EpollSet::snap_watches`] wrote, each number's
+    /// open file found by `file_of`: the same events, data and state.
+    pub fn rewatch(&self, r: &mut crate::snap::R<'_>, file_of: &dyn Fn(i32) -> Option<Arc<dyn FileHandle>>) -> Result<(), crate::snap::Refused> {
+        let n = r.len_of()?;
+        for _ in 0..n {
+            let fd = r.i32()?;
+            let events = r.u32()?;
+            let data = r.u64()?;
+            let seen = r.opt(|r| r.u64())?;
+            let armed = r.bool()?;
+            let writable = r.opt(|r| r.bool())?;
+            let file = writable.and_then(|wr| file_of(fd).map(|f| (f, wr)));
+            if writable.is_some() && file.is_none() {
+                return Err(crate::snap::Refused::new(format!("an epoll watch of fd {fd}, which is not open")));
+            }
+            self.ctl_file(epoll_op::ADD, fd, events, data, file.as_ref().map(|(f, wr)| (f, *wr)))
+                .map_err(|e| crate::snap::Refused::new(format!("an epoll watch of fd {fd}: {e:?}")))?;
+            if let Some(x) = self.watched.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|x| x.fd == fd) {
+                x.seen = seen;
+                x.armed = armed;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl FileHandle for EpollSet {
+    /// An epoll set: its watches are written with the process's
+    /// descriptors' (`snap_watches`), since they name descriptors by number.
+    fn snap(&self, w: &mut crate::snap::W, _ids: &mut crate::snap::Ids) -> Result<crate::snap::Kind, crate::snap::Refused> {
+        self.snap_watches(w);
+        Ok(crate::snap::KIND_EPOLL)
+    }
+
     fn as_epoll(self: Arc<Self>) -> Option<Arc<EpollSet>> {
         Some(self)
     }
