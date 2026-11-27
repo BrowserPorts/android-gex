@@ -28,7 +28,10 @@ on early-init
     # while the zygote's two views of its JIT memfd were copies here (boot
     # b81's "Expected invalid entry"); they are one memory since 55ce597e8,
     # and code the JIT writes again while it runs is translated again
-    # since c29d182a0 (jitrace.c).
+    # since c29d182a0 (jitrace.c). A boot configuration can still turn it
+    # off (androidboot.gex.usejit = "false", below): every method ART's
+    # JIT compiles is new machine code, which gex translates and compiles
+    # in turn, every boot.
     # The display's density, which the emulator's host gives
     # surfaceflinger (qemu.sf.lcd_density, read before ro.sf.lcd_density;
     # the image's build properties set neither): the emulator's 420 for a
@@ -63,3 +66,8 @@ service gex_logcat /system/bin/logcat -b main,system,crash -v threadtime -f /gex
     disabled
     stdio_to_kmsg
     seclabel u:r:logpersist:s0
+
+# ART's JIT off for one boot (early-init above says why one might): a boot
+# configuration with androidboot.gex.usejit = "false".
+on early-init && property:ro.boot.gex.usejit=false
+    setprop dalvik.vm.usejit false
