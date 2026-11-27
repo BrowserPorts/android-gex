@@ -19,19 +19,32 @@ trap 'rm -rf "$work"' EXIT
 status=0
 
 # snapone: one thread, its heap, a mapping, a signal handler and mask, and a
-# host file read through one descriptor (its own source).
-p=snapone
-set -- "$HERE/bin/$p" "$HERE/src/$p.c"
+# host file read through one descriptor (its own source). snaptwo: three
+# threads, two waiting on a condition variable's futexes and one sleeping,
+# each with its own id and thread-local value. snapthree: an event loop on
+# epoll over a periodic timerfd, an eventfd and a signalfd, and an
+# absolute deadline on the monotonic clock taken at its start.
+for p in snapone snaptwo snapthree; do
+case $p in
+    snapone) set -- "$HERE/bin/$p" "$HERE/src/$p.c" ;;
+    *) set -- "$HERE/bin/$p" ;;
+esac
 "$GEXC" run "$@" >/dev/null 2>&1
 "$GEXC" run "$@" >"$work/whole" 2>"$work/whole.err"
-if [ "$(tail -1 "$work/whole")" != "snapone ok" ]; then
+if [ "$(tail -1 "$work/whole")" != "$p ok" ]; then
     echo "FAIL $p: the whole run did not finish (see below)"
     tail -3 "$work/whole.err"
-    exit 1
+    status=1
+    continue
 fi
 for at in $AT; do
     rm -rf "$work/snap"
     GEX_SNAP_HOLD_AT=$at GEX_SNAP_OUT="$work/snap" GEX_SNAP_STOP=1 "$GEXC" run "$@" >"$work/first" 2>"$work/first.err"
+    # Finished before the snapshot was due: nothing to resume.
+    if cmp -s "$work/first" "$work/whole" && ! grep -q 'snapshot hold' "$work/first.err"; then
+        echo "SKIP $p at ${at}s (it had finished)"
+        continue
+    fi
     if ! grep -q 'snapshot written: pid' "$work/first.err"; then
         echo "FAIL $p at ${at}s: no snapshot ($(grep -a 'snapshot' "$work/first.err" | tail -1))"
         status=1
@@ -46,5 +59,6 @@ for at in $AT; do
         tail -3 "$work/rest.err"
         status=1
     fi
+done
 done
 exit $status
