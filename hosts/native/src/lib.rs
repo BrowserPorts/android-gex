@@ -1860,6 +1860,13 @@ fn run_program_with(
     if opts.aot_only {
         aot_only::bind_root(&mut store, &instance)?;
     }
+    // A restored tree's other processes (`--restore`), once this one's
+    // code is all placed: they take its dispatch directory.
+    if opts.restore.is_some() && fresh_process {
+        if let Some(cx) = store.data().spawn.clone() {
+            snapshot::restore_children(&cx)?;
+        }
+    }
     let stopped = match run_thread_loop(&mut store, &instance, ctx_addr, entry) {
         Ok(s) => s,
         Err(e) => {
@@ -3317,7 +3324,6 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
     // The child's kernel is a copy of the parent's: descriptors are `Arc`
     // handles, so parent and child share the open file descriptions exactly
     // as Linux does, while the VMA tree and the child list are its own.
-    let child_proc = Arc::new(ProcCell::default());
     // The other threads hold still from the parent's map to the end of the
     // copy, so the child gets the memory of one moment (`GuestGate`). Not a
     // native wasm32 program's fork (`inside`, made within the syscall): its
@@ -3437,6 +3443,27 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         let data = child_mem.bytes();
         read_u64(data, (ctx_addr + ctx::PC as u64) as usize)
     };
+    let dl_tls = crate::dylink::fork_tls(store.as_context().data());
+    start_child(&cx, child_kernel, child_mem, jit_shared, dl_tls, ctx_addr, entry)?;
+    Ok(())
+}
+
+/// A child process's context, and its first thread started at `entry` (its
+/// context at `ctx_addr`) on a host thread of its own: a fork's child
+/// (`fork_process`), or a snapshot's process restored beside the run's own
+/// (`snapshot::restore_children`). Its kernel and memory are made; the
+/// process is in the table. The context, for its other threads.
+pub(crate) fn start_child(
+    cx: &Arc<SpawnContext>,
+    mut child_kernel: Kernel,
+    child_mem: gex_mem::GuestMemory,
+    jit_shared: Option<Arc<Mutex<JitShared>>>,
+    dl_tls: std::collections::HashMap<u32, u32>,
+    ctx_addr: u64,
+    entry: u64,
+) -> Result<Arc<SpawnContext>> {
+    let pid = child_kernel.pid;
+    let child_proc = Arc::new(ProcCell::default());
     // The child's VFS was cloned from the parent's, and that clone included
     // the parent's `/proc` -- so without this the child, and everything it
     // goes on to exec, reads its ancestor's pid, maps and command line from
@@ -3469,11 +3496,12 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         jit_shared,
         limits: cx.limits,
         prof_proc: profile::fork_process(&cx.prof_proc),
-        fork_dl_tls: Mutex::new(crate::dylink::fork_tls(store.as_context().data())),
+        fork_dl_tls: Mutex::new(dl_tls),
         // the parent's free ones are mapped in the child's copy too
         provider_stacks: Mutex::new(cx.provider_stacks.lock().unwrap_or_else(|e| e.into_inner()).clone()),
     });
     snapshot::register(&child_cx);
+    let made = Arc::clone(&child_cx);
     note_live_process(&child_cx);
     note_quiescence(&child_cx, pid);
     let status = {
@@ -3567,7 +3595,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             trim_heap();
         })
         .context("spawning a child process")?;
-    Ok(())
+    Ok(made)
 }
 
 /// A guest process has ended: give the host back what the allocator kept

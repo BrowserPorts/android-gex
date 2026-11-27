@@ -344,23 +344,59 @@ pub(crate) fn register(cx: &std::sync::Arc<crate::SpawnContext>) {
     p.push(std::sync::Arc::downgrade(cx));
 }
 
+/// The head of a process's file: its section, and the version that says
+/// its parent, group and session.
+const PROC_HEAD: u32 = 0x5052_4f43;
+
 /// Write every live process of the held system to `dir`: for each, its
 /// memory map and identity (`proc-<pid>.bin`) and its memory
-/// (`mem-<pid>.bin`). A summary, or what refused.
+/// (`mem-<pid>.bin`), and `order` (the pids, a parent before its
+/// children: the order a restore makes them in). One numbering of open
+/// descriptions, pipes and the like across every process, so what two
+/// processes share is written once and is one again when restored. A
+/// summary, or what refused.
 pub(crate) fn write(dir: &std::path::Path) -> Result<String, String> {
     use std::io::Write;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let procs: Vec<_> = PROCS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|w| w.upgrade()).collect();
-    let mut said = Vec::new();
+    let procs: Vec<_> = PROCS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|w| w.upgrade()).filter(|cx| !cx.stopping.load(Ordering::Acquire)).collect();
+    // Each one's ids, and its depth among them: parents first.
+    let mut listed: Vec<(usize, i32, i32, i32, i32, std::sync::Arc<crate::SpawnContext>)> = Vec::new();
     for cx in procs {
-        if cx.stopping.load(Ordering::Acquire) {
-            continue;
-        }
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         let pid = k.pid;
+        let ppid = k.procs.ppid(pid);
+        let pgid = k.procs.pgid(pid, pid).unwrap_or(pid);
+        let sid = k.procs.sid(pid, pid).unwrap_or(pid);
+        drop(k);
+        listed.push((0, pid, ppid, pgid, sid, cx));
+    }
+    let parent: std::collections::HashMap<i32, i32> = listed.iter().map(|l| (l.1, l.2)).collect();
+    for l in &mut listed {
+        let (mut at, mut depth) = (l.2, 0);
+        while let Some(&up) = parent.get(&at) {
+            depth += 1;
+            if depth > parent.len() {
+                return Err(format!("pid {}: its parents go round", l.1));
+            }
+            at = up;
+        }
+        l.0 = depth;
+    }
+    listed.sort_by_key(|l| (l.0, l.1));
+    if listed.iter().filter(|l| l.0 == 0).count() != 1 {
+        return Err(format!("{} processes with no parent among them: a restore makes one tree", listed.iter().filter(|l| l.0 == 0).count()));
+    }
+    let mut ids = gex_kernel::snap::Ids::new();
+    let mut said = Vec::new();
+    for (_, pid, ppid, pgid, sid, cx) in &listed {
+        let (pid, ppid, pgid, sid) = (*pid, *ppid, *pgid, *sid);
+        let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         let mut w = gex_kernel::snap::W::new();
-        w.section(0x5052_4f43, 1, |w| {
+        w.section(PROC_HEAD, 2, |w| {
             w.i32(pid);
+            w.i32(ppid);
+            w.i32(pgid);
+            w.i32(sid);
             w.str(&k.exe_path);
             w.len_of(k.argv.len());
             for a in &k.argv {
@@ -377,7 +413,6 @@ pub(crate) fn write(dir: &std::path::Path) -> Result<String, String> {
         mm.snap(&mut w).map_err(|e| format!("pid {pid}: {e}"))?;
         // Its descriptors, its signals' state (dispositions, mask, pending
         // sets, alternate stack, prctl state, auxv) and its credentials.
-        let mut ids = gex_kernel::snap::Ids::new();
         k.fds.snap(&mut w, &mut ids).map_err(|e| format!("pid {pid}: {e}"))?;
         w.section(0x5349_4700, 1, |w| {
             w.bytes(&k.signals.to_bytes(true));
@@ -397,11 +432,11 @@ pub(crate) fn write(dir: &std::path::Path) -> Result<String, String> {
         })
         .map_err(|e| format!("pid {pid}: {e}"))?;
         // Its threads: the slots their contexts are in, and each one's id,
-        // context and own signal state. The first is the one that will
-        // resume as the run's own thread; it must be in slot 0.
+        // context and own signal state. Its first (whose id is the pid)
+        // goes on as the process's own thread.
         let threads = threads_in(&cx.memory);
-        if !threads.iter().any(|&(c, _)| c == gex_abi::ctx_addr(0)) {
-            return Err(format!("pid {pid}: no thread in the first slot (its first thread has ended)"));
+        if !threads.iter().any(|&(_, t)| t == pid) {
+            return Err(format!("pid {pid}: its first thread has ended"));
         }
         w.section(0x5448_5200, 1, |w| {
             k.next_ctx_slot.snap(w);
@@ -428,214 +463,340 @@ pub(crate) fn write(dir: &std::path::Path) -> Result<String, String> {
         out.flush().map_err(|e| format!("pid {pid}: memory: {e}"))?;
         said.push(format!("pid {pid}: {} mappings, {pages} pages ({} MiB)", mm.vmas().len(), bytes >> 20));
     }
+    let order: String = listed.iter().map(|l| format!("{}\n", l.1)).collect();
+    std::fs::write(dir.join("order"), order).map_err(|e| format!("order: {e}"))?;
     Ok(said.join("; "))
 }
 
-/// A snapshot's process, in place of the program this run just placed
-/// (`gexc run --restore DIR`, given the same program): its memory, memory
-/// map, descriptors, signals' state and credentials, from what [`write`]
-/// put in `dir`. Where its thread goes on: the saved context's PC (the
-/// registers came back with the memory, whose low part holds the
-/// contexts). One process, one thread: what stage 1 of snapshots carries.
+/// What a restore has made so far that more than one process may name: by
+/// the number the snapshot gave it ([`gex_kernel::snap::Ids`], one
+/// numbering across every process).
+#[derive(Default)]
+struct Objects {
+    /// Open descriptions.
+    descs: std::collections::HashMap<u32, std::sync::Arc<gex_kernel::file::OpenFile>>,
+    /// signalfd descriptions: made in each process that has one, with its
+    /// own signal state.
+    signalfds: std::collections::HashMap<u32, (u64, String, u64, bool, bool)>,
+    pipes: std::collections::HashMap<u32, std::sync::Arc<gex_kernel::pipe::Pipe>>,
+    /// The run's own standard streams, by number.
+    stdio: std::collections::HashMap<i32, std::sync::Arc<gex_kernel::file::OpenFile>>,
+}
+
+/// A process's file read as far as its head: pid, parent, group, session,
+/// program.
+struct Head {
+    pid: i32,
+    ppid: i32,
+    pgid: i32,
+    sid: i32,
+    exe: String,
+}
+
+fn read_head(r: &mut gex_kernel::snap::R<'_>) -> anyhow::Result<Head> {
+    use anyhow::anyhow;
+    let e = |e: gex_kernel::snap::Refused| anyhow!("{e}");
+    let mut head = r.expect(PROC_HEAD, 2, "process").map_err(e)?;
+    Ok(Head { pid: head.i32().map_err(e)?, ppid: head.i32().map_err(e)?, pgid: head.i32().map_err(e)?, sid: head.i32().map_err(e)?, exe: head.str().map_err(e)?.to_string() })
+}
+
+/// The processes still to make after the run's own, in order, each its
+/// file's bytes ([`apply`] reads them, [`restore_children`] makes them),
+/// and what the run's own restore made that they may share.
+static CHILDREN: std::sync::Mutex<(Vec<(std::path::PathBuf, Vec<u8>)>, Option<Objects>)> = std::sync::Mutex::new((Vec::new(), None));
+
+/// The rest of a process's file, after its head, onto kernel `k` and
+/// memory `memory`: its memory and map, descriptors, signals' state,
+/// credentials, blocked calls, threads and (the `first` process's) the
+/// guest's time; a memory that is not `first` is a fresh one.
+/// Its threads (context and id); its first, whose id is the pid, first.
+fn restore_into(k: &mut gex_kernel::syscalls::Kernel, memory: &gex_mem::GuestMemory, r: &mut gex_kernel::snap::R<'_>, mem_file: &std::path::Path, objs: &mut Objects, first: bool) -> anyhow::Result<Vec<gex_kernel::syscalls::ThreadState>> {
+    use anyhow::{anyhow, bail, Context};
+    // What the process had cleared where it or the snapshot's has
+    // anything, so what the snapshot left out as zero is zero.
+    let mut mm = k.mem.lock();
+    let mut clear: Vec<(u64, u64)> = vec![(0, gex_abi::CTX_LIMIT)];
+    clear.extend(mm.vmas().iter().filter(|v| !RUNTIME_MAPPINGS.contains(&v.name.as_str())).map(|v| (v.start, v.end)));
+    mm.unsnap(r).map_err(|e| anyhow!("{e}"))?;
+    clear.extend(mm.vmas().iter().filter(|v| !RUNTIME_MAPPINGS.contains(&v.name.as_str())).map(|v| (v.start, v.end)));
+    // (A fresh memory, another process's, is zero already: writing zeros
+    // would only make the host give it pages.)
+    let bytes = memory.bytes();
+    for (a, b) in clear.into_iter().filter(|_| first) {
+        let (a, b) = (a as usize, (b as usize).min(bytes.len()));
+        if a < b {
+            bytes[a..b].fill(0);
+        }
+    }
+    drop(mm);
+    let f = std::fs::File::open(mem_file).with_context(|| mem_file.display().to_string())?;
+    read_memory(memory, &mut std::io::BufReader::with_capacity(1 << 20, f)).with_context(|| mem_file.display().to_string())?;
+
+    // Descriptors: the host's streams it has already; host files
+    // opened again by path, at their offsets; what another process made
+    // already, shared.
+    let mut fds = r.expect(gex_kernel::file::SNAP_FDS, 1, "descriptors").map_err(|e| anyhow!("{e}"))?;
+    k.fds.close_all();
+    let mut later_signalfds: Vec<(i32, bool, u64, String, u64, bool, bool)> = Vec::new();
+    let mut later_epolls: Vec<(std::sync::Arc<gex_kernel::unix::EpollSet>, Vec<u8>)> = Vec::new();
+    let n = fds.len_of().map_err(|e| anyhow!("{e}"))?;
+    let e = |e: gex_kernel::snap::Refused| anyhow!("{e}");
+    for _ in 0..n {
+        let fd = fds.i32().map_err(e)?;
+        let cloexec = fds.bool().map_err(e)?;
+        let id = fds.u32().map_err(e)?;
+        // A signalfd's description, made later (below), named again.
+        // (Each process its own description, and each descriptor in it
+        // too: what reads from one is the process's pending signals
+        // either way.)
+        if let Some((mask, path, flags, readable, writable)) = objs.signalfds.get(&id).cloned() {
+            later_signalfds.push((fd, cloexec, mask, path, flags, readable, writable));
+            continue;
+        }
+        let file = if let Some(f) = objs.descs.get(&id) {
+            std::sync::Arc::clone(f)
+        } else {
+            let path = fds.str().map_err(e)?.to_string();
+            let flags = fds.u64().map_err(e)?;
+            let offset = fds.u64().map_err(e)?;
+            let readable = fds.bool().map_err(e)?;
+            let writable = fds.bool().map_err(e)?;
+            let kind = fds.u16().map_err(e)?;
+            let inner = fds.bytes().map_err(e)?;
+            let mut ir = gex_kernel::snap::R::new(inner);
+            let file = match kind {
+                gex_kernel::snap::KIND_STDIO => {
+                    let stream = ir.u8().map_err(e)? as i32;
+                    objs.stdio.get(&stream).cloned().ok_or_else(|| anyhow!("fd {fd}: this run has no standard stream {stream}"))?
+                }
+                gex_kernel::snap::KIND_HOST_FILE => {
+                    use gex_kernel::fs::oflags;
+                    let open = flags & !(oflags::O_CREAT | oflags::O_TRUNC | oflags::O_EXCL);
+                    let h = k.vfs.open(&path, open, 0).map_err(|er| anyhow!("fd {fd}: {path}: {er:?}"))?;
+                    let f = gex_kernel::file::OpenFile::new(h, path.clone(), flags, readable, writable);
+                    f.set_offset(offset);
+                    f
+                }
+                gex_kernel::snap::KIND_EVENTFD => {
+                    let count = ir.u64().map_err(e)?;
+                    let semaphore = ir.bool().map_err(e)?;
+                    gex_kernel::file::OpenFile::new(std::sync::Arc::new(gex_kernel::eventfd::EventFd::new(count, semaphore)), path.clone(), flags, readable, writable)
+                }
+                gex_kernel::snap::KIND_TIMERFD => {
+                    let t = gex_kernel::syscalls::timerfd_unsnap(k.clock, &mut ir).map_err(e)?;
+                    gex_kernel::file::OpenFile::new(std::sync::Arc::new(t), path.clone(), flags, readable, writable)
+                }
+                gex_kernel::snap::KIND_SIGNALFD => {
+                    // Made once the process's signal state is back
+                    // (below): it notes itself with that state.
+                    let mask = ir.u64().map_err(e)?;
+                    later_signalfds.push((fd, cloexec, mask, path.clone(), flags, readable, writable));
+                    objs.signalfds.insert(id, (mask, path.clone(), flags, readable, writable));
+                    continue;
+                }
+                gex_kernel::snap::KIND_PIPE => {
+                    let write = ir.bool().map_err(e)?;
+                    let pid = ir.u32().map_err(e)?;
+                    let pipe = if ir.bool().map_err(e)? {
+                        let p = std::sync::Arc::new(gex_kernel::pipe::Pipe::unsnap(&mut ir).map_err(e)?);
+                        objs.pipes.insert(pid, std::sync::Arc::clone(&p));
+                        p
+                    } else {
+                        std::sync::Arc::clone(objs.pipes.get(&pid).ok_or_else(|| anyhow!("fd {fd}: pipe {pid} before it was written"))?)
+                    };
+                    // Counted in as an end, as when it was made.
+                    pipe.open_end(write);
+                    gex_kernel::file::OpenFile::new(std::sync::Arc::new(gex_kernel::file::PipeEnd { pipe, write }), path.clone(), flags, readable, writable)
+                }
+                gex_kernel::snap::KIND_EPOLL => {
+                    // Its watches name descriptors by number: they are
+                    // watched again once every descriptor is back.
+                    let set = std::sync::Arc::new(gex_kernel::unix::EpollSet::new());
+                    later_epolls.push((std::sync::Arc::clone(&set), inner.to_vec()));
+                    gex_kernel::file::OpenFile::new(set, path.clone(), flags, readable, writable)
+                }
+                other => bail!("fd {fd} ({path}): a kind of file ({other}) this build does not restore"),
+            };
+            objs.descs.insert(id, std::sync::Arc::clone(&file));
+            file
+        };
+        k.fds.install(fd, file, cloexec).map_err(|er| anyhow!("fd {fd}: {er:?}"))?;
+    }
+
+    // Signals' state and credentials.
+    let mut sig = r.expect(0x5349_4700, 1, "signals").map_err(|e| anyhow!("{e}"))?;
+    let s = sig.bytes().map_err(|e| anyhow!("{e}"))?;
+    k.signals = gex_kernel::signal::Signals::from_bytes(s).ok_or_else(|| anyhow!("the snapshot's signal state does not read back"))?;
+    k.creds.restore(sig.bytes().map_err(|e| anyhow!("{e}"))?);
+    for (fd, cloexec, mask, path, flags, readable, writable) in later_signalfds {
+        let h = std::sync::Arc::new(gex_kernel::signalfd::SignalFd::new(mask, &k.signals));
+        let f = gex_kernel::file::OpenFile::new(h, path, flags, readable, writable);
+        k.fds.install(fd, f, cloexec).map_err(|er| anyhow!("fd {fd}: {er:?}"))?;
+    }
+    // Every descriptor is back: the epoll sets watch theirs again.
+    for (set, bytes) in later_epolls {
+        let fds = std::sync::Arc::clone(&k.fds);
+        let file_of = move |fd: i32| fds.get(fd).ok().map(|f| std::sync::Arc::clone(&f.handle));
+        set.rewatch(&mut gex_kernel::snap::R::new(&bytes), &file_of).map_err(|e| anyhow!("{e}"))?;
+    }
+    // A thread caught in a blocking call makes it again: its PC back
+    // on the call's instruction, its registers as it made the call.
+    let mut bl = r.expect(0x424c_4b00, 1, "blocked threads").map_err(|e| anyhow!("{e}"))?;
+    let n = bl.len_of().map_err(|e| anyhow!("{e}"))?;
+    let mut gm = gex_kernel::GuestMem::new(memory.bytes());
+    for _ in 0..n {
+        let c = bl.u64().map_err(|e| anyhow!("{e}"))?;
+        let pc = gm.read_u64(c + gex_abi::ctx::PC as u64).map_err(|er| anyhow!("{er:?}"))?;
+        // (A translated program's: a native wasm32 one marks its
+        // context instead, which is not restored.)
+        gex_kernel::syscalls::restart_call(&mut gm, c, pc, false).ok_or_else(|| anyhow!("a blocked thread's context at {c:#x} cannot be written"))?;
+    }
+    // Its threads: the same ids and slots, and each one's own signal
+    // state.
+    let mut th = r.expect(0x5448_5200, 1, "threads").map_err(|e| anyhow!("{e}"))?;
+    k.next_ctx_slot = std::sync::Arc::new(gex_kernel::syscalls::CtxSlots::unsnap(&mut th).map_err(|e| anyhow!("{e}"))?);
+    let n = th.len_of().map_err(|e| anyhow!("{e}"))?;
+    k.thread_signals.clear();
+    let mut threads = Vec::new();
+    for _ in 0..n {
+        let c = th.u64().map_err(|e| anyhow!("{e}"))?;
+        let tid = th.i32().map_err(|e| anyhow!("{e}"))?;
+        let sig = std::sync::Arc::new(gex_kernel::signal::ThreadSig::unsnap(&mut th).map_err(|e| anyhow!("{e}"))?);
+        let t = gex_kernel::syscalls::ThreadState { ctx_addr: c, tid };
+        if tid == k.pid {
+            k.signals.switch_to(std::sync::Arc::clone(&sig));
+            k.ctx_addr = c;
+            threads.insert(0, t);
+        } else {
+            k.procs.adopt_tid(k.pid, tid).map_err(|er| anyhow!("thread {tid}: {er:?}"))?;
+            threads.push(t);
+        }
+        k.thread_signals.insert(tid, sig);
+    }
+    if threads.first().is_none_or(|t| t.tid != k.pid) {
+        bail!("pid {}: no thread of its own in the snapshot", k.pid);
+    }
+    k.sig_tid = k.pid;
+    k.live_threads.store(n as u32, std::sync::atomic::Ordering::Release);
+    // Its time: from now the guest's clocks read what they read at the
+    // snapshot, so its sleeps, timers and deadlines are where they were.
+    // (One clock for the whole system: taken from the first process.)
+    let mut clk = r.expect(0x434c_4b00, 1, "clocks").map_err(|e| anyhow!("{e}"))?;
+    if first {
+        gex_kernel::syscalls::clocks_unsnap(&mut clk).map_err(|e| anyhow!("{e}"))?;
+    }
+    Ok(threads)
+}
+
+/// A snapshot's first process, in place of the program this run just
+/// placed (`gexc run --restore DIR`, given the same program): its memory,
+/// memory map, descriptors, signals' state, credentials and threads, from
+/// what [`write`] put in `dir`. Where its thread goes on: the saved
+/// context's PC (the registers came back with the memory, whose low part
+/// holds the contexts). Its other threads are started by
+/// [`start_restored`] and the snapshot's other processes made by
+/// [`restore_children`], once the run's context exists.
 pub(crate) fn apply(store: &mut wasmtime::Store<crate::HostState>, memory: &gex_mem::GuestMemory, dir: &std::path::Path) -> anyhow::Result<u64> {
     use anyhow::{anyhow, bail, Context};
-    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .with_context(|| format!("--restore {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("proc-") && n.ends_with(".bin")))
-        .collect();
-    found.sort();
-    let [proc_file] = found.as_slice() else {
-        bail!("--restore {}: {} processes; a restore of one is what is done", dir.display(), found.len());
-    };
-    let bytes = std::fs::read(proc_file).with_context(|| proc_file.display().to_string())?;
+    let order = std::fs::read_to_string(dir.join("order")).with_context(|| format!("--restore {}: its order", dir.display()))?;
+    let mut files = Vec::new();
+    for pid in order.lines().filter(|l| !l.is_empty()) {
+        let path = dir.join(format!("proc-{pid}.bin"));
+        let bytes = std::fs::read(&path).with_context(|| path.display().to_string())?;
+        files.push((path, bytes));
+    }
+    if files.is_empty() {
+        bail!("--restore {}: no process", dir.display());
+    }
+    let (_, bytes) = files.remove(0);
     let mut r = gex_kernel::snap::R::new(&bytes);
-    let mut head = r.expect(0x5052_4f43, 1, "process").map_err(|e| anyhow!("{e}"))?;
-    let pid = head.i32().map_err(|e| anyhow!("{e}"))?;
-    let exe = head.str().map_err(|e| anyhow!("{e}"))?.to_string();
-
+    let head = read_head(&mut r)?;
+    let (pid, exe) = (head.pid, head.exe.clone());
     let mem_file = dir.join(format!("mem-{pid}.bin"));
     let state = store.data_mut();
     let ctx_addr = state.thread.ctx_addr;
+    let mut objs = Objects::default();
     state.with_kernel(|k| -> anyhow::Result<()> {
         if k.exe_path != exe {
             bail!("--restore: the snapshot is of {exe}, and this run's program is {}", k.exe_path);
         }
-        // The fresh program's memory cleared where it or the snapshot's has
-        // anything, so what the snapshot left out as zero is zero.
-        let mut mm = k.mem.lock();
-        let mut clear: Vec<(u64, u64)> = vec![(0, gex_abi::CTX_LIMIT)];
-        clear.extend(mm.vmas().iter().filter(|v| !RUNTIME_MAPPINGS.contains(&v.name.as_str())).map(|v| (v.start, v.end)));
-        mm.unsnap(&mut r).map_err(|e| anyhow!("{e}"))?;
-        clear.extend(mm.vmas().iter().filter(|v| !RUNTIME_MAPPINGS.contains(&v.name.as_str())).map(|v| (v.start, v.end)));
-        let bytes = memory.bytes();
-        for (a, b) in clear {
-            let (a, b) = (a as usize, (b as usize).min(bytes.len()));
-            if a < b {
-                bytes[a..b].fill(0);
-            }
+        if k.pid != pid {
+            bail!("--restore: the snapshot's first process is {pid}, and this run's is {}", k.pid);
         }
-        drop(mm);
-        let f = std::fs::File::open(&mem_file).with_context(|| mem_file.display().to_string())?;
-        read_memory(memory, &mut std::io::BufReader::with_capacity(1 << 20, f)).with_context(|| mem_file.display().to_string())?;
-
-        // Descriptors: the host's streams it has already; host files
-        // opened again by path, at their offsets.
-        let mut fds = r.expect(gex_kernel::file::SNAP_FDS, 1, "descriptors").map_err(|e| anyhow!("{e}"))?;
-        let fresh: std::collections::HashMap<i32, std::sync::Arc<gex_kernel::file::OpenFile>> = k.fds.entries().into_iter().map(|(fd, f, _)| (fd, f)).collect();
-        k.fds.close_all();
-        let mut descs: Vec<std::sync::Arc<gex_kernel::file::OpenFile>> = Vec::new();
-        let mut later_signalfds: Vec<(i32, bool, u64, String, u64, bool, bool)> = Vec::new();
-        let mut pipes: std::collections::HashMap<u32, std::sync::Arc<gex_kernel::pipe::Pipe>> = std::collections::HashMap::new();
-        let mut later_epolls: Vec<(std::sync::Arc<gex_kernel::unix::EpollSet>, Vec<u8>)> = Vec::new();
-        // (Each of those its own description again, where the snapshot's
-        // descriptors shared one: what reads from one is the process's
-        // pending signals either way.)
-        let mut signalfd_descs: std::collections::HashMap<usize, (u64, String, u64, bool, bool)> = std::collections::HashMap::new();
-        let n = fds.len_of().map_err(|e| anyhow!("{e}"))?;
-        let e = |e: gex_kernel::snap::Refused| anyhow!("{e}");
-        for _ in 0..n {
-            let fd = fds.i32().map_err(e)?;
-            let cloexec = fds.bool().map_err(e)?;
-            let id = fds.u32().map_err(e)? as usize;
-            // A signalfd's description, made later (below), named again.
-            if let Some(&(mask, ref path, flags, readable, writable)) = signalfd_descs.get(&id) {
-                later_signalfds.push((fd, cloexec, mask, path.clone(), flags, readable, writable));
-                continue;
-            }
-            let file = if id < descs.len() {
-                std::sync::Arc::clone(&descs[id])
-            } else {
-                let path = fds.str().map_err(e)?.to_string();
-                let flags = fds.u64().map_err(e)?;
-                let offset = fds.u64().map_err(e)?;
-                let readable = fds.bool().map_err(e)?;
-                let writable = fds.bool().map_err(e)?;
-                let kind = fds.u16().map_err(e)?;
-                let inner = fds.bytes().map_err(e)?;
-                let mut ir = gex_kernel::snap::R::new(inner);
-                let file = match kind {
-                    gex_kernel::snap::KIND_STDIO => {
-                        let stream = ir.u8().map_err(e)? as i32;
-                        fresh.get(&stream).cloned().ok_or_else(|| anyhow!("fd {fd}: this run has no standard stream {stream}"))?
-                    }
-                    gex_kernel::snap::KIND_HOST_FILE => {
-                        use gex_kernel::fs::oflags;
-                        let open = flags & !(oflags::O_CREAT | oflags::O_TRUNC | oflags::O_EXCL);
-                        let h = k.vfs.open(&path, open, 0).map_err(|er| anyhow!("fd {fd}: {path}: {er:?}"))?;
-                        let f = gex_kernel::file::OpenFile::new(h, path.clone(), flags, readable, writable);
-                        f.set_offset(offset);
-                        f
-                    }
-                    gex_kernel::snap::KIND_EVENTFD => {
-                        let count = ir.u64().map_err(e)?;
-                        let semaphore = ir.bool().map_err(e)?;
-                        gex_kernel::file::OpenFile::new(std::sync::Arc::new(gex_kernel::eventfd::EventFd::new(count, semaphore)), path.clone(), flags, readable, writable)
-                    }
-                    gex_kernel::snap::KIND_TIMERFD => {
-                        let t = gex_kernel::syscalls::timerfd_unsnap(k.clock, &mut ir).map_err(e)?;
-                        gex_kernel::file::OpenFile::new(std::sync::Arc::new(t), path.clone(), flags, readable, writable)
-                    }
-                    gex_kernel::snap::KIND_SIGNALFD => {
-                        // Made once the process's signal state is back
-                        // (below): it notes itself with that state.
-                        let mask = ir.u64().map_err(e)?;
-                        later_signalfds.push((fd, cloexec, mask, path.clone(), flags, readable, writable));
-                        signalfd_descs.insert(descs.len(), (mask, path.clone(), flags, readable, writable));
-                        descs.push(gex_kernel::file::OpenFile::new(std::sync::Arc::new(gex_kernel::eventfd::EventFd::new(0, false)), String::new(), 0, false, false));
-                        continue;
-                    }
-                    gex_kernel::snap::KIND_PIPE => {
-                        let write = ir.bool().map_err(e)?;
-                        let id = ir.u32().map_err(e)?;
-                        let pipe = if ir.bool().map_err(e)? {
-                            let p = std::sync::Arc::new(gex_kernel::pipe::Pipe::unsnap(&mut ir).map_err(e)?);
-                            pipes.insert(id, std::sync::Arc::clone(&p));
-                            p
-                        } else {
-                            std::sync::Arc::clone(pipes.get(&id).ok_or_else(|| anyhow!("fd {fd}: pipe {id} before it was written"))?)
-                        };
-                        // Counted in as an end, as when it was made.
-                        pipe.open_end(write);
-                        gex_kernel::file::OpenFile::new(std::sync::Arc::new(gex_kernel::file::PipeEnd { pipe, write }), path.clone(), flags, readable, writable)
-                    }
-                    gex_kernel::snap::KIND_EPOLL => {
-                        // Its watches name descriptors by number: they are
-                        // watched again once every descriptor is back.
-                        let set = std::sync::Arc::new(gex_kernel::unix::EpollSet::new());
-                        later_epolls.push((std::sync::Arc::clone(&set), inner.to_vec()));
-                        gex_kernel::file::OpenFile::new(set, path.clone(), flags, readable, writable)
-                    }
-                    other => bail!("fd {fd} ({path}): a kind of file ({other}) this build does not restore"),
-                };
-                descs.push(std::sync::Arc::clone(&file));
-                file
-            };
-            k.fds.install(fd, file, cloexec).map_err(|er| anyhow!("fd {fd}: {er:?}"))?;
+        k.procs.adopt_process(pid, head.ppid, head.pgid, head.sid).map_err(|er| anyhow!("pid {pid}: {er:?}"))?;
+        objs.stdio = k.fds.entries().into_iter().filter(|(fd, _, _)| (0..3).contains(fd)).map(|(fd, f, _)| (fd, f)).collect();
+        let threads = restore_into(k, memory, &mut r, &mem_file, &mut objs, true)?;
+        if threads[0].ctx_addr != ctx_addr {
+            bail!("pid {pid}: its own thread's context is at {:#x}, and this run's at {ctx_addr:#x}", threads[0].ctx_addr);
         }
-
-        // Signals' state and credentials.
-        let mut sig = r.expect(0x5349_4700, 1, "signals").map_err(|e| anyhow!("{e}"))?;
-        let s = sig.bytes().map_err(|e| anyhow!("{e}"))?;
-        k.signals = gex_kernel::signal::Signals::from_bytes(s).ok_or_else(|| anyhow!("the snapshot's signal state does not read back"))?;
-        k.creds.restore(sig.bytes().map_err(|e| anyhow!("{e}"))?);
-        for (fd, cloexec, mask, path, flags, readable, writable) in later_signalfds {
-            let h = std::sync::Arc::new(gex_kernel::signalfd::SignalFd::new(mask, &k.signals));
-            let f = gex_kernel::file::OpenFile::new(h, path, flags, readable, writable);
-            k.fds.install(fd, f, cloexec).map_err(|er| anyhow!("fd {fd}: {er:?}"))?;
-        }
-        // Every descriptor is back: the epoll sets watch theirs again.
-        for (set, bytes) in later_epolls {
-            let fds = std::sync::Arc::clone(&k.fds);
-            let file_of = move |fd: i32| fds.get(fd).ok().map(|f| std::sync::Arc::clone(&f.handle));
-            set.rewatch(&mut gex_kernel::snap::R::new(&bytes), &file_of).map_err(|e| anyhow!("{e}"))?;
-        }
-        // A thread caught in a blocking call makes it again: its PC back
-        // on the call's instruction, its registers as it made the call.
-        let mut bl = r.expect(0x424c_4b00, 1, "blocked threads").map_err(|e| anyhow!("{e}"))?;
-        let n = bl.len_of().map_err(|e| anyhow!("{e}"))?;
-        let mut gm = gex_kernel::GuestMem::new(memory.bytes());
-        for _ in 0..n {
-            let c = bl.u64().map_err(|e| anyhow!("{e}"))?;
-            let pc = gm.read_u64(c + gex_abi::ctx::PC as u64).map_err(|er| anyhow!("{er:?}"))?;
-            // (A translated program's: a native wasm32 one marks its
-            // context instead, which stage 1 does not restore.)
-            gex_kernel::syscalls::restart_call(&mut gm, c, pc, false).ok_or_else(|| anyhow!("a blocked thread's context at {c:#x} cannot be written"))?;
-        }
-        // Its threads: the same ids and slots, and each one's own signal
-        // state; the first goes on as this run's thread, the rest are
-        // started once the process's context exists.
-        let mut th = r.expect(0x5448_5200, 1, "threads").map_err(|e| anyhow!("{e}"))?;
-        k.next_ctx_slot = std::sync::Arc::new(gex_kernel::syscalls::CtxSlots::unsnap(&mut th).map_err(|e| anyhow!("{e}"))?);
-        let n = th.len_of().map_err(|e| anyhow!("{e}"))?;
-        k.thread_signals.clear();
-        let mut rest = Vec::new();
-        for _ in 0..n {
-            let c = th.u64().map_err(|e| anyhow!("{e}"))?;
-            let tid = th.i32().map_err(|e| anyhow!("{e}"))?;
-            let sig = std::sync::Arc::new(gex_kernel::signal::ThreadSig::unsnap(&mut th).map_err(|e| anyhow!("{e}"))?);
-            if c == gex_abi::ctx_addr(0) {
-                if tid != k.pid {
-                    bail!("the snapshot's first thread is {tid}, and this run's process is {}", k.pid);
-                }
-                k.signals.switch_to(std::sync::Arc::clone(&sig));
-            } else {
-                k.procs.adopt_tid(k.pid, tid).map_err(|er| anyhow!("thread {tid}: {er:?}"))?;
-                rest.push(gex_kernel::syscalls::ThreadState { ctx_addr: c, tid });
-            }
-            k.thread_signals.insert(tid, sig);
-        }
-        k.sig_tid = k.pid;
-        k.live_threads.store(n as u32, std::sync::atomic::Ordering::Release);
-        *TO_START.lock().unwrap_or_else(|e| e.into_inner()) = rest;
-        // Its time: from now the guest's clocks read what they read at the
-        // snapshot, so its sleeps, timers and deadlines are where they were.
-        let mut clk = r.expect(0x434c_4b00, 1, "clocks").map_err(|e| anyhow!("{e}"))?;
-        gex_kernel::syscalls::clocks_unsnap(&mut clk).map_err(|e| anyhow!("{e}"))?;
+        *TO_START.lock().unwrap_or_else(|e| e.into_inner()) = threads[1..].to_vec();
         Ok(())
     })?;
+    *CHILDREN.lock().unwrap_or_else(|e| e.into_inner()) = (files, Some(objs));
     // Where its thread was: the saved context's PC.
     let pc = u64::from_le_bytes(memory.bytes()[(ctx_addr + gex_abi::ctx::PC as u64) as usize..][..8].try_into().unwrap());
     eprintln!("[gex] restored pid {pid} ({exe}) from {}, at {pc:#x}", dir.display());
     Ok(pc)
+}
+
+/// The snapshot's other processes, each made as a fork's child of the
+/// run's own would be (the run's kernel's namespace, process table and
+/// translated code; a fresh memory with the run's dispatch directory and
+/// runtime mappings) and then given what was saved of it: in order, a
+/// parent before its children. Only processes of the run's own program
+/// (a fork's children that have not exec'd): another program's code is
+/// not this run's to place.
+pub(crate) fn restore_children(cx: &std::sync::Arc<crate::SpawnContext>) -> anyhow::Result<()> {
+    use anyhow::{anyhow, bail, Context};
+    let (files, objs) = std::mem::take(&mut *CHILDREN.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(mut objs) = objs else { return Ok(()) };
+    for (path, bytes) in files {
+        let mut r = gex_kernel::snap::R::new(&bytes);
+        let head = read_head(&mut r).with_context(|| path.display().to_string())?;
+        let pid = head.pid;
+        let (mut child, root_vmas) = {
+            let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+            if k.exe_path != head.exe {
+                bail!("pid {pid}: runs {}, and a restore makes only processes of the run's own program ({})", head.exe, k.exe_path);
+            }
+            k.procs.adopt_process(pid, head.ppid, head.pgid, head.sid).map_err(|er| anyhow!("pid {pid}: {er:?}"))?;
+            let vmas: Vec<(u64, u64)> = k.mem.lock().vmas().iter().filter(|v| RUNTIME_MAPPINGS.contains(&v.name.as_str())).map(|v| (v.start, v.end)).collect();
+            let mut child = k.fork_kernel();
+            child.pid = pid;
+            child.tid = pid;
+            child.forget_own_pidfds();
+            (child, vmas)
+        };
+        let shared = wasmtime::SharedMemory::new(&cx.engine, crate::guest_memory_type()).map_err(|e| anyhow!("creating a restored process's memory: {e}"))?;
+        let mem = gex_mem::GuestMemory::new(shared);
+        // The run's dispatch directory and runtime mappings: the code is
+        // the run's, at the same addresses, as a fork's child has it.
+        {
+            let (src, dst) = (cx.memory.bytes(), mem.bytes());
+            let mut copy = crate::SparseCopy::new();
+            let mut ranges = vec![(gex_abi::CTX_LIMIT, gex_abi::DISPATCH_DIR_END)];
+            if gex_abi::mem64() {
+                ranges.push((gex_abi::DISPATCH_DIR64, gex_abi::PERM_TABLE64));
+            }
+            ranges.extend(root_vmas);
+            for (a, b) in ranges {
+                let (a, b) = (a as usize, (b as usize).min(src.len()));
+                if a < b {
+                    copy.copy_or_share(&cx.memory, &mem, src, dst, a, b);
+                }
+            }
+        }
+        let mem_file = path.with_file_name(format!("mem-{pid}.bin"));
+        let threads = restore_into(&mut child, &mem, &mut r, &mem_file, &mut objs, false).with_context(|| format!("pid {pid}"))?;
+        crate::publish_vm(&child, &mem);
+        child.flush_perms(&mut gex_kernel::GuestMem::new(mem.bytes()));
+        let main = threads[0];
+        let entry = u64::from_le_bytes(mem.bytes()[(main.ctx_addr + gex_abi::ctx::PC as u64) as usize..][..8].try_into().unwrap());
+        let child_cx = crate::start_child(cx, child, mem, cx.jit_shared.clone(), std::collections::HashMap::new(), main.ctx_addr, entry)?;
+        for t in &threads[1..] {
+            crate::start_guest_thread(std::sync::Arc::clone(&child_cx), *t)?;
+        }
+        eprintln!("[gex] restored pid {pid} ({}) with {} threads, at {entry:#x}", head.exe, threads.len());
+    }
+    Ok(())
 }
