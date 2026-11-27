@@ -855,6 +855,38 @@ impl Default for ProcTable {
     }
 }
 
+impl Proc {
+    /// A process just made: its ids, its parent's credentials as last
+    /// published, and nothing else yet.
+    fn fresh(pid: i32, ppid: i32, pgid: i32, sid: i32, creds: Vec<u8>, host_child: bool) -> Proc {
+        Proc {
+            pid,
+            ppid,
+            pgid,
+            sid,
+            child: Child::new(pid),
+            pending: Arc::new(AtomicU64::new(0)),
+            killed: 0,
+            senders: [0; 64],
+            child_end: None,
+            to_threads: Vec::new(),
+            queue: crate::wait::Queue::new(),
+            info: Vec::new(),
+            creds,
+            vm: None,
+            pdeathsig: 0,
+            subreaper: false,
+            host_child,
+            usage: Usage::default(),
+            crash: Vec::new(),
+            crash_more: Vec::new(),
+            ended: None,
+            crash_told: false,
+            noticed: Vec::new(),
+        }
+    }
+}
+
 impl ProcTable {
     /// A table holding just the init process, which is its own group and
     /// session leader and whose parent is the kernel that is not there.
@@ -922,31 +954,7 @@ impl ProcTable {
         };
         // The virtual init runs nothing, so a child of it is the host's.
         let host_child = ppid == INIT_PID && self.virtual_init.load(Ordering::Acquire);
-        t.procs.push(Proc {
-            pid,
-            ppid,
-            pgid,
-            sid,
-            child: Child::new(pid),
-            pending: Arc::new(AtomicU64::new(0)),
-            killed: 0,
-            senders: [0; 64],
-            child_end: None,
-            to_threads: Vec::new(),
-            queue: crate::wait::Queue::new(),
-            info: Vec::new(),
-            creds,
-            vm: None,
-            pdeathsig: 0,
-            subreaper: false,
-            host_child,
-            usage: Usage::default(),
-            crash: Vec::new(),
-            crash_more: Vec::new(),
-            ended: None,
-            crash_told: false,
-            noticed: Vec::new(),
-        });
+        t.procs.push(Proc::fresh(pid, ppid, pgid, sid, creds, host_child));
         drop(t);
         crate::cgroup::fork(ppid, pid);
         pid
@@ -1008,6 +1016,30 @@ impl ProcTable {
         t.next_pid = t.next_pid.max(tid + 1);
         drop(t);
         crate::cgroup::thread_start(pid, tid);
+        Ok(())
+    }
+
+    /// Process `pid` again, as a snapshot had it: its parent, group and
+    /// session (a restored tree keeps its numbers, which its memory and its
+    /// relatives hold), and the numbering past it. One already in the table
+    /// (the run's own first process) takes the saved ids.
+    pub fn adopt_process(&self, pid: i32, ppid: i32, pgid: i32, sid: i32) -> Result<(), crate::errno::Errno> {
+        if self.remote.is_some() {
+            return Err(crate::errno::Errno::ENOSYS);
+        }
+        let mut t = self.lock();
+        if t.threads.get(&pid).is_some_and(|&p| p != pid) {
+            return Err(crate::errno::Errno::EEXIST);
+        }
+        t.next_pid = t.next_pid.max(pid + 1);
+        if let Some(p) = t.procs.iter_mut().find(|p| p.pid == pid) {
+            (p.ppid, p.pgid, p.sid) = (ppid, pgid, sid);
+            return Ok(());
+        }
+        let creds = t.procs.iter().find(|p| p.pid == ppid).map(|p| p.creds.clone()).unwrap_or_default();
+        t.procs.push(Proc::fresh(pid, ppid, pgid, sid, creds, false));
+        drop(t);
+        crate::cgroup::fork(ppid, pid);
         Ok(())
     }
 

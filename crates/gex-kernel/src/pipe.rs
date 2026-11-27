@@ -96,7 +96,8 @@ impl Pipe {
                 w.u8(c);
             }
         }
-        w.len_of(s.cap);
+        // (a number, not a length: no bytes of it follow)
+        w.u64(s.cap as u64);
         for v in [s.short, s.refused, s.writes, s.written, s.broken] {
             w.u64(v);
         }
@@ -115,7 +116,7 @@ impl Pipe {
         {
             let mut s = p.state.lock().unwrap();
             s.buf = buf;
-            s.cap = r.len_of()?;
+            s.cap = usize::try_from(r.u64()?).map_err(|_| crate::snap::Refused::new("a pipe's capacity past this host's".to_string()))?;
             s.readers = 0;
             s.writers = 0;
             s.short = r.u64()?;
@@ -416,6 +417,26 @@ impl Pipe {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// What is in a pipe, its capacity and its counters come back from a
+    /// snapshot, and its ends count themselves in again.
+    #[test]
+    fn a_pipe_comes_back_from_its_snapshot() {
+        let p = Pipe::new();
+        p.open_end(false);
+        p.open_end(true);
+        p.write(b"hello, pipe").unwrap();
+        let mut w = crate::snap::W::new();
+        p.snap(&mut w);
+        let bytes = w.into_bytes();
+        let q = Pipe::unsnap(&mut crate::snap::R::new(&bytes)).unwrap();
+        q.open_end(false);
+        q.open_end(true);
+        assert_eq!(q.state.lock().unwrap().cap, p.state.lock().unwrap().cap);
+        let mut buf = [0u8; 32];
+        let n = q.read(&mut buf).unwrap() as usize;
+        assert_eq!(&buf[..n], b"hello, pipe");
+    }
 
     /// `read_with` takes up to what is there, sized under the lock: never a
     /// stale size that splits a record; and hands over a wrapped buffer
