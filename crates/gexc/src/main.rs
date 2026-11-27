@@ -326,6 +326,8 @@ run options:
   --selinuxfs     mount selinuxfs at /sys/fs/selinux, as Android's init
                   leaves it: programs that look there find SELinux on, with
                   no policy until one is loaded
+  --restore DIR   resume the snapshot in DIR (GEX_SNAP_OUT) instead of
+                  starting the program, which must be the one it was of
   --kernel-cmdline LINE
                   what /proc/cmdline reads (default: an empty line)
   --bootconfig FILE
@@ -446,6 +448,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs> {
             "--wayland-gpu" => opts.wayland_gpu = true,
             "--gl" => opts.gl = true,
             "--selinuxfs" => opts.selinuxfs = true,
+            "--restore" => {
+                i += 1;
+                opts.restore = Some(args.get(i).context("--restore needs a snapshot's directory")?.into());
+            }
             "--kernel-cmdline" => {
                 i += 1;
                 opts.kernel_cmdline = Some(args.get(i).context("--kernel-cmdline needs the line")?.clone());

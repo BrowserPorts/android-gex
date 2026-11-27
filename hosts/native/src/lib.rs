@@ -33,6 +33,7 @@ mod usage;
 pub(crate) mod ftab;
 pub(crate) mod door;
 mod dense;
+mod snapshot;
 pub mod wayland;
 
 /// The most functions wasmtime takes in one module, and what a translated
@@ -194,6 +195,9 @@ pub struct RunOptions {
     /// it and libselinux looks for it. Off unless asked: a program that
     /// finds it takes SELinux to be on, and says so in what it prints.
     pub selinuxfs: bool,
+    /// A snapshot's directory to resume from in place of starting the
+    /// program (`snapshot::apply`): the same program, given as for a run.
+    pub restore: Option<std::path::PathBuf>,
     /// What `/proc/cmdline` reads: the kernel's command line. Empty
     /// unless given.
     pub kernel_cmdline: Option<String>,
@@ -253,6 +257,7 @@ impl Default for RunOptions {
             wayland_gpu: false,
             gl: false,
             selinuxfs: false,
+            restore: None,
             kernel_cmdline: None,
             bootconfig: None,
             recompile_objects: false,
@@ -1169,6 +1174,7 @@ fn fixed_random() {
         gex_mem::tune_heap();
         gex_mem::heap_stats_every();
         jit_stats_every();
+        snapshot::start_test_hold();
         proc_stats_every();
         if let Ok(seed) = std::env::var("GEX_FIXED_RANDOM") {
             match seed.parse::<u64>() {
@@ -1723,7 +1729,12 @@ fn run_program_with(
             entry_hook: 0,
         },
     )?;
-    let entry = program.entry();
+    // A snapshot's process instead of the program's start
+    // (`gexc run --restore DIR`): only for a run's first program.
+    let entry = match opts.restore.as_deref().filter(|_| fresh_process) {
+        Some(dir) => snapshot::apply(&mut store, &memory, dir)?,
+        None => program.entry(),
+    };
 
     // Publish the image's page-directory entries, without which none of its
     // blocks are reachable through the table.
@@ -1807,6 +1818,7 @@ fn run_program_with(
         fork_dl_tls: Mutex::new(std::collections::HashMap::new()),
         provider_stacks: Mutex::new(Vec::new()),
     });
+    snapshot::register(&spawn);
     note_live_process(&spawn);
     let pid = store.data_mut().with_kernel(|k| k.pid);
     note_quiescence(&spawn, pid);
@@ -2136,7 +2148,7 @@ fn note_quiescence(spawn: &Arc<SpawnContext>, pid: i32) {
 /// Whether any process may have to be held: frozen, stopped, or with a
 /// stop to make.
 fn holds_any() -> bool {
-    gex_kernel::cgroup::any_freezing() || gex_kernel::proc::any_stopped() || gex_kernel::signal::stops_asked()
+    snapshot::pending() || gex_kernel::cgroup::any_freezing() || gex_kernel::proc::any_stopped() || gex_kernel::signal::stops_asked()
 }
 
 /// At a safepoint or syscall: stop here while this thread's process is
@@ -2153,9 +2165,11 @@ fn freeze_point(state: &mut HostState) -> bool {
     }
     let Some(spawn) = state.spawn.clone() else { return false };
     spawn.gate.leave();
+    // A snapshot's hold first (`snapshot`), then the freezer's and a stop's.
+    let snapped = snapshot::park();
     let held = freeze_wait(state);
     spawn.gate.enter();
-    held
+    snapped || held
 }
 
 /// [`freeze_point`] on the way back to guest code at `pc` (a syscall's
@@ -2220,6 +2234,11 @@ fn hold_then_deliver(caller: &mut Caller<'_, HostState>, pc: u64, cause: &'stati
 fn freeze_wait(state: &mut HostState) -> bool {
     if !holds_any() {
         return false;
+    }
+    // Its blocking call ended during a snapshot's hold: still, before it
+    // writes its result.
+    if snapshot::park() {
+        return true;
     }
     let Some(spawn) = state.spawn.clone() else { return false };
     // A stop a delivery found (a stop signal with its default action):
@@ -2385,7 +2404,7 @@ fn perform_block(
             // a spurious wake). Mono's GC suspends threads that sit in
             // condition-variable waits exactly this way.
             let mem = GuestMem::new(data);
-            let start = std::time::Instant::now();
+            let start = snapshot::Since::now();
             let slice = std::time::Duration::from_millis(20);
             loop {
                 let left = match deadline {
@@ -2423,7 +2442,7 @@ fn perform_block(
             }
             let _done = Done(&table, uaddr);
             use gex_kernel::futex::pi;
-            let start = std::time::Instant::now();
+            let start = snapshot::Since::now();
             loop {
                 let mut mem = GuestMem::new(&mut *data);
                 let v = gex_atomic::load_u32(mem.word_mut(uaddr).ok_or(Errno::EFAULT)?, 0).ok_or(Errno::EFAULT)?;
@@ -2459,7 +2478,7 @@ fn perform_block(
             // In slices, so a signal ends it. A flat `sleep(d)` is why
             // `nanosleep` ran its full five seconds against a one-second
             // alarm while QEMU returned `EINTR` after one.
-            let start = std::time::Instant::now();
+            let start = snapshot::Since::now();
             while start.elapsed() < d {
                 if interrupted() {
                     return Err(Errno::EINTR);
@@ -2488,7 +2507,7 @@ fn perform_block(
             deadline,
             report,
         } => {
-            let start = std::time::Instant::now();
+            let start = snapshot::Since::now();
             loop {
                 let seen = ready::seq();
                 service(data);
@@ -2576,7 +2595,7 @@ fn perform_block(
         // signal outside the set is delivered (`EINTR`). `interrupted`
         // collects what other processes sent first, so it is asked first.
         BlockOp::SigWait { set, timeout, thread, process } => {
-            let start = std::time::Instant::now();
+            let start = snapshot::Since::now();
             loop {
                 let seen = ready::seq();
                 service(data);
@@ -2772,6 +2791,8 @@ fn run_thread_loop(
     entry: u64,
 ) -> Result<Stopped> {
     let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::RUN);
+    // A live guest thread, for a snapshot's hold to wait for.
+    let _live = snapshot::Live::enter();
     let enter = instance
         .get_func(&mut *store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
@@ -3137,7 +3158,6 @@ impl SparseCopy {
 
     /// Bytes written to `dst` (the non-zero pages of `src[a..b]`).
     fn copy(&mut self, src: &[u8], dst: &mut [u8], a: usize, b: usize) -> usize {
-        use std::os::unix::fs::FileExt;
         let page = Self::PAGE;
         // Unaligned edges are copied as they are.
         let (pa, pb) = (a.next_multiple_of(page), b / page * page);
@@ -3148,6 +3168,19 @@ impl SparseCopy {
         dst[a..pa].copy_from_slice(&src[a..pa]);
         dst[pb..b].copy_from_slice(&src[pb..b]);
         let mut written = (pa - a) + (b - pb);
+        self.nonzero_pages(src, pa, pb, &mut |r| {
+            dst[r.clone()].copy_from_slice(&src[r.clone()]);
+            written += r.len();
+        });
+        written
+    }
+
+    /// Each page of `src[pa..pb]` (both page-aligned) that the host gave and
+    /// that does not read as zero, to `found`: what a copy has to carry, a
+    /// fork's or a snapshot's (`snapshot`).
+    fn nonzero_pages(&mut self, src: &[u8], pa: usize, pb: usize, found: &mut dyn FnMut(std::ops::Range<usize>)) {
+        use std::os::unix::fs::FileExt;
+        let page = Self::PAGE;
         let base = src.as_ptr() as usize;
         let mut p = pa;
         while p < pb {
@@ -3176,16 +3209,13 @@ impl SparseCopy {
                     continue;
                 }
                 let r = p + k * page..p + (k + 1) * page;
-                let s = &src[r.clone()];
-                if s.chunks(64).all(|c| c.iter().fold(0u8, |x, &y| x | y) == 0) {
+                if src[r.clone()].chunks(64).all(|c| c.iter().fold(0u8, |x, &y| x | y) == 0) {
                     continue;
                 }
-                dst[r].copy_from_slice(s);
-                written += page;
+                found(r);
             }
             p += n * page;
         }
-        written
     }
 }
 
@@ -3436,6 +3466,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
         // the parent's free ones are mapped in the child's copy too
         provider_stacks: Mutex::new(cx.provider_stacks.lock().unwrap_or_else(|e| e.into_inner()).clone()),
     });
+    snapshot::register(&child_cx);
     note_live_process(&child_cx);
     note_quiescence(&child_cx, pid);
     let status = {
@@ -5824,7 +5855,12 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 if let Some(g) = &gate {
                     g.leave();
                 }
-                let r = perform_block(op, memory.bytes(), &service, &interrupted);
+                let r = {
+                    // Still while it waits, as far as a snapshot's hold is
+                    // concerned.
+                    let _blocked = snapshot::Blocked::enter(&memory, caller.data().thread.ctx_addr);
+                    perform_block(op, memory.bytes(), &service, &interrupted)
+                };
                 // Not back into guest code while frozen.
                 freeze_wait(caller.data_mut());
                 if let Some(g) = &gate {
