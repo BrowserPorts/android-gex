@@ -7157,9 +7157,18 @@ fn translate_once(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<
     // An address a function serves counts too: a miss there gets its bridge
     // (`ftab::serves`), and its bytes may be no code at all (a 32-bit Wine builtin's
     // `ud2` stub).
+    // `GEX_REPEATABLE_REGIONS=1`: a region found from the address that
+    // missed without stopping at what other threads have translated, so
+    // that it is the same region, and the same bytes and cache key, in
+    // every run. Without it the region ends where another thread's
+    // translation began, which depends on timing, and a threaded process's
+    // translations missed the cache three times in four in a warm boot
+    // (b148). Code the function tier serves still bounds it.
+    static REPEATABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let repeatable = *REPEATABLE.get_or_init(|| std::env::var("GEX_REPEATABLE_REGIONS").as_deref() == Ok("1"));
     let known = |a: u64| {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
-        s.translated.contains(&gex_abi::addr_key(a, alt)) || ftab::serves(&s, memory.bytes(), a, alt)
+        (!repeatable && s.translated.contains(&gex_abi::addr_key(a, alt))) || ftab::serves(&s, memory.bytes(), a, alt)
     };
     let exec_ranges: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
         k.mem
@@ -7192,7 +7201,16 @@ fn translate_once(caller: &mut Caller<'_, HostState>, pc: u64) -> Result<Option<
             limits,
             // A cap keeps one miss from translating an entire library
             // synchronously; the next miss picks up where this stopped.
-            4096,
+            // Repeatable regions stop at nothing else, and at 4096 a
+            // threaded program ran six to eleven times slower (GcStress:
+            // 105 s to 1175 s cold, 67 to 423 warm, for 84% hits against
+            // 68%): `GEX_REPEATABLE_BLOCKS` sets theirs (256 unless said).
+            if repeatable {
+                static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                *CAP.get_or_init(|| std::env::var("GEX_REPEATABLE_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(256))
+            } else {
+                4096
+            },
             true,
             &Default::default(),
         )
