@@ -1819,6 +1819,10 @@ fn run_program_with(
         provider_stacks: Mutex::new(Vec::new()),
     });
     snapshot::register(&spawn);
+    // A restored process's other threads (`--restore`).
+    if opts.restore.is_some() && fresh_process {
+        snapshot::start_restored(&spawn)?;
+    }
     note_live_process(&spawn);
     let pid = store.data_mut().with_kernel(|k| k.pid);
     note_quiescence(&spawn, pid);
@@ -2792,7 +2796,10 @@ fn run_thread_loop(
 ) -> Result<Stopped> {
     let _tag = gex_mem::alloc_tag::enter(gex_mem::alloc_tag::RUN);
     // A live guest thread, for a snapshot's hold to wait for.
-    let _live = snapshot::Live::enter();
+    let _live = {
+        let tid = store.data().thread.tid;
+        snapshot::Live::enter(store.data().memory.as_ref(), ctx_addr, tid)
+    };
     let enter = instance
         .get_func(&mut *store, exports::ENTER)
         .ok_or_else(|| anyhow!("translated module does not export `enter`"))?;
