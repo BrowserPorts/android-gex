@@ -610,6 +610,9 @@ impl std::fmt::Debug for Aliases {
 }
 
 /// The process's address space.
+/// The snapshot section of a memory map ([`MemoryMap::snap`]).
+const SNAP_MAP: u32 = 0x4d41_5000;
+
 #[derive(Debug, Clone)]
 pub struct MemoryMap {
     vmas: Vec<Vma>,
@@ -957,6 +960,138 @@ impl MemoryMap {
     /// since the last call, cleared: 0 if none.
     pub fn take_short(&mut self) -> u64 {
         std::mem::take(&mut self.short)
+    }
+
+    /// The map written for a snapshot ([`crate::snap`]): its mappings and
+    /// where its allocators stand. What is the host's (the protection
+    /// table's state, the host's pages, the view, the placement hooks) is
+    /// not written: a restore makes it again from the mappings. A map with
+    /// what snapshots do not carry yet (userfaultfd ranges, two views of
+    /// one memory, shared mappings, a host's data views) refuses.
+    pub fn snap(&self, w: &mut crate::snap::W) -> Result<(), crate::snap::Refused> {
+        use crate::snap::Refused;
+        if !self.uffd.regs.is_empty() || !self.uffd.missing.all().is_empty() {
+            return Err(Refused::new("a memory map with userfaultfd ranges"));
+        }
+        if !self.aliases.ranges.is_empty() {
+            return Err(Refused::new("a memory map with two views of one memory"));
+        }
+        if !self.log.shared_maps.is_empty() {
+            return Err(Refused::new("a memory map with shared mappings"));
+        }
+        if !self.host_data.is_empty() || !self.host_live.is_empty() {
+            return Err(Refused::new("a memory map with the host's data views"));
+        }
+        if !self.log.new_code.is_empty() {
+            return Err(Refused::new("a memory map with code the host has not taken yet"));
+        }
+        let ranges = |w: &mut crate::snap::W, rs: &[(u64, u64)]| {
+            w.len_of(rs.len());
+            for &(a, b) in rs {
+                w.u64(a);
+                w.u64(b);
+            }
+        };
+        let text = |w: &mut crate::snap::W, s: Option<&str>| w.opt(s, |w, s| w.str(s));
+        w.section(SNAP_MAP, 1, |w| {
+            w.len_of(self.vmas.len());
+            for v in &self.vmas {
+                w.u64(v.start);
+                w.u64(v.end);
+                w.u32(v.prot);
+                w.str(&v.name);
+                w.opt(v.origin.as_ref(), |w, (p, o)| {
+                    w.str(p);
+                    w.u64(*o);
+                });
+                w.opt(v.code.as_ref(), |w, (p, o)| {
+                    w.str(p);
+                    w.u64(*o);
+                });
+                w.u32(v.namings);
+                w.bool(v.patched);
+                text(w, v.anon_name.as_deref());
+                w.opt(v.file_off, |w, o| w.u64(o));
+                text(w, v.shown.as_deref());
+                w.bool(v.never_write);
+                w.bool(v.shared_anon);
+            }
+            w.u64(self.start_stack);
+            w.u64(self.brk_start);
+            w.u64(self.brk_cur);
+            w.u64(self.mmap_next);
+            w.u64(self.mmap_ceiling);
+            w.bool(self.banded);
+            ranges(w, &self.arena);
+            w.u64(self.generation);
+            w.opt(self.high, |w, (a, b)| {
+                w.u64(a);
+                w.u64(b);
+            });
+            w.bool(self.high_down);
+            w.u64(self.short);
+            ranges(w, &self.clean);
+            w.opt(self.fresh, |w, (a, b)| {
+                w.u64(a);
+                w.u64(b);
+            });
+            ranges(w, &self.fixed_only);
+            w.u64(self.take_end);
+            Ok(())
+        })
+    }
+
+    /// This map as [`MemoryMap::snap`] wrote one: the same mappings and
+    /// allocators, in this map's own view and with its own host hooks, and
+    /// its protection table to be written again whole.
+    pub fn unsnap(&mut self, r: &mut crate::snap::R<'_>) -> Result<(), crate::snap::Refused> {
+        let mut b = r.expect(SNAP_MAP, 1, "memory map")?;
+        let ranges = |b: &mut crate::snap::R<'_>| -> Result<Vec<(u64, u64)>, crate::snap::Refused> {
+            let n = b.len_of()?;
+            (0..n).map(|_| Ok((b.u64()?, b.u64()?))).collect()
+        };
+        let text = |b: &mut crate::snap::R<'_>| -> Result<Option<std::sync::Arc<str>>, crate::snap::Refused> { b.opt(|b| b.str().map(std::sync::Arc::from)) };
+        let n = b.len_of()?;
+        let mut vmas = Vec::with_capacity(n);
+        for _ in 0..n {
+            vmas.push(Vma {
+                start: b.u64()?,
+                end: b.u64()?,
+                prot: b.u32()?,
+                name: b.str()?.to_string(),
+                origin: b.opt(|b| Ok((b.str()?.to_string(), b.u64()?)))?,
+                code: b.opt(|b| Ok((b.str()?.to_string(), b.u64()?)))?,
+                namings: b.u32()?,
+                patched: b.bool()?,
+                anon_name: text(&mut b)?,
+                file_off: b.opt(|b| b.u64())?,
+                shown: text(&mut b)?,
+                never_write: b.bool()?,
+                shared_anon: b.bool()?,
+            });
+        }
+        let start_stack = b.u64()?;
+        let brk_start = b.u64()?;
+        self.renew(brk_start);
+        self.vmas = vmas;
+        self.start_stack = start_stack;
+        self.brk_cur = b.u64()?;
+        self.mmap_next = b.u64()?;
+        self.mmap_ceiling = b.u64()?;
+        self.banded = b.bool()?;
+        self.arena = ranges(&mut b)?;
+        // Past the snapshot's: a reader of the old generation sees a change.
+        self.generation = b.u64()?.wrapping_add(1);
+        self.high = b.opt(|b| Ok((b.u64()?, b.u64()?)))?;
+        self.high_down = b.bool()?;
+        self.short = b.u64()?;
+        self.clean = ranges(&mut b)?;
+        self.fresh = b.opt(|b| Ok((b.u64()?, b.u64()?)))?;
+        self.fixed_only = ranges(&mut b)?;
+        self.take_end = b.u64()?;
+        b.end("memory map")?;
+        self.publish();
+        Ok(())
     }
 
     /// Start again with an empty map (an exec, a snapshot's restore): the
@@ -2858,6 +2993,42 @@ impl MemoryMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A map written for a snapshot and read back into another: the same
+    /// mappings, break and allocators, and the second map's protection
+    /// table written whole from them; what snapshots do not carry refuses.
+    #[test]
+    fn a_map_comes_back_from_its_snapshot() {
+        let at = MMAP_BOTTOM;
+        let mut m = MemoryMap::new(0x100_0000);
+        m.insert(at, at + 0x3000, prot::READ | prot::EXEC, "text");
+        m.insert(at + 0x3000, at + 0x4000, prot::READ | prot::WRITE, "data");
+        m.brk(0x100_0000 + 0x5000);
+        let anon = m.mmap(0, 0x2000, prot::READ | prot::WRITE, 0x22, "").unwrap();
+        let mut w = crate::snap::W::new();
+        m.snap(&mut w).unwrap();
+        let bytes = w.into_bytes();
+
+        let mut back = MemoryMap::new(0x200_0000);
+        back.perms = Some(Perms::default());
+        let mut r = crate::snap::R::new(&bytes);
+        back.unsnap(&mut r).unwrap();
+        assert!(r.done());
+        assert_eq!(back.vmas(), m.vmas());
+        assert_eq!((back.brk_start, back.brk_cur), (m.brk_start, m.brk_cur));
+        assert_eq!((back.mmap_next, back.mmap_ceiling, back.start_stack), (m.mmap_next, m.mmap_ceiling, m.start_stack));
+        assert!(back.vmas().iter().any(|v| v.start == anon));
+        // The next mapping goes where it would have gone.
+        let next = m.mmap(0, 0x1000, prot::READ, 0x22, "").unwrap();
+        assert_eq!(back.mmap(0, 0x1000, prot::READ, 0x22, "").unwrap(), next);
+        // Its table is written whole: every mapping's pages.
+        let writes = back.take_perm_writes();
+        assert!(writes.iter().any(|(p, _)| *p <= at >> 12), "{writes:x?}");
+
+        // What snapshots do not carry yet refuses, by name.
+        m.host_data.push((at, at + 0x1000));
+        assert!(m.snap(&mut crate::snap::W::new()).unwrap_err().0.contains("host's data"));
+    }
 
     /// The protection table's bytes follow the map: a mapping's pages get
     /// its bits, with what each and the next both allow above; a change

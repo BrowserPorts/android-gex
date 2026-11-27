@@ -328,6 +328,17 @@ fn file_times(atime: Option<(i64, u32)>, mtime: Option<(i64, u32)>) -> std::fs::
 }
 
 impl FileHandle for HostHandle {
+    /// A regular file of the host's: restore opens its path again, with
+    /// the description's flags and offset. A FIFO, socket or device of the
+    /// host's is not carried.
+    fn snap(&self, w: &mut crate::snap::W, _ids: &mut crate::snap::Ids) -> Result<crate::snap::Kind, crate::snap::Refused> {
+        if self.stream {
+            return Err(crate::snap::Refused::new(format!("a host file that is not a regular file: {}", self.at.1.display())));
+        }
+        w.str(&self.at.1.to_string_lossy());
+        Ok(crate::snap::KIND_HOST_FILE)
+    }
+
     /// The host's own `fchown`, where the host's owners are the ones said
     /// (`host_is_root`); nowhere else is there an owner to change.
     fn chown(&self, uid: Option<u32>, gid: Option<u32>) -> Option<Result<(), Errno>> {

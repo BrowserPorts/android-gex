@@ -131,7 +131,7 @@ impl Ranges {
 #[derive(Debug, Default)]
 pub struct UffdState {
     /// Registered ranges: start, end, the descriptor's number.
-    regs: Vec<(u64, u64, u64)>,
+    pub(crate) regs: Vec<(u64, u64, u64)>,
     /// The missing pages of registered ranges.
     pub(crate) missing: Ranges,
 }

@@ -66,6 +66,18 @@ impl StdStream {
 }
 
 impl FileHandle for StdStream {
+    /// One of the host's three streams: restore gives the process the
+    /// host's same stream again, whatever it is by then.
+    fn snap(&self, w: &mut crate::snap::W, _ids: &mut crate::snap::Ids) -> Result<crate::snap::Kind, crate::snap::Refused> {
+        w.u8(match self.stream {
+            Stream::In => 0,
+            Stream::Out => 1,
+            Stream::Err => 2,
+        });
+        w.bool(self.tty);
+        Ok(crate::snap::KIND_STDIO)
+    }
+
     fn poll_readable(&self) -> bool {
         self.stream != Stream::In || STDIN_READY.get().is_none_or(|f| f())
     }

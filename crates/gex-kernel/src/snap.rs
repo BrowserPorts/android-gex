@@ -27,6 +27,11 @@ use std::collections::HashMap;
 /// reused for another.
 pub type Kind = u16;
 
+/// One of the host's standard streams ([`crate::stdio::StdStream`]).
+pub const KIND_STDIO: Kind = 1;
+/// A file of the host's, opened again by its path ([`crate::vfs::hostfs`]).
+pub const KIND_HOST_FILE: Kind = 2;
+
 /// Why a snapshot could not be taken or read: what stopped it, as a
 /// person reading the error needs it ("a binder thread with a reply
 /// pending", "an unknown section 0x31 version 2").

@@ -412,6 +412,9 @@ struct Table {
 /// than that. A reader whose id falls outside takes the writers' mutex.
 pub const FD_READER_SLOTS: usize = 130;
 
+/// The snapshot section of a descriptor table ([`FdTable::snap`]).
+pub const SNAP_FDS: u32 = 0x4644_5300;
+
 /// The per-process descriptor table.
 ///
 /// No kernel lock: a lookup reads the published snapshot
@@ -850,6 +853,41 @@ impl FdTable {
                 .enumerate()
                 .filter_map(|(i, e)| e.as_ref().map(|f| (i as i32, Arc::clone(f), t.cloexec[i])))
                 .collect()
+        })
+    }
+
+    /// The table written for a snapshot ([`crate::snap`]): each open
+    /// descriptor's number and close-on-exec flag, and its description (the
+    /// path, flags, offset and access it was opened with, then what its
+    /// handle writes of itself, `FileHandle::snap`). A description two
+    /// descriptors share is written once ([`crate::snap::Ids`]). A handle
+    /// that cannot be carried refuses the whole table.
+    pub fn snap(&self, w: &mut crate::snap::W, ids: &mut crate::snap::Ids) -> Result<(), crate::snap::Refused> {
+        let entries = self.entries();
+        w.section(SNAP_FDS, 1, |w| {
+            w.len_of(entries.len());
+            for (fd, f, cloexec) in &entries {
+                w.i32(*fd);
+                w.bool(*cloexec);
+                let (id, first) = ids.of(f);
+                w.u32(id);
+                if !first {
+                    continue;
+                }
+                w.str(&f.path);
+                w.u64(f.flags());
+                w.u64(f.offset());
+                w.bool(f.readable);
+                w.bool(f.writable);
+                if f.unlink_on_close.is_some() {
+                    return Err(crate::snap::Refused::new(format!("fd {fd}: a file to be removed at its close ({})", f.path)));
+                }
+                let mut inner = crate::snap::W::new();
+                let kind = f.handle.snap(&mut inner, ids).map_err(|e| crate::snap::Refused::new(format!("fd {fd} ({}): {}", f.path, e.0)))?;
+                w.u16(kind);
+                w.bytes(&inner.into_bytes());
+            }
+            Ok(())
         })
     }
 

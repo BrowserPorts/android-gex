@@ -11864,12 +11864,42 @@ pub fn time_scale() -> u32 {
     TIME_SCALE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Host nanoseconds since the epoch when the guest's clocks were paused
+/// ([`pause_clocks`]), 0 while they run.
+static PAUSED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Host nanoseconds the guest's clocks have spent paused, in all.
+static PAUSED_FOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn host_epoch_ns() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// From now until [`resume_clocks`], the guest's clocks stand still: no
+/// time passes for the guest while the system is held for a snapshot, and
+/// the time it was held is never seen (a periodic timer would otherwise
+/// count a second of overruns that no guest instruction lived through).
+/// For the host to call with every guest thread stopped.
+pub fn pause_clocks() {
+    let _ = PAUSED_AT.compare_exchange(0, host_epoch_ns().max(1), std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire);
+}
+
+/// The guest's clocks go on from where [`pause_clocks`] stopped them.
+pub fn resume_clocks() {
+    let at = PAUSED_AT.swap(0, std::sync::atomic::Ordering::AcqRel);
+    if at != 0 {
+        PAUSED_FOR.fetch_add(host_epoch_ns().saturating_sub(at), std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 pub fn system_clock() -> (u64, u32) {
     #[cfg(not(target_family = "wasm"))]
     {
-        let mut now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
+        // While paused, the moment they were paused; and less all the time
+        // they have spent paused ([`pause_clocks`]).
+        let paused_at = PAUSED_AT.load(std::sync::atomic::Ordering::Acquire);
+        let host = if paused_at != 0 { paused_at } else { host_epoch_ns() };
+        let host = host.saturating_sub(PAUSED_FOR.load(std::sync::atomic::Ordering::Acquire));
+        let mut now = std::time::Duration::from_nanos(host);
         // Slowed ([`set_time_scale`]): from when the first slowed reading
         // was taken, that much less of the host's time has gone by.
         let scale = time_scale();
