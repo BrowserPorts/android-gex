@@ -768,6 +768,17 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
         String::new()
     }
 
+    /// This open file's state written for a snapshot of the system
+    /// ([`crate::snap`]): its kind (what restore makes it again as) and,
+    /// in `w`, what it holds. A kind with no saving written refuses, naming
+    /// itself, so a snapshot that cannot carry a file is not taken rather
+    /// than taken without it.
+    fn snap(&self, _w: &mut crate::snap::W, _ids: &mut crate::snap::Ids) -> Result<crate::snap::Kind, crate::snap::Refused> {
+        let what = format!("{self:?}");
+        let what: String = what.chars().take(120).collect();
+        Err(crate::snap::Refused::new(format!("an open file of a kind snapshots do not carry yet: {what}")))
+    }
+
     /// An `ioctl` this handle answers itself. `None` means "not mine" and the
     /// kernel's own handling runs. Guest memory is passed because an ioctl arg
     /// is usually a pointer to a struct the device reads or writes -- and a
