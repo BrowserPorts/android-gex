@@ -129,6 +129,22 @@ fn ledger_add(dir: &Path, delta: i64) -> Option<Ledger> {
 /// Evict up to `want` bytes from the oldest of the last walk's [`VICTIMS`]
 /// (at most [`VICTIM_BATCH`] entries), skipping any read since that walk
 /// (`walked`). Called under the ledger's lock. Returns the bytes removed.
+/// The entries this process has mapped (a hit, or its own store mapped
+/// back): an eviction passes over them. A file a running process maps keeps
+/// its blocks when removed, until that process ends, so removing it frees
+/// nothing while it runs and only takes the entry from the next run; a boot
+/// that evicted its own mapped units grew the cache's disk by gigabytes
+/// past its budget.
+static MAPPED: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+
+fn note_mapped(key: &str) {
+    MAPPED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(key.to_string());
+}
+
+fn is_mapped(key: &str) -> bool {
+    MAPPED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains(key))
+}
+
 fn evict_victims(dir: &Path, want: u64, walked: u64) -> u64 {
     let path = dir.join(VICTIMS);
     let Ok(text) = std::fs::read_to_string(&path) else { return 0 };
@@ -139,6 +155,9 @@ fn evict_victims(dir: &Path, want: u64, walked: u64) -> u64 {
         let Some(line) = lines.pop() else { break };
         n += 1;
         let Some((key, size)) = line.split_once(' ') else { continue };
+        if is_mapped(key) {
+            continue;
+        }
         let meta_path = dir.join(format!("{key}.meta"));
         // In whole seconds, as `walked` is: an entry the walk saw has an
         // mtime no later than the second the walk ended in.
@@ -274,6 +293,12 @@ fn evict(dir: &Path, budget: u64) -> u64 {
             continue;
         };
         let wasm_len = e.metadata().map(|m| m.len()).unwrap_or(0);
+        // This process's own: counted, never a victim.
+        if is_mapped(&key) {
+            let meta_len = std::fs::metadata(dir.join(format!("{key}.meta"))).map_or(0, |m| m.len());
+            walked += wasm_len + meta_len;
+            continue;
+        }
         let meta_path = dir.join(format!("{key}.meta"));
         let meta = std::fs::metadata(&meta_path);
         let meta_len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
@@ -491,6 +516,7 @@ pub fn load_or_compile(
         match found {
             Ok(module) => {
                 refresh(&meta_path);
+                note_mapped(key);
                 return Ok(Loaded {
                     module,
                     metadata,
@@ -512,13 +538,22 @@ pub fn load_or_compile(
     // Compiled here and not kept by the process (`memo`): what is kept is
     // the file.
     let mut module = compile_uncached(engine, &wasm).context("validating translated wasm")?;
+    // Over budget with nothing it may evict (this run maps all it has):
+    // kept in memory, not stored, so the cache's disk stays at its budget
+    // while a run makes more than the budget holds.
+    let budget = budget_for(dir);
+    let full = ledger_update(dir, |old| old.unwrap_or_default()).is_some_and(|l| l.bytes > budget);
+    if full {
+        return Ok(Loaded { module, metadata, hit: false });
+    }
     if let Some(serialized) = serialize(&module) {
         // Metadata first: a reader requires both, so the module's arrival is
         // what publishes the entry.
         store(dir, &meta_path, &metadata);
         store(dir, &path, &serialized);
-        account_store(dir, (metadata.len() + serialized.len()) as u64, budget_for(dir));
+        account_store(dir, (metadata.len() + serialized.len()) as u64, budget);
         module = mapped_instead(engine, &path, module);
+        note_mapped(key);
     }
     Ok(Loaded {
         module,
