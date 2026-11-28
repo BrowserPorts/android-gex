@@ -6759,7 +6759,18 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 if !again {
                     jit_stats::STALE_PASSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                if again {
+                if again && n % STALE_SIBLING_LIMIT == 0 {
+                    // Its own module still provides it and translating it
+                    // again has not helped, many times running: what comes
+                    // back is the same unit, its page check expecting the
+                    // same base (a zygote's WebView child sat at one block of
+                    // boot-framework.oat two million times). The page is
+                    // retired: it is numbered afresh, and what is translated
+                    // for it next checks the new base.
+                    jit_stats::STALE_SIBLING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let page = start / gex_abi::DISPATCH_PAGE * gex_abi::DISPATCH_PAGE;
+                    retire_translations(&mut caller, &[(page, page + gex_abi::DISPATCH_PAGE)])?;
+                } else if again {
                     jit_stats::STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     translate_and_install(&mut caller, start)?;
                 } else if n == STALE_SIBLING_LIMIT {
