@@ -274,7 +274,8 @@ fn dump(why: &str) {
                 let mut peeks = String::new();
                 for &(reg, off, len) in peek() {
                     let base = if reg == 31 { sp } else { gm.read_u64(p.ctx + gex_abi::ctx::x(reg) as u64).unwrap_or(0) };
-                    let at = base.wrapping_add_signed(off);
+                    // (an arm64 pointer's top byte is a tag the hardware ignores)
+                    let at = (base & 0x00ff_ffff_ffff_ffff).wrapping_add_signed(off);
                     let words: Vec<String> = match gm.read(at, len) {
                         Ok(b) => b.chunks(8).map(|c| {
                             let mut w = [0u8; 8];
