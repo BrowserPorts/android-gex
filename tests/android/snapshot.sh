@@ -25,10 +25,13 @@ status=0
 # epoll over a periodic timerfd, an eventfd and a signalfd, and an
 # absolute deadline on the monotonic clock taken at its start. snapfour:
 # two processes, a parent and its forked child, talking over two pipes,
-# the child's state in its own memory and its end waited for.
-for p in snapone snaptwo snapthree snapfour; do
+# the child's state in its own memory and its end waited for. snapfive:
+# the same with a child that execs another program (the other build of
+# it, which a run at the low base can exec).
+for p in snapone snaptwo snapthree snapfour snapfive; do
 case $p in
     snapone) set -- "$HERE/bin/$p" "$HERE/src/$p.c" ;;
+    snapfive) set -- "$HERE/bin/low/$p" "$HERE/bin/$p" ;;
     *) set -- "$HERE/bin/$p" ;;
 esac
 "$GEXC" run "$@" >/dev/null 2>&1
