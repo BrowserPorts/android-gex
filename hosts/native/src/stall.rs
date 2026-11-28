@@ -126,6 +126,27 @@ pub fn enter_at(pid: i32, tid: i32, nr: u64, memory: &gex_mem::GuestMemory, ctx:
     }
 }
 
+/// `GEX_STALL_PEEK=x23-64:64,sp+0:32,...`: memory a running thread's dump
+/// shows, each at a register (`x0`-`x30`, `sp`) plus an offset, so many
+/// bytes (whole 8-byte words; at most 4096).
+fn peek() -> &'static [(u8, i64, usize)] {
+    static P: OnceLock<Vec<(u8, i64, usize)>> = OnceLock::new();
+    P.get_or_init(|| {
+        let Ok(v) = std::env::var("GEX_STALL_PEEK") else { return Vec::new() };
+        v.split(',')
+            .filter_map(|item| {
+                let (place, len) = item.trim().split_once(':')?;
+                let len: usize = len.parse().ok().filter(|&n| n > 0 && n <= 4096)?;
+                let at = place.find(['+', '-']).unwrap_or(place.len());
+                let (reg, off) = place.split_at(at);
+                let reg = if reg == "sp" { 31 } else { reg.strip_prefix('x')?.parse::<u8>().ok().filter(|&r| r < 31)? };
+                let off: i64 = if off.is_empty() { 0 } else { off.trim_start_matches('+').parse().ok()? };
+                Some((reg, off, len.next_multiple_of(8)))
+            })
+            .collect()
+    })
+}
+
 /// Where `at` is in a process: its mapping's name and the offset in it
 /// (in its file where it was loaded from one).
 fn where_in(mm: &gex_kernel::mem::Mm, at: u64) -> String {
@@ -246,7 +267,25 @@ fn dump(why: &str) {
                 let gm = gex_kernel::GuestMem::new(p.memory.bytes());
                 let pc = gm.read_u64(p.ctx + gex_abi::ctx::PC as u64).unwrap_or(0);
                 let lr = gm.read_u64(p.ctx + gex_abi::ctx::x(30) as u64).unwrap_or(0);
-                format!("\n      pc {pc:#x} ({}) lr {lr:#x} ({})", where_in(&p.mm, pc), where_in(&p.mm, lr))
+                // Its registers as its last safepoint left them, and what
+                // `GEX_STALL_PEEK` asks to see at them.
+                let regs: Vec<String> = (0u8..31).map(|i| format!("x{i}={:#x}", gm.read_u64(p.ctx + gex_abi::ctx::x(i) as u64).unwrap_or(0))).collect();
+                let sp = gm.read_u64(p.ctx + gex_abi::ctx::SP as u64).unwrap_or(0);
+                let mut peeks = String::new();
+                for &(reg, off, len) in peek() {
+                    let base = if reg == 31 { sp } else { gm.read_u64(p.ctx + gex_abi::ctx::x(reg) as u64).unwrap_or(0) };
+                    let at = base.wrapping_add_signed(off);
+                    let words: Vec<String> = match gm.read(at, len) {
+                        Ok(b) => b.chunks(8).map(|c| {
+                            let mut w = [0u8; 8];
+                            w[..c.len()].copy_from_slice(c);
+                            format!("{:#x}", u64::from_le_bytes(w))
+                        }).collect(),
+                        Err(_) => vec!["(unreadable)".to_string()],
+                    };
+                    peeks.push_str(&format!("\n      at {}{off:+} = {at:#x}: {}", if reg == 31 { "sp".to_string() } else { format!("x{reg}") }, words.join(" ")));
+                }
+                format!("\n      pc {pc:#x} ({}) lr {lr:#x} ({})\n      {} sp={sp:#x}{peeks}", where_in(&p.mm, pc), where_in(&p.mm, lr), regs.join(" "))
             }
             _ => String::new(),
         };
