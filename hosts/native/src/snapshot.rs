@@ -491,13 +491,23 @@ struct Head {
     pgid: i32,
     sid: i32,
     exe: String,
+    argv: Vec<String>,
+    envp: Vec<String>,
 }
 
 fn read_head(r: &mut gex_kernel::snap::R<'_>) -> anyhow::Result<Head> {
     use anyhow::anyhow;
     let e = |e: gex_kernel::snap::Refused| anyhow!("{e}");
     let mut head = r.expect(PROC_HEAD, 2, "process").map_err(e)?;
-    Ok(Head { pid: head.i32().map_err(e)?, ppid: head.i32().map_err(e)?, pgid: head.i32().map_err(e)?, sid: head.i32().map_err(e)?, exe: head.str().map_err(e)?.to_string() })
+    let (pid, ppid, pgid, sid) = (head.i32().map_err(e)?, head.i32().map_err(e)?, head.i32().map_err(e)?, head.i32().map_err(e)?);
+    let exe = head.str().map_err(e)?.to_string();
+    let strs = |head: &mut gex_kernel::snap::R<'_>| -> anyhow::Result<Vec<String>> {
+        let n = head.len_of().map_err(e)?;
+        (0..n).map(|_| Ok(head.str().map_err(e)?.to_string())).collect()
+    };
+    let argv = strs(&mut head)?;
+    let envp = strs(&mut head)?;
+    Ok(Head { pid, ppid, pgid, sid, exe, argv, envp })
 }
 
 /// The processes still to make after the run's own, in order, each its
@@ -507,22 +517,23 @@ static CHILDREN: std::sync::Mutex<(Vec<(std::path::PathBuf, Vec<u8>)>, Option<Ob
 
 /// The rest of a process's file, after its head, onto kernel `k` and
 /// memory `memory`: its memory and map, descriptors, signals' state,
-/// credentials, blocked calls, threads and (the `first` process's) the
-/// guest's time; a memory that is not `first` is a fresh one.
+/// credentials, blocked calls, threads and (`clocks`: the first process's)
+/// the guest's time. `clear`: the memory has a program's own in it (a
+/// fresh one is zero already).
 /// Its threads (context and id); its first, whose id is the pid, first.
-fn restore_into(k: &mut gex_kernel::syscalls::Kernel, memory: &gex_mem::GuestMemory, r: &mut gex_kernel::snap::R<'_>, mem_file: &std::path::Path, objs: &mut Objects, first: bool) -> anyhow::Result<Vec<gex_kernel::syscalls::ThreadState>> {
+fn restore_into(k: &mut gex_kernel::syscalls::Kernel, memory: &gex_mem::GuestMemory, r: &mut gex_kernel::snap::R<'_>, mem_file: &std::path::Path, objs: &mut Objects, clear: bool, clocks: bool) -> anyhow::Result<Vec<gex_kernel::syscalls::ThreadState>> {
     use anyhow::{anyhow, bail, Context};
     // What the process had cleared where it or the snapshot's has
     // anything, so what the snapshot left out as zero is zero.
     let mut mm = k.mem.lock();
-    let mut clear: Vec<(u64, u64)> = vec![(0, gex_abi::CTX_LIMIT)];
-    clear.extend(mm.vmas().iter().filter(|v| !RUNTIME_MAPPINGS.contains(&v.name.as_str())).map(|v| (v.start, v.end)));
+    let mut clear_ranges: Vec<(u64, u64)> = vec![(0, gex_abi::CTX_LIMIT)];
+    clear_ranges.extend(mm.vmas().iter().filter(|v| !RUNTIME_MAPPINGS.contains(&v.name.as_str())).map(|v| (v.start, v.end)));
     mm.unsnap(r).map_err(|e| anyhow!("{e}"))?;
-    clear.extend(mm.vmas().iter().filter(|v| !RUNTIME_MAPPINGS.contains(&v.name.as_str())).map(|v| (v.start, v.end)));
+    clear_ranges.extend(mm.vmas().iter().filter(|v| !RUNTIME_MAPPINGS.contains(&v.name.as_str())).map(|v| (v.start, v.end)));
     // (A fresh memory, another process's, is zero already: writing zeros
     // would only make the host give it pages.)
     let bytes = memory.bytes();
-    for (a, b) in clear.into_iter().filter(|_| first) {
+    for (a, b) in clear_ranges.into_iter().filter(|_| clear) {
         let (a, b) = (a as usize, (b as usize).min(bytes.len()));
         if a < b {
             bytes[a..b].fill(0);
@@ -682,7 +693,7 @@ fn restore_into(k: &mut gex_kernel::syscalls::Kernel, memory: &gex_mem::GuestMem
     // snapshot, so its sleeps, timers and deadlines are where they were.
     // (One clock for the whole system: taken from the first process.)
     let mut clk = r.expect(0x434c_4b00, 1, "clocks").map_err(|e| anyhow!("{e}"))?;
-    if first {
+    if clocks {
         gex_kernel::syscalls::clocks_unsnap(&mut clk).map_err(|e| anyhow!("{e}"))?;
     }
     Ok(threads)
@@ -725,7 +736,7 @@ pub(crate) fn apply(store: &mut wasmtime::Store<crate::HostState>, memory: &gex_
         }
         k.procs.adopt_process(pid, head.ppid, head.pgid, head.sid).map_err(|er| anyhow!("pid {pid}: {er:?}"))?;
         objs.stdio = k.fds.entries().into_iter().filter(|(fd, _, _)| (0..3).contains(fd)).map(|(fd, f, _)| (fd, f)).collect();
-        let threads = restore_into(k, memory, &mut r, &mem_file, &mut objs, true)?;
+        let threads = restore_into(k, memory, &mut r, &mem_file, &mut objs, true, true)?;
         if threads[0].ctx_addr != ctx_addr {
             bail!("pid {pid}: its own thread's context is at {:#x}, and this run's at {ctx_addr:#x}", threads[0].ctx_addr);
         }
@@ -739,34 +750,64 @@ pub(crate) fn apply(store: &mut wasmtime::Store<crate::HostState>, memory: &gex_
     Ok(pc)
 }
 
-/// The snapshot's other processes, each made as a fork's child of the
-/// run's own would be (the run's kernel's namespace, process table and
-/// translated code; a fresh memory with the run's dispatch directory and
-/// runtime mappings) and then given what was saved of it: in order, a
-/// parent before its children. Only processes of the run's own program
-/// (a fork's children that have not exec'd): another program's code is
-/// not this run's to place.
+/// The snapshot's other processes, in order (a parent before its
+/// children). One of the run's own program (a fork's child that has not
+/// exec'd) is made as such a child of the run's would be: the run's
+/// kernel's namespace, process table and translated code, a fresh memory
+/// with the run's dispatch directory and runtime mappings, then what was
+/// saved of it. One of another program is made as a fork's child that
+/// execs it ([`crate::exec_program`]), and what was saved of it is put in
+/// place of the program's start ([`apply_exec`]). Each is restored before
+/// the next is begun, so what they share is made once.
 pub(crate) fn restore_children(cx: &std::sync::Arc<crate::SpawnContext>) -> anyhow::Result<()> {
     use anyhow::{anyhow, bail, Context};
     let (files, objs) = std::mem::take(&mut *CHILDREN.lock().unwrap_or_else(|e| e.into_inner()));
-    let Some(mut objs) = objs else { return Ok(()) };
+    let Some(objs) = objs else { return Ok(()) };
+    let objs = std::sync::Arc::new(std::sync::Mutex::new(objs));
     for (path, bytes) in files {
         let mut r = gex_kernel::snap::R::new(&bytes);
         let head = read_head(&mut r).with_context(|| path.display().to_string())?;
         let pid = head.pid;
-        let (mut child, root_vmas) = {
+        let mem_file = path.with_file_name(format!("mem-{pid}.bin"));
+        let (mut child, root_vmas, same) = {
             let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
-            if k.exe_path != head.exe {
-                bail!("pid {pid}: runs {}, and a restore makes only processes of the run's own program ({})", head.exe, k.exe_path);
-            }
             k.procs.adopt_process(pid, head.ppid, head.pgid, head.sid).map_err(|er| anyhow!("pid {pid}: {er:?}"))?;
             let vmas: Vec<(u64, u64)> = k.mem.lock().vmas().iter().filter(|v| RUNTIME_MAPPINGS.contains(&v.name.as_str())).map(|v| (v.start, v.end)).collect();
             let mut child = k.fork_kernel();
             child.pid = pid;
             child.tid = pid;
             child.forget_own_pidfds();
-            (child, vmas)
+            (child, vmas, k.exe_path == head.exe)
         };
+        if !same {
+            // Another program: exec'd into, on its own host thread, and
+            // restored where it would start; this waits for that.
+            let proc_state = std::sync::Arc::new(crate::ProcCell::default());
+            child.vfs.mount_own("/proc", std::sync::Arc::new(gex_kernel::vfs::procfs::ProcFs::new(std::sync::Arc::new(crate::KernelProcSource(std::sync::Arc::clone(&proc_state))))));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let restore = ExecRestore { bytes, mem_file, objs: std::sync::Arc::clone(&objs), done: done_tx };
+            let req = crate::ExecRequest { path: head.exe.clone(), argv: head.argv.clone(), envp: head.envp.clone() };
+            let opts = crate::RunOptions { args: head.argv.clone(), env: head.envp.clone(), ..cx.opts.clone() };
+            let (xlate, wayland) = (cx.xlate.clone(), cx.wayland.clone());
+            crate::run_child_thread(cx, pid, None, None, cx.wayland.clone(), move || {
+                EXEC_RESTORE.with(|e| *e.borrow_mut() = Some(restore));
+                let ran = crate::exec_program(req, &opts, &xlate, child, proc_state, wayland).map(|(exit, _)| exit);
+                // Ended before it was restored: say so to whoever waits.
+                if let Some(r) = EXEC_RESTORE.with(|e| e.borrow_mut().take()) {
+                    let _ = r.done.send(Err(match &ran {
+                        Err(e) => format!("{e:#}"),
+                        Ok(_) => "it ended before it was restored".to_string(),
+                    }));
+                }
+                ran
+            })?;
+            match done_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => bail!("pid {pid} ({}): {e}", head.exe),
+                Err(_) => bail!("pid {pid} ({}): its thread ended before it was restored", head.exe),
+            }
+            continue;
+        }
         let shared = wasmtime::SharedMemory::new(&cx.engine, crate::guest_memory_type()).map_err(|e| anyhow!("creating a restored process's memory: {e}"))?;
         let mem = gex_mem::GuestMemory::new(shared);
         // The run's dispatch directory and runtime mappings: the code is
@@ -786,8 +827,10 @@ pub(crate) fn restore_children(cx: &std::sync::Arc<crate::SpawnContext>) -> anyh
                 }
             }
         }
-        let mem_file = path.with_file_name(format!("mem-{pid}.bin"));
-        let threads = restore_into(&mut child, &mem, &mut r, &mem_file, &mut objs, false).with_context(|| format!("pid {pid}"))?;
+        let threads = {
+            let mut o = objs.lock().unwrap_or_else(|e| e.into_inner());
+            restore_into(&mut child, &mem, &mut r, &mem_file, &mut o, false, false).with_context(|| format!("pid {pid}"))?
+        };
         crate::publish_vm(&child, &mem);
         child.flush_perms(&mut gex_kernel::GuestMem::new(mem.bytes()));
         let main = threads[0];
@@ -797,6 +840,76 @@ pub(crate) fn restore_children(cx: &std::sync::Arc<crate::SpawnContext>) -> anyh
             crate::start_guest_thread(std::sync::Arc::clone(&child_cx), *t)?;
         }
         eprintln!("[gex] restored pid {pid} ({}) with {} threads, at {entry:#x}", head.exe, threads.len());
+    }
+    Ok(())
+}
+
+/// A process of another program than the run's, to be restored in place
+/// of that program's start ([`restore_children`], [`apply_exec`]): its
+/// file, its memory's file, what the restore has made so far, and whom to
+/// tell when it is done.
+pub(crate) struct ExecRestore {
+    bytes: Vec<u8>,
+    mem_file: std::path::PathBuf,
+    objs: std::sync::Arc<std::sync::Mutex<Objects>>,
+    done: std::sync::mpsc::Sender<Result<(), String>>,
+}
+
+thread_local! {
+    /// This host thread's program is to be restored ([`apply_exec`]).
+    static EXEC_RESTORE: std::cell::RefCell<Option<ExecRestore>> = const { std::cell::RefCell::new(None) };
+    /// Its other threads, started once its context exists
+    /// ([`start_exec_restored`]).
+    static EXEC_THREADS: std::cell::RefCell<Vec<gex_kernel::syscalls::ThreadState>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether this host thread's program is to be restored rather than
+/// started.
+pub(crate) fn exec_restore_pending() -> bool {
+    EXEC_RESTORE.with(|e| e.borrow().is_some())
+}
+
+/// The program this host thread has just placed, given what a snapshot
+/// saved of its process instead of its start: as [`apply`] does for the
+/// run's own, for a process [`restore_children`] exec'd into it. Where
+/// its thread goes on.
+pub(crate) fn apply_exec(store: &mut wasmtime::Store<crate::HostState>, memory: &gex_mem::GuestMemory) -> anyhow::Result<u64> {
+    use anyhow::{anyhow, bail};
+    let er = EXEC_RESTORE.with(|e| e.borrow_mut().take()).ok_or_else(|| anyhow!("no restore was asked of this thread"))?;
+    let tell = |res: Result<(), String>| {
+        let _ = er.done.send(res);
+    };
+    let run = (|| -> anyhow::Result<u64> {
+        let mut r = gex_kernel::snap::R::new(&er.bytes);
+        let head = read_head(&mut r)?;
+        let state = store.data_mut();
+        let ctx_addr = state.thread.ctx_addr;
+        state.with_kernel(|k| -> anyhow::Result<()> {
+            if k.exe_path != head.exe {
+                bail!("the snapshot's pid {} is of {}, and the program placed is {}", head.pid, head.exe, k.exe_path);
+            }
+            let mut o = er.objs.lock().unwrap_or_else(|e| e.into_inner());
+            let threads = restore_into(k, memory, &mut r, &er.mem_file, &mut o, true, false)?;
+            if threads[0].ctx_addr != ctx_addr {
+                bail!("pid {}: its own thread's context is at {:#x}, and the program's at {ctx_addr:#x}", head.pid, threads[0].ctx_addr);
+            }
+            EXEC_THREADS.with(|t| *t.borrow_mut() = threads[1..].to_vec());
+            Ok(())
+        })?;
+        let pc = u64::from_le_bytes(memory.bytes()[(ctx_addr + gex_abi::ctx::PC as u64) as usize..][..8].try_into().unwrap());
+        eprintln!("[gex] restored pid {} ({}), at {pc:#x}", head.pid, head.exe);
+        Ok(pc)
+    })();
+    tell(run.as_ref().map(|_| ()).map_err(|e| format!("{e:#}")));
+    run
+}
+
+/// Start an exec-restored process's other threads ([`apply_exec`]), once
+/// its context exists.
+pub(crate) fn start_exec_restored(cx: &std::sync::Arc<crate::SpawnContext>) -> anyhow::Result<()> {
+    let threads = EXEC_THREADS.with(|t| std::mem::take(&mut *t.borrow_mut()));
+    for t in threads {
+        crate::start_guest_thread(std::sync::Arc::clone(cx), t)?;
     }
     Ok(())
 }

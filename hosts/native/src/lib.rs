@@ -1731,8 +1731,11 @@ fn run_program_with(
     )?;
     // A snapshot's process instead of the program's start
     // (`gexc run --restore DIR`): only for a run's first program.
+    // Or, in a process a restore exec'd into its program, that process.
+    let exec_restored = snapshot::exec_restore_pending();
     let entry = match opts.restore.as_deref().filter(|_| fresh_process) {
         Some(dir) => snapshot::apply(&mut store, &memory, dir)?,
+        None if exec_restored => snapshot::apply_exec(&mut store, &memory)?,
         None => program.entry(),
     };
 
@@ -1822,6 +1825,9 @@ fn run_program_with(
     // A restored process's other threads (`--restore`).
     if opts.restore.is_some() && fresh_process {
         snapshot::start_restored(&spawn)?;
+    }
+    if exec_restored {
+        snapshot::start_exec_restored(&spawn)?;
     }
     note_live_process(&spawn);
     let pid = store.data_mut().with_kernel(|k| k.pid);
@@ -3504,6 +3510,27 @@ pub(crate) fn start_child(
     let made = Arc::clone(&child_cx);
     note_live_process(&child_cx);
     note_quiescence(&child_cx, pid);
+    let thread = ThreadState::new(ctx_addr, pid);
+    let cleanup = Arc::downgrade(&child_cx);
+    let kernel = Arc::clone(&child_cx.kernel);
+    let compositor = child_cx.wayland.clone();
+    run_child_thread(cx, pid, Some(cleanup), Some(kernel), compositor, move || run_guest_process(child_cx, thread, entry))?;
+    Ok(made)
+}
+
+/// A child process's host thread: `body` runs it (its first thread, or an
+/// exec into its program), and its end is told as a fork's child's is: its
+/// crash, its descriptors and record locks let go, its parent able to
+/// collect it. `cleanup` and `kernel` are its context and kernel where it
+/// has them before `body` runs (an exec'd child's are made inside it).
+fn run_child_thread(
+    cx: &Arc<SpawnContext>,
+    pid: i32,
+    cleanup: Option<std::sync::Weak<SpawnContext>>,
+    kernel: Option<Arc<Mutex<Kernel>>>,
+    compositor: Option<wayland::Wayland>,
+    body: impl FnOnce() -> Result<Exit> + Send + 'static,
+) -> Result<()> {
     let status = {
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         k.procs
@@ -3515,19 +3542,17 @@ pub(crate) fn start_child(
         let k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(&k.procs)
     };
-    let thread = ThreadState::new(ctx_addr, pid);
+    let locks = Arc::clone(&cx.kernel.lock().unwrap_or_else(|e| e.into_inner()).file_locks);
     std::thread::Builder::new()
         .name(format!("gex-pid-{pid}"))
         .stack_size(guest_thread_stack())
         .spawn(move || {
-            // Weak: a child that execs drops this context, and its memory
-            // (the parent's copy) with it, while the new program runs.
-            let cleanup = Arc::downgrade(&child_cx);
-            let kernel = Arc::clone(&child_cx.kernel);
-            let compositor = child_cx.wayland.clone();
+            // (Weak: a child that execs drops its context, and its memory
+            // (the parent's copy) with it, while the new program runs.)
+            // (Its record locks are in a table every process shares.)
             // Two numbers, deliberately: the process table keeps the one a
             // shell would print, and `wait4` gets the kernel's encoding.
-            let (code, wstatus) = match run_guest_process(child_cx, thread, entry) {
+            let (code, wstatus) = match body() {
                 Ok(exit) => {
                     say_killed(pid, &exit);
                     if let Some(note) = crash_note(&exit) {
@@ -3551,11 +3576,13 @@ pub(crate) fn start_child(
                     // A process that dies takes its threads and descriptors
                     // with it: otherwise its threads park in a futex nobody
                     // wakes and its pipes never reach EOF for their readers.
-                    if let Some(cx) = cleanup.upgrade() {
+                    if let Some(cx) = cleanup.as_ref().and_then(|c| c.upgrade()) {
                         stop_other_threads(&cx, false);
                     }
                     gex_kernel::syscalls::outgrow_ending(pid, 127 << 8, &procs);
-                    kernel.lock().unwrap_or_else(|e| e.into_inner()).release_at_exit();
+                    if let Some(k) = &kernel {
+                        k.lock().unwrap_or_else(|e| e.into_inner()).release_at_exit();
+                    }
                     (127, 127 << 8)
                 }
             };
@@ -3566,7 +3593,7 @@ pub(crate) fn start_child(
             }
             // Its record locks, however it ended (a descriptor table the
             // process drops closes nothing), and whoever waits for them.
-            kernel.lock().unwrap_or_else(|e| e.into_inner()).file_locks.release_pid(pid, None);
+            locks.release_pid(pid, None);
             ready::notify();
             if std::env::var_os("GEX_TRACE_EXIT").is_some() {
                 eprintln!("[gex:{pid}] process finished: code {code}, wait status {wstatus:#x}");
@@ -3583,9 +3610,8 @@ pub(crate) fn start_child(
             gex_kernel::syscalls::outgrow_ending(pid, wstatus, &procs);
             // Its descriptors close before its parent can see it gone, as on
             // Linux: a listening socket's port is free once `wait4` returns.
-            {
-                let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
-                k.release_at_exit();
+            if let Some(k) = &kernel {
+                k.lock().unwrap_or_else(|e| e.into_inner()).release_at_exit();
             }
             procs.exit(pid, wstatus);
             usage::forget(pid);
@@ -3595,7 +3621,7 @@ pub(crate) fn start_child(
             trim_heap();
         })
         .context("spawning a child process")?;
-    Ok(made)
+    Ok(())
 }
 
 /// A guest process has ended: give the host back what the allocator kept
