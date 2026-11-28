@@ -5769,7 +5769,10 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let stall_on = stall::on();
             if stall_on {
                 let pid = KernelProcSource(Arc::clone(&state.proc_state)).pid();
-                stall::enter(pid, state.thread.tid, nr);
+                match state.memory.clone() {
+                    Some(memory) => stall::enter_at(pid, state.thread.tid, nr, &memory, state.thread.ctx_addr, || state.with_kernel(|k| k.mem.shared())),
+                    None => stall::enter(pid, state.thread.tid, nr),
+                }
             }
             watch_check(&gm, pc as u64, state.thread.tid);
             lockstep::log_entry(&gm, state.thread.ctx_addr, state.thread.tid, pc as u64);

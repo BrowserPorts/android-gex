@@ -62,6 +62,17 @@ struct Entry {
     co: (u64, u64),
     co_n: u64,
     co_aborts: u64,
+    /// Its process's memory, its context's address there and the process's
+    /// memory map, from its latest call ([`enter_at`]): where a thread that
+    /// is outside a call is running, said by its PC and link register.
+    place: Option<Place>,
+}
+
+#[derive(Clone)]
+struct Place {
+    memory: gex_mem::GuestMemory,
+    ctx: u64,
+    mm: gex_kernel::mem::Mm,
 }
 
 static START: OnceLock<Instant> = OnceLock::new();
@@ -86,13 +97,46 @@ pub fn enter(pid: i32, tid: i32, nr: u64) {
     LAST_ENTRY_MS.store(now.duration_since(start()).as_millis() as u64, Relaxed);
     let host = HOST_TID.with(|t| *t);
     let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, call: None, bt: None, since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0 });
+    let e = g.get_or_insert_with(HashMap::new).entry(host).or_insert(Entry { tid, pid, inside: None, call: None, bt: None, since: now, last: !0, co: (0, 0), co_n: 0, co_aborts: 0, place: None });
     e.tid = tid;
     e.pid = pid;
     e.inside = Some(nr);
     e.call = None;
     e.bt = None;
     e.since = now;
+}
+
+/// [`enter`], and where the thread's context is: its process's `memory`
+/// at `ctx`, and the process's map (`mm`, asked for only when the memory
+/// is not the one noted already: at its first call and after an exec).
+pub fn enter_at(pid: i32, tid: i32, nr: u64, memory: &gex_mem::GuestMemory, ctx: u64, mm: impl FnOnce() -> gex_kernel::mem::Mm) {
+    enter(pid, tid, nr);
+    let host = HOST_TID.with(|t| *t);
+    let known = {
+        let g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().and_then(|m| m.get(&host)).and_then(|e| e.place.as_ref()).is_some_and(|p| p.ctx == ctx && p.memory.bytes().as_ptr() == memory.bytes().as_ptr())
+    };
+    if known {
+        return;
+    }
+    let place = Place { memory: memory.clone(), ctx, mm: mm() };
+    let mut g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.get_or_insert_with(HashMap::new).get_mut(&host) {
+        e.place = Some(place);
+    }
+}
+
+/// Where `at` is in a process: its mapping's name and the offset in it
+/// (in its file where it was loaded from one).
+fn where_in(mm: &gex_kernel::mem::Mm, at: u64) -> String {
+    let m = mm.lock();
+    match m.vma_at(at) {
+        Some(v) => match &v.code {
+            Some((file, off)) => format!("{file}+{:#x}", off + (at - v.start)),
+            None => format!("{}+{:#x}", if v.name.is_empty() { "[anon]" } else { &v.name }, at - v.start),
+        },
+        None => "no mapping".to_string(),
+    }
 }
 
 /// `GEX_STALL_BT=1` (with `GEX_WASM_BACKTRACE=1`): keep where each blocking
@@ -148,6 +192,7 @@ pub fn callout(target: u64, ret: u64, aborted: bool) {
         co: (0, 0),
         co_n: 0,
         co_aborts: 0,
+        place: None,
     });
     e.co = (target, ret);
     e.co_n += 1;
@@ -194,8 +239,19 @@ fn dump(why: &str) {
             (Some(_), Some(bt)) => format!("\n      at {bt}"),
             _ => String::new(),
         };
+        // Running guest code: where (its context holds the PC its last
+        // safepoint or call-out wrote).
+        let at = match (&e.inside, &e.place) {
+            (None, Some(p)) => {
+                let gm = gex_kernel::GuestMem::new(p.memory.bytes());
+                let pc = gm.read_u64(p.ctx + gex_abi::ctx::PC as u64).unwrap_or(0);
+                let lr = gm.read_u64(p.ctx + gex_abi::ctx::x(30) as u64).unwrap_or(0);
+                format!("\n      pc {pc:#x} ({}) lr {lr:#x} ({})", where_in(&p.mm, pc), where_in(&p.mm, lr))
+            }
+            _ => String::new(),
+        };
         lines.push((e.pid, e.tid, format!(
-            "  pid {} tid {} [{} {}] {} for {} ms, cpu {} ms/200{co}{bt}",
+            "  pid {} tid {} [{} {}] {} for {} ms, cpu {} ms/200{co}{bt}{at}",
             e.pid, e.tid, h, name, state, e.since.elapsed().as_millis(), a.saturating_sub(*b)
         )));
     }
