@@ -977,11 +977,13 @@ impl<'a> Emitter<'a> {
                 .iter()
                 .map(|a| (self.cx.gir[a].end - self.cx.gir[a].start) / 4)
                 .sum();
+            let members: Vec<String> = region.iter().map(|a| format!("{a:#x}")).collect();
             eprintln!(
-                "[region] {} blocks, {} instructions, {} registers held",
+                "[region] {} blocks, {} instructions, {} registers held: {}",
                 n,
                 insts,
-                touched.len()
+                touched.len(),
+                members.join(" ")
             );
         }
         for r in touched {
@@ -1478,6 +1480,18 @@ impl<'a> Emitter<'a> {
     /// happen on some executions, so the emitter must keep believing the
     /// context is stale and write them back again on the paths that leave.
     fn flush_conditional(&mut self) {
+        // In a region, which registers are dirty follows the order the
+        // members are emitted in, not the order the guest runs them: a fault
+        // in a member emitted before the one that wrote a register would
+        // leave the context's older value, which the fault's handler sees
+        // and the access then resumes with (ART's ClassLinker::FindClass
+        // probed its class table on with a bound of 0, for ever). Every
+        // register the region writes is in its local and current: all of
+        // them, as at an exit.
+        if self.region.is_some() {
+            self.flush_region_exit();
+            return;
+        }
         self.flush_inner(true);
     }
 
@@ -5786,9 +5800,10 @@ impl<'a> Emitter<'a> {
         self.f.i32_const(0);
         self.f.byte(0x4c); // i32.le_s
         self.f.if_void();
-        // Inside a fused loop the registers live only in locals, so the slow
-        // path -- which may deliver a signal and unwind -- must write them back.
-        if self.loop_depth.is_some() {
+        // Inside a fused loop or a region the registers live only in locals,
+        // so the slow path -- which may deliver a signal and unwind -- must
+        // write them back.
+        if self.loop_depth.is_some() || self.region.is_some() {
             self.flush_conditional();
         }
         self.f.local_get(self.ctx_local);
